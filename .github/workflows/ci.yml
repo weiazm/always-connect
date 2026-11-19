@@ -1,8 +1,11 @@
 # CI: Rust tests on Linux (full, incl. libopenconnect auth against a
 # local ocserv gateway) and macOS (core tests + staticlib + Xcode build
-# with signing off). The macOS job is the no-local-Mac verification loop:
-# it proves the Swift shell compiles and links against the Rust core,
-# and runs the Helper's pf generation as a smoke check.
+# with signing off). The macOS checks are the no-local-Mac verification
+# loop: they prove the Swift shell compiles and links against the Rust
+# core, and run the Helper's pf generation as a smoke check. They are
+# split into three parallel jobs (macos, macos-harness,
+# macos-openconnect; DESIGN.md §六十五) so the slow harnesses do not run
+# one after another; scripts/release-ci.py requires every job by name.
 # It does NOT prove a real gateway connection, phone approval, or
 # live traffic routing — those still need a trusted Mac (Phase 0).
 name: CI
@@ -30,7 +33,13 @@ jobs:
       - name: Release gate and publication failure cases (no secrets or network)
         run: python3 scripts/release-ci-test.py
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libopenconnect-dev ocserv openconnect
+        # No recommended extras (dnsmasq, docs, test tools: ~55 -> fewer
+        # packages), and a stalled mirror fetch times out and retries
+        # instead of hanging (one run spent 9 min here, DESIGN §65.1).
+        run: >-
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update &&
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15
+          install -y --no-install-recommends libopenconnect-dev ocserv openconnect
       - name: Start test gateway
         # ocserv refuses to run without root ("This server requires root
         # access to operate"); Actions runners have passwordless sudo.
@@ -60,9 +69,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Rust tests (macOS, default features)
-        working-directory: core
-        run: cargo test
       - name: Build Rust staticlib for the Swift shell
         working-directory: core
         run: cargo build --release
@@ -75,8 +81,6 @@ jobs:
           xcodebuild -project AlwaysConnect.xcodeproj
           -scheme AlwaysConnect -destination 'platform=macOS'
           build CODE_SIGNING_ALLOWED=NO
-      - name: Private descriptor creation and explicit child IO
-        run: scripts/private-descriptors-test.sh
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
       - name: Emergency recovery route plan (stubbed, no network changes)
@@ -280,13 +284,6 @@ jobs:
           "$HELPER" dump-script > /tmp/ac-vpnc-plan.sh
           chmod +x /tmp/ac-vpnc-plan.sh
           core/scripts/vpnc-route-plan-test.sh /tmp/ac-vpnc-plan.sh
-      - name: Cisco engine harness (fake Cisco CLI)
-        # Sources/App/CiscoEngine.swift against core/scripts/
-        # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
-        # manual disconnect, rejected login without retry, transient
-        # retry, adopting a live session. Logic only; Cisco itself is
-        # Mac proof.
-        run: scripts/cisco-engine-test.sh
       - name: Cisco session traffic parser
         run: scripts/cisco-traffic-test.sh
       - name: Quit cleanup (descendant processes, SIGTERM then SIGKILL)
@@ -294,8 +291,6 @@ jobs:
         # processes (DESIGN.md §23.11). The App's and the background
         # service's actual quit is Mac proof.
         run: scripts/process-sweep-test.sh
-      - name: Diagnostics file names no VPN (DESIGN.md §36.3)
-        run: scripts/diagnostics-redaction-test.sh
       - name: Background-service client check (same certificate only, DESIGN.md §36.3)
         run: scripts/helper-client-test.sh
       - name: Administrator child authenticates its parent
@@ -304,11 +299,6 @@ jobs:
         # Sources/Helper/BootSession.swift (DESIGN.md §23.12). The
         # real reboot is Mac proof.
         run: scripts/boot-session-test.sh
-      - name: Background-service lifecycle (session harness, pfctl stand-in)
-        # HelperSession + kill switch + engine with a logging pfctl
-        # stub and fake-openconnect (DESIGN.md §二十五): every
-        # disconnect/release path gives pf back. Real pf is Mac proof.
-        run: scripts/session-test.sh
       - name: Background-service uid ownership
         run: scripts/helper-uid-test.sh
       - name: Drop history (episodes, outcomes, retries, old records)
@@ -319,24 +309,12 @@ jobs:
         # Sources/App/ApprovalPromptTracker.swift (DESIGN.md §29). The
         # window on a real screen is Mac proof.
         run: scripts/approval-prompt-test.sh
-      - name: On-demand policy and connection orchestration
-        run: scripts/on-demand-test.sh
-      - name: Split list rules (domains, geosite, geoip, networks; bundled data)
-        # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
-        run: scripts/list-rules-test.sh
       - name: Other VPN / proxy notices (classification only)
         # Sources/App/NetworkNeighbors.swift (DESIGN.md §27.2).
         run: scripts/neighbors-test.sh
       - name: Connections page classification and route lookup
         # Sources/Helper/Connections.swift (DESIGN.md §28.7).
         run: scripts/connections-test.sh
-      - name: Connections settings scroll and resize (sample data)
-        run: scripts/connections-ui-test.sh
-      - name: Clean uninstall (fake file system, commands logged)
-        # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
-        # (Cisco, foreign bundles), the from-App detach and wait. The real
-        # removal and network restore on a Mac are Mac proof.
-        run: scripts/uninstall-test.sh
       - name: Privileged bundle verification and quoting (no administrator operation)
         run: scripts/privileged-bundle-test.sh
       - name: Third-party notices match Cargo.lock
@@ -346,22 +324,8 @@ jobs:
         # Sources/App/ConnectionCheck.swift (DESIGN.md §26.11). The probes
         # and the automatic disconnect in the running App are Mac proof.
         run: scripts/connection-check-test.sh
-      - name: Quit from any caller (terminateLater from main-queue blocks)
-        # Sources/App/AppQuit.swift (DESIGN.md §37): the uninstall from
-        # Settings and the one-click update quit from inside main-queue
-        # blocks. The real quit on a Mac is Mac proof.
-        run: scripts/quit-test.sh
       - name: Private settings IPC and process lifetime
         run: scripts/settings-transport-test.sh
-      - name: Update check (GitHub releases list, local fake server)
-        # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
-        # §三十三). The real GitHub answer and the panel notice are Mac proof.
-        run: scripts/update-check-test.sh
-      - name: One-line installer (install.sh, local fake releases)
-        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
-        # stage-then-install, quarantine cleared. Quitting a real running
-        # App and the real GitHub download are Mac proof.
-        run: scripts/install-test.sh
       - name: Installer version and final-copy policy (signature stub)
         run: scripts/install-policy-test.sh
       - name: DNS forwarder harness (domain split, loopback fake upstreams)
@@ -369,18 +333,79 @@ jobs:
         # before the answer, IPv4 only; other names to the tunnel's DNS
         # with server switching and TCP fallback. Real DNS is Mac proof.
         run: scripts/dns-forwarder-test.sh
-      - name: Certificate relay harness (mock gateway demanding a client certificate)
-        # Sources/App/CertificateRelay.swift with test certificates only
-        # (DESIGN.md §二十三): CSTP reassembly, one TLS record per packet
-        # both ways, local mutual TLS refusing foreign clients, and the
-        # Helper's openconnect engine logging in through the relay to a
-        # mock gateway that demands a client certificate. Real gateway
-        # and keychain identity are Mac proof.
-        timeout-minutes: 8
-        run: |
-          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
-          test -n "$HELPER"
-          scripts/relay-test.sh "$HELPER"
+
+  # Script harnesses that build what they need themselves (cargo +
+  # swiftc); split from `macos` so the slow ones run in parallel.
+  macos-harness:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust tests (macOS, default features)
+        working-directory: core
+        run: cargo test
+      - name: Cisco engine harness (fake Cisco CLI)
+        # Sources/App/CiscoEngine.swift against core/scripts/
+        # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
+        # manual disconnect, rejected login without retry, transient
+        # retry, adopting a live session. Logic only; Cisco itself is
+        # Mac proof.
+        run: scripts/cisco-engine-test.sh
+      - name: Background-service lifecycle (session harness, pfctl stand-in)
+        # HelperSession + kill switch + engine with a logging pfctl
+        # stub and fake-openconnect (DESIGN.md §二十五): every
+        # disconnect/release path gives pf back. Real pf is Mac proof.
+        run: scripts/session-test.sh
+      - name: Update check (GitHub releases list, local fake server)
+        # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
+        # §三十三). The real GitHub answer and the panel notice are Mac proof.
+        run: scripts/update-check-test.sh
+      - name: Private descriptor creation and explicit child IO
+        run: scripts/private-descriptors-test.sh
+      - name: Diagnostics file names no VPN (DESIGN.md §36.3)
+        run: scripts/diagnostics-redaction-test.sh
+      - name: Clean uninstall (fake file system, commands logged)
+        # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
+        # (Cisco, foreign bundles), the from-App detach and wait. The real
+        # removal and network restore on a Mac are Mac proof.
+        run: scripts/uninstall-test.sh
+      - name: Quit from any caller (terminateLater from main-queue blocks)
+        # Sources/App/AppQuit.swift (DESIGN.md §37): the uninstall from
+        # Settings and the one-click update quit from inside main-queue
+        # blocks. The real quit on a Mac is Mac proof.
+        run: scripts/quit-test.sh
+      - name: One-line installer (install.sh, local fake releases)
+        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
+        # stage-then-install, quarantine cleared. Quitting a real running
+        # App and the real GitHub download are Mac proof.
+        run: scripts/install-test.sh
+      - name: Split list rules (domains, geosite, geoip, networks; bundled data)
+        # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
+        run: scripts/list-rules-test.sh
+      - name: On-demand policy and connection orchestration
+        run: scripts/on-demand-test.sh
+
+  # Real openconnect against the mock gateway; needs the Xcode-built
+  # background service, so it builds it too.
+  macos-openconnect:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Rust staticlib for the Swift shell
+        working-directory: core
+        run: cargo build --release
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build (signing off — compile + link check only)
+        run: >-
+          xcodebuild -project AlwaysConnect.xcodeproj
+          -scheme AlwaysConnect -destination 'platform=macOS'
+          build CODE_SIGNING_ALLOWED=NO
+      - name: Install openconnect
+        # approval-wait-test.sh skips without openconnect on PATH; the
+        # bundle step copies Homebrew's build. Fail here instead.
+        run: brew install openconnect && command -v openconnect
       - name: Own-connection phone-approval wait (real openconnect, mock gateway)
         # DESIGN.md §30.9: the mock holds its answer to the password as
         # the company gateway does while it waits for the phone; the
@@ -400,3 +425,17 @@ jobs:
           scripts/bundle-openconnect.sh /tmp/oc-bundle
           /tmp/oc-bundle/bin/openconnect --version | head -1
           ALWAYSCONNECT_TEST_OPENCONNECT=/tmp/oc-bundle/bin/openconnect scripts/relay-test.sh "$HELPER"
+      - name: Connections settings scroll and resize (sample data)
+        run: scripts/connections-ui-test.sh
+      - name: Certificate relay harness (mock gateway demanding a client certificate)
+        # Sources/App/CertificateRelay.swift with test certificates only
+        # (DESIGN.md §二十三): CSTP reassembly, one TLS record per packet
+        # both ways, local mutual TLS refusing foreign clients, and the
+        # Helper's openconnect engine logging in through the relay to a
+        # mock gateway that demands a client certificate. Real gateway
+        # and keychain identity are Mac proof.
+        timeout-minutes: 8
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          scripts/relay-test.sh "$HELPER"

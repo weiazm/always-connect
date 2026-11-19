@@ -21,6 +21,8 @@ enum CiscoProfiles {
 struct Harness {
     static func main() {
         let dir = ProcessInfo.processInfo.environment["FAKE_CISCO_DIR"]!
+        var available = true
+        CiscoEngine.physicalAvailability = { available }
         CiscoEngine.cliPath = CommandLine.arguments[1]
         CiscoEngine.approvalTimeoutMinimum = 0.5
         // The fake CLI changes no routes: the fallback check finds drops.
@@ -42,33 +44,40 @@ struct Harness {
         func wait(_ seconds: Double) {
             RunLoop.main.run(until: Date().addingTimeInterval(seconds))
         }
-        log("STEP connect")
-        engine.connect(); wait(4)
-        log("STEP drop")
-        setState("Disconnected"); wait(9)
-        log("STEP manual-disconnect")
-        let done = DispatchSemaphore(value: 0)
-        engine.disconnect { done.signal() }; wait(2)
-        log("STEP rejected")
-        password = "bad"
-        engine.connect(); wait(5)
-        log("STEP transient-then-good")
-        password = "flaky"
-        engine.connect(); wait(2)
-        password = "good"; wait(5)
-        engine.disconnect {}; wait(1)
-        log("STEP approval-expired")
-        password = "noapprove"
-        engine.connect(); wait(3)
-        engine.disconnect {}; wait(1)
-        log("STEP quick-login-failed")
-        password = "quickfail"
-        engine.connect(); wait(2)
-        log("STEP pushed-failure")
-        engine.disconnect {}; wait(1)
-        password = "pushfail"
-        engine.connect(); wait(3)
-        engine.disconnect {}; wait(1)
+        // Part "1" = connect..pushed-failure, "2" = adopt-on-refresh..end.
+        // The two parts share no state, so the test script runs them as two
+        // processes at once (own fake-CLI directory and defaults domain).
+        let part = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "all"
+        if part != "2" {
+            log("STEP connect")
+            engine.connect(); wait(4)
+            log("STEP drop")
+            setState("Disconnected"); wait(9)
+            log("STEP manual-disconnect")
+            let done = DispatchSemaphore(value: 0)
+            engine.disconnect { done.signal() }; wait(2)
+            log("STEP rejected")
+            password = "bad"
+            engine.connect(); wait(5)
+            log("STEP transient-then-good")
+            password = "flaky"
+            engine.connect(); wait(2)
+            password = "good"; wait(5)
+            engine.disconnect {}; wait(1)
+            log("STEP approval-expired")
+            password = "noapprove"
+            engine.connect(); wait(3)
+            engine.disconnect {}; wait(1)
+            log("STEP quick-login-failed")
+            password = "quickfail"
+            engine.connect(); wait(2)
+            log("STEP pushed-failure")
+            engine.disconnect {}; wait(1)
+            password = "pushfail"
+            engine.connect(); wait(3)
+            engine.disconnect {}; wait(1)
+        }
+        if part == "1" { log("DONE"); return }
         password = "good"
         log("STEP adopt-on-refresh")
         setState("Disconnected")
@@ -89,6 +98,56 @@ struct Harness {
         third.refresh(); wait(3)
         log("EVENT3 managing=\(third.isManaging)")
         engine.disconnect {}; second.disconnect {}; wait(2)
+        func cancellationCount() -> Int {
+            (try? String(contentsOfFile: dir + "/cancellations", encoding: .utf8))?.split(separator: "\n").count ?? 0
+        }
+        log("STEP offline-cancel")
+        let beforeCancel = cancellationCount()
+        password = "slow"
+        engine.connect(); wait(1)
+        available = false
+        engine.networkChanged(); wait(3)
+        log("offline owned=\(engine.isManaging)")
+        log("offline cancel-issued=\(cancellationCount() > beforeCancel)")
+        let stoppedState = (try? String(contentsOfFile: dir + "/state", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+        log("offline daemon-state=\(stoppedState)")
+        log("STEP offline-resume")
+        password = "good"
+        available = true
+        engine.networkChanged(); wait(3)
+        engine.disconnect {}; wait(1)
+        log("STEP offline-manual-stop")
+        password = "slow"
+        engine.connect(); wait(1)
+        available = false
+        engine.networkChanged(); wait(3)
+        engine.disconnect {}; wait(1)
+        log("STEP restored-after-manual")
+        available = true
+        engine.networkChanged(); wait(2)
+        log("STEP stop-active-login")
+        let beforeActiveStop = cancellationCount()
+        password = "slow"
+        engine.connect(); wait(1)
+        engine.disconnect {}; wait(3)
+        log("cancelled owned=\(engine.isManaging)")
+        log("active cancel-issued=\(cancellationCount() > beforeActiveStop)")
+        // A session Cisco already holds is kept through an outage (§64.2).
+        log("STEP offline-keep")
+        func loginCount() -> Int {
+            (try? String(contentsOfFile: dir + "/commands", encoding: .utf8))?.split(separator: "\n").count ?? 0
+        }
+        password = "good"
+        engine.connect(); wait(3)
+        let loginsBeforeKeep = loginCount()
+        let cancelsBeforeKeep = cancellationCount()
+        available = false
+        engine.networkChanged(); wait(3)
+        log("keep cancel-issued=\(cancellationCount() > cancelsBeforeKeep)")
+        available = true
+        engine.networkChanged(); wait(3)
+        log("keep relogin=\(loginCount() > loginsBeforeKeep)")
+        engine.disconnect {}; wait(1)
         log("DONE")
     }
 }
