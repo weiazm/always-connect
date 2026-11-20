@@ -49,8 +49,8 @@ fn run(drop_protection: bool, egress_on: bool, gate: Option<&str>) -> Run {
         &cli,
         r#"#!/bin/sh
 root=$(dirname "$0")
-printf '%s\n' "$@" > "$root/args.tmp" && mv "$root/args.tmp" "$root/args"
 printf 'control=%s\ntun=%s\n' "$AC_GATE_CONTROL" "$AC_GATE_TUN" > "$root/env"
+printf '%s\n' "$@" > "$root/args.tmp" && mv "$root/args.tmp" "$root/args"
 read -r credential
 while [ ! -f "$root/exit" ]; do sleep 0.01; done
 "#,
