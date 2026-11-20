@@ -15,9 +15,9 @@ import argparse, json, os, secrets, socket, ssl, subprocess, sys, threading, tim
 LOC = {"protected.test": "ZZ", "blocked.test": "YY", "range.test": "ZZ"}
 
 
-def jlog(path, **kw):
+def jlog(logfile, **kw):
     kw["t"] = time.time()
-    with open(path, "a") as f:
+    with open(logfile, "a") as f:
         f.write(json.dumps(kw) + "\n")
 
 

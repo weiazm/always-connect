@@ -148,8 +148,9 @@ q=$(count '"port": 443' "$W/site.log"); o=$(count '"port": 9999' "$W/site.log")
 # 6. Concurrent connections share one check (after the last verdict expired).
 sleep 1.5
 before=$(count '"group": 1,' "$W/controller.log")
-for i in 1 2 3 4 5; do nsx "${CURL[@]}" -o /dev/null --resolve protected.test:443:$SITE https://protected.test/ & done
-wait
+CPIDS=()
+for i in 1 2 3 4 5; do nsx "${CURL[@]}" -o /dev/null --resolve protected.test:443:$SITE https://protected.test/ & CPIDS+=($!); done
+wait "${CPIDS[@]}" || true   # only the curls: a bare wait would wait for the servers too
 after=$(count '"group": 1,' "$W/controller.log")
 [ $((after - before)) = 1 ] && pass "5 concurrent connections, 1 check" || fail "concurrent checks: $((after - before))"
 
