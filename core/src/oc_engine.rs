@@ -86,6 +86,11 @@ pub struct Config {
     pub approval_quiet_secs: f64,
     pub approval_expiry_minimum: f64,
     pub push_backoff: Vec<f64>,
+    /// Egress protection (DESIGN §66): when on (and drop protection is on),
+    /// openconnect runs in --script-tun mode through the gate program.
+    pub egress: Option<crate::egress_control::EgressConfig>,
+    /// TestSeam's stand-in gate program, when test_active.
+    pub test_gate: Option<String>,
 }
 
 pub const QUIET_AFTER: f64 = 3600.0;
@@ -155,6 +160,7 @@ enum Event {
     Availability(bool),
     OfflineDeadline(u64),
     Release,
+    Egress(crate::egress_control::EgressConfig),
 }
 
 // MARK: - Helpers (pure)
@@ -220,6 +226,16 @@ pub fn bundled_is_trusted(file: &str) -> bool {
 fn is_executable(path: &str) -> bool {
     std::ffi::CString::new(path).map(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0).unwrap_or(false)
         && Path::new(path).is_file()
+}
+
+/// Egress protection runs only with drop protection (§66.8) and at least
+/// one enabled group.
+pub fn egress_active(config: &Config) -> bool {
+    config.drop_protection && config.egress.as_ref().is_some_and(|e| e.enabled && e.groups.iter().any(|g| g.enabled))
+}
+
+pub fn egress_socket(support: &Path) -> PathBuf {
+    support.join("egress.sock")
 }
 
 pub fn route_state_path(support: &Path) -> PathBuf {
@@ -444,6 +460,10 @@ pub struct Shared {
     /// What the service reads, published before every callback: the
     /// callbacks may read it, and must never wait for the core.
     info: Mutex<Info>,
+    /// The gate's controller while egress protection runs (§66.5), outside
+    /// the core so status and set-up probes never wait for it.
+    egress: Mutex<Option<Arc<crate::egress_control::Controller>>>,
+    egress_probe: Mutex<Option<crate::egress_control::ProbeHook>>,
 }
 
 pub struct Engine {
@@ -522,6 +542,8 @@ impl Engine {
             child_pid: Mutex::new(None),
             timer_seq: AtomicU64::new(0),
             info: Mutex::new(Info::default()),
+            egress: Mutex::new(None),
+            egress_probe: Mutex::new(None),
         });
         let s = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -548,6 +570,26 @@ impl Engine {
         self.send(Event::Stop { keep_session, notify });
     }
     pub fn network_changed(&self) { self.send(Event::NetworkChanged); }
+
+    /// The platform's HTTPS-through-the-tunnel probe (§66.4).
+    pub fn set_egress_probe(&self, hook: crate::egress_control::ProbeHook) {
+        *self.shared.egress_probe.lock().expect("probe") = Some(hook);
+    }
+    /// New groups/methods; on/off takes effect at the next connect.
+    pub fn update_egress(&self, cfg: crate::egress_control::EgressConfig) {
+        self.send(Event::Egress(cfg));
+    }
+    /// JSON status for the App; `{"running":false}` when not in use.
+    pub fn egress_status(&self) -> String {
+        let ctl = self.shared.egress.lock().expect("egress").clone();
+        ctl.map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
+    }
+    /// Set-up probing of one site with every method (§66.4); empty when the
+    /// gate is not running (nothing can go through the tunnel's gate).
+    pub fn egress_probe_host(&self, host: &str) -> Vec<crate::egress_control::Observation> {
+        let ctl = self.shared.egress.lock().expect("egress").clone();
+        ctl.map(|c| c.probe_all(host)).unwrap_or_default()
+    }
 
     pub fn update_direct_domains(&self, d: Vec<String>) {
         self.send(Event::DirectDomains(d));
@@ -762,6 +804,7 @@ impl Shared {
                     }
                 }
                 Event::NetworkChanged => {
+                    self.egress_invalidate();
                     if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
                 }
                 Event::DirectDomains(d) => {
@@ -774,6 +817,12 @@ impl Shared {
                     c.config.direct_domains = Some(d);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
+                Event::Egress(cfg) => {
+                    if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+                        ctl.update(cfg.clone());
+                    }
+                    c.config.egress = Some(cfg);
+                }
                 Event::AllowNetworks(n) => {
                     c.reset_direct_retries();
                     c.config.allow_networks = n.iter().map(|x| x.trim().to_string()).filter(|x| crate::kill_switch::is_cidr(x)).collect();
@@ -997,6 +1046,7 @@ impl Shared {
         // Retire the offline intent before guard cleanup and terminal callbacks:
         // queued network events must not revive a completed engine.
         c.network.stop();
+        self.egress.lock().expect("egress").take();
         self.guard.own_engine_finished(&self.holder);
         c.last_terminal = Some(reason);
         c.in_drop_episode = false;
@@ -1279,6 +1329,43 @@ impl Shared {
         });
     }
 
+    /// The trusted gate program and a running controller (§66.5). Errors are
+    /// user-facing: egress protection never falls back to an unchecked tunnel.
+    fn start_egress(&self, c: &mut Core) -> Result<String, String> {
+        let gate = if c.config.test_active {
+            c.config.test_gate.clone().filter(|g| !g.is_empty()).ok_or_else(|| "出口保护组件缺失".to_string())?
+        } else {
+            let g = format!("{BUNDLED_DIR}/bin/alwaysconnect-gate");
+            if !bundled_is_trusted(&g) {
+                return Err("出口保护组件缺失或不可信，请重新安装后台服务".into());
+            }
+            g
+        };
+        let cfg = c.config.egress.clone().unwrap_or_default();
+        let mut slot = self.egress.lock().expect("egress");
+        match slot.as_ref() {
+            Some(ctl) => ctl.update(cfg),
+            None => {
+                let hook = self.egress_probe.lock().expect("probe").clone().unwrap_or_else(|| std::sync::Arc::new(|_: &crate::egress_control::ProbeRequest| None));
+                let support = c.support();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::create_dir_all(&support);
+                    let _ = std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700));
+                }
+                let ctl = crate::egress_control::Controller::start(&egress_socket(&support), cfg, hook).map_err(|e| format!("出口保护无法启动：{e}"))?;
+                *slot = Some(Arc::new(ctl));
+            }
+        }
+        Ok(gate)
+    }
+
+    fn egress_invalidate(&self) {
+        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+            ctl.invalidate();
+        }
+    }
+
     fn stop_split(&self, c: &mut Core) {
         c.watching = false;
         if let Some(stop) = c.watch_stop.take() {
@@ -1442,7 +1529,28 @@ impl Shared {
         };
         // openconnect hands --script to /bin/sh -c as a command line, and
         // the installed path has a space ("Application Support").
-        args.push(format!("--script={}", shell_quoted(&c.config.script_path)));
+        let gate = if egress_active(&c.config) {
+            match self.start_egress(c) {
+                Ok(g) => Some(g),
+                Err(detail) => {
+                    self.stop_split(c);
+                    c.last_error = Some(detail.clone());
+                    c.driver.on_manual_disconnect();
+                    self.finish_terminal(c, Terminal::ComponentMissing, &detail);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(gate) = &gate {
+            // §66.5: the gate owns the utun and runs the same vpnc-script,
+            // whose path stays on openconnect's command line.
+            args.push("--script-tun".into());
+            args.push(format!("--script={} {}", shell_quoted(gate), shell_quoted(&c.config.script_path)));
+        } else {
+            args.push(format!("--script={}", shell_quoted(&c.config.script_path)));
+        }
         args.push("--dump-http-traffic".into());
 
         let support = c.support();
@@ -1474,6 +1582,10 @@ impl Shared {
         }
         if c.forwarder.is_some() {
             cmd.env("ALWAYSCONNECT_DNS_FIRST", "127.0.0.1");
+        }
+        cmd.env_remove("AC_GATE_CONTROL").env_remove("AC_GATE_TUN").env_remove("AC_GATE_VPNC_SCRIPT");
+        if gate.is_some() {
+            cmd.env("AC_GATE_CONTROL", egress_socket(&support)).env("AC_GATE_TUN", "utun");
         }
         c.driver.on_authenticated();
         let label = if c.fed == Credential::Cookie { "cookie" } else { "password" };
@@ -1600,6 +1712,7 @@ impl Shared {
         let pairs: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
         match event {
             "connect" => {
+                self.egress_invalidate();
                 c.tunnel_dns.clear();
                 let mut tun = None;
                 let mut gateway = None;
@@ -2937,3 +3050,5 @@ exit 0
 
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod egress_tests;
