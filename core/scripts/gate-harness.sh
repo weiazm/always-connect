@@ -44,15 +44,25 @@ dump() {
 }
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
-count() { grep -c "$1" "$2" 2>/dev/null || true; }   # grep -c exits 1 on zero
+count() { local c; c=$(grep -c "$1" "$2" 2>/dev/null) || true; echo "${c:-0}"; }   # grep -c exits 1 on zero; a missing log counts 0
 nsx() { ip netns exec "$NS" "$@"; }
 
 # Test CA and one site certificate for every test name.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Gate Harness CA" \
-  -keyout "$W/ca.key" -out "$W/ca.pem" 2>/dev/null
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -addext "subjectKeyIdentifier=hash" -keyout "$W/ca.key" -out "$W/ca.pem" 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=protected.test" \
   -keyout "$W/site.key" -out "$W/site.csr" 2>/dev/null
-printf 'subjectAltName=DNS:protected.test,DNS:blocked.test,DNS:follow.blocked.test,DNS:free.test,DNS:range.test\n' > "$W/site.ext"
+# Full leaf extensions: Python 3.13+ verifies strictly (VERIFY_X509_STRICT)
+# and rejects a leaf without an authority key identifier.
+cat > "$W/site.ext" <<'EXT'
+subjectAltName=DNS:protected.test,DNS:blocked.test,DNS:follow.blocked.test,DNS:free.test,DNS:range.test
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+EXT
 openssl x509 -req -in "$W/site.csr" -CA "$W/ca.pem" -CAkey "$W/ca.key" -CAcreateserial \
   -out "$W/site.pem" -days 2 -extfile "$W/site.ext" 2>/dev/null
 
