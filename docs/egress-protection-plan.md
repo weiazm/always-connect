@@ -42,7 +42,7 @@
 
 ## 5. 文档、验证与交付
 
-接线的行为、边界和验证级别已记在 DESIGN §66.14。真实网关与资源数据保留在 §K，当前未验。
+接线的行为、边界和验证级别已记在 DESIGN §66.14。真实网关、闸门恢复、浏览器、匿名检测及开销的机测数据见 DESIGN §66.15，逐项完成情况见 mac-proof §K。
 
 - 每批：代码与 DESIGN（§66.14 进度、验证级别）、UI-DESIGN、HANDOVER、实测清单同批改；`cd core && cargo test`；`scripts/build-local.sh --tests`；推送前对 `git log -p origin/main..HEAD` 做关键词审查（清单只在本地，见项目记忆）；四个 CI job 全绿再汇报；更新 PR #7 描述。
 - 开销：按 §32 量出口保护关着（必须零新增）与开着时的 footprint / CPU / 每秒唤醒与 VPN 吞吐，写进 DESIGN。
