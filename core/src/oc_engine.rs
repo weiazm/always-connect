@@ -390,6 +390,8 @@ fn interface_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+mod cstp_dns;
+
 struct Core {
     config: Config,
     protected_routes: Option<Arc<crate::egress_control::ProtectedRoutes>>,
@@ -436,6 +438,7 @@ struct Core {
     last_pf: Option<(String, Vec<String>)>,
     last_allow_direct_egress: bool,
     tunnel_dns: Vec<String>,
+    cstp_dns: cstp_dns::CstpDns,
     tunnel_if: Option<String>,
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
@@ -529,6 +532,7 @@ impl Engine {
                 last_pf: None,
                 last_allow_direct_egress: false,
                 tunnel_dns: Vec::new(),
+                cstp_dns: Default::default(),
                 tunnel_if: None,
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
@@ -1555,6 +1559,7 @@ impl Shared {
         c.tunnel_retrying = false;
         c.saw_login_failed = false;
         c.tunnel_dns.clear();
+        c.cstp_dns = Default::default();
         c.tunnel_lease = None;
         c.tunnel_if = None;
         self.update_forwarder(c);
@@ -1633,6 +1638,8 @@ impl Shared {
         let mut cmd = Command::new(&executable);
         crate::reset_child_signals(&mut cmd);
         cmd.args(&args)
+            .env("LC_MESSAGES", "C")
+            .env("LANGUAGE", "C")
             .env_remove("ALWAYSCONNECT_MANUAL_DISCONNECT")
             // The script's disconnect branch reads a FILE (stop() creates
             // it before terminating the child); a stale one is removed now.
@@ -1765,6 +1772,23 @@ impl Shared {
             self.handle_hook(c, payload);
             return;
         }
+        if stdout && c.forwarder.is_some() && c.cstp_dns.observe(line) && c.hook_fired {
+            // A script-tun gate survives an internal transport reconnect.
+            // Its previous checks no longer describe the new connection.
+            self.egress_invalidate();
+            let servers = c.cstp_dns.accepted().expect("completed CSTP negotiation");
+            if servers != c.tunnel_dns {
+                c.tunnel_dns = servers.to_vec();
+                self.update_forwarder(c);
+                // Script-tun gets no reconnect hook. The gate's confirmed
+                // interface remains the owner; native mode rearms in its hook.
+                if !c.tunnel_retrying && !c.recovery_suspended() && c.child_alive() {
+                    if let (Some(tun), Some((_, gateways))) = (c.tunnel_if.clone(), c.last_pf.clone()) {
+                        self.load_pf(c, Some(tun), gateways, c.last_allow_direct_egress);
+                    }
+                }
+            }
+        }
         if let Some(cookie) = capture_cookie(line) {
             cookie_save(&c.config.cookie_store_path, &cookie, &c.config.server);
             return;
@@ -1817,6 +1841,9 @@ impl Shared {
                     }
                 }
                 c.hook_fired = true;
+                if let Some(servers) = c.cstp_dns.accepted() {
+                    c.tunnel_dns = servers.to_vec();
+                }
                 c.tunnel_retrying = false;
                 if c.forwarder.is_some() || c.config.relay.is_some() {
                     c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(&c.config.physical_if) };
@@ -1839,6 +1866,7 @@ impl Shared {
             "attempt-reconnect" => {
                 // openconnect is retrying inside the same process (§28.1).
                 c.tunnel_retrying = true;
+                c.cstp_dns = Default::default();
                 c.tunnel_if = None;
                 self.update_forwarder(c);
                 let phys = pairs.iter().find(|(k, v)| *k == "phys" && !v.is_empty()).map(|(_, v)| v.to_string());
@@ -1856,7 +1884,9 @@ impl Shared {
                 if !c.config.no_routes { self.refresh_network(c); }
                 c.tunnel_if = pairs.iter().find(|(k,v)| *k == "tun" && !v.is_empty()).map(|(_,v)| v.to_string())
                     .or_else(|| c.last_pf.as_ref().map(|p| p.0.clone()));
-                if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
+                if let Some(servers) = c.cstp_dns.accepted() {
+                    c.tunnel_dns = servers.to_vec();
+                } else if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
                     c.tunnel_dns = dns.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
                 }
                 self.remember_tunnel(c);
@@ -2486,6 +2516,67 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(support).unwrap();
     }
+    #[test]
+    fn reconnect_uses_current_cstp_dns_even_if_the_script_reports_the_initial_servers() {
+        let (engine, support) = split_engine("cstp-dns");
+        let mut c = engine.shared.core.lock().unwrap();
+        let upstream = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        upstream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let iface = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
+        c.forwarder = Some(Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), port,
+            Duration::from_millis(400), vec![],
+            Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }, None));
+        let dns = c.forwarder.as_ref().unwrap().inner().clone();
+        let receive = |c: &mut Core, dns: Option<&str>| {
+            for line in ["> CONNECT /CSCOSSLC/tunnel HTTP/1.1", "Got CONNECT response: HTTP/1.1 200 OK"] {
+                engine.shared.handle_line(c, line, true);
+            }
+            if let Some(server) = dns {
+                engine.shared.handle_line(c, &format!("X-CSTP-DNS: {server}"), true);
+            }
+            engine.shared.handle_line(c, "CSTP connected. DPD 30, Keepalive 20", true);
+        };
+        receive(&mut c, Some("192.0.2.11"));
+        engine.shared.handle_hook(&mut c, &format!("connect tun={iface} gateway=198.51.100.1 dns=192.0.2.11"));
+        engine.shared.handle_hook(&mut c, "attempt-reconnect");
+        receive(&mut c, Some("127.0.0.1"));
+        engine.shared.handle_hook(&mut c, &format!("reconnect tun={iface} dns=192.0.2.11"));
+        let refreshed = c.tunnel_dns.clone();
+        let server = std::thread::spawn(move || {
+            let mut bytes = [0; 512];
+            let (len, peer) = upstream.recv_from(&mut bytes).unwrap();
+            let mut answer = bytes[..len].to_vec();
+            answer[2..12].copy_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+            answer.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 29]);
+            upstream.send_to(&answer, peer).unwrap();
+        });
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04site\x07example\x00\x00\x01\x00\x01";
+        let answer = dns.resolve(query);
+        // In script-tun mode the still-running gate gets no second hook.
+        receive(&mut c, Some("192.0.2.33"));
+        let without_hook = c.tunnel_dns.clone();
+        engine.shared.handle_hook(&mut c, "attempt-reconnect");
+        receive(&mut c, None);
+        engine.shared.handle_hook(&mut c, &format!("reconnect tun={iface} dns=192.0.2.11"));
+        let withdrawn = c.tunnel_dns.clone();
+        let after_withdrawal = dns.resolve(query);
+        drop(c);
+        engine.stop(false, false);
+        let (done, stopped) = mpsc::channel();
+        engine.send(Event::Barrier(done));
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+        assert_eq!(refreshed, ["127.0.0.1"], "old hook env replaced the newly negotiated upstream");
+        server.join().unwrap();
+        assert_eq!(dns_forwarder::ipv4_answers(&answer.expect("the new upstream answered")),
+                   [Ipv4Addr::new(203, 0, 113, 29)]);
+        assert!(withdrawn.is_empty(), "an explicitly withdrawn upstream was reinstated");
+        assert!(after_withdrawal.is_none());
+        assert_eq!(without_hook, ["192.0.2.33"]);
+    }
+
     #[test]
     fn reconnect_and_network_change_invalidate_vpn_dns_interface() {
         let (engine, support) = split_engine("reconnect");
