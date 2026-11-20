@@ -1884,7 +1884,7 @@ impl Shared {
                 if !c.config.no_routes { self.refresh_network(c); }
                 c.tunnel_if = pairs.iter().find(|(k,v)| *k == "tun" && !v.is_empty()).map(|(_,v)| v.to_string())
                     .or_else(|| c.last_pf.as_ref().map(|p| p.0.clone()));
-                if let Some(servers) = c.cstp_dns.accepted() {
+                if let Some(servers) = c.cstp_dns.for_reconnect_hook() {
                     c.tunnel_dns = servers.to_vec();
                 } else if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
                     c.tunnel_dns = dns.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();

@@ -22,6 +22,16 @@ impl CstpDns {
         }
     }
 
+    /// Older clients that emit only a hook still use its DNS. If a new
+    /// negotiation has already started, that cached hook is no longer proof.
+    pub(super) fn for_reconnect_hook(&self) -> Option<&[String]> {
+        match self {
+            Self::Idle => None,
+            Self::Accepted(servers) => Some(servers),
+            Self::Request | Self::Headers { .. } => Some(&[]),
+        }
+    }
+
     /// Return true only after the CLI accepted the complete option set.
     pub(super) fn observe(&mut self, line: &str) -> bool {
         if line == "> CONNECT /CSCOSSLC/tunnel HTTP/1.1" {
@@ -65,6 +75,7 @@ mod tests {
             state.observe(line);
         }
         assert!(state.accepted().is_none());
+        assert!(state.for_reconnect_hook().is_none());
         for line in [
             request,
             response,
@@ -79,6 +90,7 @@ mod tests {
             state.observe(line);
         }
         assert!(state.accepted().is_none());
+        assert_eq!(state.for_reconnect_hook().unwrap().len(), 0);
         assert!(state.observe(accepted));
         assert_eq!(state.accepted().unwrap(), ["192.0.2.11", "192.0.2.13"]);
         for line in [request, response, accepted] {
