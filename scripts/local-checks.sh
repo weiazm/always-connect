@@ -70,6 +70,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/reset-network-test.sh" && pass reset-network-plan || fail reset-network-plan
 "$REPO/scripts/recovery-shortcut-test.sh" && pass recovery-shortcut || fail recovery-shortcut
 "$REPO/scripts/gateway-resolution-test.sh" && pass gateway-resolution || fail gateway-resolution
+python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sample || fail connectivity-sample
 "$REPO/scripts/private-descriptors-test.sh" && pass private-descriptors || fail private-descriptors
 # 4b vpnc-script route plan (stubbed route/ifconfig/scutil, routes ON)
 "$REPO/core/scripts/vpnc-route-plan-test.sh" $S > /tmp/ac-route-plan.log 2>&1 && pass vpnc-route-plan || { fail vpnc-route-plan; grep -v '^AC-SCRIPT' /tmp/ac-route-plan.log; }

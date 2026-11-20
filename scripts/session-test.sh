@@ -21,7 +21,7 @@ swiftc -O -parse-as-library -module-name SessionHarness "${SOURCES[@]}" \
 
 SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cisco-disconnect protection-off own-disconnect own-then-cisco
-    own-protection-off own-protection-toggle
+    own-protection-off own-protection-toggle egress-drop-dependency
     grace-expiry grace-cancelled quit-no-relaunch restart-same-boot restart-other-boot legacy-pf-state
     own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal
     takeover-adopted takeover-replace protection-off-adopted held-allow-update

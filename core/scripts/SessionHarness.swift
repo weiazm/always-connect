@@ -132,6 +132,17 @@ struct SessionHarness {
             session.harnessOwner(attached: true, appPath: app)
         }
         switch scenario {
+        case "egress-drop-dependency":
+            let group = EgressProtection.Group(id: 1, name: "Fixture", enabled: true,
+                members: [.init(pattern: "site.example", method: "trace")], expect: ["ZZ"])
+            let config = EgressProtection(enabled: true, groups: [group])
+            let json = String(decoding: try! JSONEncoder().encode(config), as: UTF8.self)
+            func apply() -> Bool? { sync { reply in session.setEgressProtection(json, withReply: reply) } }
+            func setDrop(_ on: Bool) -> Bool? { sync { reply in session.setDropProtection(on, withReply: reply) } }
+            check(apply() == true, "group accepted with drop protection enabled")
+            check(setDrop(false) == true, "service accepts switch-off")
+            check(apply() == false, "egress cannot be enabled without drop protection")
+            check(setDrop(true) == true && apply() == true, "group accepted after restoring drop protection")
         case "cisco-disconnect":
             check(arm(session, 1), "kill switch armed (connected)")
             check(loads() == 1, "connected set loaded")
