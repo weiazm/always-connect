@@ -116,6 +116,9 @@ RES=$REPO/.local-build/AlwaysConnect.app/Contents/Resources
 NOK=1
 for f in THIRD_PARTY_NOTICES.md RESPONSIBLE-USE.md LICENSE.txt third_party/rust-crates.txt third_party/licenses/LGPL-2.1.txt \
          third_party/licenses/v2fly-domain-list-community.txt; do [ -s "$RES/$f" ] || { echo "  missing $f"; NOK=0; }; done
+[ -x "$RES/openconnect/bin/alwaysconnect-gate" ] &&
+  codesign --verify --strict "$RES/openconnect/bin/alwaysconnect-gate" &&
+  pass egress-gate-bundle || fail egress-gate-bundle
 if [ -x "$RES/openconnect/bin/openconnect" ]; then
   for f in SOURCES README-LGPL.txt licenses/LGPL-2.1.txt licenses/LGPL-3.0.txt licenses/GPL-2.0.txt licenses/GPL-3.0.txt; do
     [ -s "$RES/openconnect/$f" ] || { echo "  missing openconnect/$f"; NOK=0; }; done

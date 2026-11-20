@@ -17,12 +17,16 @@ ACTUAL=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Co
 [ "$ACTUAL" = "$VERSION" ]
 for FILE in "$APP/Contents/MacOS/AlwaysConnect" \
     "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper" \
-    "$APP/Contents/Resources/openconnect/bin/openconnect"; do
+    "$APP/Contents/Resources/openconnect/bin/openconnect" \
+    "$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"; do
     [ -x "$FILE" ]
     [ "$(lipo -archs "$FILE")" = arm64 ]
 done
+codesign --verify --strict -R="certificate leaf = H\"$PIN\"" \
+    "$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
 "$APP/Contents/Resources/openconnect/bin/openconnect" --version >/dev/null 2>&1
 if otool -L "$APP/Contents/Resources/openconnect/bin/openconnect" \
+    "$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate" \
     "$APP"/Contents/Resources/openconnect/lib/*.dylib | grep -Eq '/opt/homebrew|/usr/local|@rpath'; then
     echo 'Release depends on build-machine libraries' >&2; exit 1
 fi

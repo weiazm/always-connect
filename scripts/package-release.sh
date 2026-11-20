@@ -43,6 +43,10 @@ if [ "$IDENTITY" != - ] && ! security find-identity -p codesigning | grep -q "\"
 fi
 SIGN_IDENTITY=$IDENTITY "$ROOT/scripts/build-local.sh"
 APP="$ROOT/.local-build/AlwaysConnect.app"
+GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
+test -x "$APP/Contents/Resources/openconnect/bin/openconnect"
+test -x "$GATE"
+codesign --verify --strict "$GATE"
 if [ "$IDENTITY" != - ]; then
     codesign -d -r- "$APP" 2>&1 | grep -q 'certificate leaf' \
         || { echo "built App is not signed with a fixed certificate" >&2; exit 1; }
@@ -58,6 +62,7 @@ if [ "$IDENTITY" != - ]; then
         echo "(or, for a fork's first release, set RELEASE_SIGNER in install.sh)." >&2
         exit 1
     }
+    codesign --verify --strict -R="certificate leaf = H\"$LEAF\"" "$GATE"
 fi
 # Nothing in the shipped files may name the builder (DESIGN.md §36.5):
 # no home directory or user name in any string of any file.

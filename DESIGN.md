@@ -3910,7 +3910,7 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 
 闸门的判定逻辑与"openconnect → 闸门 → 隧道"的数据通路已在 CI 上证明。2026-11-20 起：Rust 控制方（`core/src/egress_control`，12 个单测）与引擎以 `-S` 启动（`oc_engine/egress_tests.rs`，3 个启动契约测试）已完成，均为单测级。分批实现计划见 `docs/egress-protection-plan.md`。接进产品还差：
 
-1. 后台服务在出口保护开着时以 `-S` 启动 openconnect、把闸门程序装到 root 私有目录并验签（§36.3），新文件同批加进 uninstall.sh 与 uninstall-test.sh。
+1. 已接入本机构建、发布包与卸载，要求闸门可执行且签名有效。恢复脚本一并清扫闸门与控制 socket。后台服务侧的验签与启动待同产品接线核对。
 2. 后台服务里的检查执行（Network.framework 薄壳发 HTTPS、ALPN 带记号、指定隧道网卡）与 XPC；Rust 侧解析、判定、失效与拦截记录已完成。
 3. 组与检测方式的配置模型、规则 JSON 导入导出，以及 UI-DESIGN 出口保护一节的界面。
 4. DNS 转发器去掉 HTTPS 记录里的 `ech` 参数（§42 同一处）。

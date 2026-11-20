@@ -109,6 +109,11 @@ IDENTITY=${SIGN_IDENTITY:--}
 if ! "$ROOT/scripts/bundle-openconnect.sh" "$APP/Contents/Resources/openconnect" "$IDENTITY" >/tmp/ac-bundle-oc.log 2>&1; then
     echo "warning: openconnect not bundled (see /tmp/ac-bundle-oc.log)" >&2
 fi
+GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
+mkdir -p "$(dirname "$GATE")"
+install -m 755 "$ROOT/core/target/release/alwaysconnect-gate" "$GATE"
+codesign --force --sign "$IDENTITY" --timestamp=none "$GATE"
+codesign --verify --strict "$GATE"
 codesign --force --options runtime --sign "$IDENTITY" \
     --identifier com.alwaysconnect.app.helper \
     "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper"

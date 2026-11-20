@@ -190,6 +190,7 @@ sys launchctl bootout "system/$LABEL"
 # ---- 3 system files
 remove "$R/Library/LaunchDaemons/$LABEL.plist"
 remove "$R/Library/PrivilegedHelperTools/$LABEL"
+# Includes the signed tunnel gate and its root-private controller socket.
 remove "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
 remove "$R/Library/Application Support/AlwaysConnect"
 remove "$R/Library/Logs/AlwaysConnect"

@@ -216,6 +216,9 @@ done
 for p in $(pgrep -f "^[^ ]*/openconnect .*alwaysconnect-vpnc\.sh"); do
     say "stop our openconnect (pid $p)"; run kill -9 "$p"
 done
+for p in $(pgrep -f "^/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate( |$)"); do
+    say "stop our tunnel gate (pid $p)"; run kill -9 "$p"
+done
 for p in $(pgrep -f "^[^ ]*mihomo .*AlwaysConnect/core"); do
     say "stop our routing core (pid $p)"; run kill -9 "$p"
 done
@@ -254,7 +257,7 @@ if [ -f "$SUPPORT/direct-routes" ]; then
         [ -n "$NET" ] && run route -n add -net "$NET" -interface "$i"
     done
 fi
-for f in guard.json pf-state.json route-state manual-disconnect direct-routes; do
+for f in guard.json pf-state.json route-state manual-disconnect direct-routes egress.sock; do
     if [ "$f" = route-state ] && [ "$SCOPED_PENDING" = 1 ]; then
         say "scoped route cleanup unconfirmed; keep its journal for retry"
         continue
