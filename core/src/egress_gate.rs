@@ -163,8 +163,11 @@ impl Gate {
 
     /// Forget every verdict (reconnect, network change, wake: §66.6).
     pub fn invalidate(&mut self) {
-        for g in self.groups.values_mut() {
-            g.verdict = None;
+        let pending: Vec<_> = self.flows.iter().filter_map(|(key, flow)|
+            matches!(&flow.state, State::Holding(held) if held.group.is_some()).then_some(*key)).collect();
+        self.groups.clear();
+        for key in pending {
+            self.block(key);
         }
     }
 
@@ -174,8 +177,12 @@ impl Gate {
     pub fn reconfigure(&mut self, probe_alpn: Vec<u8>, classifier: Box<dyn Classifier + Send>) {
         self.cfg.probe_alpn = probe_alpn;
         self.classifier = classifier;
-        self.learned.clear();
-        self.groups.clear();
+        self.learned.retain(|_, (group, name, _)| {
+            let Some(next) = self.classifier.group_for_name(name) else { return false };
+            *group = next;
+            true
+        });
+        self.invalidate();
     }
 
     pub fn flow_count(&self) -> usize {
@@ -263,6 +270,7 @@ impl Gate {
                 State::Pass => Step::Forward,
                 State::Blocked => Step::Consumed,
                 State::Holding(h) => {
+                    if h.bytes.saturating_add(pkt.len()) > self.cfg.max_held_bytes { return Step::Consumed; }
                     h.packets.push(pkt.to_vec());
                     h.bytes += pkt.len();
                     Step::Consumed

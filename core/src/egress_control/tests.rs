@@ -95,12 +95,12 @@ fn chunked_bodies_are_joined() {
 fn targets_follow_the_group_rules() {
     let c = cfg();
     let g = c.group(1).unwrap();
-    // The trigger has its own method: only it is probed.
+    // Every checkable member is probed even when the trigger has a method.
     let t = probe_targets(&c, g, Some("a.example"));
-    assert_eq!(t.iter().map(|(h, m)| (h.as_str(), m.id.as_str())).collect::<Vec<_>>(), vec![("a.example", PRESET_TRACE)]);
+    assert_eq!(t.iter().map(|(h, m)| (h.as_str(), m.id.as_str())).collect::<Vec<_>>(), vec![("a.example", PRESET_TRACE), ("www.b.example", PRESET_CDN)]);
     // A wildcard member's site is probed with the name the connection used.
     let t = probe_targets(&c, g, Some("api.b.example"));
-    assert_eq!(t[0].0, "api.b.example");
+    assert_eq!(t[1].0, "api.b.example");
     // "Follow the group": the other checkable members are probed.
     let t = probe_targets(&c, g, Some("c.example"));
     assert_eq!(t.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>(), vec!["a.example", "www.b.example"]);
@@ -164,9 +164,11 @@ fn controller_answers_a_gate() {
     let hook: ProbeHook = Arc::new(move |r: &ProbeRequest| {
         s2.lock().unwrap().push(r.clone());
         let loc = if r.host == "a.example" { "ZZ" } else { "YY" };
-        Some(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=198.51.100.7\nloc={loc}\n").into_bytes())
+        Some(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\ncf-ray: test-IAD\r\n\r\nip=198.51.100.7\nloc={loc}\n").into_bytes())
     });
-    let ctl = Controller::start(&sock, cfg(), hook).unwrap();
+    let mut config = cfg();
+    config.groups[0].expect.push("US".into());
+    let ctl = Controller::start(&sock, config, hook.clone()).unwrap();
     let mut gate = UnixStream::connect(&sock).unwrap();
     gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut reader = BufReader::new(gate.try_clone().unwrap());
@@ -183,7 +185,9 @@ fn controller_answers_a_gate() {
         assert_eq!(r.alpn, vec!["http/1.1".to_string(), ctl.marker()]);
         assert_eq!(r.interface, "utun9");
     }
-    // A follow member: the other members are probed; one is in YY.
+    // Change the expected countries; the other member now blocks the group.
+    ctl.update(cfg());
+    for _ in 0..2 { line.clear(); reader.read_line(&mut line).unwrap(); }
     gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\"}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
@@ -206,9 +210,44 @@ fn controller_answers_a_gate() {
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("invalidate"));
     // Set-up probing runs every method.
-    let all = ctl.probe_all("a.example");
+    let all = probe_methods(&cfg(), "a.example", &hook, &ctl.marker(), "utun9");
     assert_eq!(all.len(), preset_methods().len() + 1);
     drop(ctl);
     assert!(!sock.exists(), "socket removed on stop");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_probe_started_before_rule_change_cannot_release_a_flow() {
+    let dir = std::env::temp_dir().join(format!("ac-verdict-{:x}", random_u64()));
+    std::fs::create_dir(&dir).unwrap();
+    let sock = dir.join("egress.sock");
+    let (entered, started) = std::sync::mpsc::channel();
+    let (finish, released) = std::sync::mpsc::channel();
+    let released = Mutex::new(released);
+    let hook: ProbeHook = Arc::new(move |_| {
+        entered.send(()).unwrap();
+        released.lock().unwrap().recv_timeout(Duration::from_secs(3)).ok()?;
+        Some(b"HTTP/1.1 200 OK\r\n\r\nloc=ZZ\n".to_vec())
+    });
+    let mut config = cfg();
+    config.groups[0].members.truncate(1);
+    let ctl = Controller::start(&sock, config.clone(), hook).unwrap();
+    let mut gate = UnixStream::connect(&sock).unwrap();
+    gate.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut reader = BufReader::new(gate.try_clone().unwrap());
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).unwrap() > 0);
+    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\"}}\n").unwrap();
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+    config.groups[0].expect = vec!["YY".into()];
+    ctl.update(config);
+    for _ in 0..2 { line.clear(); assert!(reader.read_line(&mut line).unwrap() > 0); }
+    finish.send(()).unwrap();
+    line.clear();
+    gate.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    assert!(reader.read_line(&mut line).is_err(), "stale verdict must never reach the gate: {line}");
+    assert!(ctl.shared.state.lock().unwrap().status.records.is_empty());
+    drop(ctl);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

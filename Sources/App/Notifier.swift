@@ -21,6 +21,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private var authRequested = false
     static let heldCategory = "network-held"
     static let restoreAction = "restore-direct"
+    static let egressCategory = "egress-blocked"
+    static let trustEgressAction = "trust-egress"
 
     private override init() { super.init() }
 
@@ -89,6 +91,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Self.heldCategory, actions: [restore],
                                    intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: Self.egressCategory, actions: [
+                UNNotificationAction(identifier: Self.trustEgressAction, title: "信任新出口", options: []),
+                UNNotificationAction(identifier: "keep-egress-blocked", title: "继续拦截", options: []),
+            ], intentIdentifiers: [], options: []),
         ])
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
@@ -111,6 +117,23 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
              body: "连上后 30 秒都上不了网，已断开 VPN、恢复直连。可在设置里改用「经 Cisco」连接。")
     }
 
+    func egressBlocked(_ record: EgressProtection.BlockRecord) {
+        let observed = record.observed.filter { item in
+            item.country.map { !record.expected.contains($0) } ?? true
+        }.map { item in
+            "\(item.host)：\(item.country ?? "未查到")" + (item.ip.map { "（\($0)）" } ?? "")
+        }
+        let canTrust = !record.observed.isEmpty && record.observed.allSatisfy { $0.country != nil }
+        post(title: "出口变了，已拦住：\(record.name)",
+             body: observed.joined(separator: "、") + "。预期出口：" + record.expected.joined(separator: "、"),
+             category: canTrust ? Self.egressCategory : nil,
+             info: ["group": record.group, "started": record.started])
+    }
+
+    func egressRecovered(_ group: String) {
+        post(title: "出口已恢复", body: group)
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -118,6 +141,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         if response.actionIdentifier == Self.restoreAction {
             DispatchQueue.main.async { HelperClient.shared.disconnect() }
+        } else if response.actionIdentifier == Self.trustEgressAction,
+                  let group = response.notification.request.content.userInfo["group"] as? NSNumber,
+                  let started = response.notification.request.content.userInfo["started"] as? NSNumber {
+            DispatchQueue.main.async {
+                HelperClient.shared.trustEgress(group: group.uint32Value, started: started.doubleValue)
+            }
         }
         completionHandler()
     }
@@ -130,13 +159,16 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .sound])
     }
 
-    private func post(title: String, body: String, held: Bool = false) {
+    private func post(title: String, body: String, held: Bool = false, category: String? = nil,
+                      info: [AnyHashable: Any] = [:]) {
         let center = UNUserNotificationCenter.current()
         requestAuthorization()
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         if held { content.categoryIdentifier = Self.heldCategory }
+        if let category { content.categoryIdentifier = category }
+        content.userInfo = info
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,
             content: content,

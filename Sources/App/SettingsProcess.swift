@@ -129,6 +129,19 @@ final class SettingsLink {
         case "pushDirectDomains":
             client.pushDirectDomains { [weak self] ok in self?.reply(id, ok.map { $0 ? "1" : "0" }) }
             return
+        case "saveEgress":
+            guard let config = try? JSONDecoder().decode(EgressProtection.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.saveEgress(config) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
+        case "egressStatus":
+            client.fetchEgressJSON { [weak self] json in self?.reply(id, json) }
+            return
+        case "probeEgress":
+            client.probeEgressJSON(argument) { [weak self] json in self?.reply(id, json) }
+            return
         case "updateAllowNetworks":
             let networks = argument.split(separator: "\n").map(String.init)
             client.updateAllowNetworks(networks) { [weak self] ok in self?.reply(id, ok.map { $0 ? "1" : "0" }) }

@@ -89,6 +89,8 @@ pub struct Config {
     /// Egress protection (DESIGN §66): when on (and drop protection is on),
     /// openconnect runs in --script-tun mode through the gate program.
     pub egress: Option<crate::egress_control::EgressConfig>,
+    /// The platform shell verified the separately signed installed gate.
+    pub gate_signature_verified: bool,
     /// TestSeam's stand-in gate program, when test_active.
     pub test_gate: Option<String>,
 }
@@ -231,7 +233,7 @@ fn is_executable(path: &str) -> bool {
 /// Egress protection runs only with drop protection (§66.8) and at least
 /// one enabled group.
 pub fn egress_active(config: &Config) -> bool {
-    config.drop_protection && config.egress.as_ref().is_some_and(|e| e.enabled && e.groups.iter().any(|g| g.enabled))
+    config.drop_protection && config.egress.as_ref().is_some_and(|e| e.active())
 }
 
 pub fn egress_socket(support: &Path) -> PathBuf {
@@ -389,6 +391,7 @@ fn interface_index(name: &str) -> Option<u32> {
 
 struct Core {
     config: Config,
+    protected_routes: Option<Arc<crate::egress_control::ProtectedRoutes>>,
     driver: SessionDriver,
     child: Option<Child>,
     generation: u64,
@@ -462,7 +465,7 @@ pub struct Shared {
     info: Mutex<Info>,
     /// The gate's controller while egress protection runs (§66.5), outside
     /// the core so status and set-up probes never wait for it.
-    egress: Mutex<Option<Arc<crate::egress_control::Controller>>>,
+    egress: Mutex<Option<crate::egress_control::Controller>>,
     egress_probe: Mutex<Option<crate::egress_control::ProbeHook>>,
 }
 
@@ -478,10 +481,13 @@ impl Engine {
         guard.own_engine_started(&holder);
         let (tx, rx) = mpsc::channel();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
+        let protected_routes = egress_active(&config)
+            .then(|| Arc::new(config.egress.as_ref().expect("active").protected_routes()));
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 driver: SessionDriver::new(seed),
                 config,
+                protected_routes,
                 child: None,
                 generation: 0,
                 stop_requested: false,
@@ -581,14 +587,25 @@ impl Engine {
     }
     /// JSON status for the App; `{"running":false}` when not in use.
     pub fn egress_status(&self) -> String {
-        let ctl = self.shared.egress.lock().expect("egress").clone();
-        ctl.map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
+        let ctl = self.shared.egress.lock().expect("egress");
+        ctl.as_ref().map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
     }
-    /// Set-up probing of one site with every method (§66.4); empty when the
-    /// gate is not running (nothing can go through the tunnel's gate).
+    /// Set-up probing also works on the ordinary tunnel before protection
+    /// is enabled. Never run a probe against the physical interface.
     pub fn egress_probe_host(&self, host: &str) -> Vec<crate::egress_control::Observation> {
-        let ctl = self.shared.egress.lock().expect("egress").clone();
-        ctl.map(|c| c.probe_all(host)).unwrap_or_default()
+        let marker = self.shared.egress.lock().expect("egress").as_ref().map(|ctl| ctl.marker());
+        let (cfg, iface) = {
+            let c = self.shared.core.lock().expect("engine");
+            if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() {
+                return Vec::new();
+            }
+            (c.config.egress.clone().unwrap_or_default(), c.tunnel_if.clone())
+        };
+        let (Some(iface), Some(hook)) = (iface, self.shared.egress_probe.lock().expect("probe").clone())
+        else { return Vec::new() };
+        if cfg.active() && marker.is_none() { return Vec::new(); }
+        let marker = marker.unwrap_or_default();
+        crate::egress_control::probe_methods(&cfg, host, &hook, &marker, &iface)
     }
 
     pub fn update_direct_domains(&self, d: Vec<String>) {
@@ -708,7 +725,15 @@ impl Core {
                 out.push(n.clone());
             }
         }
+        if let Some(protected) = &self.protected_routes {
+            out.retain(|range| !protected.overlaps(range));
+        }
         out
+    }
+
+    fn split_rules(&self) -> dns_forwarder::SplitRules {
+        dns_forwarder::SplitRules::new(self.config.direct_domains.as_deref().unwrap_or_default())
+            .with_protection(self.protected_routes.clone())
     }
 
     fn support(&self) -> PathBuf {
@@ -808,20 +833,37 @@ impl Shared {
                     if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
                 }
                 Event::DirectDomains(d) => {
+                    c.config.direct_domains = Some(d);
                     c.reset_direct_retries();
                     if let Some(f) = &c.forwarder {
-                        f.set_rules(&d);
+                        f.set_parsed_rules(c.split_rules());
                     }
-                    c.split_policy.revalidate(&dns_forwarder::SplitRules::new(&d));
+                    let rules = c.split_rules();
+                    c.split_policy.revalidate(&rules);
                     self.sync_split_routes(&mut c);
-                    c.config.direct_domains = Some(d);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
                 Event::Egress(cfg) => {
+                    if c.config.egress.as_ref() == Some(&cfg) { continue; }
                     if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
                         ctl.update(cfg.clone());
                     }
                     c.config.egress = Some(cfg);
+                    let was_active = c.protected_routes.is_some();
+                    c.protected_routes = egress_active(&c.config)
+                        .then(|| Arc::new(c.config.egress.as_ref().expect("active").protected_routes()));
+                    if was_active || c.protected_routes.is_some() {
+                        if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
+                        let rules = c.split_rules();
+                        c.split_policy.revalidate(&rules);
+                        c.reset_direct_retries();
+                        self.sync_split_routes(&mut c);
+                        self.route_networks_direct(&mut c);
+                        if let Some((tun, gateways)) = c.last_pf.clone() {
+                            let allow = c.last_allow_direct_egress;
+                            self.load_pf(&mut c, Some(tun), gateways, allow);
+                        }
+                    }
                 }
                 Event::AllowNetworks(n) => {
                     c.reset_direct_retries();
@@ -1073,6 +1115,7 @@ impl Shared {
         });
         let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
             Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
+        if c.protected_routes.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {
@@ -1336,7 +1379,7 @@ impl Shared {
             c.config.test_gate.clone().filter(|g| !g.is_empty()).ok_or_else(|| "出口保护组件缺失".to_string())?
         } else {
             let g = format!("{BUNDLED_DIR}/bin/alwaysconnect-gate");
-            if !bundled_is_trusted(&g) {
+            if !c.config.gate_signature_verified || !bundled_is_trusted(&g) {
                 return Err("出口保护组件缺失或不可信，请重新安装后台服务".into());
             }
             g
@@ -1349,12 +1392,15 @@ impl Shared {
                 let hook = self.egress_probe.lock().expect("probe").clone().unwrap_or_else(|| std::sync::Arc::new(|_: &crate::egress_control::ProbeRequest| None));
                 let support = c.support();
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::create_dir_all(&support);
-                    let _ = std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700));
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let private = std::fs::symlink_metadata(&support).is_ok_and(|meta|
+                        meta.is_dir() && (c.config.test_active || meta.uid() == 0));
+                    if !private || std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700)).is_err() {
+                        return Err("出口保护需要后台服务的私有目录，请重新安装后台服务".into());
+                    }
                 }
                 let ctl = crate::egress_control::Controller::start(&egress_socket(&support), cfg, hook).map_err(|e| format!("出口保护无法启动：{e}"))?;
-                *slot = Some(Arc::new(ctl));
+                *slot = Some(ctl);
             }
         }
         Ok(gate)

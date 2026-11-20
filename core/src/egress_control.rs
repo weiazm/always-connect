@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,8 +91,88 @@ pub enum ExtractKind {
     Header,
 }
 
+#[derive(Deserialize)]
+pub struct GateGroup {
+    id: u32,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    cidrs: Vec<String>,
+}
+
+struct ProtectedGroup {
+    id: u32,
+    exact: std::collections::HashSet<String>,
+    wildcards: Vec<String>,
+    lists: crate::dns_forwarder::SplitRules,
+    cidrs: Vec<(IpAddr, u8)>,
+}
+
+pub struct ProtectedRoutes(Vec<ProtectedGroup>);
+
+impl ProtectedRoutes {
+    pub fn new(groups: &[GateGroup]) -> Self {
+        Self(groups.iter().map(|group| {
+            let mut exact = std::collections::HashSet::new();
+            let mut wildcards = Vec::new();
+            let mut lists = Vec::new();
+            for name in &group.names {
+                if name.starts_with("*.") {
+                    wildcards.push(name.to_string());
+                } else if name.contains(':') {
+                    lists.push(name.to_string());
+                } else {
+                    exact.insert(name.trim_end_matches('.').to_ascii_lowercase());
+                }
+            }
+            ProtectedGroup { id: group.id, exact, wildcards,
+                lists: crate::dns_forwarder::SplitRules::new(&lists),
+                cidrs: group.cidrs.iter().filter_map(|cidr| parse_cidr(cidr)).collect() }
+        }).collect())
+    }
+
+    pub fn overlaps(&self, range: &str) -> bool {
+        let Some((addr, len)) = parse_cidr(range) else { return false };
+        self.0.iter().any(|group| group.cidrs.iter().any(|&(other, bits)|
+            in_net(addr, other, len.min(bits))))
+    }
+}
+
+impl crate::egress_gate::Classifier for ProtectedRoutes {
+    fn group_for_name(&self, name: &str) -> Option<u32> {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        self.0.iter().find(|group| group.exact.contains(&name)
+            || group.wildcards.iter().any(|pattern| pattern_matches(pattern, &name))
+            || group.lists.matches(&name).is_some()).map(|group| group.id)
+    }
+
+    fn group_for_ip(&self, ip: IpAddr) -> Option<u32> {
+        self.0.iter().find(|group| group.cidrs.iter().any(|&(net, len)| in_net(ip, net, len)))
+            .map(|group| group.id)
+    }
+}
+
+fn in_net(ip: IpAddr, net: IpAddr, len: u8) -> bool {
+    match (ip, net) {
+        (IpAddr::V4(a), IpAddr::V4(n)) => len <= 32 && (len == 0 || (u32::from(a) ^ u32::from(n)) >> (32 - len as u32) == 0),
+        (IpAddr::V6(a), IpAddr::V6(n)) => len <= 128 && (len == 0 || (u128::from(a) ^ u128::from(n)) >> (128 - len as u32) == 0),
+        _ => false,
+    }
+}
+
+fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
+    let (ip, len) = s.split_once('/').unwrap_or((s, ""));
+    let ip: IpAddr = ip.trim().parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let len = if len.is_empty() { max } else { len.trim().parse().ok()? };
+    (len <= max).then_some((ip, len))
+}
+
 pub const PRESET_TRACE: &str = "trace";
 pub const PRESET_CDN: &str = "cdn-node";
+const MAX_METHODS: usize = 8;
+const MAX_GROUPS: usize = 16;
+const MAX_PROBES_PER_GROUP: usize = 8;
 
 /// Built-in methods (§66.4). Generic, no company or service names.
 pub fn preset_methods() -> Vec<ProbeMethod> {
@@ -114,6 +195,36 @@ pub fn preset_methods() -> Vec<ProbeMethod> {
 }
 
 impl EgressConfig {
+    pub fn active(&self) -> bool {
+        self.enabled && self.groups.iter().any(|g| g.enabled)
+    }
+
+    pub fn protected_routes(&self) -> ProtectedRoutes {
+        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled).map(|g| GateGroup {
+            id: g.id,
+            names: g.members.iter().map(|m| m.pattern.trim().to_string()).collect(),
+            cidrs: g.cidrs.clone(),
+        }).collect::<Vec<_>>())
+    }
+
+    pub fn valid(&self) -> bool {
+        let group_ids: std::collections::HashSet<_> = self.groups.iter().map(|g| g.id).collect();
+        let method_ids: std::collections::HashSet<_> = self.methods.iter().map(|m| &m.id).collect();
+        group_ids.len() == self.groups.len() && method_ids.len() == self.methods.len()
+            && self.methods.len() <= MAX_METHODS && self.groups.len() <= MAX_GROUPS
+            && self.groups.iter().all(|g| {
+                let checkable = g.members.iter().filter(|m| m.method.is_some()).count();
+                g.members.len() <= 2_048 && g.cidrs.len() <= 256
+                    && g.cidrs.iter().all(|range| parse_cidr(range).is_some())
+                    && g.expect.iter().all(|country| country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()))
+                    && checkable <= MAX_PROBES_PER_GROUP
+                    && (!g.enabled || (!g.expect.is_empty() && checkable > 0 && probe_targets(self, g, None).len() == checkable))
+            })
+            && self.methods.iter().all(|m| !m.extract.key.is_empty()
+                && m.extract.regex.as_ref().is_none_or(|pattern| regex_lite::Regex::new(pattern).is_ok())
+                && build_request(m, "site.example").is_ok())
+    }
+
     pub fn method(&self, id: &str) -> Option<ProbeMethod> {
         self.methods.iter().find(|m| m.id == id).cloned().or_else(|| preset_methods().into_iter().find(|m| m.id == id))
     }
@@ -172,22 +283,37 @@ pub struct Observation {
 }
 
 pub fn build_request(method: &ProbeMethod, host: &str) -> Result<(String, u16, String), String> {
+    if !valid_host(host) { return Err("需要具体的网站名".into()); }
     let url = method.url.replace("{host}", host);
     let rest = url.strip_prefix("https://").ok_or("只接受 https 地址")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    let (h, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.contains(']') || h.ends_with(']') => (h.to_string(), p.parse::<u16>().map_err(|_| "端口不对")?),
-        _ => (authority.to_string(), 443),
+    let (host, suffix) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']').ok_or("地址里缺网站名")?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() { return Err("地址里缺网站名".into()); }
+        (host, suffix)
+    } else {
+        let (host, suffix) = authority.find(':').map_or((authority, ""), |i| authority.split_at(i));
+        if !valid_host(host) { return Err("地址里缺网站名".into()); }
+        (host, suffix)
     };
-    if h.is_empty() || h.contains(['{', '}', ' ']) {
-        return Err("地址里缺网站名".into());
+    let port = if suffix.is_empty() { 443 } else {
+        suffix.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0).ok_or("端口不对")?
+    };
+    if !path.bytes().all(|c| c.is_ascii_graphic() && c != b'#') {
+        return Err("请求路径格式不对".into());
     }
     let verb = if method.head { "HEAD" } else { "GET" };
-    let req = format!("{verb} {path} HTTP/1.1\r\nHost: {h}\r\nUser-Agent: AlwaysConnect-egress-check\r\nAccept: */*\r\nConnection: close\r\n\r\n");
-    Ok((h, port, req))
+    let req = format!("{verb} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    Ok((host.into(), port, req))
+}
+
+pub fn valid_host(host: &str) -> bool {
+    host.len() <= 253 && host.trim_end_matches('.').split('.').all(|label|
+        !label.is_empty() && label.len() <= 63
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 pub struct Response {
@@ -203,7 +329,7 @@ pub fn parse_response(raw: &[u8]) -> Option<Response> {
     let status = lines.next()?.split(' ').nth(1)?.parse().ok()?;
     let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     let mut body = raw[end + 4..].to_vec();
-    if headers.iter().any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked")) {
+    if !body.is_empty() && headers.iter().any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked")) {
         body = dechunk(&body)?;
     }
     Some(Response { status, headers, body })
@@ -297,7 +423,7 @@ pub fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str
     if !alpn.is_empty() {
         list.push(alpn.into());
     }
-    let req = ProbeRequest { host: h, port, request, alpn: list, interface: interface.into(), timeout_ms: 3000 };
+    let req = ProbeRequest { host: h, port, request, alpn: list, interface: interface.into(), timeout_ms: 2400 };
     match hook(&req).as_deref().and_then(parse_response) {
         None => obs.error = Some("连不上或没有回答".into()),
         Some(resp) => match extract(method, &resp) {
@@ -314,28 +440,39 @@ pub fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str
 // --------------------------------------------------------------- decisions
 
 /// Which (host, method) pairs a check for `group` triggered by `host` probes
-/// (§66.6): the trigger itself when it has a method, otherwise every other
-/// checkable member.
+/// (§66.6): every checkable member, using the actual name for matching wildcards.
 pub fn probe_targets(cfg: &EgressConfig, group: &Group, host: Option<&str>) -> Vec<(String, ProbeMethod)> {
     let concrete = |m: &Member| -> Option<String> {
         if !m.pattern.starts_with("*.") {
-            Some(m.pattern.trim().to_ascii_lowercase())
+            valid_host(m.pattern.trim()).then(|| m.pattern.trim().to_ascii_lowercase())
         } else {
-            m.probe_host.clone().filter(|h| pattern_matches(&m.pattern, h))
+            m.probe_host.clone().filter(|h| valid_host(h) && pattern_matches(&m.pattern, h))
         }
     };
-    if let Some(h) = host {
-        if let Some(m) = group.members.iter().find(|m| pattern_matches(&m.pattern, h)) {
-            if let Some(method) = m.method.as_deref().and_then(|id| cfg.method(id)) {
-                return vec![(h.to_ascii_lowercase(), method)];
-            }
-        }
-    }
     group
         .members
         .iter()
-        .filter_map(|m| Some((concrete(m)?, cfg.method(m.method.as_deref()?)?)))
+        .filter_map(|m| {
+            let target = host.filter(|h| pattern_matches(&m.pattern, h))
+                .map(str::to_ascii_lowercase).or_else(|| concrete(m))?;
+            Some((target, cfg.method(m.method.as_deref()?)?))
+        })
         .collect()
+}
+
+pub fn probe_methods(cfg: &EgressConfig, host: &str, hook: &ProbeHook, marker: &str, iface: &str) -> Vec<Observation> {
+    if !valid_host(host) || iface.is_empty() { return Vec::new(); }
+    std::thread::scope(|scope| {
+        let mut methods = preset_methods();
+        for preset in &mut methods {
+            if let Some(custom) = cfg.methods.iter().find(|method| method.id == preset.id) {
+                *preset = custom.clone();
+            }
+        }
+        methods.extend(cfg.methods.iter().filter(|method| method.id != PRESET_TRACE && method.id != PRESET_CDN).cloned());
+        methods.into_iter().filter_map(|method| std::thread::Builder::new().spawn_scoped(scope, move || probe_once(hook, &method, host, marker, iface)).ok())
+            .collect::<Vec<_>>().into_iter().filter_map(|worker| worker.join().ok()).collect()
+    })
 }
 
 pub fn decide(group: &Group, obs: &[Observation]) -> bool {
@@ -375,6 +512,7 @@ pub const MAX_RECORDS: usize = 10;
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub running: bool,
+    pub checking: Vec<u32>,
     pub interface: String,
     pub groups: Vec<GroupStatus>,
     pub records: VecDeque<BlockRecord>,
@@ -413,34 +551,66 @@ impl Status {
 // --------------------------------------------------------------- controller
 
 struct Shared {
-    cfg: Mutex<EgressConfig>,
-    status: Mutex<Status>,
-    gate: Mutex<Option<UnixStream>>,
+    state: Mutex<ControlState>,
     marker: String,
     hook: ProbeHook,
     stop: AtomicBool,
+}
+
+struct ControlState {
+    config: EgressConfig,
+    status: Status,
+    peer: Option<UnixStream>,
+    peer_id: u64,
+    epoch: u64,
+    checks: HashMap<u32, u64>,
+}
+
+impl ControlState {
+    fn send(&mut self, line: &str) {
+        if let Some(peer) = &mut self.peer {
+            if peer.write_all(format!("{line}\n").as_bytes()).is_err() {
+                self.disconnect();
+            }
+        }
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(peer) = self.peer.take() {
+            let _ = peer.shutdown(std::net::Shutdown::Both);
+        }
+        self.status.interface.clear();
+        self.peer_id = self.peer_id.wrapping_add(1);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
 }
 
 /// Listens on a root-private UNIX socket for the gate (one at a time).
 pub struct Controller {
     shared: Arc<Shared>,
     path: PathBuf,
+    wake_stop: Option<OwnedFd>,
 }
 
 impl Controller {
     pub fn start(path: &Path, cfg: EgressConfig, hook: ProbeHook) -> std::io::Result<Controller> {
         let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let marker = format!("ac-probe-{:016x}", random_u64());
-        let shared = Arc::new(Shared { cfg: Mutex::new(cfg), status: Mutex::new(Status::default()), gate: Mutex::new(None), marker, hook, stop: AtomicBool::new(false) });
-        let s = shared.clone();
+        let (wake, wake_stop) = crate::child_io::pipe()?;
+        let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(ControlState {
+                config: cfg, status: Status::default(), peer: None, peer_id: 0,
+                epoch: 0, checks: HashMap::new(),
+            }),
+            marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
+        });
+        let controller = Controller { shared, path: path.to_path_buf(), wake_stop: Some(wake_stop) };
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let shared = controller.shared.clone();
         listener.set_nonblocking(true)?;
-        std::thread::Builder::new().name("egress-control".into()).spawn(move || accept_loop(listener, s))?;
-        Ok(Controller { shared, path: path.to_path_buf() })
+        std::thread::Builder::new().name("egress-control".into()).spawn(move || accept_loop(listener, wake, shared))?;
+        Ok(controller)
     }
 
     pub fn marker(&self) -> String {
@@ -448,47 +618,36 @@ impl Controller {
     }
 
     pub fn status_json(&self) -> String {
-        let mut st = self.shared.status.lock().expect("status").clone();
-        st.running = self.shared.gate.lock().expect("gate").is_some();
-        serde_json::to_string(&st).unwrap_or_else(|_| "{}".into())
+        let state = self.shared.state.lock().expect("controller");
+        let mut status = state.status.clone();
+        status.running = state.peer.is_some();
+        status.checking = state.checks.iter().filter_map(|(&group, &epoch)| (epoch == state.epoch).then_some(group)).collect();
+        serde_json::to_string(&status).unwrap_or_else(|_| "{}".into())
     }
 
-    /// New groups/methods while running (expected countries after "trust",
-    /// members added): the gate gets the new names, verdicts are dropped.
+    /// Send the new rules. A probe started before this configuration can no longer release packets.
     pub fn update(&self, cfg: EgressConfig) {
+        let mut state = self.shared.state.lock().expect("controller");
         let line = config_line(&cfg, &self.shared.marker);
-        *self.shared.cfg.lock().expect("cfg") = cfg;
-        send_line(&self.shared, &line);
-        send_line(&self.shared, "{\"invalidate\":true}");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
+        state.config = cfg;
+        state.send(&line);
+        state.send("{\"invalidate\":true}");
     }
 
-    /// Network change, wake, reconnect (§66.6).
     pub fn invalidate(&self) {
-        send_line(&self.shared, "{\"invalidate\":true}");
-    }
-
-    /// Set-up time probing (§66.4): every method for one site.
-    pub fn probe_all(&self, host: &str) -> Vec<Observation> {
-        let (cfg, iface) = (self.shared.cfg.lock().expect("cfg").clone(), self.shared.status.lock().expect("status").interface.clone());
-        let mut methods = preset_methods();
-        methods.extend(cfg.methods.iter().cloned());
-        let handles: Vec<_> = methods
-            .into_iter()
-            .map(|m| {
-                let (hook, marker, host, iface) = (self.shared.hook.clone(), self.shared.marker.clone(), host.to_string(), iface.clone());
-                std::thread::spawn(move || probe_once(&hook, &m, &host, &marker, &iface))
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        let mut state = self.shared.state.lock().expect("controller");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.send("{\"invalidate\":true}");
     }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(g) = self.shared.gate.lock().expect("gate").take() {
-            let _ = g.shutdown(std::net::Shutdown::Both);
-        }
+        self.shared.state.lock().expect("controller").disconnect();
+        self.wake_stop.take();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -506,31 +665,45 @@ fn config_line(cfg: &EgressConfig, marker: &str) -> String {
     serde_json::json!({ "probe_alpn": marker, "groups": cfg.gate_groups() }).to_string()
 }
 
-fn send_line(shared: &Shared, line: &str) {
-    if let Some(g) = shared.gate.lock().expect("gate").as_mut() {
-        let _ = g.write_all(format!("{line}\n").as_bytes());
-    }
-}
-
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
     while !shared.stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let line = config_line(&shared.cfg.lock().expect("cfg"), &shared.marker);
-                let mut w = match stream.try_clone() {
-                    Ok(w) => w,
-                    Err(_) => continue,
-                };
-                if w.write_all(format!("{line}\n").as_bytes()).is_err() {
-                    continue;
-                }
-                *shared.gate.lock().expect("gate") = Some(w);
-                let s = shared.clone();
-                let _ = std::thread::Builder::new().name("egress-gate".into()).spawn(move || read_loop(stream, s));
+        let mut fds = [
+            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+            break;
+        }
+        if fds[1].revents != 0 || fds[0].revents & libc::POLLIN == 0 { break; }
+        let stream = match crate::child_io::creation(|| listener.accept()) {
+            Ok((stream, _)) => stream,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => continue,
+            Err(_) => break,
+        };
+        if stream.set_nonblocking(false).is_err() { continue; }
+        let Ok(writer) = stream.try_clone() else { continue };
+        if writer.set_write_timeout(Some(Duration::from_millis(100))).is_err() { continue; }
+        #[cfg(target_os = "macos")]
+        {
+            let on: libc::c_int = 1;
+            if unsafe { libc::setsockopt(writer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_NOSIGPIPE,
+                (&on as *const libc::c_int).cast(), std::mem::size_of_val(&on) as libc::socklen_t) } != 0 {
+                continue;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+        let mut state = shared.state.lock().expect("controller");
+        if shared.stop.load(Ordering::SeqCst) { break; }
+        state.disconnect();
+        state.peer = Some(writer);
+        let peer_id = state.peer_id;
+        let line = config_line(&state.config, &shared.marker);
+        state.send(&line);
+        let shared = shared.clone();
+        if std::thread::Builder::new().name("egress-gate".into())
+            .spawn(move || read_loop(stream, shared, peer_id)).is_err()
+        {
+            state.disconnect();
         }
     }
 }
@@ -550,44 +723,61 @@ struct UpMsg {
     ifname: String,
 }
 
-fn read_loop(stream: UnixStream, shared: Arc<Shared>) {
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let Ok(msg) = serde_json::from_str::<GateMsg>(&line) else { continue };
-        if let Some(up) = msg.up {
-            shared.status.lock().expect("status").interface = up.ifname;
-        }
-        if let Some(c) = msg.check {
-            let s = shared.clone();
-            let _ = std::thread::Builder::new().name("egress-check".into()).spawn(move || run_check(&s, c.group, c.host));
-        }
-    }
-    *shared.gate.lock().expect("gate") = None;
+fn verdict(group: u32, ok: bool) -> String {
+    serde_json::json!({ "verdict": { "group": group, "ok": ok } }).to_string()
 }
 
-fn run_check(shared: &Shared, group_id: u32, host: Option<String>) {
-    let cfg = shared.cfg.lock().expect("cfg").clone();
-    let iface = shared.status.lock().expect("status").interface.clone();
-    let (ok, group, obs) = match cfg.group(group_id).filter(|g| g.enabled) {
-        None => (false, None, Vec::new()),
-        Some(g) => {
-            let targets = probe_targets(&cfg, g, host.as_deref());
-            let handles: Vec<_> = targets
-                .into_iter()
-                .map(|(h, m)| {
-                    let (hook, marker, iface) = (shared.hook.clone(), shared.marker.clone(), iface.clone());
-                    std::thread::spawn(move || probe_once(&hook, &m, &h, &marker, &iface))
-                })
-                .collect();
-            let obs: Vec<Observation> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
-            (decide(g, &obs), Some(g.clone()), obs)
+fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        let Ok(msg) = serde_json::from_str::<GateMsg>(&line) else { continue };
+        let mut state = shared.state.lock().expect("controller");
+        if state.peer_id != peer_id { return; }
+        if let Some(up) = msg.up {
+            state.status.interface = up.ifname;
         }
-    };
-    if let Some(g) = group {
-        shared.status.lock().expect("status").apply(&g, host.as_deref(), obs, ok, now());
+        if let Some(check) = msg.check {
+            let group_id = check.group;
+            let Some(group) = state.config.group(group_id).filter(|group| group.enabled).cloned() else {
+                state.send(&verdict(group_id, false));
+                continue;
+            };
+            if state.status.interface.is_empty() || state.checks.contains_key(&group_id) {
+                state.send(&verdict(group_id, false));
+                continue;
+            }
+            let epoch = state.epoch;
+            let targets = probe_targets(&state.config, &group, check.host.as_deref());
+            let iface = state.status.interface.clone();
+            state.checks.insert(group_id, epoch);
+            let worker = shared.clone();
+            if std::thread::Builder::new().name("egress-check".into()).spawn(move ||
+                run_check(&worker, group, check.host, targets, iface, epoch)).is_err()
+            {
+                state.checks.remove(&group_id);
+                state.send(&verdict(group_id, false));
+            }
+        }
     }
-    send_line(shared, &serde_json::json!({ "verdict": { "group": group_id, "ok": ok } }).to_string());
+    let mut state = shared.state.lock().expect("controller");
+    if state.peer_id == peer_id { state.disconnect(); }
+}
+
+fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<(String, ProbeMethod)>,
+             iface: String, epoch: u64) {
+    let observed: Vec<Observation> = std::thread::scope(|scope| {
+        targets.iter().filter_map(|(host, method)| {
+            let iface = &iface;
+            std::thread::Builder::new().spawn_scoped(scope, move ||
+                probe_once(&shared.hook, method, host, &shared.marker, iface)).ok()
+        }).collect::<Vec<_>>().into_iter().filter_map(|worker| worker.join().ok()).collect()
+    });
+    let ok = observed.len() == targets.len() && decide(&group, &observed);
+    let mut state = shared.state.lock().expect("controller");
+    state.checks.remove(&group.id);
+    if epoch != state.epoch { return; }
+    state.status.apply(&group, host.as_deref(), observed, ok, now());
+    state.send(&verdict(group.id, ok));
 }
 
 #[cfg(test)]

@@ -68,6 +68,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Kill switch not in force (Cisco engine): shown in red on the
     /// panel. Nil when pf is applied or nothing needs it.
     @Published private(set) var pfWarning: String?
+    @Published private(set) var egressLine: String?
+    @Published private(set) var egressBlocked = false
+    private var egressTimer: Timer?
+    private var egressPollPending = false
+    private var egressNotifications: [Double: Bool] = [:]
 
     /// Drop episodes → DropRecords (DESIGN.md §21.22).
     private var dropTracker = DropEpisodeTracker()
@@ -641,8 +646,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// back, and the panel and a notification say so. The user is never
     /// left to rescue the network by hand.
     private func startConnectionCheck() {
+        guard ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
         connectionCheck.start { [weak self] in
-            guard let self, self.state == .connected, !self.usesCisco else { return }
+            guard let self, self.state == .connected, !self.usesCisco,
+                  ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
             self.autoStopNotice = "自建连接连上后 30 秒都上不了网，已自动断开并恢复直连。"
                 + "可以先在设置里改用「经 Cisco」连接。"
             self.disconnect()
@@ -881,6 +888,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Own connection: tell the background service (§26.19).
     func dropProtectionChanged() {
         if AppRole.isSettings { SettingsLink.shared.send("dropProtectionChanged"); return }
+        updateEgressMonitoring()
         if usesCisco {
             cisco?.rearm()
             if !ProfileStore.loadAppSettings().isDropProtectionOn {
@@ -1027,13 +1035,30 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // takes it over at once and must pass the LAN (§30.1).
                 self.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
             }
-            self.connect(server: server, group: profile.group,
-                         username: username, password: password) {
-                // The Helper starts with the built-in LAN allowlist; push
-                // the user's list as soon as the engine exists (the
-                // connect reply means it does). Best effort: a stale
-                // list is corrected on the next connect or Settings save.
-                HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+            let begin = {
+                self.connect(server: server, group: profile.group,
+                             username: username, password: password) {
+                    // The connect reply means the engine exists and can take the LAN list.
+                    HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+                }
+            }
+            let settings = ProfileStore.loadAppSettings()
+            let egress = settings.egressProtection ?? EgressProtection()
+            if egress.isActive && settings.isDropProtectionOn && !self.usesCisco {
+                let generation = self.relayGeneration
+                self.sendEgress(egress) { ok in
+                    guard self.relayGeneration == generation, !self.usesCisco else { return }
+                    if ok { begin() }
+                    else {
+                        self.lastError = "后台服务未接受出口保护设置。请更新后台服务后再连接。"
+                        self.detail = self.lastError ?? ""
+                    }
+                }
+            } else if !self.usesCisco, settings.isDropProtectionOn, settings.egressProtection != nil {
+                self.sendEgress(egress) { _ in }
+                begin()
+            } else {
+                begin()
             }
         }
         return true
@@ -1371,6 +1396,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             return
         }
         state = parsed
+        if parsed != old { updateEgressMonitoring() }
         self.detail = detail
         if parsed != .connected { splitWarning = nil }
         if parsed != old, !usesCisco {
@@ -1542,6 +1568,136 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     if !finished { finished = true; done(rows) }
                 }
             }
+        }
+    }
+
+    private func egressRPC<Value>(_ call: @escaping (AlwaysConnectHelperProtocol, @escaping (Value) -> Void) -> Void,
+                                  completion: @escaping (Value?) -> Void) {
+        guard !HelperInstaller.installedHelperOutdated, HelperInstaller.installedHelperMatchesBundle else {
+            completion(nil)
+            return
+        }
+        var pending = true
+        func finish(_ result: Value?) {
+            guard pending else { return }
+            pending = false
+            completion(result)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil) }
+        ensureConnection { proxy in
+            call(proxy) { result in DispatchQueue.main.async { finish(result) } }
+        }
+    }
+
+    private func sendEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
+        guard let data = try? JSONEncoder().encode(config.forService()) else { completion(false); return }
+        let json = String(decoding: data, as: UTF8.self)
+        egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
+    }
+
+    func saveEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            guard let data = try? JSONEncoder().encode(config) else { completion(false); return }
+            SettingsLink.shared.send("saveEgress", String(decoding: data, as: UTF8.self)) {
+                completion($0 == "1")
+            }
+            return
+        }
+        let settings = ProfileStore.loadAppSettings()
+        guard !config.enabled || (!usesCisco && settings.isDropProtectionOn) else { completion(false); return }
+        sendEgress(config) { ok in
+            if ok {
+                var latest = ProfileStore.loadAppSettings()
+                if config.enabled && (!latest.isDropProtectionOn || self.usesCisco) {
+                    completion(false)
+                    return
+                }
+                latest.egressProtection = config
+                ProfileStore.saveAppSettings(latest, updatingEgress: true)
+                self.updateEgressMonitoring()
+            }
+            completion(ok)
+        }
+    }
+
+    func fetchEgressJSON(_ completion: @escaping (String?) -> Void) {
+        if AppRole.isSettings { SettingsLink.shared.send("egressStatus", done: completion); return }
+        guard !usesCisco else { completion(nil); return }
+        egressRPC({ $0.getEgressStatus(withReply: $1) }, completion: completion)
+    }
+
+    func probeEgressJSON(_ host: String, completion: @escaping (String?) -> Void) {
+        if AppRole.isSettings { SettingsLink.shared.send("probeEgress", host, done: completion); return }
+        guard !usesCisco, state == .connected else { completion(nil); return }
+        egressRPC({ $0.probeEgress(host, withReply: $1) }, completion: completion)
+    }
+
+    func trustEgress(group: UInt32, started: Double) {
+        fetchEgressJSON { json in
+            guard let json,
+                  let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
+                  let record = status.records.first(where: { $0.group == group && $0.started == started && $0.ended == nil }),
+                  let current = status.groups.first(where: { $0.id == group && $0.blocked }) else { return }
+            var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+            guard config.enabled, let index = config.groups.firstIndex(where: { $0.id == group && $0.enabled }),
+                  config.groups[index].expect == record.expected else { return }
+            let countries = Set(record.observed.compactMap(\.country))
+            guard !countries.isEmpty, record.observed.allSatisfy({ $0.country != nil }),
+                  current.observed.allSatisfy({ $0.country != nil }),
+                  countries == Set(current.observed.compactMap(\.country)) else { return }
+            config.groups[index].expect = countries.union(record.expected).sorted()
+            self.saveEgress(config) { _ in }
+        }
+    }
+
+    private func updateEgressMonitoring() {
+        guard !AppRole.isSettings else { return }
+        let settings = ProfileStore.loadAppSettings()
+        let enabled = !usesCisco && settings.isDropProtectionOn && settings.egressProtection?.isActive == true
+        guard enabled, state == .connected else {
+            egressTimer?.invalidate()
+            egressTimer = nil
+            if egressLine != nil { egressLine = nil }
+            if egressBlocked { egressBlocked = false }
+            if !enabled { egressNotifications.removeAll() }
+            return
+        }
+        if egressTimer == nil {
+            let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in self?.refreshEgress() }
+            timer.tolerance = 1
+            RunLoop.main.add(timer, forMode: .common)
+            egressTimer = timer
+        }
+        refreshEgress()
+    }
+
+    func refreshEgress() {
+        guard egressTimer != nil, !egressPollPending else { return }
+        egressPollPending = true
+        fetchEgressJSON { json in
+            self.egressPollPending = false
+            guard self.egressTimer != nil else { return }
+            let status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
+            let blocked = status?.groups.filter(\.blocked) ?? []
+            let line: String
+            if !blocked.isEmpty { line = "出口不对，已拦截：" + blocked.map(\.name).joined(separator: "、") }
+            else if status?.checking.isEmpty == false { line = "正在检查出口" }
+            else if status?.groups.contains(where: { $0.state == "ok" }) == true { line = "已验证出口" }
+            else { line = status?.running == true ? "正在等待出口检查" : "出口保护尚未就绪" }
+            if self.egressLine != line { self.egressLine = line }
+            if self.egressBlocked != !blocked.isEmpty { self.egressBlocked = !blocked.isEmpty }
+            guard let status else { return }
+            var seen: [Double: Bool] = [:]
+            for record in status.records.reversed() {
+                let ended = record.ended != nil
+                if self.egressNotifications[record.started] == nil && !ended {
+                    Notifier.shared.egressBlocked(record)
+                } else if self.egressNotifications[record.started] == false && ended {
+                    Notifier.shared.egressRecovered(record.name)
+                }
+                seen[record.started] = ended
+            }
+            self.egressNotifications = seen
         }
     }
 

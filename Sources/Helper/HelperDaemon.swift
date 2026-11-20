@@ -160,7 +160,13 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
     static var leftoverMarkers: [(String, String)] {
         let dir = CLIOrchestrator.defaultSupportDir
         let script = dir.appendingPathComponent("alwaysconnect-vpnc.sh").path
-        return [("openconnect", "--script=" + CLIOrchestrator.shellQuoted(script))]
+        let gate = ClientRequirement.egressGatePath
+        let quotedScript = CLIOrchestrator.shellQuoted(script)
+        return [
+            ("openconnect", "--script=" + quotedScript),
+            ("openconnect", "--script=" + CLIOrchestrator.shellQuoted(gate) + " " + quotedScript),
+            (gate, gate + " " + script),
+        ]
     }
 
     // MARK: - NSXPCListenerDelegate
@@ -226,6 +232,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var allowNetworks: [String] = []
     /// 断线保护 for the own connection (DESIGN.md §26.19), from the App.
     private var dropProtection = true
+    private var egress = EgressProtection()
+    private var probingEgress = false
     private var lastStateCode = 0
     private var lastDetail = ""
     /// Last terminal reason code + drop-episode retries, for
@@ -442,6 +450,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         config.relay = relay
         // Own connection: the domain split's forwarder runs (§26.5).
         if relay != nil { config.directDomains = directDomains }
+        if relay != nil { config.egress = egress }
         config.dropProtection = dropProtection
         // Redacted child output into the daemon's log (launchd
         // StandardErrorPath), only when the plist opts in: the dev
@@ -551,7 +560,12 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
 
     func setDropProtection(_ on: Bool, withReply reply: @escaping (Bool) -> Void) {
         queue.async {
+            let wasGated = self.dropProtection && self.egress.isActive
             self.dropProtection = on
+            if !on {
+                self.egress.enabled = false
+                if wasGated && self.restartForEgressChange() { reply(true); return }
+            }
             if let engine = self.engine {
                 engine.updateDropProtection(on)
             } else if !on, let held = NetworkGuard.shared.held, held.holder != NetworkGuard.ciscoHolder {
@@ -564,6 +578,47 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 }
             }
             reply(true)
+        }
+    }
+
+    /// Use the normal same-login handover so the cookie and network hold survive.
+    @discardableResult
+    private func restartForEgressChange() -> Bool {
+        guard relay != nil, let parameters = activeParameters else { return false }
+        startEngine(server: parameters[0], group: parameters[1], username: parameters[2],
+                    password: parameters[3], parameters: parameters) { _ in }
+        return true
+    }
+
+    func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard ac_egress_config_valid(json),
+                  let config = try? JSONDecoder().decode(EgressProtection.self, from: Data(json.utf8)),
+                  !config.enabled || self.dropProtection else { reply(false); return }
+            let modeChanged = config.isActive != self.egress.isActive
+            self.egress = config
+            if self.relay != nil && !(modeChanged && self.restartForEgressChange()) {
+                self.engine?.updateEgress(json)
+            }
+            reply(true)
+        }
+    }
+
+    func getEgressStatus(withReply reply: @escaping (String) -> Void) {
+        queue.async { reply(self.engine?.egressStatus() ?? "{}") }
+    }
+
+    func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void) {
+        queue.async {
+            guard self.relay != nil, !self.probingEgress, let engine = self.engine else { reply("[]"); return }
+            self.probingEgress = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = engine.probeEgress(host)
+                self.queue.async {
+                    self.probingEgress = false
+                    reply(self.engine === engine ? result : "[]")
+                }
+            }
         }
     }
 

@@ -19,10 +19,10 @@
 //! `linux:<name>[:netns=<ns>]` (the CI harness, which keeps the client side
 //! in its own network namespace).
 
-use alwaysconnect_core::egress_gate::{Classifier, Gate, GateConfig, GroupId, Out, Step};
+use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
+use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, Step};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
-use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,18 +35,9 @@ extern "C" fn on_signal(_: libc::c_int) {
 }
 
 #[derive(Deserialize)]
-struct GroupCfg {
-    id: GroupId,
-    #[serde(default)]
-    names: Vec<String>,
-    #[serde(default)]
-    cidrs: Vec<String>,
-}
-
-#[derive(Deserialize)]
 struct ControllerCfg {
     probe_alpn: String,
-    groups: Vec<GroupCfg>,
+    groups: Vec<GateGroup>,
 }
 
 #[derive(Deserialize)]
@@ -61,48 +52,7 @@ struct ControlMsg {
     invalidate: Option<bool>,
     /// A new configuration while running (same shape as the first line).
     probe_alpn: Option<String>,
-    groups: Option<Vec<GroupCfg>>,
-}
-
-/// Exact names, `*.suffix` wildcards (subdomains only) and CIDRs. The
-/// product will feed the split-rule engine's resolved lists here.
-struct Groups {
-    groups: Vec<(GroupId, Vec<String>, Vec<(IpAddr, u8)>)>,
-}
-
-impl Classifier for Groups {
-    fn group_for_name(&self, name: &str) -> Option<GroupId> {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
-        self.groups.iter().find(|(_, names, _)| names.iter().any(|p| match p.strip_prefix("*.") {
-            Some(suffix) => name.len() > suffix.len() && name.ends_with(suffix) && name.as_bytes()[name.len() - suffix.len() - 1] == b'.',
-            None => *p == name,
-        })).map(|(id, _, _)| *id)
-    }
-    fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId> {
-        self.groups.iter().find(|(_, _, nets)| nets.iter().any(|(net, len)| in_net(ip, *net, *len))).map(|(id, _, _)| *id)
-    }
-}
-
-fn in_net(ip: IpAddr, net: IpAddr, len: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(a), IpAddr::V4(n)) => len <= 32 && (len == 0 || (u32::from(a) ^ u32::from(n)) >> (32 - len as u32) == 0),
-        (IpAddr::V6(a), IpAddr::V6(n)) => len <= 128 && (len == 0 || (u128::from(a) ^ u128::from(n)) >> (128 - len as u32) == 0),
-        _ => false,
-    }
-}
-
-fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
-    let (ip, len) = s.split_once('/').unwrap_or((s, ""));
-    let ip: IpAddr = ip.trim().parse().ok()?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    let len = if len.is_empty() { max } else { len.trim().parse().ok()? };
-    (len <= max).then_some((ip, len))
-}
-
-fn groups_from(cfg: &[GroupCfg]) -> Groups {
-    Groups {
-        groups: cfg.iter().map(|g| (g.id, g.names.iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).collect(), g.cidrs.iter().filter_map(|c| parse_cidr(c)).collect())).collect(),
-    }
+    groups: Option<Vec<GateGroup>>,
 }
 
 fn log(msg: &str) {
@@ -113,12 +63,20 @@ fn log(msg: &str) {
 
 trait Tun {
     fn fd(&self) -> RawFd;
-    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn read<'a>(&self, buf: &'a mut [u8]) -> std::io::Result<&'a [u8]>;
     fn write(&self, pkt: &[u8]) -> std::io::Result<()>;
 }
 
 fn sys(r: isize) -> std::io::Result<usize> {
     if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(r as usize) }
+}
+
+fn cloexec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -127,8 +85,9 @@ mod linux_tun {
     pub struct LinuxTun(pub OwnedFd);
     impl Tun for LinuxTun {
         fn fd(&self) -> RawFd { self.0.as_raw_fd() }
-        fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            sys(unsafe { libc::read(self.fd(), buf.as_mut_ptr().cast(), buf.len()) })
+        fn read<'a>(&self, buf: &'a mut [u8]) -> std::io::Result<&'a [u8]> {
+            let len = sys(unsafe { libc::read(self.fd(), buf.as_mut_ptr().cast(), buf.len()) })?;
+            Ok(&buf[..len])
         }
         fn write(&self, pkt: &[u8]) -> std::io::Result<()> {
             sys(unsafe { libc::write(self.fd(), pkt.as_ptr().cast(), pkt.len()) }).map(|_| ())
@@ -174,19 +133,18 @@ mod utun {
     pub struct Utun { pub fd: OwnedFd, pub name: String }
     impl Tun for Utun {
         fn fd(&self) -> RawFd { self.fd.as_raw_fd() }
-        fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let mut tmp = vec![0u8; buf.len() + 4];
-            let n = sys(unsafe { libc::read(self.fd(), tmp.as_mut_ptr().cast(), tmp.len()) })?;
-            if n < 4 { return Ok(0); }
-            buf[..n - 4].copy_from_slice(&tmp[4..n]);
-            Ok(n - 4)
+        fn read<'a>(&self, buf: &'a mut [u8]) -> std::io::Result<&'a [u8]> {
+            let len = sys(unsafe { libc::read(self.fd(), buf.as_mut_ptr().cast(), buf.len()) })?;
+            Ok(buf.get(4..len).unwrap_or_default())
         }
         fn write(&self, pkt: &[u8]) -> std::io::Result<()> {
             let af: u32 = if pkt.first().map(|b| b >> 4) == Some(6) { libc::AF_INET6 as u32 } else { libc::AF_INET as u32 };
-            let mut v = Vec::with_capacity(pkt.len() + 4);
-            v.extend_from_slice(&af.to_be_bytes());
-            v.extend_from_slice(pkt);
-            sys(unsafe { libc::write(self.fd(), v.as_ptr().cast(), v.len()) }).map(|_| ())
+            let family = af.to_be_bytes();
+            let slices = [
+                libc::iovec { iov_base: family.as_ptr().cast_mut().cast(), iov_len: family.len() },
+                libc::iovec { iov_base: pkt.as_ptr().cast_mut().cast(), iov_len: pkt.len() },
+            ];
+            sys(unsafe { libc::writev(self.fd(), slices.as_ptr(), 2) }).map(|_| ())
         }
     }
     pub fn open() -> std::io::Result<Utun> {
@@ -194,6 +152,7 @@ mod utun {
             let fd = libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL);
             if fd < 0 { return Err(std::io::Error::last_os_error()); }
             let fd = OwnedFd::from_raw_fd(fd);
+            cloexec(fd.as_raw_fd())?;
             let mut info: libc::ctl_info = std::mem::zeroed();
             for (i, b) in b"com.apple.net.utun_control".iter().enumerate() { info.ctl_name[i] = *b as libc::c_char; }
             if libc::ioctl(fd.as_raw_fd(), libc::CTLIOCGINFO, &mut info) < 0 { return Err(std::io::Error::last_os_error()); }
@@ -219,21 +178,13 @@ mod utun {
 
 /// Run the existing vpnc-script for the interface the gate created, so
 /// addresses, routes, DNS and drop protection stay exactly as today.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn vpnc_script(reason: &str, tundev: &str) -> bool {
     // The engine passes the installed vpnc-script as our first argument, so
     // openconnect's command line still names it (process sweeps and the
     // recovery script find it, DESIGN §66.5).
-    let mut cmd = if let Some(path) = std::env::args().nth(1) {
-        std::process::Command::new(path)
-    } else if let Ok(script) = std::env::var("AC_GATE_VPNC_SCRIPT") {
-        let mut c = std::process::Command::new("/bin/sh");
-        c.args(["-c", &script]);
-        c
-    } else {
-        return true;
-    };
-    cmd.env("reason", reason)
+    let Some(path) = std::env::args().nth(1) else { return false; };
+    std::process::Command::new(path).env("reason", reason)
         .env("TUNDEV", tundev)
         .env_remove("VPNFD")
         .status()
@@ -265,6 +216,7 @@ fn open_tun() -> std::io::Result<(Box<dyn Tun>, String)> {
         let t = utun::open()?;
         let name = t.name.clone();
         if !vpnc_script("connect", &name) {
+            let _ = vpnc_script("disconnect", &name);
             return Err(std::io::Error::other("vpnc-script connect failed"));
         }
         Ok((Box::new(t), name))
@@ -308,6 +260,14 @@ fn main() {
         std::process::exit(2);
     };
     let vpn = unsafe { OwnedFd::from_raw_fd(vpnfd) };
+    if let Err(error) = cloexec(vpn.as_raw_fd()) {
+        log(&format!("invalid tunnel descriptor: {error}"));
+        std::process::exit(1);
+    }
+    let Some((controller, cfg)) = connect_control() else {
+        log("no initial configuration; refusing to start the tunnel");
+        std::process::exit(1);
+    };
     let (tun, ifname) = match open_tun() {
         Ok(t) => t,
         Err(e) => {
@@ -315,14 +275,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let (mut control, cfg) = match connect_control() {
-        Some((c, cfg)) => (Some(c), cfg),
-        None => {
-            log("no controller: protected connections will be refused (fail closed)");
-            (None, ControllerCfg { probe_alpn: String::new(), groups: Vec::new() })
-        }
-    };
-    let groups = groups_from(&cfg.groups);
+    let mut control = Some(controller);
+    let groups = ProtectedRoutes::new(&cfg.groups);
     let gcfg = GateConfig { probe_alpn: cfg.probe_alpn.into_bytes(), ..GateConfig::default() };
     let mut gate = Gate::new(gcfg, Box::new(groups));
     log(&format!("up on {ifname}"));
@@ -331,9 +285,9 @@ fn main() {
     }
     let _ = std::io::stdout().flush();
 
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 65_540];
     let mut last_tick = Instant::now();
-    let mut ctl_line = String::new();
+    let mut ctl_line = Vec::new();
     while !STOP.load(Ordering::SeqCst) {
         let mut fds = vec![
             libc::pollfd { fd: tun.fd(), events: libc::POLLIN, revents: 0 },
@@ -342,22 +296,66 @@ fn main() {
         if let Some(c) = &control {
             fds.push(libc::pollfd { fd: c.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         }
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 250) };
+        let buffered = control.as_ref().is_some_and(|c| !c.reader.buffer().is_empty());
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, if buffered { 0 } else { 250 }) };
         if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             break;
         }
         let now = Instant::now();
+        if buffered || (fds.len() > 2 && fds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0) {
+            let mut lost = false;
+            if let Some(c) = &mut control {
+                loop {
+                    match c.reader.read_until(b'\n', &mut ctl_line) {
+                        Ok(0) => {
+                            lost = true;
+                            break;
+                        }
+                        Ok(_) => match serde_json::from_slice::<ControlMsg>(&std::mem::take(&mut ctl_line)) {
+                            Ok(m) => {
+                                if let Some(v) = m.verdict {
+                                    log(&format!("verdict group={} ok={}", v.group, v.ok));
+                                    gate.verdict(v.group, v.ok, Instant::now());
+                                }
+                                if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
+                                    log("new configuration");
+                                    gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
+                                }
+                                if m.invalidate == Some(true) {
+                                    gate.invalidate();
+                                }
+                            }
+                            Err(e) => log(&format!("bad control line: {e}")),
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            lost = ctl_line.len() > 524_288;
+                            break;
+                        }
+                        Err(_) => {
+                            lost = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if lost {
+                log("controller gone: protected connections will be refused (fail closed)");
+                gate.invalidate();
+                control = None;
+            }
+            apply(&mut gate, &vpn, tun.as_ref(), &mut control);
+        }
         if fds[0].revents & libc::POLLIN != 0 {
             // Drain a burst from the Mac side.
             for _ in 0..64 {
                 match tun.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if gate.outbound(&buf[..n], now) == Step::Forward {
-                            let _ = send(&vpn, &buf[..n]);
+                    Ok(pkt) if !pkt.is_empty() => {
+                        if gate.outbound(pkt, now) == Step::Forward {
+                            let _ = send(&vpn, pkt);
                         }
                         apply(&mut gate, &vpn, tun.as_ref(), &mut control);
                     }
+                    _ => break,
                 }
                 if !readable(tun.fd()) {
                     break;
@@ -380,46 +378,6 @@ fn main() {
                     break;
                 }
             }
-        }
-        if fds.len() > 2 && fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let mut lost = false;
-            if let Some(c) = &mut control {
-                loop {
-                    ctl_line.clear();
-                    match c.reader.read_line(&mut ctl_line) {
-                        Ok(0) => {
-                            lost = true;
-                            break;
-                        }
-                        Ok(_) => match serde_json::from_str::<ControlMsg>(&ctl_line) {
-                            Ok(m) => {
-                                if let Some(v) = m.verdict {
-                                    log(&format!("verdict group={} ok={}", v.group, v.ok));
-                                    gate.verdict(v.group, v.ok, Instant::now());
-                                }
-                                if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
-                                    log("new configuration");
-                                    gate.reconfigure(alpn.into_bytes(), Box::new(groups_from(&groups)));
-                                }
-                                if m.invalidate == Some(true) {
-                                    gate.invalidate();
-                                }
-                            }
-                            Err(e) => log(&format!("bad control line: {e}")),
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => {
-                            lost = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if lost {
-                log("controller gone: protected connections will be refused (fail closed)");
-                control = None;
-            }
-            apply(&mut gate, &vpn, tun.as_ref(), &mut control);
         }
         if now.duration_since(last_tick) >= Duration::from_millis(250) {
             gate.tick(now);
@@ -451,7 +409,7 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
                 let _ = tun.write(&p);
             }
             Out::Check { group, host } => {
-                log(&format!("check group={group} host={}", host.as_deref().unwrap_or("-")));
+                log(&format!("check group={group}"));
                 if let Some(c) = control {
                     let line = serde_json::json!({ "check": { "group": group, "host": host } }).to_string() + "\n";
                     let _ = c.stream.write_all(line.as_bytes());

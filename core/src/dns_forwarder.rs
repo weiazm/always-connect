@@ -18,6 +18,7 @@
 //! client retries), which leave after 30 s without work. Idle, the
 //! forwarder is one parked thread and wakes for nothing.
 
+use crate::egress_gate::Classifier;
 use regex_lite::Regex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -252,18 +253,19 @@ fn parts(m: &[u8], data: usize, stop: usize, shape: &[Shape]) -> Option<Vec<Part
 
 /// An SVCB/HTTPS record's data (RFC 9460 §2.2) with ipv4hint and
 /// ipv6hint taken out (and out of "mandatory", which may list them).
-fn svcb_without_hints(m: &[u8], data: usize, stop: usize) -> Option<Svcb> {
+fn svcb_without_hints(m: &[u8], data: usize, stop: usize, strip_ech: bool) -> Option<Svcb> {
     let priority = m.get(data..data + 2)?.to_vec();
     let (target, mut at) = read_labels(m, data + 2)?;
     let mut params = Vec::new();
     let mut removed = false;
+    let omit = |key| key == SVC_IPV4HINT || key == SVC_IPV6HINT || (strip_ech && key == 5);
     while at < stop {
         let head = m.get(at..at + 4)?;
         let key = (head[0] as u16) << 8 | head[1] as u16;
         let len = (head[2] as usize) << 8 | head[3] as usize;
         let value = m.get(at + 4..at + 4 + len)?;
         at += 4 + len;
-        if key == SVC_IPV4HINT || key == SVC_IPV6HINT {
+        if omit(key) {
             removed = true;
             continue;
         }
@@ -276,7 +278,7 @@ fn svcb_without_hints(m: &[u8], data: usize, stop: usize) -> Option<Svcb> {
                 .chunks(2)
                 .filter(|k| {
                     let k = (k[0] as u16) << 8 | k[1] as u16;
-                    k != SVC_IPV4HINT && k != SVC_IPV6HINT
+                    !omit(k)
                 })
                 .flatten()
                 .copied()
@@ -332,6 +334,10 @@ fn write_plain(out: &mut Vec<u8>, labels: &[Vec<u8>], terminate: bool) {
 /// (a CNAME's target, a TargetName other than "."): the client would go
 /// on to a name the list may not cover.
 pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
+    sanitize_service_answer(answer, direct, false)
+}
+
+fn sanitize_service_answer(answer: &[u8], direct: bool, strip_ech: bool) -> Option<Vec<u8>> {
     if answer.len() < 12 {
         return None;
     }
@@ -373,7 +379,7 @@ pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
                     continue;
                 }
                 TYPE_SVCB | TYPE_HTTPS => {
-                    let (priority, target, params, removed) = svcb_without_hints(answer, data, stop)?;
+                    let (priority, target, params, removed) = svcb_without_hints(answer, data, stop, strip_ech)?;
                     if direct && (!same_name(&owner, &qname) || !target.is_empty()) {
                         return None;
                     }
@@ -434,6 +440,7 @@ pub struct SplitRules {
     keywords: Vec<String>,
     regexes: Vec<Regex>,
     ranges: Vec<(u32, u32)>,
+    protected: Option<Arc<crate::egress_control::ProtectedRoutes>>,
 }
 
 fn trim_domain(s: &str) -> String {
@@ -512,7 +519,7 @@ impl SplitRules {
     /// there is one), or None.
     pub fn matches(&self, name: &str) -> Option<String> {
         let n = trim_dots(name);
-        if n.is_empty() {
+        if n.is_empty() || self.protects_name(&n) {
             return None;
         }
         if self.fulls.contains(&n) {
@@ -538,10 +545,24 @@ impl SplitRules {
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        if self.protects_ip(ip) { return false; }
         let v = u32::from(ip);
         // The last range starting at or below v.
         let idx = self.ranges.partition_point(|r| r.0 <= v);
         idx > 0 && v <= self.ranges[idx - 1].1
+    }
+
+    pub(crate) fn with_protection(mut self, protection: Option<Arc<crate::egress_control::ProtectedRoutes>>) -> Self {
+        self.protected = protection;
+        self
+    }
+
+    pub(crate) fn protects_name(&self, name: &str) -> bool {
+        self.protected.as_ref().is_some_and(|routes| routes.group_for_name(name).is_some())
+    }
+
+    pub(crate) fn protects_ip(&self, ip: Ipv4Addr) -> bool {
+        self.protected.as_ref().is_some_and(|routes| routes.group_for_ip(ip.into()).is_some())
     }
 }
 
@@ -957,7 +978,9 @@ impl Inner {
             answer_addresses(&answer, query)?
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
+        let protected = rules.protects_name(&q.name);
         let direct: Vec<_> = addresses.iter().copied()
+            .filter(|ip| !protected && !rules.protects_ip(*ip))
             .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
         if self.settings.read().unwrap().epoch != epoch { return None; }
         if q.qtype == TYPE_A {
@@ -989,7 +1012,8 @@ impl Inner {
         }
         self.remember(&addresses, &q.name);
         if is_service(q.qtype) {
-            return without_addresses(&answer, entry.is_some()).or_else(|| empty_answer(query));
+            return sanitize_service_answer(&answer, entry.is_some(), rules.protected.is_some())
+                .or_else(|| empty_answer(query));
         }
         Some(answer)
     }
@@ -1128,9 +1152,12 @@ impl Forwarder {
     }
 
     pub fn set_rules(&self, direct: &[String]) {
-        let parsed = Arc::new(SplitRules::new(direct));
+        self.set_parsed_rules(SplitRules::new(direct));
+    }
+
+    pub(crate) fn set_parsed_rules(&self, parsed: SplitRules) {
         let mut settings = self.inner.settings.write().unwrap();
-        settings.rules = parsed;
+        settings.rules = Arc::new(parsed);
         self.inner.acknowledged.lock().unwrap().clear();
         settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
     }
@@ -1457,6 +1484,19 @@ mod tests {
         bad[12] = 0xC0;
         bad[13] = 12;
         assert_eq!(question(&bad), None);
+    }
+
+    #[test]
+    fn protected_dns_strips_ech_and_preserves_other_parameters() {
+        let here = [0xC0, 0x0C];
+        for kind in [TYPE_HTTPS, TYPE_SVCB] {
+            let q = query("site.example", kind, 23);
+            let params = [param(0, &[0, 1, 0, 5]), param(1, b"\x02h2"), param(5, b"test-ech")].concat();
+            let answer = reply(&q, &[rr(&here, kind, 300, &svcb_data(1, ".", &params))], &[], &[]);
+            assert_eq!(sanitize_service_answer(&answer, false, false).unwrap(), answer);
+            let stripped = sanitize_service_answer(&answer, false, true).unwrap();
+            assert_eq!(records(&stripped)[0].3, "prio=1 target= 0:\0\u{1} 1:\u{2}h2");
+        }
     }
 
     #[test]

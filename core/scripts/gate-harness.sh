@@ -47,6 +47,15 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 count() { local c; c=$(grep -c "$1" "$2" 2>/dev/null) || true; echo "${c:-0}"; }   # grep -c exits 1 on zero; a missing log counts 0
 nsx() { ip netns exec "$NS" "$@"; }
 
+# Before any interface or route is created, a missing initial policy is fatal.
+if VPNFD=0 AC_GATE_CONTROL="$W/absent" "$GATE" </dev/null >"$W/no-control.log" 2>&1; then
+  fail "the gate started without an initial policy"
+elif grep -q "no initial configuration" "$W/no-control.log"; then
+  pass "gate starts only with an initial policy"
+else
+  fail "the gate did not reject the missing policy"
+fi
+
 # Test CA and one site certificate for every test name.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Gate Harness CA" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \

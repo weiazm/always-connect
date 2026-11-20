@@ -84,6 +84,7 @@ struct GeneralPage: View {
     @State private var loginItemOn = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
     @State private var recording = false
+    @State private var egressDisabledWithDrop = false
 
     var body: some View {
         Form {
@@ -98,8 +99,12 @@ struct GeneralPage: View {
                 Toggle("断线保护", isOn: Binding(
                     get: { settings.isDropProtectionOn },
                     set: { on in
-                        settings.dropProtection = on
-                        ProfileStore.saveAppSettings(settings)
+                        var latest = ProfileStore.loadAppSettings()
+                        latest.dropProtection = on
+                        egressDisabledWithDrop = !on && latest.egressProtection?.enabled == true
+                        if !on { latest.egressProtection?.enabled = false }
+                        settings = latest
+                        ProfileStore.saveAppSettings(settings, updatingEgress: !on)
                         HelperClient.shared.dropProtectionChanged()
                     }))
             } header: {
@@ -109,7 +114,8 @@ struct GeneralPage: View {
                          ? (HelperClient.shared.usesCisco
                             ? "断线保护开：VPN 断开时暂停上网，直到重新连上或你手动断开，公司流量不会走本地网络。"
                             : "断线保护开：VPN 断开时暂停上网（名单里的网站照常），直到重新连上或你手动断开，公司流量不会走本地网络。")
-                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。")
+                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。"
+                           + (egressDisabledWithDrop ? "出口保护已关闭。自建连接需要重新连接一次才能生效。" : ""))
             }
 
             Section("启动与通知") {
@@ -793,6 +799,8 @@ struct SplitPage: View {
                     ? "改动立即生效，不用重新连接。写法示例：鼠标停在输入框旁的问号上；点问号打开全部清单名。"
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
+
+            EgressProtectionSection()
 
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {

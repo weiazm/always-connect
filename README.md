@@ -18,6 +18,8 @@
 
 ---
 
+自建连接的「出口保护」可按组核对网站的 VPN 出口。默认关闭，需要断线保护开启。真实 Mac 验证见 [实测清单 K 节](docs/mac-proof-checklist.md#k-出口保护隧道闸门design-六十六真机待验)。
+
 ## 这是什么
 
 如果你每天要用 Cisco Secure Client（AnyConnect）连公司 VPN，AlwaysConnect 会替你盯着它：

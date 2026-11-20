@@ -1623,6 +1623,49 @@ pub extern "C" fn ac_oc_kill_child(e: *const oc_engine::Engine) {
 pub extern "C" fn ac_oc_update_direct_domains(e: *const oc_engine::Engine, domains: *const c_char) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_direct_domains(c_list(domains, '\n')) }
 }
+type EgressProbe = extern "C" fn(*mut c_void, *const c_char, *mut usize) -> *mut u8;
+
+#[no_mangle]
+pub extern "C" fn ac_oc_set_egress_probe(
+    e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbe,
+) {
+    let Some(e) = (unsafe { e.as_ref() }) else { return };
+    // The macOS hook is stateless. Any context must outlive in-flight calls.
+    let ctx = ctx as usize;
+    e.set_egress_probe(std::sync::Arc::new(move |req| {
+        let json = CString::new(serde_json::to_string(req).ok()?).ok()?;
+        let mut len = 0;
+        let bytes = probe(ctx as *mut c_void, json.as_ptr(), &mut len);
+        if bytes.is_null() { return None; }
+        let result = (len <= 65_536).then(|| unsafe { std::slice::from_raw_parts(bytes, len).to_vec() });
+        unsafe { libc::free(bytes.cast()) };
+        result
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_update_egress(e: *const oc_engine::Engine, json: *const c_char) {
+    let (Some(e), Some(json)) = (unsafe { e.as_ref() }, c_str(json)) else { return };
+    if let Ok(cfg) = serde_json::from_str(&json) { e.update_egress(cfg); }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_egress_config_valid(json: *const c_char) -> bool {
+    c_str(json).filter(|s| s.len() <= 524_288)
+        .and_then(|s| serde_json::from_str::<crate::egress_control::EgressConfig>(&s).ok())
+        .is_some_and(|cfg| cfg.valid())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_egress_status(e: *const oc_engine::Engine) -> *mut c_char {
+    owned(unsafe { e.as_ref() }.map(|e| e.egress_status()).unwrap_or_else(|| "{}".into()))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_egress_probe_host(e: *const oc_engine::Engine, host: *const c_char) -> *mut c_char {
+    let (Some(e), Some(host)) = (unsafe { e.as_ref() }, c_str(host)) else { return owned("[]".into()) };
+    owned(serde_json::to_string(&e.egress_probe_host(&host)).unwrap_or_else(|_| "[]".into()))
+}
 #[no_mangle]
 pub extern "C" fn ac_oc_update_drop_protection(e: *const oc_engine::Engine, on: bool) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_drop_protection(on) }

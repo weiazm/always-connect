@@ -121,6 +121,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func getSplitStatus(withReply reply: @escaping (String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
+    func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
+    func getEgressStatus(withReply reply: @escaping (String) -> Void)
+    func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the
     /// engine loads no pf set and a drop gives the local network back
     /// while it retries. In force at once in a running session, else

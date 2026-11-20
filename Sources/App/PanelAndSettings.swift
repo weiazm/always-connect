@@ -22,6 +22,7 @@ struct PanelView: View {
     @State private var servers = ProfileStore.loadServers()
     @State private var selectedServer = ProfileStore.loadProfile().server
     @State private var protectionOn = ProfileStore.loadAppSettings().isDropProtectionOn
+    @State private var egressDisabledWithDrop = false
     @State private var showConfirmQuit = false
     /// The split switch flipped while connected: reconnect first (§26.12).
     @State private var confirmSplit: Bool?
@@ -270,6 +271,7 @@ struct PanelView: View {
         .onAppear {
             speed.start()
             manager.refreshSplitActivity()
+            manager.refreshEgress()
             let active = manager.state != .disconnected
             let cisco = manager.usesCisco
             let split = manager.ownConnection
@@ -449,6 +451,15 @@ struct PanelView: View {
             .padding(.vertical, 9)
             Divider()
             splitRow
+            if let line = manager.egressLine {
+                Divider()
+                Button { onOpenSettings("split") } label: {
+                    rowLabel("shield.lefthalf.filled", "出口保护", line)
+                        .foregroundStyle(manager.egressBlocked ? Color.red : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 8)
+            }
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
             // the local network instead of pausing it.
             Divider()
@@ -458,13 +469,19 @@ struct PanelView: View {
                     protectionOn = on
                     var settings = ProfileStore.loadAppSettings()
                     settings.dropProtection = on
-                    ProfileStore.saveAppSettings(settings)
+                    egressDisabledWithDrop = !on && settings.egressProtection?.enabled == true
+                    if !on { settings.egressProtection?.enabled = false }
+                    ProfileStore.saveAppSettings(settings, updatingEgress: !on)
                     manager.dropProtectionChanged()
                 })) {
                 rowLabel(protectionOn ? "lock.shield" : "lock.open", "断线保护",
                          protectionOn ? "掉线时暂停上网，不漏走直连" : "关：掉线时改走本地网络")
             }
             .padding(.vertical, 8)
+            if egressDisabledWithDrop {
+                Text("出口保护已关闭。自建连接需要重新连接一次才能生效。")
+                    .font(.caption).foregroundStyle(.secondary).padding(.bottom, 8)
+            }
         }
         .font(.callout)
         .padding(.horizontal, 12)
