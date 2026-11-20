@@ -140,3 +140,36 @@ fn a_missing_gate_refuses_to_connect() {
     assert_eq!(r.terminal.recv_timeout(Duration::from_secs(5)).unwrap(), Terminal::ComponentMissing as i32);
     assert!(!r.dir.join("args").exists(), "no unchecked tunnel");
 }
+
+#[test]
+fn losing_the_gate_restarts_a_still_running_vpn_child() {
+    let run = run(true, true, Some("/opt/test/alwaysconnect-gate"));
+    args(&run);
+    let generation = run.engine.shared.core.lock().unwrap().generation;
+    let mut gate = BufReader::new(UnixStream::connect(run.dir.join("egress.sock")).unwrap());
+    let mut policy = String::new();
+    assert!(gate.read_line(&mut policy).unwrap() > 0);
+    drop(gate);
+    assert!(wait_until(|| run.engine.shared.core.lock().unwrap().generation > generation),
+            "the VPN child outlived its gate and never started a new one");
+}
+
+#[test]
+fn stale_gate_loss_and_manual_stop_do_not_start_another_vpn() {
+    let run = run(true, true, Some("/opt/test/alwaysconnect-gate"));
+    let _ = args(&run);
+    let generation = run.engine.shared.core.lock().unwrap().generation;
+    run.engine.send(Event::EgressGateLost(generation - 1));
+    let (tx, rx) = mpsc::channel();
+    run.engine.send(Event::Barrier(tx));
+    rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    {
+        let core = run.engine.shared.core.lock().unwrap();
+        assert!(!core.gate_lost);
+        assert_eq!(core.generation, generation);
+    }
+    run.engine.stop(false, false);
+    run.engine.send(Event::EgressGateLost(generation));
+    assert_eq!(run.terminal.recv_timeout(Duration::from_secs(5)).unwrap(), Terminal::StoppedManual as i32);
+    assert_eq!(run.engine.shared.core.lock().unwrap().generation, generation);
+}

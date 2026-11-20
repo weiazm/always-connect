@@ -564,13 +564,14 @@ struct ControlState {
     peer_id: u64,
     epoch: u64,
     checks: HashMap<u32, u64>,
+    on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
 impl ControlState {
     fn send(&mut self, line: &str) {
         if let Some(peer) = &mut self.peer {
             if peer.write_all(format!("{line}\n").as_bytes()).is_err() {
-                self.disconnect();
+                self.peer_lost();
             }
         }
     }
@@ -582,6 +583,11 @@ impl ControlState {
         self.status.interface.clear();
         self.peer_id = self.peer_id.wrapping_add(1);
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn peer_lost(&mut self) {
+        self.disconnect();
+        if let Some(notify) = &self.on_peer_loss { notify(); }
     }
 }
 
@@ -600,7 +606,7 @@ impl Controller {
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
                 config: cfg, status: Status::default(), peer: None, peer_id: 0,
-                epoch: 0, checks: HashMap::new(),
+                epoch: 0, checks: HashMap::new(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
         });
@@ -615,6 +621,17 @@ impl Controller {
 
     pub fn marker(&self) -> String {
         self.shared.marker.clone()
+    }
+
+    /// Retire the previous script's reader before starting another VPN process.
+    pub(crate) fn watch_next_launch(&self, notify: Box<dyn Fn() + Send>) {
+        let mut state = self.shared.state.lock().expect("controller");
+        state.disconnect();
+        state.on_peer_loss = Some(notify);
+    }
+
+    pub(crate) fn has_peer(&self) -> bool {
+        self.shared.state.lock().expect("controller").peer.is_some()
     }
 
     pub fn status_json(&self) -> String {
@@ -703,7 +720,7 @@ fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
         if std::thread::Builder::new().name("egress-gate".into())
             .spawn(move || read_loop(stream, shared, peer_id)).is_err()
         {
-            state.disconnect();
+            state.peer_lost();
         }
     }
 }
@@ -760,7 +777,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         }
     }
     let mut state = shared.state.lock().expect("controller");
-    if state.peer_id == peer_id { state.disconnect(); }
+    if state.peer_id == peer_id { state.peer_lost(); }
 }
 
 fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<(String, ProbeMethod)>,

@@ -163,6 +163,7 @@ enum Event {
     OfflineDeadline(u64),
     Release,
     Egress(crate::egress_control::EgressConfig),
+    EgressGateLost(u64),
 }
 
 // MARK: - Helpers (pure)
@@ -399,6 +400,7 @@ struct Core {
     network: crate::offline::Gate,
     resume_after_exit: bool,
     hook_fired: bool,
+    gate_lost: bool,
     saw_login_failed: bool,
     fed: Credential,
     cookie_fallback_used: bool,
@@ -494,6 +496,7 @@ impl Engine {
                 network: crate::offline::Gate::default(),
                 resume_after_exit: false,
                 hook_fired: false,
+                gate_lost: false,
                 saw_login_failed: false,
                 fed: Credential::Password,
                 cookie_fallback_used: false,
@@ -695,7 +698,7 @@ impl Core {
     /// A cancelled child is unavailable even after the physical path returns.
     /// Mandatory protection/retirement continues; optional permissions do not.
     fn recovery_suspended(&self) -> bool {
-        self.network.paused || self.resume_after_exit
+        self.network.paused || self.resume_after_exit || self.gate_lost
     }
     fn direct_retry_ready(&self,ip:&Ipv4Addr,now:Instant)->bool {
         self.direct_retries.get(ip).is_none_or(|retry|now>=retry.until)
@@ -843,6 +846,7 @@ impl Shared {
                     self.sync_split_routes(&mut c);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
+                Event::EgressGateLost(generation) => self.recover_lost_gate(&mut c, generation),
                 Event::Egress(cfg) => {
                     if c.config.egress.as_ref() == Some(&cfg) { continue; }
                     if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
@@ -1403,7 +1407,33 @@ impl Shared {
                 *slot = Some(ctl);
             }
         }
+        let generation = c.generation + 1;
+        let tx = self.tx.lock().expect("engine sender").clone();
+        slot.as_ref().expect("controller installed").watch_next_launch(Box::new(move || {
+            let _ = tx.send(Event::EgressGateLost(generation));
+        }));
         Ok(gate)
+    }
+
+    fn recover_lost_gate(self: &Arc<Self>, c: &mut Core, generation: u64) {
+        if generation != c.generation || c.stop_requested || c.recovery_suspended() || !c.child_alive()
+            || self.egress.lock().expect("egress").as_ref().is_none_or(|ctl| ctl.has_peer()) {
+            return;
+        }
+        let pid = c.child.as_ref().expect("live child").pid;
+        c.gate_lost = true;
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        if c.config.drop_protection {
+            if let Some((tun, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tun), gateways, false);
+            }
+        }
+        self.report(c, "出口保护闸门已停止，正在重新连接");
+        // HUP preserves the VPN cookie. The regular child-exit path owns the
+        // retry and backoff. A manual stop still takes precedence.
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        self.after(2.0, Event::StopKill { pid, generation });
     }
 
     fn egress_invalidate(&self) {
@@ -1887,9 +1917,10 @@ impl Shared {
         // This intent belongs to the exiting child, even when another offline
         // episode currently prevents its requested restart.
         let resume_after_exit = std::mem::take(&mut c.resume_after_exit);
+        let gate_lost = std::mem::take(&mut c.gate_lost);
         // Partial trailing lines.
         for stdout in [true, false] {
-            if c.network.paused || resume_after_exit {
+            if c.network.paused || resume_after_exit || gate_lost {
                 break;
             }
             let rest = std::mem::take(if stdout { &mut c.out_buffer } else { &mut c.err_buffer });
@@ -1965,7 +1996,7 @@ impl Shared {
             self.finish_terminal(c, Terminal::AuthFailure, &e);
             return;
         }
-        if c.fed == Credential::Cookie && !c.hook_fired {
+        if c.fed == Credential::Cookie && !c.hook_fired && !gate_lost {
             // Cookie refused before any tunnel: drop it, password once.
             let _ = std::fs::remove_file(&c.config.cookie_store_path);
             if !c.cookie_fallback_used {
