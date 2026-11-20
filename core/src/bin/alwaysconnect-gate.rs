@@ -59,6 +59,9 @@ struct Verdict {
 struct ControlMsg {
     verdict: Option<Verdict>,
     invalidate: Option<bool>,
+    /// A new configuration while running (same shape as the first line).
+    probe_alpn: Option<String>,
+    groups: Option<Vec<GroupCfg>>,
 }
 
 /// Exact names, `*.suffix` wildcards (subdomains only) and CIDRs. The
@@ -94,6 +97,12 @@ fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
     let max = if ip.is_ipv4() { 32 } else { 128 };
     let len = if len.is_empty() { max } else { len.trim().parse().ok()? };
     (len <= max).then_some((ip, len))
+}
+
+fn groups_from(cfg: &[GroupCfg]) -> Groups {
+    Groups {
+        groups: cfg.iter().map(|g| (g.id, g.names.iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).collect(), g.cidrs.iter().filter_map(|c| parse_cidr(c)).collect())).collect(),
+    }
 }
 
 fn log(msg: &str) {
@@ -212,10 +221,19 @@ mod utun {
 /// addresses, routes, DNS and drop protection stay exactly as today.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn vpnc_script(reason: &str, tundev: &str) -> bool {
-    let Ok(script) = std::env::var("AC_GATE_VPNC_SCRIPT") else { return true };
-    std::process::Command::new("/bin/sh")
-        .args(["-c", &script])
-        .env("reason", reason)
+    // The engine passes the installed vpnc-script as our first argument, so
+    // openconnect's command line still names it (process sweeps and the
+    // recovery script find it, DESIGN §66.5).
+    let mut cmd = if let Some(path) = std::env::args().nth(1) {
+        std::process::Command::new(path)
+    } else if let Ok(script) = std::env::var("AC_GATE_VPNC_SCRIPT") {
+        let mut c = std::process::Command::new("/bin/sh");
+        c.args(["-c", &script]);
+        c
+    } else {
+        return true;
+    };
+    cmd.env("reason", reason)
         .env("TUNDEV", tundev)
         .env_remove("VPNFD")
         .status()
@@ -304,12 +322,13 @@ fn main() {
             (None, ControllerCfg { probe_alpn: String::new(), groups: Vec::new() })
         }
     };
-    let groups = Groups {
-        groups: cfg.groups.iter().map(|g| (g.id, g.names.iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).collect(), g.cidrs.iter().filter_map(|c| parse_cidr(c)).collect())).collect(),
-    };
+    let groups = groups_from(&cfg.groups);
     let gcfg = GateConfig { probe_alpn: cfg.probe_alpn.into_bytes(), ..GateConfig::default() };
     let mut gate = Gate::new(gcfg, Box::new(groups));
     log(&format!("up on {ifname}"));
+    if let Some(c) = &mut control {
+        let _ = c.stream.write_all((serde_json::json!({ "up": { "ifname": ifname } }).to_string() + "\n").as_bytes());
+    }
     let _ = std::io::stdout().flush();
 
     let mut buf = vec![0u8; 65536];
@@ -377,6 +396,10 @@ fn main() {
                                 if let Some(v) = m.verdict {
                                     log(&format!("verdict group={} ok={}", v.group, v.ok));
                                     gate.verdict(v.group, v.ok, Instant::now());
+                                }
+                                if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
+                                    log("new configuration");
+                                    gate.reconfigure(alpn.into_bytes(), Box::new(groups_from(&groups)));
                                 }
                                 if m.invalidate == Some(true) {
                                     gate.invalidate();

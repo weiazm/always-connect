@@ -168,6 +168,16 @@ impl Gate {
         }
     }
 
+    /// New groups or probe marker from the controller (§66.6): established
+    /// connections keep their decision; verdicts and learned addresses,
+    /// which name the old groups, are dropped.
+    pub fn reconfigure(&mut self, probe_alpn: Vec<u8>, classifier: Box<dyn Classifier + Send>) {
+        self.cfg.probe_alpn = probe_alpn;
+        self.classifier = classifier;
+        self.learned.clear();
+        self.groups.clear();
+    }
+
     pub fn flow_count(&self) -> usize {
         self.flows.len()
     }
