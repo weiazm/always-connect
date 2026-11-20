@@ -164,11 +164,12 @@ fn controller_answers_a_gate() {
     let hook: ProbeHook = Arc::new(move |r: &ProbeRequest| {
         s2.lock().unwrap().push(r.clone());
         let loc = if r.host == "a.example" { "ZZ" } else { "YY" };
-        Some(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\ncf-ray: test-IAD\r\n\r\nip=198.51.100.7\nloc={loc}\n").into_bytes())
+        Some(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=198.51.100.7\nloc={loc}\n").into_bytes())
     });
     let mut config = cfg();
-    config.groups[0].expect.push("US".into());
-    let ctl = Controller::start(&sock, config, hook.clone()).unwrap();
+    config.groups[0].members[1].method = Some(PRESET_TRACE.into());
+    config.groups[0].expect.push("YY".into());
+    let ctl = Controller::start(&sock, config.clone(), hook.clone()).unwrap();
     let mut gate = UnixStream::connect(&sock).unwrap();
     gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut reader = BufReader::new(gate.try_clone().unwrap());
@@ -186,7 +187,8 @@ fn controller_answers_a_gate() {
         assert_eq!(r.interface, "utun9");
     }
     // Change the expected countries; the other member now blocks the group.
-    ctl.update(cfg());
+    config.groups[0].expect.pop();
+    ctl.update(config.clone());
     for _ in 0..2 { line.clear(); reader.read_line(&mut line).unwrap(); }
     gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\"}}\n").unwrap();
     line.clear();
@@ -202,7 +204,7 @@ fn controller_answers_a_gate() {
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
     // Live update reaches the gate.
-    ctl.update(cfg());
+    ctl.update(config);
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("probe_alpn"));
