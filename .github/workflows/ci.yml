@@ -61,6 +61,13 @@ jobs:
           AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
           AC_TEST_USER: testuser
         run: sudo -E core/scripts/cli-behavior-test.sh
+      - name: Egress gate harness (openconnect --script-tun through the gate, DESIGN §66.13)
+        env:
+          AC_TEST_URL: https://127.0.0.1:4443
+          AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
+        run: |
+          (cd core && cargo build --release --bin alwaysconnect-gate)
+          sudo -E core/scripts/gate-harness.sh core/target/release/alwaysconnect-gate
       - name: Stop test gateway
         if: always()
         run: sudo core/scripts/ocserv-test.sh stop
