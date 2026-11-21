@@ -45,8 +45,23 @@ struct SessionHarness {
     }
 
     static func arm(_ s: HelperSession, _ mode: Int) -> Bool {
+        if mode == 1 {
+            let firewall = NetworkGuard.shared
+            firewall.supersedeOwnHolders()
+            guard firewall.installLogin(holder: NetworkGuard.ciscoHolder, physical: "en0",
+                                        gateways: ["198.51.100.7"], port: 443, cisco: true, verify: true) == nil else { return false }
+            let accepted: Bool? = sync { reply in s.setKillSwitch(2, tunnelIf: "", gatewayIps: []) { ok, _ in reply(ok) } }
+            guard accepted == true else { return false }
+        }
+        // The firewall is a stub; the production interface-existence check is real.
+        // A host with no utun can validate rejection and release of its strict hold.
+        let tunnel = (0..<256).map { "utun" + String($0) }.first { if_nametoindex($0) != 0 }
         let r: (Bool, String)? = sync { reply in
-            s.setKillSwitch(mode, tunnelIf: "utun99", gatewayIps: ["198.51.100.7"]) { reply(($0, $1)) }
+            s.setKillSwitch(mode, tunnelIf: tunnel ?? "utun99", gatewayIps: ["198.51.100.7"]) { reply(($0, $1)) }
+        }
+        if mode == 1 && tunnel == nil {
+            check(r?.0 == false && NetworkGuard.shared.isHolding, "missing tunnel keeps the strict Cisco hold")
+            return r?.0 == false && NetworkGuard.shared.isHolding
         }
         return r?.0 ?? false
     }
@@ -144,12 +159,12 @@ struct SessionHarness {
             check(apply() == false, "egress cannot be enabled without drop protection")
             check(setDrop(true) == true && apply() == true, "group accepted after restoring drop protection")
         case "cisco-disconnect":
-            check(arm(session, 1), "kill switch armed (connected)")
-            check(loads() == 1, "connected set loaded")
+            check(arm(session, 1), "Cisco hold armed")
+            check(loads() == (NetworkGuard.shared.held?.inputs.tunnelIf.isEmpty == false ? 2 : 1), "strict hold precedes any connected Cisco rules")
             check(disconnect(session), "disconnect replied")
             assertReleased("cisco-disconnect")
         case "protection-off":
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             check(arm(session, 0), "kill switch set off")
             assertReleased("protection-off")
         case "own-then-cisco":
@@ -162,7 +177,7 @@ struct SessionHarness {
             }
             check(stopped, "own engine stopped")
             assertReleased("own disconnect")
-            check(arm(session, 1), "Cisco kill switch armed (connected)")
+            check(arm(session, 1), "Cisco Cisco hold armed")
             check(disconnect(session), "Cisco disconnect replied")
             assertReleased("own-then-cisco")
         case "own-disconnect":
@@ -235,7 +250,7 @@ struct SessionHarness {
         case "grace-expiry":
             // App crashed while holding: relaunch tried, hold ends after
             // the grace period, reason kept for the App.
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             session.harnessOwner(attached: false)
             check(relaunches() == 1, "App relaunch attempted once")
             check(NetworkGuard.shared.isHolding, "still holding within the grace period")
@@ -243,7 +258,7 @@ struct SessionHarness {
             check(lastRelease() == NetworkGuard.Reason.appGone, "release reason recorded: app-gone (\(lastRelease()))")
             assertReleased("grace-expiry")
         case "grace-cancelled":
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             session.harnessOwner(attached: false)
             usleep(500_000)
             session.harnessOwner(attached: true, appPath: app)
@@ -254,7 +269,7 @@ struct SessionHarness {
             assertReleased("grace-cancelled")
         case "quit-no-relaunch":
             // A quit releases first: the App leaving is not a crash.
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             check(disconnect(session), "quit's disconnect replied")
             session.harnessOwner(attached: false)
             check(relaunches() == 0, "no relaunch after a quit")

@@ -91,6 +91,8 @@ jobs:
           build CODE_SIGNING_ALLOWED=NO
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
+      - name: Protected login gateway preparation (loopback TLS)
+        run: scripts/login-gateway-test.sh
       - name: DNS and fixed-address connectivity sampler (fixtures)
         run: python3 core/scripts/connectivity-sample-test.py
       - name: Emergency recovery route plan (stubbed, no network changes)

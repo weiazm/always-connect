@@ -430,7 +430,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         let login = preparedLogin
         if dropProtection && (!TestSeam.isActive || login != nil) {
             guard let login, !login.cisco, login.target == GatewayAddress(server),
-                  relay.map({ login.gateways.contains($0.gatewayIp) }) ?? true else { reply(false); return }
+                  relay.map({ login.gateways.contains($0.gatewayIp) }) ?? true else {
+                let firewall = NetworkGuard.shared
+                let holder = firewall.newOwnHolder()
+                _ = firewall.installLogin(holder: holder, physical: "", gateways: [],
+                                          port: GatewayAddress(server)?.port ?? 443, cisco: false, verify: false)
+                Self.log("protected login paused: missing current preparation")
+                reply(false); return
+            }
         }
         lastReasonCode = 0
         lastRetryCount = 0
@@ -714,6 +721,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
                              withReply reply: @escaping (Bool, [String], String) -> Void) {
         queue.async {
+            func reject(_ message: String) {
+                Self.log("protected login paused: " + message)
+                reply(false, [], message)
+            }
             self.preparedLogin = nil
             self.startGeneration += 1
             self.userReleased = false
@@ -725,10 +736,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             let target = GatewayAddress(server)
             let port = target?.port ?? 443
             if let error = guardService.installLogin(holder: holder, physical: "", gateways: [], port: port, cisco: cisco, verify: false) {
-                reply(false, [], error); return
+                reject(error); return
             }
             guard let target, let physical = PhysicalNetwork.current(preferring: "")?.interface else {
-                reply(false, [], "网关或物理网络不可用，登录已暂停"); return
+                reject("网关或物理网络不可用，登录已暂停"); return
             }
             var addresses = LoginGatewayCache.lookup(in: CLIOrchestrator.defaultSupportDir, target: target)
             for address in [target.host, candidate] where NetworkGuard.isIPAddress(address) && !addresses.contains(address) {
@@ -740,12 +751,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                                                       port: port, cisco: cisco, verify: true) {
                 // Keep the tighter policy if another rule or old state prevents verification.
                 _ = guardService.installLogin(holder: holder, physical: physical, gateways: [], port: port, cisco: cisco, verify: false)
-                reply(false, [], error); return
+                reject(error); return
             }
             guard !addresses.isEmpty else {
-                reply(false, [], "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"); return
+                reject("网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"); return
             }
             self.preparedLogin = (target, addresses, physical, cisco)
+            Self.log("protected login verified")
             reply(true, addresses, "")
         }
     }

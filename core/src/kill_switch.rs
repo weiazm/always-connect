@@ -263,7 +263,7 @@ case "$*" in
     '-a com.apple/300.AlwaysConnect -F rules')
         [ ! -e "$dir/refuse-release" ] || exit 1
         : > "$dir/rules" ;;
-    '-a com.apple/300.AlwaysConnect -F Tables'|'-s states'|'-X 10') ;;
+    '-a com.apple/300.AlwaysConnect -F Tables'|'-s states'|'-vv -s states'|'-X 10') ;;
     '-s rules') echo 'anchor "com.apple/300.AlwaysConnect" all' ;;
     '-s info') echo 'Status: Enabled' ;;
     *) exit 1 ;;

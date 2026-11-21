@@ -65,6 +65,7 @@ enum CiscoProfiles {
         let engine = CiscoEngine()
         engine.credentialsProvider = { .init(entry: profile.server, username: "USER_CANARY_7", password: "synthetic-only") }
         var got = false
+        engine.onProtectionRequest = { _, _, _, done in done(true) }
         engine.onState = { state, detail in
             client.state = state
             client.detail = detail
