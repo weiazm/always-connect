@@ -29,9 +29,11 @@ mkdir -m 700 support
 
 python3 -I - <<'PY'
 from socketserver import BaseRequestHandler, ThreadingTCPServer
+import errno
 import ssl
 import subprocess
 from threading import Thread
+import time
 
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain('server.pem', 'server.key')
@@ -59,6 +61,18 @@ class MutualTLS(TLS):
     context = mutual_context
 
 
+class DelayedTLS(TLS):
+    def handle(self):
+        time.sleep(2.25)
+        try:
+            super().handle()
+        except OSError as error:
+            # Darwin can return EINVAL from getpeername after the client
+            # forcibly closes the socket at the preparation deadline.
+            if error.errno != errno.EINVAL:
+                raise
+
+
 class Silent(BaseRequestHandler):
     def handle(self):
         self.request.settimeout(3)
@@ -73,11 +87,12 @@ with (
     ThreadingTCPServer(('127.0.0.1', 0), TLS) as tls,
     ThreadingTCPServer(('127.0.0.1', 0), Silent) as stalled,
     ThreadingTCPServer(('127.0.0.1', 0), MutualTLS) as mutual,
+    ThreadingTCPServer(('127.0.0.1', 0), DelayedTLS) as delayed,
 ):
-    for server in (tls, stalled, mutual):
+    for server in (tls, stalled, mutual, delayed):
         server.daemon_threads = True
         Thread(target=server.serve_forever, daemon=True).start()
     subprocess.run(['./harness', 'ca.der', str(tls.server_address[1]), str(stalled.server_address[1]),
-                    str(mutual.server_address[1]), 'support'],
+                    str(mutual.server_address[1]), str(delayed.server_address[1]), 'support'],
                    check=True, timeout=20)
 PY

@@ -84,31 +84,35 @@ extern "C" fn ac_login_preparation_finish(
     preparation: *mut Preparation,
     request: u64,
     address: *const c_char,
+    certificate_rejected: bool,
 ) {
     if let Some(preparation) = unsafe { preparation.as_mut() } {
-        let now = Instant::now();
-        if string_ptr(address, |address| {
-            preparation.finish(request, Some(address), now)
-        })
-        .is_none()
-        {
-            preparation.finish(request, None, now);
-        }
+        let result = if certificate_rejected {
+            Some(PreparedGateway::CertificateRejected)
+        } else {
+            string_ptr(address, parse_address)
+                .flatten()
+                .map(PreparedGateway::Address)
+        };
+        preparation.finish(request, result, Instant::now());
     }
 }
 
 #[no_mangle]
-extern "C" fn ac_login_preparation_take_for_intent(
+extern "C" fn ac_login_preparation_take_result_for_intent(
     preparation: *mut Preparation,
     host: *const c_char,
     port: u16,
+    certificate_rejected: *mut bool,
 ) -> *mut c_char {
-    let Some(preparation) = (unsafe { preparation.as_mut() }) else {
-        return std::ptr::null_mut();
-    };
-    preparation
-        .take_for_intent(gateway(host, port).as_ref(), Instant::now())
-        .map_or(std::ptr::null_mut(), |address| {
-            into_string(address.to_string())
-        })
+    let result = unsafe { preparation.as_mut() }.and_then(|preparation| {
+        preparation.take_for_intent(gateway(host, port).as_ref(), Instant::now())
+    });
+    if let Some(output) = unsafe { certificate_rejected.as_mut() } {
+        *output = result == Some(PreparedGateway::CertificateRejected);
+    }
+    match result {
+        Some(PreparedGateway::Address(address)) => into_string(address.to_string()),
+        _ => std::ptr::null_mut(),
+    }
 }

@@ -3,7 +3,7 @@ import Network
 import Security
 
 /// One TLS connection during explicitly confirmed direct networking. Rust owns
-/// the candidate lifetime and its binding to the selected host and port.
+/// the result lifetime and its binding to the selected host and port.
 final class LoginGatewayPreparation {
     private let queue = DispatchQueue(label: "com.alwaysconnect.login-gateway")
     private let preparation = ac_login_preparation_new()
@@ -41,15 +41,21 @@ final class LoginGatewayPreparation {
         }
     }
 
-    /// Consume a ready candidate and synchronously cancel in-flight I/O before
-    /// arming protection. The caller never waits for resolution or TLS here.
     func takeForIntent(_ target: GatewayAddress?) -> String? {
+        takeResultForIntent(target).address
+    }
+
+    /// Consume the matching ready result and synchronously cancel in-flight
+    /// I/O. Only a completed system trust rejection sets the failure flag.
+    func takeResultForIntent(_ target: GatewayAddress?) -> (address: String?, certificateRejected: Bool) {
         queue.sync {
             stopTransport()
-            guard let raw = ac_login_preparation_take_for_intent(preparation, target?.host, target?.port ?? 0)
-            else { return nil }
+            var rejected = false
+            guard let raw = ac_login_preparation_take_result_for_intent(
+                preparation, target?.host, target?.port ?? 0, &rejected
+            ) else { return (nil, rejected) }
             defer { ac_login_preparation_freeString(raw) }
-            return String(cString: raw)
+            return (String(cString: raw), rejected)
         }
     }
 
@@ -89,10 +95,12 @@ final class LoginGatewayPreparation {
                 }
             }
             #endif
-            let status = SecTrustEvaluateAsyncWithError(object, self.queue) { [weak self] _, accepted, _ in
+            let status = SecTrustEvaluateAsyncWithError(object, self.queue) { [weak self] trust, accepted, _ in
                 guard let self, self.request == token else { complete(false); return }
                 self.certificateVerified = accepted
+                let rejected = !accepted && Self.isTrustRejection(trust)
                 complete(accepted)
+                if rejected { self.finish(token, certificateRejected: true) }
             }
             if status != errSecSuccess { complete(false) }
         }, queue)
@@ -119,6 +127,15 @@ final class LoginGatewayPreparation {
         stream.start(queue: queue)
     }
 
+    private static func isTrustRejection(_ trust: SecTrust) -> Bool {
+        var result = SecTrustResultType.invalid
+        guard SecTrustGetTrustResult(trust, &result) == errSecSuccess else { return false }
+        switch result {
+        case .deny, .recoverableTrustFailure, .fatalTrustFailure: return true
+        default: return false
+        }
+    }
+
     private static func remoteAddress(of stream: NWConnection?, port: NWEndpoint.Port) -> String? {
         guard case .hostPort(let host, let remotePort) = stream?.currentPath?.remoteEndpoint,
               remotePort == port else { return nil }
@@ -129,10 +146,10 @@ final class LoginGatewayPreparation {
         }
     }
 
-    private func finish(_ token: UInt64, address: String? = nil) {
+    private func finish(_ token: UInt64, address: String? = nil, certificateRejected: Bool = false) {
         guard request == token else { return }
         stopTransport()
-        ac_login_preparation_finish(preparation, token, address)
+        ac_login_preparation_finish(preparation, token, address, certificateRejected)
         #if LOGIN_GATEWAY_PREPARATION_TEST
         onTestFinish?()
         #endif
@@ -158,9 +175,11 @@ private func ac_login_preparation_confirm_direct(_ preparation: OpaquePointer)
 @_silgen_name("ac_login_preparation_begin")
 private func ac_login_preparation_begin(_ preparation: OpaquePointer, _ host: UnsafePointer<CChar>, _ port: UInt16) -> UInt64
 @_silgen_name("ac_login_preparation_finish")
-private func ac_login_preparation_finish(_ preparation: OpaquePointer, _ token: UInt64, _ address: UnsafePointer<CChar>?)
-@_silgen_name("ac_login_preparation_take_for_intent")
-private func ac_login_preparation_take_for_intent(_ preparation: OpaquePointer, _ host: UnsafePointer<CChar>?,
-                                                 _ port: UInt16) -> UnsafeMutablePointer<CChar>?
+private func ac_login_preparation_finish(_ preparation: OpaquePointer, _ token: UInt64,
+                                         _ address: UnsafePointer<CChar>?, _ certificateRejected: Bool)
+@_silgen_name("ac_login_preparation_take_result_for_intent")
+private func ac_login_preparation_take_result_for_intent(_ preparation: OpaquePointer, _ host: UnsafePointer<CChar>?,
+                                                        _ port: UInt16, _ certificateRejected: UnsafeMutablePointer<Bool>)
+    -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_string_free")
 private func ac_login_preparation_freeString(_ text: UnsafeMutablePointer<CChar>)

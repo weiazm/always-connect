@@ -20,7 +20,7 @@ const MAX_ADDRESSES: usize = 8;
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const ADDRESS_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const PROBE_BUDGET: Duration = Duration::from_secs(2);
-const CANDIDATE_TTL: Duration = Duration::from_secs(60);
+const PREPARATION_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct Gateway {
@@ -309,8 +309,8 @@ fn write_cache(dir: &File, cache: &Cache) -> io::Result<()> {
 }
 
 /// A single selected gateway can be prepared while the owner has confirmed
-/// direct networking and has no connection intent. TLS success is only a
-/// candidate for that specific host/port. It has no path to the disk cache.
+/// direct networking and has no connection intent. Its TLS result applies
+/// only to that host and port and has no path to the disk cache.
 #[derive(Default)]
 struct Preparation {
     sequence: u64,
@@ -327,12 +327,18 @@ enum PreparationState {
         gateway: Gateway,
         deadline: Instant,
     },
-    Candidate {
+    Ready {
         gateway: Gateway,
-        address: IpAddr,
+        result: PreparedGateway,
         expires: Instant,
         verified_at: SystemTime,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedGateway {
+    Address(IpAddr),
+    CertificateRejected,
 }
 
 impl Preparation {
@@ -350,12 +356,14 @@ impl Preparation {
                 deadline,
                 ..
             } if *active == gateway && now < *deadline => return None,
-            PreparationState::Candidate {
+            PreparationState::Ready {
                 gateway: active,
                 expires,
                 verified_at,
-                ..
-            } if *active == gateway && candidate_fresh(now, *expires, *verified_at) => return None,
+                result: PreparedGateway::Address(_),
+            } if *active == gateway && preparation_fresh(now, *expires, *verified_at) => {
+                return None
+            }
             _ => {}
         }
         self.sequence = self.sequence.checked_add(1)?;
@@ -367,7 +375,7 @@ impl Preparation {
         Some(self.sequence)
     }
 
-    fn finish(&mut self, request: u64, address: Option<&str>, now: Instant) {
+    fn finish(&mut self, request: u64, result: Option<PreparedGateway>, now: Instant) {
         if !matches!(&self.state, PreparationState::Checking { request: active, .. } if *active == request)
         {
             return;
@@ -377,36 +385,40 @@ impl Preparation {
             gateway, deadline, ..
         } = previous
         {
-            if let Some(address) = address.and_then(parse_address).filter(|_| now < deadline) {
-                self.state = PreparationState::Candidate {
+            if let Some(result) = result.filter(|_| now < deadline) {
+                self.state = PreparationState::Ready {
                     gateway,
-                    address,
-                    expires: now + CANDIDATE_TTL,
+                    result,
+                    expires: now + PREPARATION_TTL,
                     verified_at: SystemTime::now(),
                 };
             }
         }
     }
 
-    fn take_for_intent(&mut self, target: Option<&Gateway>, now: Instant) -> Option<IpAddr> {
+    fn take_for_intent(
+        &mut self,
+        target: Option<&Gateway>,
+        now: Instant,
+    ) -> Option<PreparedGateway> {
         match std::mem::take(&mut self.state) {
-            PreparationState::Candidate {
+            PreparationState::Ready {
                 gateway,
-                address,
+                result,
                 expires,
                 verified_at,
-            } if Some(&gateway) == target && candidate_fresh(now, expires, verified_at) => {
-                Some(address)
+            } if Some(&gateway) == target && preparation_fresh(now, expires, verified_at) => {
+                Some(result)
             }
             _ => None,
         }
     }
 }
 
-fn candidate_fresh(now: Instant, expires: Instant, verified_at: SystemTime) -> bool {
+fn preparation_fresh(now: Instant, expires: Instant, verified_at: SystemTime) -> bool {
     // Some platforms' monotonic Instant excludes sleep. Check wall time too
-    // so a prepared address cannot be used after a long suspension.
-    now < expires && verified_at.elapsed().is_ok_and(|age| age < CANDIDATE_TTL)
+    // so a preparation result cannot be used after a long suspension.
+    now < expires && verified_at.elapsed().is_ok_and(|age| age < PREPARATION_TTL)
 }
 
 // Swift calls these on a single serial queue per preparation instance.

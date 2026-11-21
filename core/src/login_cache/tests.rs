@@ -113,22 +113,26 @@ fn intent_consumes_only_fresh_matching_tls_result_and_never_writes_disk() {
     assert!(prep.begin(key.clone(), now).is_none());
     prep.confirm_direct();
     let request = prep.begin(key.clone(), now).unwrap();
-    prep.finish(request, Some(FIRST), now);
-    assert_eq!(prep.take_for_intent(Some(&key), now), parse_address(FIRST));
+    let address = PreparedGateway::Address(parse_address(FIRST).unwrap());
+    prep.finish(request, Some(address), now);
+    assert_eq!(prep.take_for_intent(Some(&key), now), Some(address));
     assert_eq!(prep.take_for_intent(Some(&key), now), None);
     assert!(prep.begin(key.clone(), now).is_none());
     assert!(lookup(&dir.0, HOST, 443).is_empty());
 
     prep.confirm_direct();
     let request = prep.begin(key.clone(), now).unwrap();
-    prep.finish(request, Some(FIRST), now);
+    prep.finish(request, Some(address), now);
     let other_port = Gateway::new(HOST, 8443).unwrap();
     assert_eq!(prep.take_for_intent(Some(&other_port), now), None);
 
     prep.confirm_direct();
     let request = prep.begin(key.clone(), now).unwrap();
-    prep.finish(request, Some(FIRST), now);
-    assert_eq!(prep.take_for_intent(Some(&key), now + CANDIDATE_TTL), None);
+    prep.finish(request, Some(address), now);
+    assert_eq!(
+        prep.take_for_intent(Some(&key), now + PREPARATION_TTL),
+        None
+    );
 }
 
 #[test]
@@ -139,17 +143,67 @@ fn cancelled_late_timed_out_and_failed_tls_results_are_discarded() {
     prep.confirm_direct();
     let old = prep.begin(key.clone(), now).unwrap();
     assert_eq!(prep.take_for_intent(Some(&key), now), None);
-    prep.finish(old, Some(FIRST), now);
+    let rejected = Some(PreparedGateway::CertificateRejected);
+    prep.finish(old, rejected, now);
     assert_eq!(prep.take_for_intent(Some(&key), now), None);
 
     prep.confirm_direct();
     let newer = prep.begin(key.clone(), now).unwrap();
-    prep.finish(old, Some(FIRST), now);
-    prep.finish(newer, None, now); // TLS verification or connection failed.
+    prep.finish(old, rejected, now);
+    prep.finish(newer, None, now); // Transport failed without a trust rejection.
     assert_eq!(prep.take_for_intent(Some(&key), now), None);
 
     prep.confirm_direct();
     let timed = prep.begin(key.clone(), now).unwrap();
-    prep.finish(timed, Some(FIRST), now + PROBE_BUDGET);
+    prep.finish(timed, rejected, now + PROBE_BUDGET);
     assert_eq!(prep.take_for_intent(Some(&key), now + PROBE_BUDGET), None);
+}
+
+#[test]
+fn trust_rejection_is_one_use_bound_to_target_and_expires() {
+    let dir = Scratch::new();
+    let now = Instant::now();
+    let key = Gateway::new(HOST, 443).unwrap();
+    let other_host = Gateway::new("another.example", 443).unwrap();
+    let other_port = Gateway::new(HOST, 8443).unwrap();
+    let mut prep = Preparation::default();
+    let rejected = Some(PreparedGateway::CertificateRejected);
+
+    prep.confirm_direct();
+    let request = prep.begin(key.clone(), now).unwrap();
+    prep.finish(request, rejected, now);
+    assert_eq!(prep.take_for_intent(Some(&key), now), rejected);
+    assert_eq!(prep.take_for_intent(Some(&key), now), None);
+    assert!(lookup(&dir.0, HOST, 443).is_empty());
+
+    for other in [Some(&other_host), Some(&other_port), None] {
+        prep.confirm_direct();
+        let request = prep.begin(key.clone(), now).unwrap();
+        prep.finish(request, rejected, now);
+        assert_eq!(prep.take_for_intent(other, now), None);
+        assert_eq!(prep.take_for_intent(Some(&key), now), None);
+    }
+
+    prep.confirm_direct();
+    let request = prep.begin(key.clone(), now).unwrap();
+    prep.finish(request, rejected, now);
+    assert_eq!(
+        prep.take_for_intent(Some(&key), now + PREPARATION_TTL),
+        None
+    );
+}
+
+#[test]
+fn fresh_preparation_replaces_prior_trust_rejection() {
+    let now = Instant::now();
+    let key = Gateway::new(HOST, 443).unwrap();
+    let mut prep = Preparation::default();
+    prep.confirm_direct();
+    let old = prep.begin(key.clone(), now).unwrap();
+    prep.finish(old, Some(PreparedGateway::CertificateRejected), now);
+    let new = prep.begin(key.clone(), now).unwrap();
+    prep.finish(old, Some(PreparedGateway::CertificateRejected), now);
+    let address = PreparedGateway::Address(parse_address(FIRST).unwrap());
+    prep.finish(new, Some(address), now);
+    assert_eq!(prep.take_for_intent(Some(&key), now), Some(address));
 }
