@@ -1569,6 +1569,15 @@ impl Shared {
         if c.config.drop_protection && c.last_pf.is_some() && c.pf_needs_load {
             c.last_allow_direct_egress = false;
             if !self.apply_base_pf(c) {
+                // The bounded command-line runner must finish even when it
+                // cannot install PF. The resident engine has no attempt limit.
+                if let Some(max) = c.config.max_attempts {
+                    c.attempts = c.attempts.saturating_add(1);
+                    if c.attempts >= max {
+                        self.finish_terminal(c, Terminal::AttemptsExhausted, "attempt limit reached while installing protection");
+                        return;
+                    }
+                }
                 self.respawn_after(5.0);
                 return;
             }
@@ -3038,6 +3047,26 @@ mod tests {
             assert!(!c.pf_needs_load && c.finished);
             assert_eq!(guard.holder().as_deref(), Some(engine.shared.holder.as_str()));
             c.stop_requested = true;
+        }
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_stops_at_its_limit_with_the_guard_still_held() {
+        let (support, guard, tool) = recovery_guard("bounded-protection");
+        let engine = recovery_engine(&support, guard.clone());
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["192.0.2.9".into()],
+                physical_if: "en0".into(), ..Inputs::default() };
+            assert!(guard.apply("previous", false, &inputs).is_none());
+            std::fs::write(tool.with_extension("fail"), "").unwrap();
+            c.config.max_attempts = Some(1);
+            engine.shared.take_over_held_set(&mut c);
+            engine.shared.spawn_next(&mut c);
+            assert!(c.finished && c.child.is_none());
+            assert_eq!(c.last_terminal, Some(Terminal::AttemptsExhausted));
+            assert!(guard.held().is_some());
         }
         std::fs::remove_dir_all(support).unwrap();
     }
