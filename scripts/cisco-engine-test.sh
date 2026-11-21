@@ -14,12 +14,14 @@ swiftc -O -parse-as-library -module-name CiscoHarness \
     "$ROOT/Sources/Shared/PhysicalConnectivity.swift" "$ROOT/Sources/App/CiscoEngine.swift" "$ROOT/core/scripts/CiscoEngineHarness.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/harness" 2>&1 | grep -v "built for newer"
 [ -x "$WORK/harness" ] || exit 1
-# Two independent halves run at once, each with its own fake Cisco state
+# Independent groups run at once, each with its own fake Cisco state
 # and, through a different executable name, its own defaults domain.
-mkdir -p "$WORK/a" "$WORK/b"
+mkdir -p "$WORK/a" "$WORK/b" "$WORK/c"
 cp "$WORK/harness" "$WORK/harness-a"; cp "$WORK/harness" "$WORK/harness-b"
+cp "$WORK/harness" "$WORK/harness-c"
 FAKE_CISCO_DIR="$WORK/a" "$WORK/harness-a" "$ROOT/core/scripts/fake-cisco-vpn.sh" 1 > "$WORK/a.out" 2>&1 &
 FAKE_CISCO_DIR="$WORK/b" "$WORK/harness-b" "$ROOT/core/scripts/fake-cisco-vpn.sh" 2 > "$WORK/b.out" 2>&1 &
+FAKE_CISCO_DIR="$WORK/c" "$WORK/harness-c" "$ROOT/core/scripts/fake-cisco-vpn.sh" 3 > "$WORK/c.out" 2>&1 &
 wait
 grep -q '^ *[0-9.]* DONE$' "$WORK/a.out" || { echo "FAIL first half did not finish"; cat "$WORK/a.out"; exit 1; }
 OUT=$(grep -v '^ *[0-9.]* DONE$' "$WORK/a.out"; cat "$WORK/b.out")
@@ -86,6 +88,17 @@ S=$(section offline-keep DONE)
 need offline-keep "$S" "等待网络恢复"
 need offline-keep "$S" "keep cancel-issued=false"
 need offline-keep "$S" "keep relogin=false"
+cat "$WORK/c.out"
+S=$(cat "$WORK/c.out")
+need certificate "$S" "Certificate validation failure"
+need certificate "$S" "no-login-after-late-timeout=true"
+need certificate "$S" "no-login-after-refusal=true"
+need certificate "$S" "no-login-after-manual-stop=true"
+none certificate "$S" "killswitch=1"
+none certificate "$S" "killswitch=2 gw=198.51.100"
+need certificate "$S" "terminal=1"
+need certificate "$S" "Cisco 会话尚未确认"
+need certificate "$S" "DONE"
 LOGINS=$(cat "$WORK/a/commands" "$WORK/b/commands" 2>/dev/null | grep -c . || true)
 echo "logins attempted: $LOGINS"
 rm -rf "$WORK"

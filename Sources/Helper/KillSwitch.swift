@@ -25,16 +25,20 @@ final class KillSwitch {
     /// panel's red pf line shows.
     func set(mode: Mode, tunnelIf: String, gatewayIps: [String],
              reply: @escaping (Bool, String) -> Void) {
-        queue.async {
+        // The service serializes begin, Cisco transitions and release on its
+        // session queue. Complete the actual write before the next one runs.
+        let (ok, message) = queue.sync {
             var ok = false
             let message = NetworkGuard.take(ac_ks_set(Int32(mode.rawValue), tunnelIf,
                                                       gatewayIps.joined(separator: ","), &ok)) ?? ""
-            reply(ok, message)
+            return (ok, message)
         }
+        reply(ok, message)
     }
 
-    func updateAllowNetworks(_ networks: [String]) {
-        queue.async { ac_ks_update_allow_networks(networks.joined(separator: ",")) }
+    func updateAllowNetworks(_: [String]) {
+        // Strict Cisco protection permits only the directly attached LAN.
+        queue.async { ac_ks_refresh_allow_networks() }
     }
 
     var isOff: Bool { queue.sync { ac_ks_is_off() } }
@@ -62,7 +66,7 @@ func isValidIP(_ value: String) -> Bool {
 @_silgen_name("ac_ks_set")
 func ac_ks_set(_ mode: Int32, _ tunnelIf: UnsafePointer<CChar>, _ gateways: UnsafePointer<CChar>,
                _ ok: UnsafeMutablePointer<Bool>) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("ac_ks_update_allow_networks") func ac_ks_update_allow_networks(_ n: UnsafePointer<CChar>)
+@_silgen_name("ac_ks_refresh_allow_networks") func ac_ks_refresh_allow_networks()
 @_silgen_name("ac_ks_is_off") func ac_ks_is_off() -> Bool
 @_silgen_name("ac_ks_snapshot") func ac_ks_snapshot() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_ks_disarm") func ac_ks_disarm()

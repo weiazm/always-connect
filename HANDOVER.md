@@ -199,6 +199,7 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
 - 实测：网关强制钥匙串证书且私钥不可导出（DESIGN §20.13）。用户选方案 A：Cisco 引擎
   （DESIGN §二十一）——App 经 Cisco CLI 登录/监视/重连，Helper 只管 pf 封网（setKillSwitch）。
   逻辑由假 Cisco CLI 的 harness 验证；真实连接与断线实测见 mac-proof 清单 H 节。
+  §21.23 接入首次登录与掉线重登的严格保护，证书错误期间继续拦截。替身防火墙与假 Cisco CLI 已覆盖逻辑，集成交付后按 H8 实测。
 - 分流接入按用户确认的分批计划推进（后由方案二取代，docs/split-plan-v2.md；
   用户已向公司 IT 核实允许自建连接）。第 1 批"自建连接"已完成代码（DESIGN §二十三）：设置里可选
   "经 Cisco（默认）/ 自建连接（实验）"，App 内证书转接 + 后台服务 openconnect，全部走 VPN、还没有分流。

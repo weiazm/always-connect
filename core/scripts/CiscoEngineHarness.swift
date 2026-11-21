@@ -11,12 +11,6 @@ final class HelperClient {
     }
 }
 
-enum CiscoProfiles {
-    // No real lookup in the harness: the entry name stays unresolved.
-    static func resolve(_ server: String) -> String { "" }
-    static func hostEntries() -> [String: String] { [:] }
-}
-
 @main
 struct Harness {
     static func main() {
@@ -37,12 +31,71 @@ struct Harness {
         engine.credentialsProvider = { .init(entry: "VPN-A", username: "u", password: password) }
         engine.onState = { state, detail in log("EVENT state=\(state) \(detail)") }
         engine.onTerminal = { log("EVENT terminal=\($0)") }
-        engine.onKillSwitch = { mode, _, gws in log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))") }
+        engine.onProtectionRequest = { mode, _, gws, done in
+            log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))")
+            done(true)
+        }
         func setState(_ s: String) {
             try? s.write(toFile: dir + "/state", atomically: true, encoding: .utf8)
         }
         func wait(_ seconds: Double) {
             RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        }
+        func loginCount() -> Int {
+            (try? String(contentsOfFile: dir + "/commands", encoding: .utf8))?.split(separator: "\n").count ?? 0
+        }
+        if CommandLine.arguments.last == "3" {
+            log("STEP certificate-failure")
+            password = "certfail"
+            var replies: [(Bool) -> Void] = []
+            engine.onProtectionRequest = { mode, _, gws, done in
+                log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))")
+                replies.append(done)
+            }
+            func until(_ observed: () -> Bool) {
+                let deadline = Date().addingTimeInterval(18)
+                while !observed() && Date() < deadline { wait(0.05) }
+                precondition(observed(), "expected fake CLI event was not observed")
+            }
+            engine.connect()
+            until { replies.count == 1 }
+            let timedOutReply = replies.removeFirst()
+            until { replies.count == 1 }
+            timedOutReply(true)
+            wait(0.2)
+            log("no-login-after-late-timeout=\(loginCount() == 0)")
+            replies.removeFirst()(false)
+            until { replies.count == 1 }
+            log("no-login-after-refusal=\(loginCount() == 0)")
+            replies.removeFirst()(true)
+            until { loginCount() == 1 && replies.count == 1 }
+            replies.removeFirst()(true)
+            until { loginCount() == 2 && replies.count == 1 }
+            let lateReply = replies.removeFirst()
+            var disconnected = false
+            engine.disconnect { disconnected = true }
+            until { disconnected }
+            lateReply(true)
+            wait(0.5)
+            log("no-login-after-manual-stop=\(loginCount() == 2)")
+            log("STEP stale-success")
+            engine.onProtectionRequest = { mode, _, gws, done in
+                log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))")
+                done(true)
+            }
+            var sawUnconfirmedSession = false
+            engine.onState = { state, detail in
+                log("EVENT state=\(state) \(detail)")
+                if detail == "Cisco 会话尚未确认" { sawUnconfirmedSession = true }
+            }
+            password = "stale-success"
+            engine.connect()
+            until { sawUnconfirmedSession }
+            disconnected = false
+            engine.disconnect { disconnected = true }
+            until { disconnected }
+            log("DONE")
+            return
         }
         // Part "1" = connect..pushed-failure, "2" = adopt-on-refresh..end.
         // The two parts share no state, so the test script runs them as two
@@ -85,7 +138,7 @@ struct Harness {
         let second = CiscoEngine()
         second.credentialsProvider = engine.credentialsProvider
         second.onState = { state, detail in log("EVENT2 state=\(state) \(detail)") }
-        second.onKillSwitch = { mode, _, _ in log("EVENT2 killswitch=\(mode)") }
+        second.onProtectionRequest = { mode, _, _, done in log("EVENT2 killswitch=\(mode)"); done(true) }
         second.refresh(); wait(3)
         log("STEP no-adopt-foreign")
         // A Cisco session the user started in Cisco's own window
@@ -94,7 +147,7 @@ struct Harness {
         let third = CiscoEngine()
         third.credentialsProvider = engine.credentialsProvider
         third.onState = { state, detail in log("EVENT3 state=\(state) \(detail)") }
-        third.onKillSwitch = { mode, _, _ in log("EVENT3 killswitch=\(mode)") }
+        third.onProtectionRequest = { mode, _, _, done in log("EVENT3 killswitch=\(mode)"); done(true) }
         third.refresh(); wait(3)
         log("EVENT3 managing=\(third.isManaging)")
         engine.disconnect {}; second.disconnect {}; wait(2)
@@ -134,9 +187,6 @@ struct Harness {
         log("active cancel-issued=\(cancellationCount() > beforeActiveStop)")
         // A session Cisco already holds is kept through an outage (§64.2).
         log("STEP offline-keep")
-        func loginCount() -> Int {
-            (try? String(contentsOfFile: dir + "/commands", encoding: .utf8))?.split(separator: "\n").count ?? 0
-        }
         password = "good"
         engine.connect(); wait(3)
         let loginsBeforeKeep = loginCount()

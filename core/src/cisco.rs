@@ -8,8 +8,8 @@
 //!   re-establish a lost session forever (backoff 1, 2, 5, 10, 30 s with
 //!   jitter), map everything onto the App's six states.
 //! - The kill switch is asked of the background service through
-//!   `kill_switch(mode, tunnel, gateways)`: 1 = connected set while the
-//!   tunnel is up, 2 = blocking set the moment it is lost.
+//!   `kill_switch(mode, tunnel, gateways, request)`: wait for confirmed
+//!   blocking before each login and hand off only after Cisco is connected.
 //! - "Login error." = rejected: never retried on our own (anti-lockout).
 //!   "Login failed." at least `approval_timeout_minimum` after the
 //!   password went in = the phone approval expired untapped: asked again
@@ -25,12 +25,12 @@
 //! observes cancellation within its existing 200 ms read wait.
 
 use std::io::{Read, Write};
-use std::net::ToSocketAddrs;
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub const DISCONNECTED: i32 = 0;
@@ -54,6 +54,9 @@ const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 mod timeline;
 use timeline::{Operation, Outcome, Phase, Recorder};
+use crate::kill_switch::{BLOCKING, CONNECTED as GUARD_CONNECTED};
+
+const PROTECTION_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Closed error categories reused by the whole diagnostic export.
 pub(crate) fn diagnostic_detail(text: &str) -> &'static str {
@@ -261,49 +264,14 @@ pub fn parse_state(output: &str) -> Option<String> {
 /// `vpn stats` "Server Address:" value, when it is an IP literal.
 pub fn parse_server_address(stats: &str) -> Option<String> {
     stats.lines().filter(|l| l.contains("Server Address:")).find_map(|l| {
-        let value = l.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-        value.chars().next().filter(|c| c.is_ascii_digit()).map(|_| value.to_string())
+        let (_, value) = l.split_once(':')?;
+        value.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string())
     })
 }
 
 /// The last `>> error:` line, without the prefix.
 pub fn last_error(output: &str) -> Option<String> {
     output.lines().filter_map(|l| l.split_once(">> error: ").map(|(_, e)| e.trim().to_string())).last()
-}
-
-pub fn host_part(address: &str) -> String {
-    let mut host = address;
-    if let Some(i) = host.find("://") {
-        host = &host[i + 3..];
-    }
-    if let Some(i) = host.find('/') {
-        host = &host[..i];
-    }
-    if !host.contains(']') {
-        if let Some(i) = host.rfind(':') {
-            host = &host[..i];
-        }
-    }
-    host.to_string()
-}
-
-/// The host's IPv4 addresses, in the resolver's order.
-pub fn resolve(host: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if host.is_empty() {
-        return out;
-    }
-    if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
-        for a in addrs {
-            if let std::net::SocketAddr::V4(v4) = a {
-                let ip = v4.ip().to_string();
-                if !out.contains(&ip) {
-                    out.push(ip);
-                }
-            }
-        }
-    }
-    out
 }
 
 /// The tunnel interface holding the default route, or None.
@@ -345,16 +313,16 @@ impl Drop for Credentials {
     }
 }
 
+type KillSwitchHook = dyn Fn(i32, &str, &[String], u64) + Send + Sync;
+
 pub struct Hooks {
     /// (state, detail). The App moves it to its main queue.
     pub state: Box<dyn Fn(i32, &str) + Send + Sync>,
     /// 1 = manual, 2 = rejected.
     pub terminal: Box<dyn Fn(i32) + Send + Sync>,
-    pub kill_switch: Box<dyn Fn(i32, &str, &[String]) + Send + Sync>,
+    pub kill_switch: Box<KillSwitchHook>,
     /// Fresh for every (re)connect: the keychain is the only long-term store.
     pub credentials: Box<dyn Fn() -> Option<Credentials> + Send + Sync>,
-    /// Every gateway host the Cisco profiles name, plus the selected entry's.
-    pub profile_hosts: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     /// A fresh, read-only physical-route fact for change/deadline events.
     pub network_available: Box<dyn Fn() -> bool + Send + Sync>,
     /// Before a CLI login: ask Cisco's window app to quit (it holds the
@@ -407,7 +375,20 @@ struct Shared {
     reported: AtomicI32,
     offline: AtomicBool,
     network: Mutex<crate::offline::Gate>,
+    protection: Mutex<Protection>,
+    protection_changed: Condvar,
     timeline: Recorder,
+}
+
+#[derive(Default)]
+struct Protection {
+    next_request: u64,
+    pending: Option<ProtectionRequest>,
+}
+
+struct ProtectionRequest {
+    id: u64,
+    reply: Option<bool>,
 }
 
 pub struct Engine {
@@ -425,7 +406,7 @@ struct State {
     backoff_index: usize,
     push_backoff_index: usize,
     unanswered_since: Option<Instant>,
-    last_kill_switch: Option<(i32, String, Vec<String>)>,
+    last_kill_switch: Option<i32>,
     last_tick: Option<Instant>,
 }
 
@@ -446,6 +427,8 @@ impl Engine {
             reported: AtomicI32::new(DISCONNECTED),
             offline: AtomicBool::new(false),
             network: Mutex::new(crate::offline::Gate::default()),
+            protection: Mutex::new(Protection::default()),
+            protection_changed: Condvar::new(),
             timeline: Recorder::new(),
         });
         let (tx, rx) = mpsc::channel::<Command_>();
@@ -574,6 +557,15 @@ impl Engine {
         );
     }
 
+    pub fn protection_pending(&self, request: u64) -> bool {
+        self.shared.protection.lock().unwrap().pending.as_ref()
+            .is_some_and(|p| p.id == request && p.reply.is_none())
+    }
+
+    pub fn protection_reply(&self, request: u64, applied: bool) {
+        self.shared.protection_reply(request, applied);
+    }
+
     /// Launch / panel open with the App's stored "owned" flag set: adopt a
     /// tunnel Cisco already has up.
     pub fn refresh(&self) {
@@ -618,6 +610,16 @@ impl Engine {
 }
 
 impl Shared {
+    fn protection_reply(&self, request: u64, applied: bool) {
+        let mut protection = self.protection.lock().unwrap();
+        if let Some(pending) = protection.pending.as_mut()
+            .filter(|p| p.id == request && p.reply.is_none())
+        {
+            pending.reply = Some(applied);
+            self.protection_changed.notify_one();
+        }
+    }
+
     fn enqueue(
         &self,
         tx: &Sender<Command_>,
@@ -636,7 +638,13 @@ impl Shared {
     }
 
     fn advance_intent(&self) -> u32 {
-        let old = self.cancel_generation.fetch_add(1, Ordering::SeqCst);
+        let old = {
+            let mut protection = self.protection.lock().unwrap();
+            let old = self.cancel_generation.fetch_add(1, Ordering::SeqCst);
+            protection.pending = None;
+            self.protection_changed.notify_one();
+            old
+        };
         if old != 0 {
             let trace = self.timeline.begin(Operation::Intent, old);
             trace.note(Phase::Cancel, Outcome::Cancelled);
@@ -821,17 +829,8 @@ impl Shared {
     }
 
     fn state_now(&self, intent: u32) -> Option<String> {
-        parse_state(
-            &self
-                .cli(
-                    intent,
-                    &["state"],
-                    None,
-                    Duration::from_secs(30),
-                    &mut |_| {},
-                )
-                .output,
-        )
+        let state = self.cli(intent, &["state"], None, Duration::from_secs(30), &mut |_| {});
+        (state.status == 0).then(|| parse_state(&state.output)).flatten()
     }
 
     fn post(&self, state: i32, detail: &str) {
@@ -850,27 +849,54 @@ impl Shared {
         self.reported.load(Ordering::SeqCst)
     }
 
-    fn send_kill_switch(&self, st: &mut State, mode: i32, tun: &str, gateways: Vec<String>) {
-        if !self.is_current(st.intent) || self.stop_requested.load(Ordering::SeqCst) {
-            return;
+    fn send_kill_switch(&self, intent: u32, mode: i32, tun: &str, gateways: &[String]) -> bool {
+        let request = {
+            let mut protection = self.protection.lock().unwrap();
+            if !self.is_current(intent) || self.stop_requested.load(Ordering::SeqCst)
+                || (mode == GUARD_CONNECTED && self.offline.load(Ordering::SeqCst))
+            {
+                return false;
+            }
+            protection.next_request += 1;
+            let request = protection.next_request;
+            protection.pending = Some(ProtectionRequest { id: request, reply: None });
+            request
+        };
+        let trace = self.timeline.begin(Operation::Protection, intent);
+        (self.hooks.log)(&format!("killswitch mode={mode} gateways={}", gateways.len()));
+        (self.hooks.kill_switch)(mode, tun, gateways, request);
+        let (mut protection, deadline) = self.protection_changed.wait_timeout_while(
+            self.protection.lock().unwrap(),
+            PROTECTION_TIMEOUT,
+            |state| state.pending.as_ref().is_some_and(|p| p.id == request && p.reply.is_none()),
+        ).unwrap();
+        let result = protection.pending.take().and_then(|pending| pending.reply);
+        let applied = self.is_current(intent) && result == Some(true);
+        trace.result(match result {
+            Some(true) if applied => Outcome::Success,
+            Some(false) => Outcome::Failed,
+            None if deadline.timed_out() => Outcome::Timeout,
+            _ => Outcome::Cancelled,
+        });
+        applied
+    }
+
+    fn block(&self, st: &mut State) -> bool {
+        // The background service owns the verified gateway list and port.
+        let applied = self.send_kill_switch(st.intent, BLOCKING, "", &[]);
+        st.last_kill_switch = applied.then_some(BLOCKING);
+        applied
+    }
+
+    fn report_reconnecting(&self, st: &mut State, detail: &str) {
+        let protected = self.block(st);
+        if self.permits_attempt(st.intent) {
+            if protected {
+                self.report(RECONNECTING, detail);
+            } else {
+                self.report(RECONNECTING, &format!("{detail}，断线保护未确认"));
+            }
         }
-        (self.hooks.log)(&format!(
-            "killswitch mode={mode} gateways={}",
-            gateways.len()
-        ));
-        let last = st.last_kill_switch.take();
-        let keep_tun = if tun.is_empty() {
-            last.as_ref().map(|l| l.1.clone()).unwrap_or_default()
-        } else {
-            tun.to_string()
-        };
-        let keep_gw = if gateways.is_empty() {
-            last.map(|l| l.2).unwrap_or_default()
-        } else {
-            gateways.clone()
-        };
-        st.last_kill_switch = Some((mode, keep_tun, keep_gw));
-        (self.hooks.kill_switch)(mode, tun, &gateways);
     }
 
     fn command(&self, st: &mut State, cmd: Command_) {
@@ -896,6 +922,7 @@ impl Shared {
                 }
                 st.intent = intent;
                 st.wanted = true;
+                st.retry_at = None;
                 if self.offline.load(Ordering::SeqCst) {
                     self.report(RECONNECTING, "等待网络恢复");
                     return;
@@ -903,11 +930,7 @@ impl Shared {
                 st.backoff_index = 0;
                 st.push_backoff_index = 0;
                 st.unanswered_since = None;
-                if self.state_now(st.intent).as_deref() == Some("Connected") {
-                    self.adopt_connected(st);
-                } else {
-                    self.attempt(st);
-                }
+                self.attempt(st);
                 if self.permits_attempt(intent) && st.monitor_at.is_none() {
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
                 }
@@ -928,7 +951,7 @@ impl Shared {
                     // Keep ownership and the held set. Never use manual-stop's
                     // release path for an unavailable physical network.
                     if st.last_kill_switch.is_some() {
-                        self.send_kill_switch(st, 2, "", Vec::new());
+                        self.block(st);
                     }
                     // Only an unfinished login is cancelled. A session Cisco
                     // already holds (Connected, or resuming it as
@@ -953,13 +976,7 @@ impl Shared {
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
                     // Cisco may have kept or resumed its session meanwhile:
                     // adopt it instead of logging in over it.
-                    match self.state_now(st.intent).as_deref() {
-                        Some("Connected") => self.adopt_connected(st),
-                        Some("Reconnecting") => {
-                            self.report(RECONNECTING, "Cisco 正在重连，网络已拦截")
-                        }
-                        _ => self.attempt(st),
-                    }
+                    self.attempt(st);
                 }
             }
             Command_::Disconnect(intent) => {
@@ -989,8 +1006,11 @@ impl Shared {
                 let _ = done.send(());
             }
             Command_::Rearm => {
-                if let Some((mode, tun, gateways)) = st.last_kill_switch.clone() {
-                    self.send_kill_switch(st, mode, &tun, gateways);
+                match st.last_kill_switch {
+                    Some(GUARD_CONNECTED) if self.permits_attempt(st.intent) => self.adopt_connected(st),
+                    Some(_) => { self.block(st); }
+                    None if st.wanted => { self.block(st); }
+                    None => {}
                 }
             }
             Command_::Changed => {
@@ -1012,6 +1032,11 @@ impl Shared {
                     if st.monitor_at.is_none() {
                         st.monitor_at = Some(Instant::now() + self.config.monitor);
                     }
+                } else if state.as_deref() == Some("Reconnecting") && !st.wanted {
+                    st.wanted = true;
+                    st.ever_connected = true;
+                    st.monitor_at = Some(Instant::now() + self.config.monitor);
+                    self.report_reconnecting(st, "Cisco 正在重连");
                 } else if state.as_deref() == Some("Disconnected") && !st.wanted {
                     // Ours once, gone since, not being brought back: forget it.
                     self.set_owned(false);
@@ -1024,6 +1049,25 @@ impl Shared {
         let intent = st.intent;
         st.retry_at = None;
         if !st.wanted || !self.permits_attempt(intent) {
+            return;
+        }
+        match self.state_now(intent).as_deref() {
+            Some("Connected") => { self.adopt_connected(st); return; }
+            Some("Reconnecting") => {
+                st.ever_connected = true;
+                self.report_reconnecting(st, "Cisco 正在重连");
+                return;
+            }
+            _ => {}
+        }
+        if !self.permits_attempt(intent) {
+            return;
+        }
+        if !self.block(st) {
+            self.schedule_retry(st, "断线保护未确认，暂不登录", false, false);
+            return;
+        }
+        if !self.permits_attempt(intent) {
             return;
         }
         let credentials = {
@@ -1048,14 +1092,6 @@ impl Shared {
         self.stage(Operation::GuiWait, intent, || (self.hooks.before_login)());
         // Credentials / quitting the Cisco window can block. A stop during
         // either operation must not start a new CLI login afterwards.
-        if !self.permits_attempt(intent) {
-            return;
-        }
-        if st.ever_connected && st.last_kill_switch.as_ref().is_some_and(|k| k.0 == 2) {
-            // Resolved now, through the DNS the blocking set lets out.
-            let gateways = self.gateway_addresses(st, None);
-            self.send_kill_switch(st, 2, "", gateways);
-        }
         if !self.permits_attempt(intent) {
             return;
         }
@@ -1110,9 +1146,7 @@ impl Shared {
             return;
         }
         let output = result.output;
-        if parse_state(&output).as_deref() == Some("Connected")
-            || output.contains(">> state: Connected")
-        {
+        if result.status == 0 && parse_state(&output).as_deref() == Some("Connected") {
             self.adopt_connected(st);
             return;
         }
@@ -1189,64 +1223,49 @@ impl Shared {
         st.retry_at = Some(Instant::now() + Duration::from_secs_f64(delay));
     }
 
-    /// Every address a Cisco login may use: the live session's server,
-    /// every IP of every gateway in the Cisco profiles (one name has
-    /// several, and Cisco may pick another or a backup, §21.10), and the
-    /// ones already let through.
-    fn gateway_addresses(&self, st: &State, server: Option<String>) -> Vec<String> {
-        self.stage(Operation::GatewayResolution, st.intent, || {
-            self.gateway_addresses_inner(st, server)
-        })
-    }
-
-    fn gateway_addresses_inner(&self, st: &State, server: Option<String>) -> Vec<String> {
-        let mut gateways: Vec<String> = server.into_iter().collect();
-        let mut hosts: Vec<String> = (self.hooks.profile_hosts)().iter().map(|h| host_part(h)).collect();
-        hosts.sort();
-        hosts.dedup();
-        for host in hosts {
-            for ip in resolve(&host) {
-                if !gateways.contains(&ip) {
-                    gateways.push(ip);
-                }
-            }
-        }
-        if let Some((_, _, last)) = &st.last_kill_switch {
-            for ip in last {
-                if !gateways.contains(ip) {
-                    gateways.push(ip.clone());
-                }
-            }
-        }
-        gateways
-    }
-
     fn adopt_connected(&self, st: &mut State) {
-        let stats = self
-            .cli(
-                st.intent,
-                &["stats"],
-                None,
-                Duration::from_secs(30),
-                &mut |_| {},
-            )
-            .output;
+        if st.last_kill_switch != Some(BLOCKING) && !self.block(st) {
+            if self.permits_attempt(st.intent) {
+                self.report(RECONNECTING, "Cisco 已连上，断线保护未确认");
+            }
+            return;
+        }
+        let stats = self.cli(st.intent, &["stats"], None, Duration::from_secs(30), &mut |_| {});
+        let gateway = (stats.status == 0).then(|| parse_server_address(&stats.output)).flatten();
         if !self.permits_attempt(st.intent) {
             return;
         }
-        st.tunnel_if = default_route_tunnel().unwrap_or_else(|| st.tunnel_if.clone());
-        let gateways = self.gateway_addresses(st, parse_server_address(&stats));
+        // The connect stream can contain the old session, and the daemon can
+        // lose the tunnel while stats is collected. Recheck before switching.
+        let state = self.state_now(st.intent);
         if !self.permits_attempt(st.intent) {
             return;
         }
+        let Some(gateway) = gateway.filter(|_| state.as_deref() == Some("Connected")) else {
+            self.report_reconnecting(st, "Cisco 会话尚未确认");
+            if state.as_deref() == Some("Disconnected") {
+                self.schedule_retry(st, "连接未完成", false, false);
+            }
+            return;
+        };
+        let tunnel = default_route_tunnel().unwrap_or_default();
         st.ever_connected = true;
+        if !self.send_kill_switch(st.intent, GUARD_CONNECTED, &tunnel, &[gateway]) {
+            if self.permits_attempt(st.intent) {
+                self.report_reconnecting(st, "Cisco 已连上，正在确认断线保护");
+            }
+            return;
+        }
+        if !self.permits_attempt(st.intent) {
+            return;
+        }
+        st.last_kill_switch = Some(GUARD_CONNECTED);
+        st.tunnel_if = tunnel;
         self.episode_retries.store(0, Ordering::SeqCst);
         st.backoff_index = 0;
         st.push_backoff_index = 0;
         st.unanswered_since = None;
         st.retry_at = None;
-        let tun = st.tunnel_if.clone();
-        self.send_kill_switch(st, 1, &tun, gateways);
         self.report(CONNECTED, "已连接（经 Cisco）");
     }
 
@@ -1270,16 +1289,15 @@ impl Shared {
         self.timeline.observe_state(st.intent, state.as_deref());
         match state.as_deref() {
             Some("Connected") => {
-                let tun = default_route_tunnel().unwrap_or_else(|| st.tunnel_if.clone());
+                let tun = default_route_tunnel().unwrap_or_default();
                 if self.reported() != CONNECTED || tun != st.tunnel_if {
                     self.adopt_connected(st);
                 }
             }
             Some("Reconnecting") => {
                 // Cisco is resuming its own session: hold the line.
-                if self.reported() == CONNECTED {
-                    self.send_kill_switch(st, 2, "", Vec::new());
-                    self.report(RECONNECTING, "Cisco 正在重连，网络已拦截");
+                if st.last_kill_switch != Some(BLOCKING) || self.reported() != RECONNECTING {
+                    self.report_reconnecting(st, "Cisco 正在重连");
                 }
             }
             Some("Disconnected") => {
@@ -1287,19 +1305,26 @@ impl Shared {
                 if !st.ever_connected {
                     return;
                 }
-                let reported = self.reported();
-                if reported == CONNECTED
-                    || (reported == RECONNECTING
-                        && st.last_kill_switch.as_ref().map(|k| k.0) != Some(2))
-                {
-                    self.send_kill_switch(st, 2, "", Vec::new());
-                    self.report(RECONNECTING, "已断开，网络已拦截，正在重连");
+                if st.last_kill_switch != Some(BLOCKING) || self.reported() == CONNECTED {
+                    self.report_reconnecting(st, "Cisco 已断开");
                 }
                 self.schedule_retry(st, "会话已断开", false, false);
             }
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+fn accept_protection() -> (Box<KillSwitchHook>, impl FnOnce(&Engine)) {
+    let shared = Arc::new(Mutex::new(std::sync::Weak::<Shared>::new()));
+    let attached = Arc::clone(&shared);
+    (
+        Box::new(move |_, _, _, request| {
+            shared.lock().unwrap().upgrade().unwrap().protection_reply(request, true);
+        }),
+        move |engine| *attached.lock().unwrap() = Arc::downgrade(&engine.shared),
+    )
 }
 
 #[cfg(test)]
@@ -1325,6 +1350,7 @@ mod tests {
         let (release, wait_release) = mpsc::channel();
         let wait_release = Mutex::new(wait_release);
         let (done, wait_done) = mpsc::channel();
+        let (kill_switch, attach) = accept_protection();
         let engine = Engine::new(
             Config {
                 cli: cli.to_str().unwrap().into(),
@@ -1334,7 +1360,7 @@ mod tests {
             Hooks {
                 state: Box::new(|_, _| {}),
                 terminal: Box::new(|_| {}),
-                kill_switch: Box::new(|_, _, _| {}),
+                kill_switch,
                 credentials: Box::new(|| {
                     Some(Credentials {
                         entry: "VPN-A".into(),
@@ -1342,7 +1368,6 @@ mod tests {
                         password: "p".into(),
                     })
                 }),
-                profile_hosts: Box::new(Vec::new),
                 network_available: Box::new(|| true),
                 before_login: Box::new(move || {
                     entered.send(()).unwrap();
@@ -1355,6 +1380,7 @@ mod tests {
                 }),
             },
         );
+        attach(&engine);
         engine.connect();
         wait_entered.recv_timeout(Duration::from_secs(15)).unwrap();
         engine.disconnect();
@@ -1384,9 +1410,8 @@ mod tests {
         assert_eq!(parse_server_address("  Server Address:   198.51.100.9\n").as_deref(), Some("198.51.100.9"));
         assert_eq!(parse_server_address("  Server Address: gw.example\n"), None);
         assert_eq!(last_error("  >> error: one\n  >> error: two \n").as_deref(), Some("two"));
-        assert_eq!(host_part("https://gw.example:8443/group"), "gw.example");
-        assert_eq!(host_part("gw.example"), "gw.example");
-        assert_eq!(resolve("127.0.0.1"), vec!["127.0.0.1"]);
+        assert_eq!(parse_server_address("Server Address: fe80::1\n").as_deref(), Some("fe80::1"));
+        assert_eq!(parse_server_address("Server Address: 1.invalid\n"), None);
     }
 
     #[test]

@@ -69,6 +69,7 @@ esac
         let (release, released) = mpsc::channel();
         let released = Mutex::new(released);
         let (done_tx, done) = mpsc::channel();
+        let (kill_switch, attach) = accept_protection();
         let engine = Engine::new(
             Config {
                 cli: cli_override
@@ -82,7 +83,7 @@ esac
                 terminal: Box::new(move |_| {
                     terminal_events.fetch_add(1, Ordering::SeqCst);
                 }),
-                kill_switch: Box::new(|_, _, _| {}),
+                kill_switch,
                 credentials: Box::new(move || {
                     if credentials_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                         Some(Credentials {
@@ -95,7 +96,6 @@ esac
                         None
                     }
                 }),
-                profile_hosts: Box::new(Vec::new),
                 network_available: Box::new(move || net.load(Ordering::SeqCst)),
                 before_login: Box::new(move || {
                     entered_tx.send(()).unwrap();
@@ -108,6 +108,7 @@ esac
                 }),
             },
         );
+        attach(&engine);
         Self {
             engine,
             dir,

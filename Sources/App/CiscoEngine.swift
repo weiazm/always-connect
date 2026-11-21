@@ -17,9 +17,8 @@ import os
 /// - This engine: log in with the Keychain password, watch Cisco's
 ///   state, re-establish a lost session forever (with backoff), map
 ///   everything onto the App's six states.
-/// - Helper (root): the pf kill switch via setKillSwitch — connected
-///   set while the tunnel is up, blocking set (plus DNS) the moment it
-///   is lost, unloaded only on a manual disconnect. The Helper also
+/// - Helper (root): confirm the strict pf set before each login and
+///   switch to the connected set after Cisco confirms the tunnel. The Helper also
 ///   watches the tunnel interface itself, so a drop is blocked even
 ///   when the App is not running.
 ///
@@ -57,8 +56,10 @@ final class CiscoEngine {
     var onState: ((HelperClient.State, String) -> Void)?
     /// Terminal reason on the main queue: 1 = manual, 2 = rejected.
     var onTerminal: ((Int) -> Void)?
-    /// Kill switch request (mode, tunnelIf, gatewayIps) on the main queue.
+    /// Legacy blocking notification for callers without an acknowledgement channel.
     var onKillSwitch: ((Int, String, [String]) -> Void)?
+    /// Firewall request (mode, tunnelIf, gatewayIps, acknowledgement) on the main queue.
+    var onProtectionRequest: ((Int, String, [String], @escaping (Bool) -> Void) -> Void)?
     /// Fresh credentials for every (re)connect: the Keychain is the
     /// only long-term store, nothing is cached here between attempts.
     var credentialsProvider: (() -> Credentials?)?
@@ -150,11 +151,23 @@ final class CiscoEngine {
                 guard let engine = WeakBox.engine(ctx) else { return }
                 DispatchQueue.main.async { engine.onTerminal?(Int(code)) }
             },
-            killSwitch: { ctx, mode, tun, gateways in
+            killSwitch: { ctx, mode, tun, gateways, request in
                 guard let engine = WeakBox.engine(ctx) else { return }
                 let t = tun.map { String(cString: $0) } ?? ""
                 let g = gateways.map { String(cString: $0) }?.split(separator: ",").map(String.init) ?? []
-                DispatchQueue.main.async { engine.onKillSwitch?(Int(mode), t, g) }
+                DispatchQueue.main.async {
+                    guard let handle = engine.existing, ac_cisco_protection_pending(handle, request) else { return }
+                    if let protect = engine.onProtectionRequest {
+                        protect(Int(mode), t, g) { ok in
+                            ac_cisco_protection_reply(handle, request, ok)
+                        }
+                    } else {
+                        if mode == 2 {
+                            engine.onKillSwitch?(Int(mode), t, g)
+                        }
+                        ac_cisco_protection_reply(handle, request, false)
+                    }
+                }
             },
             credentials: { ctx, entry, user, pass in
                 guard let engine = WeakBox.engine(ctx), let c = engine.credentialsProvider?() else { return false }
@@ -162,13 +175,6 @@ final class CiscoEngine {
                 user?.pointee = strdup(c.username)
                 pass?.pointee = strdup(c.password)
                 return true
-            },
-            profileHosts: { ctx in
-                guard let engine = WeakBox.engine(ctx) else { return nil }
-                var hosts = Array(CiscoProfiles.hostEntries().values)
-                // The selected server may be a hand-added address (§21.13).
-                if let entry = engine.credentialsProvider?()?.entry { hosts.append(CiscoProfiles.resolve(entry)) }
-                return strdup(hosts.joined(separator: ","))
             },
             networkAvailable: { _ in CiscoEngine.physicalAvailability() },
             beforeLogin: { _ in CiscoEngine.quitCiscoGUI() },
@@ -251,11 +257,10 @@ struct AcCiscoHooks {
     var ctx: UnsafeMutableRawPointer?
     var state: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void
     var terminal: @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
-    var killSwitch: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
+    var killSwitch: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UInt64) -> Void
     var credentials: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Bool
-    var profileHosts: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
     var networkAvailable: @convention(c) (UnsafeMutableRawPointer?) -> Bool
     var beforeLogin: @convention(c) (UnsafeMutableRawPointer?) -> Void
     var owned: @convention(c) (UnsafeMutableRawPointer?, Bool) -> Void
@@ -271,6 +276,10 @@ func ac_cisco_new(_ cli: UnsafePointer<CChar>, _ approvalMinimumMs: UInt32, _ mo
 func ac_cisco_connect(_ e: OpaquePointer)
 @_silgen_name("ac_cisco_disconnect")
 func ac_cisco_disconnect(_ e: OpaquePointer)
+@_silgen_name("ac_cisco_protection_pending")
+func ac_cisco_protection_pending(_ e: OpaquePointer, _ request: UInt64) -> Bool
+@_silgen_name("ac_cisco_protection_reply")
+func ac_cisco_protection_reply(_ e: OpaquePointer, _ request: UInt64, _ applied: Bool)
 @_silgen_name("ac_cisco_rearm")
 func ac_cisco_rearm(_ e: OpaquePointer)
 @_silgen_name("ac_cisco_refresh")

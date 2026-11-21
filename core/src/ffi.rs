@@ -1162,11 +1162,9 @@ pub struct AcCiscoHooks {
     pub ctx: *mut c_void,
     pub state: extern "C" fn(*mut c_void, c_int, *const c_char),
     pub terminal: extern "C" fn(*mut c_void, c_int),
-    pub kill_switch: extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char),
+    pub kill_switch: extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, u64),
     /// Fills three malloc'd strings (entry, username, password); false = none.
     pub credentials: extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char, *mut *mut c_char) -> bool,
-    /// Comma-separated hosts (malloc'd) or null.
-    pub profile_hosts: extern "C" fn(*mut c_void) -> *mut c_char,
     pub network_available: extern "C" fn(*mut c_void) -> bool,
     pub before_login: extern "C" fn(*mut c_void),
     pub owned: extern "C" fn(*mut c_void, bool),
@@ -1208,14 +1206,14 @@ pub extern "C" fn ac_cisco_new(cli: *const c_char, approval_minimum_ms: u32, mon
     let (Some(cli), Some(h)) = (c_str(cli), unsafe { hooks.as_ref() }) else { return std::ptr::null_mut() };
     let ctx = std::sync::Arc::new(Ctx(h.ctx, h.release));
     let (state, terminal, kill_switch, credentials) = (h.state, h.terminal, h.kill_switch, h.credentials);
-    let (profile_hosts, before_login, owned, log, disconnected) = (h.profile_hosts, h.before_login, h.owned, h.log, h.disconnected);
+    let (before_login, owned, log, disconnected) = (h.before_login, h.owned, h.log, h.disconnected);
     let c = || std::sync::Arc::clone(&ctx);
     let hooks = cisco::Hooks {
         state: { let x = c(); Box::new(move |s, d| state(x.0, s, cstring(d).as_ptr())) },
         terminal: { let x = c(); Box::new(move |code| terminal(x.0, code)) },
         kill_switch: {
             let x = c();
-            Box::new(move |mode, tun, gws| kill_switch(x.0, mode, cstring(tun).as_ptr(), cstring(&gws.join(",")).as_ptr()))
+            Box::new(move |mode, tun, gws, request| kill_switch(x.0, mode, cstring(tun).as_ptr(), cstring(&gws.join(",")).as_ptr(), request))
         },
         credentials: {
             let x = c();
@@ -1227,14 +1225,6 @@ pub extern "C" fn ac_cisco_new(cli: *const c_char, approval_minimum_ms: u32, mon
                     (true, Some(entry), Some(username), Some(password)) => Some(cisco::Credentials { entry, username, password }),
                     _ => None,
                 }
-            })
-        },
-        profile_hosts: {
-            let x = c();
-            Box::new(move || {
-                take_malloced(profile_hosts(x.0))
-                    .map(|s| s.split(',').filter(|h| !h.is_empty()).map(str::to_string).collect())
-                    .unwrap_or_default()
             })
         },
         network_available: { let x = c(); let available = h.network_available; Box::new(move || available(x.0)) },
@@ -1264,6 +1254,16 @@ pub extern "C" fn ac_cisco_connect(e: *const cisco::Engine) {
 #[no_mangle]
 pub extern "C" fn ac_cisco_disconnect(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.disconnect() }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_cisco_protection_pending(e: *const cisco::Engine, request: u64) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|e| e.protection_pending(request))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_cisco_protection_reply(e: *const cisco::Engine, request: u64, applied: bool) {
+    if let Some(e) = unsafe { e.as_ref() } { e.protection_reply(request, applied); }
 }
 /// Delivers an OS network-change event; availability and debounce stay in Rust.
 #[no_mangle]
@@ -1517,9 +1517,9 @@ pub extern "C" fn ac_ks_set(mode: c_int, tunnel_if: *const c_char, gateways: *co
 }
 
 #[no_mangle]
-pub extern "C" fn ac_ks_update_allow_networks(networks: *const c_char) {
+pub extern "C" fn ac_ks_refresh_allow_networks() {
     if let Some(ks) = kill_switch() {
-        ks.update_allow_networks(&c_list(networks, ','));
+        ks.refresh_allow_networks();
     }
 }
 
