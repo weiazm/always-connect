@@ -57,6 +57,8 @@ final class ApprovalPrompt {
     func start() {
         guard cancellable == nil else { return }
         cancellable = HelperClient.shared.$state
+            .combineLatest(HelperClient.shared.$gatewayTrustFailed)
+            .map { state, failed in failed ? HelperClient.State.disconnected : state }
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in self?.stateChanged(state) }
@@ -69,7 +71,7 @@ final class ApprovalPrompt {
             tracker = ApprovalPromptTracker()
             dismiss(animated: true)
         } else {
-            stateChanged(HelperClient.shared.state)
+            stateChanged(HelperClient.shared.gatewayTrustFailed ? .disconnected : HelperClient.shared.state)
         }
     }
 
@@ -82,7 +84,7 @@ final class ApprovalPrompt {
             apply(.approval)
         case .authenticating where !HelperClient.shared.usesCisco:
             let item = DispatchWorkItem { [weak self] in
-                guard HelperClient.shared.state == .authenticating,
+                guard !HelperClient.shared.gatewayTrustFailed, HelperClient.shared.state == .authenticating,
                       !HelperClient.shared.usesCisco else { return }
                 self?.apply(.ownLogin)
             }

@@ -23,13 +23,11 @@ impl Fixture {
         Self::with_physical_facts(false)
     }
     fn with_physical_facts(stable: bool) -> Self {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ac-flaps-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
         let cli = dir.join("openconnect");

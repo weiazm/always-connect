@@ -84,6 +84,7 @@ struct GeneralPage: View {
     @State private var loginItemOn = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
     @State private var recording = false
+    @State private var egressDisabledWithDrop = false
 
     var body: some View {
         Form {
@@ -98,8 +99,12 @@ struct GeneralPage: View {
                 Toggle("断线保护", isOn: Binding(
                     get: { settings.isDropProtectionOn },
                     set: { on in
-                        settings.dropProtection = on
-                        ProfileStore.saveAppSettings(settings)
+                        var latest = ProfileStore.loadAppSettings()
+                        latest.dropProtection = on
+                        egressDisabledWithDrop = !on && latest.egressProtection?.enabled == true
+                        if !on { latest.egressProtection?.enabled = false }
+                        settings = latest
+                        ProfileStore.saveAppSettings(settings, updatingEgress: !on)
                         HelperClient.shared.dropProtectionChanged()
                     }))
             } header: {
@@ -109,7 +114,8 @@ struct GeneralPage: View {
                          ? (HelperClient.shared.usesCisco
                             ? "断线保护开：VPN 断开时暂停上网，直到重新连上或你手动断开，公司流量不会走本地网络。"
                             : "断线保护开：VPN 断开时暂停上网（名单里的网站照常），直到重新连上或你手动断开，公司流量不会走本地网络。")
-                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。")
+                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。"
+                           + (egressDisabledWithDrop ? "出口保护已关闭。自建连接需要重新连接一次才能生效。" : ""))
             }
 
             Section("启动与通知") {
@@ -545,7 +551,7 @@ struct CredentialForm: View {
                 }
                 if showsStatus {
                     LabeledContent("当前状态") {
-                        Text(manager.stateLine).foregroundStyle(.secondary)
+                        Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary)
                     }
                 }
             }
@@ -794,6 +800,8 @@ struct SplitPage: View {
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
 
+            EgressProtectionSection()
+
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {
                     LocalLanStatus()
@@ -1012,9 +1020,9 @@ struct DiagnosticsPage: View {
             .onChange(of: HelperClient.shared.state) { _ in checkNeighbors() }
 
             Section("当前连接") {
-                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(.secondary) }
+                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary) }
                 LabeledContent("连接时长") {
-                    if let since = manager.connectedSince {
+                    if manager.showsConnected, let since = manager.connectedSince {
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
                             Text(durationText(Date().timeIntervalSince(since))).monospacedDigit()
                         }
@@ -1040,7 +1048,7 @@ struct DiagnosticsPage: View {
                         }
                         .buttonStyle(.borderless)
                         .help("刷新本次 VPN 流量")
-                        .disabled(statsRunning || manager.state != .connected)
+                        .disabled(statsRunning || !manager.showsConnected)
                     }
                 }
             }
@@ -1102,7 +1110,7 @@ struct DiagnosticsPage: View {
                     Text("泄漏自检")
                     Spacer()
                     Button("运行") { runLeakCheck() }
-                        .disabled(manager.state != .connected)
+                        .disabled(!manager.showsConnected)
                 }
                 if let leakMessage {
                     Text(leakMessage).foregroundStyle(.red)
@@ -1144,7 +1152,7 @@ struct DiagnosticsPage: View {
         }
         .formStyle(.grouped)
         .onAppear(perform: refreshStats)
-        .onChange(of: manager.state) { _ in
+        .onChange(of: manager.showsConnected) { _ in
             refreshStats()
             leakItems = nil
             leakMessage = nil
@@ -1164,7 +1172,7 @@ struct DiagnosticsPage: View {
         statsRequest = request
         stats = nil
         statsMessage = nil
-        statsRunning = manager.state == .connected
+        statsRunning = manager.showsConnected
         guard statsRunning else { return }
         HelperClient.shared.fetchStats { result in
             guard statsRequest == request else { return }

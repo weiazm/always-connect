@@ -28,7 +28,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod login_deadline;
+pub use login_deadline::LoginDeadlineStatus;
+use login_deadline::LoginDeadline;
 
 pub const ANCHOR: &str = "com.apple/300.AlwaysConnect";
 pub const DIRECT_TABLE: &str = "ac_direct";
@@ -62,6 +66,30 @@ pub struct Inputs {
     pub strict_dns: bool,
     #[serde(default)]
     pub block_direct: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_port: Option<u16>,
+    #[serde(rename = "loginUDP", default)]
+    pub login_udp: bool,
+    #[serde(default)]
+    pub login_generation: u64,
+}
+
+impl Inputs {
+    pub fn login(physical: &str, gateways: Vec<String>, port: u16, udp: bool) -> Self {
+        let mut lans = Vec::new();
+        if !physical.is_empty() {
+            for (interface, (lo, hi)) in crate::direct_routes::attached_interfaces() {
+                if interface != physical { continue; }
+                let (first, last) = (std::net::Ipv4Addr::from(lo), std::net::Ipv4Addr::from(hi));
+                let prefix = (lo ^ hi).leading_zeros();
+                if first.is_private() && last.is_private() && prefix >= 8 {
+                    lans.push(format!("{first}/{prefix}"));
+                }
+            }
+        }
+        Self { physical_if: physical.to_owned(), gateway_ips: gateways, allow_networks: lans,
+            login_port: Some(port), login_udp: udp, strict_dns: true, ..Self::default() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -103,6 +131,9 @@ pub fn is_ip(s: &str) -> bool {
 
 /// The anchor text for a set (core/src/pf.rs), or None when refused.
 pub fn text(connected: bool, i: &Inputs) -> Option<String> {
+    if let Some(port) = i.login_port.filter(|_| !connected && i.tunnel_if.is_empty()) {
+        return pf::login_rules(&i.physical_if, &i.gateway_ips, port, i.login_udp, &i.allow_networks);
+    }
     // As the comma-separated C call did: entries trimmed, empty ones dropped.
     let clean = |v: &Vec<String>| -> Vec<String> {
         v.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && !x.contains(',')).collect()
@@ -131,6 +162,46 @@ struct Pfctl {
 }
 
 impl Pfctl {
+    fn audit(&self, args: &[&str], deadline: Instant) -> Result<crate::pf_verify::PfOutput, ()> {
+        self.audit_input(args, None, deadline)
+    }
+
+    fn audit_input(&self, args: &[&str], input: Option<&str>, deadline: Instant) -> Result<crate::pf_verify::PfOutput, ()> {
+        use std::io::Read;
+        if Instant::now() >= deadline { return Err(()); }
+        let mut cmd = Command::new(self.path.as_deref().ok_or(())?);
+        let mut child = crate::child_io::spawn(cmd.args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped()).stderr(Stdio::piped())).map_err(|_| ())?;
+        fn read(pipe: impl Read) -> Result<String, ()> {
+            let mut bytes = Vec::new();
+            pipe.take(512 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| ())?;
+            if bytes.len() > 512 * 1024 { return Err(()); }
+            String::from_utf8(bytes).map_err(|_| ())
+        }
+        std::thread::scope(|scope| {
+            let writer = child.stdin.take().zip(input).map(|(mut pipe, input)| {
+                scope.spawn(move || pipe.write_all(input.as_bytes()).map_err(|_| ()))
+            });
+            let out = scope.spawn({let pipe=child.stdout.take().unwrap(); move || read(pipe)});
+            let err = scope.spawn({let pipe=child.stderr.take().unwrap(); move || read(pipe)});
+            let ok = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(3)),
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
+            };
+            if !ok { return Err(()); }
+            if let Some(writer) = writer { writer.join().map_err(|_| ())??; }
+            Ok(crate::pf_verify::PfOutput { stdout: out.join().map_err(|_| ())??, stderr: err.join().map_err(|_| ())?? })
+        })
+    }
+
     /// stderr on success, Err(stderr) on failure.
     fn run(&self, args: &[&str]) -> Result<String, String> {
         self.run_input(args, None)
@@ -193,6 +264,19 @@ impl Pfctl {
         self.run_input(&["-a", ANCHOR, "-f", "-"], Some(anchor_text)).map(|_| ())
     }
 
+    fn load_before(&mut self, anchor_text: &str, deadline: Instant) -> Result<(), ()> {
+        if self.token.is_none() {
+            let out = self.audit(&["-E"], deadline)?;
+            self.token = Self::parse_token(&out.stderr);
+            if self.token.is_none() {
+                log("guard: pfctl -E did not return a releasable reference");
+                return Err(());
+            }
+        }
+        self.audit_input(&["-a", ANCHOR, "-f", "-"], Some(anchor_text), deadline)?;
+        Ok(())
+    }
+
     fn unload(&mut self) -> Result<(), String> {
         self.run(&["-a", ANCHOR, "-F", "rules"])?;
         // The anchor's tables too, scoped to our anchor; never `-F all`.
@@ -218,6 +302,8 @@ struct State {
     /// Grace clock: Some(generation) while one runs.
     grace: Option<u64>,
     grace_generation: u64,
+    login_deadline: Option<LoginDeadline>,
+    login_deadline_needs_recovery: bool,
     direct: BTreeSet<String>,
     pf: Pfctl,
 }
@@ -226,6 +312,7 @@ pub struct Guard {
     settings: Settings,
     state: Mutex<State>,
     grace_wake: Condvar,
+    login_wake: Condvar,
     on_grace_expired: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -252,10 +339,13 @@ impl Guard {
                 owner_present: false,
                 grace: None,
                 grace_generation: 0,
+                login_deadline: None,
+                login_deadline_needs_recovery: false,
                 direct: BTreeSet::new(),
                 pf,
             }),
             grace_wake: Condvar::new(),
+            login_wake: Condvar::new(),
             on_grace_expired: Mutex::new(None),
         }
     }
@@ -275,6 +365,7 @@ impl Guard {
     /// A new own-connection engine: every earlier one becomes stale.
     pub fn new_own_holder(&self) -> String {
         let mut s = self.state.lock().unwrap();
+        self.clear_login_deadline(&mut s);
         s.own_generation += 1;
         format!("own:{}", s.own_generation)
     }
@@ -286,6 +377,56 @@ impl Guard {
         }
     }
 
+    pub(crate) fn was_superseded(&self, holder: &str) -> bool {
+        Self::is_stale(&self.state.lock().unwrap(), holder)
+    }
+
+    pub fn install_login(self: &Arc<Self>, holder: &str, inputs: &Inputs) -> Result<(), String> {
+        if inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() { return Err("登录保护规则无效".into()); }
+        let mut state = self.state.lock().unwrap();
+        if Self::is_stale(&state, holder) { return Err("连接请求已过期".into()); }
+        self.clear_login_deadline(&mut state);
+        let mut next = inputs.clone();
+        next.login_generation = state.own_generation;
+        if let Some(error) = self.apply_locked(&mut state, holder, false, &next) { return Err(error); }
+        Ok(())
+    }
+
+    pub fn verify_login(&self, holder: &str) -> Result<(), String> {
+        let state = self.state.lock().unwrap();
+        self.verify_login_locked(&state, holder, Instant::now() + Duration::from_secs(2))
+    }
+
+    fn verify_login_locked(&self, state: &State, holder: &str, deadline: Instant) -> Result<(), String> {
+        let record = state.record.as_ref().ok_or("登录保护未装载")?;
+        let inputs = &record.inputs;
+        if record.holder != holder || record.connected || inputs.login_port.is_none()
+            || !inputs.tunnel_if.is_empty() || Self::is_stale(&state, holder) {
+            return Err("登录保护已变化".into());
+        }
+        let rules = text(false, inputs).ok_or("登录保护规则无效")?;
+        let path = self.settings.pfctl.as_deref().ok_or("系统防火墙不可用")?;
+        crate::network_check::confirm_login_rules(path, &rules)?;
+        crate::pf_verify::verify_rule_chain(|args| state.pf.audit(args, deadline))
+            .map_err(|_| "防火墙调用顺序未确认，已停止登录")?;
+        let policy = crate::pf_verify::BlockingPolicy::new(&inputs.physical_if, &inputs.gateway_ips,
+            inputs.login_port.unwrap(), inputs.login_udp, &inputs.allow_networks).map_err(|_| "登录保护规则无效")?;
+        crate::pf_verify::clear_states(&policy, |args| state.pf.audit(args, deadline))
+            .map_err(|_| "已有连接的拦截未确认，已停止登录")?;
+        Ok(())
+    }
+
+    pub fn apply_cisco_if_held(self: &Arc<Self>, expected: &Inputs, connected: bool, inputs: &Inputs) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if self.deadline_owns_rules(&state) || !state.record.as_ref().is_some_and(|r| r.holder == CISCO_HOLDER && r.inputs == *expected) {
+            return Err("连接请求已过期".into());
+        }
+        let mut next = inputs.clone();
+        next.login_generation = expected.login_generation;
+        if let Some(error) = self.apply_locked(&mut state, CISCO_HOLDER, connected, &next) { return Err(error); }
+        Ok(())
+    }
+
     /// Load the connected or blocking set for `holder`. None on success
     /// (or when the holder is stale), else the panel's red pf line.
     pub fn apply(self: &Arc<Self>, holder: &str, connected: bool, inputs: &Inputs) -> Option<String> {
@@ -293,6 +434,7 @@ impl Guard {
         if Self::is_stale(&s, holder) {
             return None;
         }
+        self.clear_login_deadline(&mut s);
         self.apply_locked(&mut s,holder,connected,inputs)
     }
 
@@ -345,6 +487,9 @@ impl Guard {
             if s.record.as_ref().is_some_and(|r| r.holder != h) {
                 return;
             }
+            if s.record.is_none() && s.login_deadline.as_ref().is_some_and(|task| task.holder != h) {
+                return;
+            }
         }
         self.release_locked(&mut s, why);
     }
@@ -368,12 +513,17 @@ impl Guard {
     /// An engine is being replaced while a set is held (§30.1): every own
     /// engine so far goes stale; the record stays.
     pub fn supersede_own_holders(&self) {
-        self.state.lock().unwrap().own_generation += 1;
+        let mut state = self.state.lock().unwrap();
+        self.clear_login_deadline(&mut state);
+        state.own_generation += 1;
     }
 
     pub fn own_engine_started(&self,holder:&str) {
         let mut s=self.state.lock().unwrap();
-        if !Self::is_stale(&s,holder) {s.active_own=Some(holder.into());}
+        if !Self::is_stale(&s,holder) {
+            self.clear_login_deadline(&mut s);
+            s.active_own=Some(holder.into());
+        }
     }
     pub fn own_engine_finished(&self,holder:&str) {
         let mut s=self.state.lock().unwrap();
@@ -389,7 +539,7 @@ impl Guard {
     pub fn update_held_allow_networks(self:&Arc<Self>, networks: &[String]) {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return };
-        if current.holder == CISCO_HOLDER || current.inputs.allow_networks == networks {
+        if current.holder == CISCO_HOLDER || current.inputs.login_port.is_some() || current.inputs.allow_networks == networks {
             return;
         }
         current.inputs.allow_networks = networks.to_vec();
@@ -402,7 +552,7 @@ impl Guard {
     pub fn refresh_bootstrap_dns(self:&Arc<Self>, physical: &str, servers: &[String]) -> bool {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return true };
-        if current.holder == CISCO_HOLDER || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
+        if current.holder == CISCO_HOLDER || current.inputs.login_port.is_some() || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
         if s.active_own.as_deref()==Some(current.holder.as_str())&&!Self::is_stale(&s,&current.holder) {
             return current.inputs.physical_if==physical&&current.inputs.local_dns_servers==servers;
         }
@@ -546,7 +696,17 @@ impl Guard {
         }
         s.direct = saved.direct.clone().unwrap_or_default().into_iter().collect();
         // No owner yet and the tunnel's fate unknown: fail closed.
-        if saved.connected || saved.inputs.direct_table {
+        if let Some(port) = saved.inputs.login_port {
+            s.own_generation = s.own_generation.max(saved.inputs.login_generation);
+            saved.inputs = Inputs::login(&saved.inputs.physical_if, saved.inputs.gateway_ips.clone(), port, saved.inputs.login_udp);
+            saved.inputs.login_generation = s.own_generation;
+            saved.connected = false;
+            saved.direct = None;
+            s.direct.clear();
+            if text(false, &saved.inputs).is_none_or(|rules| s.pf.load(&rules).is_err()) {
+                log("guard: restored login policy could not be confirmed");
+            }
+        } else if saved.connected || saved.inputs.direct_table {
             // A restarted daemon has not reconciled the old session's route
             // ownership or DNS policy. Keep base protection without bypasses.
             if saved.inputs.direct_table { saved.inputs.block_direct=true; }
@@ -569,12 +729,13 @@ impl Guard {
     // MARK: Internals
 
     fn release_locked(self: &Arc<Self>, s: &mut State, why: &str) {
+        self.clear_login_deadline(s);
         s.grace = None;
         s.grace_generation += 1;
         self.grace_wake.notify_all();
         if s.record.is_none() && !self.record_path().exists() {
             // Nothing recorded; still make sure our anchor is empty.
-            let _ = s.pf.unload();
+            if s.pf.unload().is_ok() { s.login_deadline_needs_recovery = false; }
             return;
         }
         if s.pf.unload().is_err() {
@@ -587,6 +748,7 @@ impl Guard {
             return;
         }
         s.record = None;
+        s.login_deadline_needs_recovery = false;
         s.direct.clear();
         let _ = std::fs::remove_file(self.record_path());
         if why != reason::USER {
@@ -676,7 +838,7 @@ mod tests {
         let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
             grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
         let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.1".into()],
-            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], tunnel_dns_servers:vec![], direct_table: true, strict_dns: false, block_direct: false };
+            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], tunnel_dns_servers:vec![], direct_table: true, strict_dns: false, block_direct: false, ..Inputs::default() };
         let holder = guard.new_own_holder();
         assert!(guard.apply(&holder, false, &inputs).is_none());
         assert!(guard.add_direct(&["203.0.113.9".into()]));
@@ -702,7 +864,7 @@ mod tests {
         std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
         let settings=||Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())};
         let guard=Arc::new(Guard::new(settings()));guard.owner_attached();let holder=guard.new_own_holder();
-        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],tunnel_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false};
+        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],tunnel_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false,..Inputs::default()};
         assert!(guard.apply(&holder,false,&inputs).is_none());assert!(guard.add_direct(&["203.0.113.9".into()]));
         let recovered=Arc::new(Guard::new(settings()));recovered.adopt_at_start();recovered.owner_attached();
         assert!(recovered.is_holding());assert!(recovered.held().unwrap().1.block_direct);

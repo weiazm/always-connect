@@ -36,9 +36,9 @@
 //! Caller responsibilities, stated plainly because the generator cannot
 //! enforce them: resolve gateway hostnames to IPs BEFORE calling (this
 //! API takes IPs only); regenerate + reload when a gateway IP changes;
-//! install these rules only once the tunnel is up (before first connect
-//! there is no tunnel and nothing to leak, and no gateway IP is known
-//! yet); treat a pfctl load failure as a hard error surfaced to the
+//! these rules require an established or previously known tunnel. They
+//! cannot attest to a cold login that failed during TLS authentication.
+//! Treat a pfctl load failure as a hard error surfaced to the
 //! user, never as a silent skip. Rules are outbound-only; inbound
 //! traffic is untouched by this anchor. pfctl itself is the final
 //! validator of the generated text.
@@ -167,6 +167,30 @@ fn valid_cidr(s: &str) -> bool {
     }
 }
 
+/// Before authentication there is no trusted tunnel. Keep DNS on loopback and
+/// admit only the selected gateway transport and directly attached private LANs.
+pub fn login_rules(physical: &str, gateways: &[String], port: u16, udp: bool, lans: &[String]) -> Option<String> {
+    if port == 0 || (!valid_iface(physical) && !(physical.is_empty() && gateways.is_empty() && lans.is_empty())) { return None; }
+    let mut out = String::from("pass out quick on lo0 all no state\nblock drop out quick proto { udp tcp } to any port 53\n");
+    let transport = if udp { "{ tcp udp }" } else { "tcp" };
+    for raw in gateways {
+        let ip = raw.parse::<std::net::IpAddr>().ok()?;
+        out.push_str(&format!("pass out quick on {physical} proto {transport} to {ip} port {port} no state\n"));
+    }
+    for lan in lans {
+        if !valid_cidr(lan) { return None; }
+        out.push_str(&format!("pass out quick on {physical} to {lan} no state\n"));
+    }
+    out.push_str("pass out quick inet proto udp from any port 68 to any port 67 no state\n");
+    out.push_str("pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n");
+    out.push_str("pass out quick inet6 proto icmp6 to ff02::/16 no state\n");
+    out.push_str("pass out quick inet6 to fe80::/10 no state\n");
+    out.push_str("pass out quick proto udp to 224.0.0.251 port 5353 no state\n");
+    out.push_str("pass out quick proto udp to ff02::fb port 5353 no state\n");
+    out.push_str("block drop out quick all\n");
+    Some(out)
+}
+
 /// Generate the anchor text. Deterministic: same input, same output
 /// byte for byte (tests pin the exact text).
 pub fn generate(input: &PfInput) -> Result<String, PfError> {
@@ -246,7 +270,7 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     let tuns: Vec<String> = (0..64).map(|n| format!("utun{n}")).collect();
     out.push_str(&format!("pass out quick on {{ {} }} all no state\n", tuns.join(" ")));
     out.push_str("pass out quick on lo0 all no state\n");
-    out.push_str("pass out quick inet proto udp from any port 68 to any port 67\n");
+    out.push_str("pass out quick inet proto udp from any port 68 to any port 67 no state\n");
     // Passes and the final block apply to EVERY interface (DESIGN.md
     // §25.3): a drop that moves the default route to another interface
     // (Ethernet, a dock, a phone hotspot) must not leak around a block
@@ -257,13 +281,13 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     for n in &networks {
         out.push_str(&format!("pass out quick to {n} no state\n"));
     }
-    out.push_str("pass out quick proto udp to 224.0.0.251 port 5353\n");
-    out.push_str("pass out quick proto udp to ff02::fb port 5353\n");
+    out.push_str("pass out quick proto udp to 224.0.0.251 port 5353 no state\n");
+    out.push_str("pass out quick proto udp to ff02::fb port 5353 no state\n");
     // Link-scoped multicast cannot carry traffic to the public Internet.
     // Keep neighbour/router discovery and DHCPv6 working on the LAN.
     out.push_str("pass out quick inet6 proto icmp6 to ff02::/16 no state\n");
     out.push_str("pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n");
-    out.push_str("pass out quick inet6 to fe80::/10\n");
+    out.push_str("pass out quick inet6 to fe80::/10 no state\n");
     if !input.strict_dns && !input.direct_table {
         for ip in &dns_servers {
             out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 no state\n"));
@@ -276,7 +300,7 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
         out.push_str("pass out quick proto { udp tcp } to any port 53 no state\n");
     }
     if input.allow_direct_egress {
-        out.push_str(&format!("pass out quick on {phys} all\n"));
+        out.push_str(&format!("pass out quick on {phys} all no state\n"));
     } else {
         out.push_str("block drop out quick all\n");
     }
@@ -286,6 +310,32 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unauthenticated_login_has_only_the_carrier_and_lan_exceptions() {
+        let lans = vec!["192.168.2.0/24".into()];
+        let no_gateway = login_rules("en0", &[], 443, false, &lans).unwrap();
+        assert!(!no_gateway.contains(" port 443") && !no_gateway.contains("utun"));
+        assert!(no_gateway.find("to any port 53").unwrap() < no_gateway.find(&lans[0]).unwrap());
+        for udp in [true, false] {
+            let text = login_rules("en0", &["192.0.2.9".into()], 8443, udp, &lans).unwrap();
+            assert!(text.contains("to 192.0.2.9 port 8443 no state"));
+            assert_eq!(text.contains("proto { tcp udp } to 192.0.2.9"), udp);
+            assert!(text.ends_with("block drop out quick all\n"));
+            assert!(!text.contains("user root") && !text.contains("utun") && !text.contains("on en0 all"));
+        }
+    }
+
+    #[test]
+    fn our_passes_cannot_create_states_that_outlive_a_policy_change() {
+        let mut input = secure_input();
+        for connected in [false, true] {
+            input.allow_direct_egress = connected;
+            for line in generate(&input).unwrap().lines().filter(|r| r.starts_with("pass ")) {
+                assert!(line.ends_with(" no state"), "stateful permission: {line}");
+            }
+        }
+    }
 
     #[test]
     fn ipv6_cannot_use_the_dhcp_exception_and_lan_discovery_is_retained() {
@@ -399,14 +449,14 @@ mod tests {
 pass out quick on utun5 all no state\n\
 pass out quick on { utun0 utun1 utun2 utun3 utun4 utun5 utun6 utun7 utun8 utun9 utun10 utun11 utun12 utun13 utun14 utun15 utun16 utun17 utun18 utun19 utun20 utun21 utun22 utun23 utun24 utun25 utun26 utun27 utun28 utun29 utun30 utun31 utun32 utun33 utun34 utun35 utun36 utun37 utun38 utun39 utun40 utun41 utun42 utun43 utun44 utun45 utun46 utun47 utun48 utun49 utun50 utun51 utun52 utun53 utun54 utun55 utun56 utun57 utun58 utun59 utun60 utun61 utun62 utun63 } all no state\n\
 pass out quick on lo0 all no state\n\
-pass out quick inet proto udp from any port 68 to any port 67\n\
+pass out quick inet proto udp from any port 68 to any port 67 no state\n\
 pass out quick to 203.0.113.10 no state\n\
 pass out quick to 192.168.0.0/16 no state\n\
-pass out quick proto udp to 224.0.0.251 port 5353\n\
-pass out quick proto udp to ff02::fb port 5353\n\
+pass out quick proto udp to 224.0.0.251 port 5353 no state\n\
+pass out quick proto udp to ff02::fb port 5353 no state\n\
 pass out quick inet6 proto icmp6 to ff02::/16 no state\n\
 pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n\
-pass out quick inet6 to fe80::/10\n\
+pass out quick inet6 to fe80::/10 no state\n\
 block drop out quick all\n";
         assert_eq!(generate(&secure_input()).unwrap(), expected);
     }
@@ -423,15 +473,15 @@ block drop out quick all\n";
 pass out quick on utun5 all no state\n\
 pass out quick on { utun0 utun1 utun2 utun3 utun4 utun5 utun6 utun7 utun8 utun9 utun10 utun11 utun12 utun13 utun14 utun15 utun16 utun17 utun18 utun19 utun20 utun21 utun22 utun23 utun24 utun25 utun26 utun27 utun28 utun29 utun30 utun31 utun32 utun33 utun34 utun35 utun36 utun37 utun38 utun39 utun40 utun41 utun42 utun43 utun44 utun45 utun46 utun47 utun48 utun49 utun50 utun51 utun52 utun53 utun54 utun55 utun56 utun57 utun58 utun59 utun60 utun61 utun62 utun63 } all no state\n\
 pass out quick on lo0 all no state\n\
-pass out quick inet proto udp from any port 68 to any port 67\n\
+pass out quick inet proto udp from any port 68 to any port 67 no state\n\
 pass out quick to 203.0.113.10 no state\n\
 pass out quick to 192.168.0.0/16 no state\n\
-pass out quick proto udp to 224.0.0.251 port 5353\n\
-pass out quick proto udp to ff02::fb port 5353\n\
+pass out quick proto udp to 224.0.0.251 port 5353 no state\n\
+pass out quick proto udp to ff02::fb port 5353 no state\n\
 pass out quick inet6 proto icmp6 to ff02::/16 no state\n\
 pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n\
-pass out quick inet6 to fe80::/10\n\
-pass out quick on en0 all\n";
+pass out quick inet6 to fe80::/10 no state\n\
+pass out quick on en0 all no state\n";
         assert_eq!(generate(&input).unwrap(), expected);
         // The blocking set is unchanged by the new field's default.
         assert!(generate(&secure_input())

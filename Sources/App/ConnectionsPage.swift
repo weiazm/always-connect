@@ -53,6 +53,8 @@ struct ConnectionsPage: View {
     /// The "不走 VPN" list, read on appear and after each change here.
     @State private var sites: [DirectSite] = []
     @State private var notice: Notice?
+    @State private var egressAddition: EgressAddition?
+    @State private var egressNotice: EgressNotice?
     /// Totals since the previous refresh; nil until there are two samples.
     @State private var totals: (vpn: [Int], direct: [Int])?
     @State private var sortOrder: [KeyPathComparator<Row>] = []
@@ -70,6 +72,20 @@ struct ConnectionsPage: View {
         var id = UUID()
         var text: String
         var before: [DirectSite]
+    }
+
+    private struct EgressAddition: Identifiable {
+        let id = UUID()
+        let site: String
+        let group: EgressProtection.Group
+        let config: EgressProtection
+    }
+
+    private struct EgressNotice: Identifiable {
+        let id = UUID()
+        let before: EgressProtection.Group?
+        let after: EgressProtection.Group
+        let site: String
     }
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
@@ -153,6 +169,17 @@ struct ConnectionsPage: View {
             if let message {
                 Text(message).font(.caption).foregroundStyle(.orange)
             }
+            if let egressNotice {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("已把 \(egressNotice.site) 加入出口保护组「\(egressNotice.after.name)」。")
+                        .font(.caption)
+                    Spacer()
+                    Button("撤销") { undoEgressAddition(egressNotice) }.buttonStyle(.borderless)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+            }
             Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
                  + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
                     : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
@@ -170,6 +197,11 @@ struct ConnectionsPage: View {
         .onChange(of: preview) { if let sample = $0 { update(sample) } }
         .onReceive(timer) { _ in if preview == nil { refresh() } }
         .onDisappear { if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } } }
+        .sheet(item: $egressAddition) { addition in
+            EgressGroupEditor(group: addition.group, config: addition.config, pendingSite: addition.site) { group, done in
+                saveEgressAddition(group, site: addition.site, completion: done)
+            }
+        }
     }
 
     private var protocolColumnWidth: CGFloat {
@@ -214,8 +246,13 @@ struct ConnectionsPage: View {
                     .font(.caption)
                     .fixedSize()
                 } else {
-                    Text("已加入").font(.caption).foregroundStyle(.secondary)
-                        .help("已在不走 VPN 的名单里：等程序重新连接后直连")
+                    HStack(spacing: 4) {
+                        Text("已加入").font(.caption).foregroundStyle(.secondary)
+                            .help("已在不走 VPN 的名单里")
+                        if row.via == "vpn" && ProfileStore.loadAppSettings().isDropProtectionOn {
+                            egressMenu(row).menuStyle(.borderlessButton).font(.caption)
+                        }
+                    }
                 }
             } else if row.via == "vpn" {
                 let choices = DirectSites.choices(host: row.host, address: row.remote)
@@ -229,6 +266,9 @@ struct ConnectionsPage: View {
                         if row.host == nil {
                             Text("这个程序没经过系统查域名，只能按地址加；对方换了地址就不再生效。")
                         }
+                        if ProfileStore.loadAppSettings().isDropProtectionOn {
+                            egressMenu(row)
+                        }
                     }
                     .menuStyle(.borderlessButton)
                     .menuIndicator(.hidden)
@@ -236,8 +276,56 @@ struct ConnectionsPage: View {
                     .font(.caption)
                     .fixedSize()
                     .help("加入不走 VPN 的名单")
+                } else if ProfileStore.loadAppSettings().isDropProtectionOn {
+                    egressMenu(row).menuStyle(.borderlessButton).font(.caption)
                 }
             }
+        } else if !manager.usesCisco && row.via == "vpn" && ProfileStore.loadAppSettings().isDropProtectionOn {
+            egressMenu(row).menuStyle(.borderlessButton).font(.caption)
+        }
+    }
+
+    private func egressMenu(_ row: Row) -> some View {
+        Menu("加入出口保护") {
+            let config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+            let site = row.host ?? row.remote
+            ForEach(config.groups) { group in
+                Button(group.name) { egressAddition = .init(site: site, group: group, config: config) }
+            }
+            Button("新建组") {
+                egressAddition = .init(site: site, group: EgressProtection.newGroup(in: config), config: config)
+            }
+        }
+    }
+
+    private func saveEgressAddition(_ group: EgressProtection.Group, site: String, completion: @escaping (Bool) -> Void) {
+        var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let before = config.groups.first { $0.id == group.id }
+        if let index = config.groups.firstIndex(where: { $0.id == group.id }) { config.groups[index] = group }
+        else { config.groups.append(group) }
+        manager.saveEgress(config) { ok in
+            if ok {
+                let notice = EgressNotice(before: before, after: group, site: site)
+                egressNotice = notice
+                DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                    if egressNotice?.id == notice.id { egressNotice = nil }
+                }
+            }
+            completion(ok)
+        }
+    }
+
+    private func undoEgressAddition(_ notice: EgressNotice) {
+        var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard let index = config.groups.firstIndex(of: notice.after) else {
+            message = "这一组已在别处修改，请在「分流」页编辑。"
+            return
+        }
+        if let before = notice.before { config.groups[index] = before }
+        else { config.groups.remove(at: index) }
+        manager.saveEgress(config) { ok in
+            if ok { egressNotice = nil }
+            else { message = "撤销未生效，请到「分流」页检查后台服务。" }
         }
     }
 

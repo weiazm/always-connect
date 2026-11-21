@@ -19,7 +19,8 @@ resolve=resolve.replace('DispatchQueue.main.asyncAfter(deadline: .now() + 3)','C
 prepare=method('Sources/App/CertificateRelay.swift','func prepare(prefer:')
 daemon=method('Sources/Helper/HelperDaemon.swift','func resolveGatewayIPv4(').replace('DispatchQueue.global(qos: .utility).async','Clock.enqueue')
 source=(root/'Sources/App/HelperClient.swift').read_text()
-assert 'known: memory.addresses, resolved: addresses)' in source
+assert 'known: authorisedAddresses ?? memory.addresses, resolved: addresses)' in source
+assert 'if let authorisedAddresses { prepare(authorisedAddresses) }' in source
 assert 'connection.setCodeSigningRequirement(requirement)' in (root/'Sources/Helper/HelperDaemon.swift').read_text()
 text='''import Foundation
 @_silgen_name("ac_gateway_system_bootstrap") func ac_gateway_system_bootstrap(_ held: Int32) -> Bool
@@ -66,13 +67,13 @@ enum PhysicalNetwork {
 }
 enum LocalDNS { static func servers(for interface: String) -> [String] { ["192.168.1.1"] } }
 enum NetworkGuard {
-    struct Inputs { var physicalIf: String; var localDNSServers: [String] }
+    struct Inputs { var physicalIf: String; var localDNSServers: [String]; var loginPort: UInt16?; var tunnelIf = "" }
     static let shared = Inputs(physicalIf: "en7", localDNSServers: ["192.168.7.1"])
     static func take(_ value: UnsafeMutablePointer<CChar>?) -> String? {
         guard let value else { return nil }; defer { free(value) }; return String(cString: value)
     }
 }
-extension NetworkGuard.Inputs { var gatewayBootstrapContext: Self? { self } }
+extension NetworkGuard.Inputs { var gatewayBootstrapContext: Self? { self }; var held: (holder:String, inputs:Self)? { nil } }
 var observedInterface = ""; var observedServers = ""
 func ac_gateway_active(_ handle: Int) -> Bool { true }
 func ac_resolve_gateway(_ handle: Int, _ host: String, _ servers: String, _ interface: String) -> UnsafeMutablePointer<CChar>? {

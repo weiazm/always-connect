@@ -18,6 +18,7 @@
 //! client retries), which leave after 30 s without work. Idle, the
 //! forwarder is one parked thread and wakes for nothing.
 
+use crate::egress_gate::Classifier;
 use regex_lite::Regex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -252,18 +253,19 @@ fn parts(m: &[u8], data: usize, stop: usize, shape: &[Shape]) -> Option<Vec<Part
 
 /// An SVCB/HTTPS record's data (RFC 9460 §2.2) with ipv4hint and
 /// ipv6hint taken out (and out of "mandatory", which may list them).
-fn svcb_without_hints(m: &[u8], data: usize, stop: usize) -> Option<Svcb> {
+fn svcb_without_hints(m: &[u8], data: usize, stop: usize, strip_ech: bool) -> Option<Svcb> {
     let priority = m.get(data..data + 2)?.to_vec();
     let (target, mut at) = read_labels(m, data + 2)?;
     let mut params = Vec::new();
     let mut removed = false;
+    let omit = |key| key == SVC_IPV4HINT || key == SVC_IPV6HINT || (strip_ech && key == 5);
     while at < stop {
         let head = m.get(at..at + 4)?;
         let key = (head[0] as u16) << 8 | head[1] as u16;
         let len = (head[2] as usize) << 8 | head[3] as usize;
         let value = m.get(at + 4..at + 4 + len)?;
         at += 4 + len;
-        if key == SVC_IPV4HINT || key == SVC_IPV6HINT {
+        if omit(key) {
             removed = true;
             continue;
         }
@@ -276,7 +278,7 @@ fn svcb_without_hints(m: &[u8], data: usize, stop: usize) -> Option<Svcb> {
                 .chunks(2)
                 .filter(|k| {
                     let k = (k[0] as u16) << 8 | k[1] as u16;
-                    k != SVC_IPV4HINT && k != SVC_IPV6HINT
+                    !omit(k)
                 })
                 .flatten()
                 .copied()
@@ -332,6 +334,10 @@ fn write_plain(out: &mut Vec<u8>, labels: &[Vec<u8>], terminate: bool) {
 /// (a CNAME's target, a TargetName other than "."): the client would go
 /// on to a name the list may not cover.
 pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
+    sanitize_service_answer(answer, direct, false)
+}
+
+fn sanitize_service_answer(answer: &[u8], direct: bool, strip_ech: bool) -> Option<Vec<u8>> {
     if answer.len() < 12 {
         return None;
     }
@@ -373,7 +379,7 @@ pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
                     continue;
                 }
                 TYPE_SVCB | TYPE_HTTPS => {
-                    let (priority, target, params, removed) = svcb_without_hints(answer, data, stop)?;
+                    let (priority, target, params, removed) = svcb_without_hints(answer, data, stop, strip_ech)?;
                     if direct && (!same_name(&owner, &qname) || !target.is_empty()) {
                         return None;
                     }
@@ -434,6 +440,7 @@ pub struct SplitRules {
     keywords: Vec<String>,
     regexes: Vec<Regex>,
     ranges: Vec<(u32, u32)>,
+    protected: Option<Arc<crate::egress_control::ProtectedRoutes>>,
 }
 
 fn trim_domain(s: &str) -> String {
@@ -512,7 +519,7 @@ impl SplitRules {
     /// there is one), or None.
     pub fn matches(&self, name: &str) -> Option<String> {
         let n = trim_dots(name);
-        if n.is_empty() {
+        if n.is_empty() || self.protects_name(&n) {
             return None;
         }
         if self.fulls.contains(&n) {
@@ -538,10 +545,24 @@ impl SplitRules {
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        if self.protects_ip(ip) { return false; }
         let v = u32::from(ip);
         // The last range starting at or below v.
         let idx = self.ranges.partition_point(|r| r.0 <= v);
         idx > 0 && v <= self.ranges[idx - 1].1
+    }
+
+    pub(crate) fn with_protection(mut self, protection: Option<Arc<crate::egress_control::ProtectedRoutes>>) -> Self {
+        self.protected = protection;
+        self
+    }
+
+    pub(crate) fn protects_name(&self, name: &str) -> bool {
+        self.protected.as_ref().is_some_and(|routes| routes.group_for_name(name).is_some())
+    }
+
+    pub(crate) fn protects_ip(&self, ip: Ipv4Addr) -> bool {
+        self.protected.as_ref().is_some_and(|routes| routes.group_for_ip(ip.into()).is_some())
     }
 }
 
@@ -721,22 +742,45 @@ fn tcp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&
 /// consume the same budget instead of starting another socket timeout.
 pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
     let binding=match interface {Some(name)=>Some(InterfaceBinding::new(name)?),None=>None};
-    exchange_bound(query,servers,port,binding.as_ref(),timeout)
+    exchange_bound(query, servers, port, binding.as_ref(), timeout, 0).map(|(_, reply)| reply)
 }
-fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
-    let attempts=u32::try_from(servers.len().saturating_mul(2)).unwrap_or(u32::MAX);
-    let budget=timeout.saturating_mul(attempts).min(Duration::from_secs(8));
-    exchange_until(query,servers,port,interface,timeout,Instant::now()+budget)
+
+const BACKUP_DELAY: Duration = Duration::from_millis(350);
+const PREFER_BACKUP_FOR: Duration = Duration::from_secs(30);
+
+fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>,
+                  timeout: Duration, first: usize) -> Option<(usize, Vec<u8>)> {
+    let attempts = u32::try_from(servers.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let deadline = Instant::now() + timeout.saturating_mul(attempts).min(Duration::from_secs(8));
+    if servers.len() > 1 && timeout > BACKUP_DELAY {
+        // A silent primary must not exhaust the system resolver's own timeout.
+        // Try only peers in this DNS view, using the same interface binding.
+        for offset in 0..servers.len() {
+            remaining(deadline)?;
+            let index = (first + offset) % servers.len();
+            let server = &servers[index];
+            if let Some(answer) = udp_exchange_until(query, server, port, interface, deadline.min(Instant::now() + BACKUP_DELAY)) {
+                if !is_truncated(&answer) { return Some((index, answer)); }
+                if let Some(full) = tcp_exchange_until(query, server, port, interface, deadline.min(Instant::now() + BACKUP_DELAY)) {
+                    if !is_truncated(&full) { return Some((index, full)); }
+                }
+            }
+        }
+    }
+    // Slow UDP-only and TCP-only resolvers retain the full transport attempts.
+    exchange_until(query, servers, port, interface, timeout, deadline)
 }
-fn exchange_until(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, attempt: Duration, deadline: Instant) -> Option<Vec<u8>> {
-    for server in servers {
+
+fn exchange_until(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>,
+                  attempt: Duration, deadline: Instant) -> Option<(usize, Vec<u8>)> {
+    for (index, server) in servers.iter().enumerate() {
         remaining(deadline)?;
-        if let Some(answer)=udp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
-            if !is_truncated(&answer) { return Some(answer); }
+        if let Some(answer) = udp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
+            if !is_truncated(&answer) { return Some((index, answer)); }
         }
         remaining(deadline)?;
-        if let Some(answer)=tcp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
-            if !is_truncated(&answer) { return Some(answer); }
+        if let Some(answer) = tcp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
+            if !is_truncated(&answer) { return Some((index, answer)); }
         }
     }
     None
@@ -797,7 +841,7 @@ pub(crate) fn resolve_gateway_with(permit: &GatewayPermit, host: &str, servers: 
     let Some(binding)=InterfaceBinding::new(physical_if) else {return vec![]};
     let Some(left)=remaining(permit.deadline) else {return vec![]};
     let slots=(servers.len().max(1)*2) as u32;
-    let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
+    let Some((_, answer))=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
     answer_addresses(&answer,&query).unwrap_or_default().iter().map(ToString::to_string).collect()
 }
 
@@ -865,6 +909,14 @@ struct Settings {
     tunnel_binding: Option<InterfaceBinding>,
 }
 
+// Only the latest failed VPN A lookup is shown in the local panel.
+struct DnsFailure {
+    epoch: u64,
+    observed: Instant,
+    name: String,
+    reason: &'static str,
+}
+
 type Acknowledged = (u64, Vec<Ipv4Addr>, Vec<Ipv4Addr>);
 
 pub struct Inner {
@@ -872,6 +924,8 @@ pub struct Inner {
     timeout: Duration,
     settings: RwLock<Settings>,
     on_answer: Option<AnswerHook>,
+    recent_failure: Mutex<Option<DnsFailure>>,
+    preferred_server: [Mutex<Option<(u64, usize, Instant)>>; 2],
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -927,6 +981,28 @@ impl Inner {
         self.resolve_in_session(query, None)
     }
 
+    fn record_dns_failure(&self, epoch: u64, name: &str, reason: &'static str) {
+        let settings = self.settings.read().unwrap();
+        if !settings.enabled || settings.epoch != epoch || name.is_empty()
+            || !name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_')) {
+            return;
+        }
+        *self.recent_failure.lock().unwrap() = Some(DnsFailure {
+            epoch, observed: Instant::now(), name: name.to_owned(), reason,
+        });
+    }
+
+    pub(crate) fn recent_dns_notice(&self) -> Option<String> {
+        let settings = self.settings.read().unwrap();
+        let mut recent = self.recent_failure.lock().unwrap();
+        let issue = recent.as_ref()?;
+        if !settings.enabled || settings.epoch != issue.epoch || issue.observed.elapsed() >= Duration::from_secs(60) {
+            *recent = None;
+            return None;
+        }
+        Some(format!("最近一分钟，{} 查询失败：{}", issue.name, issue.reason))
+    }
+
     fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
@@ -942,6 +1018,10 @@ impl Inner {
         } else {
             // Never create an unbound VPN socket, including before connect,
             // after a drop, or while an interface change is being confirmed.
+            if q.qtype == TYPE_A && (up.tunnel.is_empty() || tunnel_binding.is_none()) {
+                self.record_dns_failure(epoch, &q.name, "VPN DNS 尚未就绪");
+                return None;
+            }
             (&up.tunnel, Some(tunnel_binding.as_ref()?))
         };
         let path = &self.path_inflight[usize::from(entry.is_some())];
@@ -950,14 +1030,38 @@ impl Inner {
             return None;
         }
         let slot = PathSlot(path);
-        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout);
+        let preference = &self.preferred_server[usize::from(entry.is_some())];
+        let first = if servers.len() > 1 {
+            preference.lock().unwrap().filter(|(generation, index, since)|
+                *generation == epoch && *index < servers.len() && since.elapsed() < PREFER_BACKUP_FOR
+            ).map_or(0, |(_, index, _)| index)
+        } else { 0 };
+        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout, first)
+            .map(|(index, answer)| {
+                if first != index && self.settings.read().unwrap().epoch == epoch {
+                    *preference.lock().unwrap() = Some((epoch, index, Instant::now()));
+                }
+                answer
+            });
         drop(slot);
+        if entry.is_none() && q.qtype == TYPE_A {
+            let reason = match answer.as_ref().map(|a| a[3] & 0x0f) {
+                None => Some("VPN DNS 未返回有效应答"),
+                Some(3) => Some("VPN DNS 返回域名不存在（NXDOMAIN）"),
+                Some(2) => Some("VPN DNS 解析失败（SERVFAIL）"),
+                Some(5) => Some("VPN DNS 拒绝查询（REFUSED）"),
+                _ => None,
+            };
+            if let Some(reason) = reason { self.record_dns_failure(epoch, &q.name, reason); }
+        }
         let answer = answer?;
         let mut addresses = if q.qtype == TYPE_A && answer[3] & 0x0f == 0 {
             answer_addresses(&answer, query)?
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
+        let protected = rules.protects_name(&q.name);
         let direct: Vec<_> = addresses.iter().copied()
+            .filter(|ip| !protected && !rules.protects_ip(*ip))
             .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
         if self.settings.read().unwrap().epoch != epoch { return None; }
         if q.qtype == TYPE_A {
@@ -989,7 +1093,8 @@ impl Inner {
         }
         self.remember(&addresses, &q.name);
         if is_service(q.qtype) {
-            return without_addresses(&answer, entry.is_some()).or_else(|| empty_answer(query));
+            return sanitize_service_answer(&answer, entry.is_some(), rules.protected.is_some())
+                .or_else(|| empty_answer(query));
         }
         Some(answer)
     }
@@ -1111,6 +1216,8 @@ impl Forwarder {
                 settings: RwLock::new(Settings { epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
                     rules: Arc::new(SplitRules::new(&direct)), upstreams, enabled: true, physical_binding, tunnel_binding }),
                 on_answer,
+                recent_failure: Mutex::default(),
+                preferred_server: Default::default(),
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
@@ -1128,9 +1235,12 @@ impl Forwarder {
     }
 
     pub fn set_rules(&self, direct: &[String]) {
-        let parsed = Arc::new(SplitRules::new(direct));
+        self.set_parsed_rules(SplitRules::new(direct));
+    }
+
+    pub(crate) fn set_parsed_rules(&self, parsed: SplitRules) {
         let mut settings = self.inner.settings.write().unwrap();
-        settings.rules = parsed;
+        settings.rules = Arc::new(parsed);
         self.inner.acknowledged.lock().unwrap().clear();
         settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
     }
@@ -1285,6 +1395,83 @@ mod tests {
 
     fn loopback_interface() -> &'static str {
         if cfg!(target_os = "macos") { "lo0" } else { "lo" }
+    }
+
+    #[test]
+    fn silent_primary_does_not_consume_the_clients_deadline() {
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let primary = silent.local_addr().unwrap();
+        let _silent_tcp = TcpListener::bind(primary).unwrap();
+        let (port, _) = fake_udp([192, 0, 2, 5], false);
+        let servers = vec![primary.to_string(), format!("127.0.0.1:{port}")];
+        let q = query("intranet.example", TYPE_A, 13);
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53, Duration::from_secs(1),
+            vec![], Upstreams { tunnel: servers, local: vec![], physical_if: None,
+                tunnel_if: Some(loopback_interface().into()) }, None);
+        let start = Instant::now();
+        let result = forwarder.inner().resolve(&q).unwrap();
+        assert_eq!(ipv4_answers(&result), vec![Ipv4Addr::new(192, 0, 2, 5)]);
+        assert!(start.elapsed() < Duration::from_millis(1500), "backup answered too late");
+        let mut buf = [0; 512];
+        silent.set_nonblocking(true).unwrap();
+        assert!(silent.recv(&mut buf).is_ok());
+        assert!(forwarder.inner().resolve(&q).is_some());
+        assert_eq!(silent.recv(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn complete_negative_answer_does_not_switch_dns_views_or_servers() {
+        let primary = UdpSocket::bind("127.0.0.1:0").unwrap();
+        primary.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let addr = primary.local_addr().unwrap().to_string();
+        let (backup, seen) = fake_udp([192, 0, 2, 8], false);
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, peer) = primary.recv_from(&mut buf).unwrap();
+            let mut negative = empty_answer(&buf[..len]).unwrap();
+            negative[3] |= 3;
+            primary.send_to(&negative, peer).unwrap();
+        });
+        let servers = vec![addr, format!("127.0.0.1:{backup}")];
+        let reply = exchange(&query("missing.example", TYPE_A, 14), &servers, 53,
+            Some(loopback_interface()), Duration::from_secs(1)).unwrap();
+        assert_eq!(reply[3] & 15, 3);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn vpn_dns_notice_distinguishes_missing_upstream_and_negative_answer() {
+        let query = query("intranet.example", TYPE_A, 901);
+        let up = Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None };
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53,
+            Duration::from_millis(50), vec![], up.clone(), None);
+        assert!(forwarder.inner().resolve(&query).is_none());
+        assert!(forwarder.inner().recent_dns_notice().unwrap().contains("尚未就绪"));
+        let previous = forwarder.epoch();
+        forwarder.set_upstreams(up);
+        forwarder.inner().record_dns_failure(previous, "old.example", "域名不存在");
+        assert!(forwarder.inner().recent_dns_notice().is_none());
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let reply = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, peer) = socket.recv_from(&mut buf).unwrap();
+            let mut response = empty_answer(&buf[..len]).unwrap();
+            response[3] |= 3;
+            socket.send_to(&response, peer).unwrap();
+        });
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), port,
+            Duration::from_millis(500), vec![], Upstreams { tunnel: vec!["127.0.0.1".into()],
+                local: vec![], physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        assert_eq!(forwarder.inner().resolve(&query).unwrap()[3] & 15, 3);
+        reply.join().unwrap();
+        let notice = forwarder.inner().recent_dns_notice().unwrap();
+        assert!(notice.contains("intranet.example") && notice.contains("域名不存在"));
+        forwarder.inner().recent_failure.lock().unwrap().as_mut().unwrap().observed -= Duration::from_secs(61);
+        assert!(forwarder.inner().recent_dns_notice().is_none());
     }
 
     fn query(name: &str, qtype: u16, id: u16) -> Vec<u8> {
@@ -1457,6 +1644,19 @@ mod tests {
         bad[12] = 0xC0;
         bad[13] = 12;
         assert_eq!(question(&bad), None);
+    }
+
+    #[test]
+    fn protected_dns_strips_ech_and_preserves_other_parameters() {
+        let here = [0xC0, 0x0C];
+        for kind in [TYPE_HTTPS, TYPE_SVCB] {
+            let q = query("site.example", kind, 23);
+            let params = [param(0, &[0, 1, 0, 5]), param(1, b"\x02h2"), param(5, b"test-ech")].concat();
+            let answer = reply(&q, &[rr(&here, kind, 300, &svcb_data(1, ".", &params))], &[], &[]);
+            assert_eq!(sanitize_service_answer(&answer, false, false).unwrap(), answer);
+            let stripped = sanitize_service_answer(&answer, false, true).unwrap();
+            assert_eq!(records(&stripped)[0].3, "prio=1 target= 0:\0\u{1} 1:\u{2}h2");
+        }
     }
 
     #[test]

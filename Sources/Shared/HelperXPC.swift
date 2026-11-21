@@ -105,6 +105,24 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// openconnect will present to the relay (the relay accepts no
     /// other client); "" when the settings were invalid or the
     /// certificate could not be made, and after a clear.
+    /// Installs the pre-login firewall before any VPN connection or DNS lookup.
+    /// The candidate, if provided, was TLS-verified before this login intent.
+    /// Scope a rejected handshake and its later tunnel verification to the same relay and incident.
+    func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
+    func hasVerifiedRelayTunnel(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
+    func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)
+    /// True if this server already has a usable peer from an authenticated session.
+    func hasTrustedLoginGateway(_ server: String, cisco: Bool, withReply reply: @escaping (Bool) -> Void)
+    /// 1 = usable peer, 0 = confirmed miss, -1 = unreadable or invalid.
+    func getLoginGatewayReadiness(_ server: String, cisco: Bool, withReply reply: @escaping (Int) -> Void)
+    /// A nonzero ticket permits one bounded TLS preparation. A zero ticket returns the protection result.
+    func requestProtectedLogin(_ server: String, cisco: Bool, candidate: String, rejected: Bool,
+                               allowPreparation: Bool, deadline: UInt64,
+                               withReply reply: @escaping (UInt64, Bool, [String], String) -> Void)
+    func finishProtectedLogin(_ ticket: UInt64, candidate: String,
+                              withReply reply: @escaping (Bool, [String], String) -> Void)
+    func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
+                             withReply reply: @escaping (Bool, [String], String) -> Void)
     func prepareRelay(gatewayIp: String, serverPin: String,
                       withReply reply: @escaping (String) -> Void)
     /// Own connection's domain split (DESIGN.md §26.5): the names (and
@@ -121,6 +139,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func getSplitStatus(withReply reply: @escaping (String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
+    func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
+    func getEgressStatus(withReply reply: @escaping (String) -> Void)
+    func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the
     /// engine loads no pf set and a drop gives the local network back
     /// while it retries. In force at once in a running session, else
@@ -150,4 +171,12 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 /// polls.
 @objc protocol AlwaysConnectHelperClientProtocol {
     func statusChanged(state: Int, detail: String)
+}
+
+
+enum ProtectedLoginNotice {
+    static let preparationTimedOut = "查找 VPN 服务器超时。网络已拦截，请恢复直连后重试。"
+    static let preparationUnavailable = "网络已拦截。无法确认可用于查找网关的直连网络，请恢复直连后重试。"
+    static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
+    static let preparingGateway = "首次连接正在查网关，当前仍直连"
 }

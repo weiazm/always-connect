@@ -21,6 +21,27 @@ disconnect) echo cancel >> "$DIR/cancellations"; banner; echo Disconnected > "$D
     echo "$cmd" >> "$DIR/commands"
     printf 'VPN> %s\n  >> contacting host for login information...\n' "$cmd"
     case "$pass" in
+    certfail)
+        # The banner may mention a previous session before the current failure.
+        printf '  >> state: Connected\n  >> state: Disconnected\n  >> error: Certificate validation failure.'
+        exit 1 ;;
+    certfail-conflicting)
+        # Simulate an old daemon status and a contradictory final CLI line.
+        echo Connected > "$DIR/state"
+        printf '  >> error: Certificate validation failure.\n'
+        sleep 2
+        touch "$DIR/certificate-complete"
+        printf '  >> Login error.\n  >> state: Connected\n'
+        exit 0 ;;
+    stale-success)
+        # The command claims success, but the daemon has already lost the tunnel.
+        printf '  >> state: Connected\n'
+        exit 0 ;;
+    stale-after-rejection)
+        # A later CLI call still sees the old session without authenticating.
+        echo Connected > "$DIR/state"
+        printf '  >> state: Connected\n'
+        exit 0 ;;
     good|bad|pushfail|noapprove|quickfail|slow) ;;
     *) printf '  >> error: The VPN connection failed due to unsuccessful domain name resolution.\n'; exit 0 ;;
     esac

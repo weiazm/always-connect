@@ -183,6 +183,33 @@ fn routes_match(output: &str, expected: &Expected) -> bool {
     })
 }
 
+// Only attest to unambiguous local states. Floating, NAT and unfamiliar
+// forms stay unconfirmed. No endpoint or state-table text leaves this check.
+fn loopback_state(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("lo0") || !matches!(fields.next(), Some("tcp" | "udp")) {
+        return false;
+    }
+    let local = |field: Option<&str>| field.and_then(|v| v.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|endpoint| endpoint.ip().is_loopback());
+    local(fields.next()) && matches!(fields.next(), Some("->" | "<-")) && local(fields.next())
+        && fields.next().is_some() && fields.next().is_none()
+}
+
+pub(crate) fn confirm_login_rules(pfctl: &str, expected: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut get = |_: &str, args: &[&str]| read_command(pfctl,
+        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400)));
+    let info = get(pfctl, &["-s", "info"]);
+    if !info.ok || !info.text.contains("Status: Enabled") { return Err("系统防火墙状态未确认，已停止登录".into()); }
+    let anchor = get(pfctl, &["-a", crate::pf::ANCHOR, "-s", "rules"]);
+    if !anchor.ok || !expand_loaded_tables(&anchor.text, &mut get).is_some_and(|actual| rules_match(&actual, expected)) {
+        return Err("登录保护规则未确认，已停止登录".into());
+    }
+    Ok(())
+}
+
 /// Confirm the small, unconditional Apple wildcard/direct call chain. Unknown
 /// filter rules and populated sibling anchors are conservatively unconfirmed.
 fn anchor_calls(text: &str) -> Option<Vec<String>> {
@@ -245,8 +272,27 @@ fn apple_children(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
 /// are failed observations, never inferred success from the engine's memory.
 pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Output) -> Vec<Item> {
     let mut result = Vec::new();
-    let Some(tunnel) = &expected.tunnel else { return vec![item("当前 VPN 路径", false, "没有已确认的隧道；不能确认 VPN 路径")]; };
     let mut get = |path: &str, args: &[&str]| exec(path, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let Some(tunnel) = &expected.tunnel else {
+        result.push(item("当前 VPN 路径", false, "没有已确认的 VPN 隧道"));
+        if expected.protection {
+            let loaded = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-s", "rules"]);
+            let enabled = get("/sbin/pfctl", &["-s", "info"]);
+            let matches = loaded.ok && expected.rules.as_ref().is_some_and(|rules| {
+                expand_loaded_tables(&loaded.text, &mut get).is_some_and(|actual|
+                    rules_match(&actual, rules))
+            });
+            let reached = enabled.ok && enabled.text.contains("Status: Enabled") && matches && anchor_chain(&mut get);
+            result.push(item("当前拦截规则与调用链", reached,
+                "核对防火墙启用状态、拦截规则和上级锚点，规则内的例外仍然适用"));
+            let states = get("/sbin/pfctl", &["-s", "states"]);
+            let only_loopback = states.ok && states.text.lines().filter(|s| !s.trim().is_empty()).all(loopback_state);
+            result.push(item("已有防火墙状态不影响外部拦截", only_loopback,
+                if only_loopback { "状态表为空或仅含绑定回环接口的状态" }
+                else { "无法排除其他连接沿用旧状态，现有流量的拦截尚未确认" }));
+        }
+        return result;
+    };
     let default = get("/sbin/route", &["-n", "get", "default"]);
     result.push(item("默认路由指向当前隧道", default.ok && interface(&default.text) == Some(tunnel), "读取系统实际默认路由，不比较公网出口 IP"));
     let scoped = get("/sbin/route", &["-n", "get", "-ifscope", tunnel, "default"]);
@@ -357,6 +403,24 @@ mod tests {
         else { "Destination Gateway Flags Netif Expire\n198.51.100.9 192.168.1.1 UGHS en0".into() };
         Output{ok:true,text}
     }
+    #[test]
+    fn pre_tunnel_checks_do_not_certify_unreadable_or_existing_external_states() {
+        let mut e = expected();
+        e.tunnel = None;
+        for (ok, states, clear) in [(true, "", true), (true, "lo0 tcp 127.0.0.1:5000 -> 127.0.0.1:8000 ESTABLISHED:ESTABLISHED", true),
+            (true, "lo0 tcp malformed", false),
+            (true, "all tcp external", false), (true, "en0 udp active", false), (false, "", false)] {
+            let rows = run_with(&e, |p, args| if args == ["-s", "states"] {
+                Output { ok, text: states.into() }
+            } else { fixture(&e, p, args) });
+            assert_eq!(rows.last().unwrap().passed, clear);
+        }
+        let rows = run_with(&e, |p, args| if args == ["-s", "rules"] {
+            Output { ok: true, text: "pass out quick all".into() }
+        } else { fixture(&e, p, args) });
+        assert!(!rows[1].passed);
+    }
+
     #[test]
     fn missing_parent_disabled_pf_or_earlier_pass_cannot_report_protection() {
         let e=expected();

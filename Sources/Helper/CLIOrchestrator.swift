@@ -38,6 +38,9 @@ final class CLIOrchestrator {
         var directDomains: [String]? = nil
         /// 断线保护 (§26.19). Default on.
         var dropProtection = true
+        var loginTarget: GatewayAddress?
+        var loginGateways: [String] = []
+        var egress: EgressProtection?
     }
 
     enum FedCredential { case password, cookie }
@@ -103,10 +106,21 @@ final class CLIOrchestrator {
         if let cafile = config.cafile { json["cafile"] = cafile }
         if let max = config.maxAttempts { json["maxAttempts"] = max }
         if let tool = TestSeam.tool("openconnect") { json["testOpenconnect"] = tool }
+        if let target = config.loginTarget {
+            json["loginHost"] = target.host
+            json["loginPort"] = Int(target.port)
+            json["loginGateways"] = config.loginGateways
+        }
         if let relay = config.relay {
             json["relay"] = ["gatewayIp": relay.gatewayIp, "arguments": relay.arguments(server: config.server)]
         }
         if let domains = config.directDomains { json["directDomains"] = domains }
+        if let egress = config.egress, let data = try? JSONEncoder().encode(egress) {
+            json["egress"] = try? JSONSerialization.jsonObject(with: data)
+            if config.dropProtection && egress.isActive {
+                json["gateSignatureVerified"] = ClientRequirement.verifiesEgressGate()
+            }
+        }
         var text = (try? JSONSerialization.data(withJSONObject: json)).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
         let ctx = Unmanaged.passRetained(box).toOpaque()
         var hooks = AcEngineHooks(
@@ -145,6 +159,10 @@ final class CLIOrchestrator {
             },
             release: { ctx in if let ctx { Unmanaged<Box>.fromOpaque(ctx).release() } })
         handle = ac_oc_new(text, &hooks)!
+        ac_oc_set_egress_probe(handle, nil) { _, request, length in
+            guard let request, let length else { return nil }
+            return EgressProbe.exchange(request, length: length)
+        }
         text = String(repeating: " ", count: text.count)
     }
 
@@ -184,6 +202,10 @@ final class CLIOrchestrator {
     }
 
     func updateDropProtection(_ on: Bool) { ac_oc_update_drop_protection(handle, on) }
+
+    func updateEgress(_ json: String) { ac_oc_update_egress(handle, json) }
+    func egressStatus() -> String { NetworkGuard.take(ac_oc_egress_status(handle)) ?? "{}" }
+    func probeEgress(_ host: String) -> String { NetworkGuard.take(ac_oc_egress_probe_host(handle, host)) ?? "[]" }
 
     func updateAllowNetworks(_ networks: [String]) {
         ac_oc_update_allow_networks(handle, networks.joined(separator: ","))
@@ -230,7 +252,9 @@ final class CLIOrchestrator {
         return (info.splitHits, info.splitAddresses)
     }
 
-    func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_info(handle)) ?? "{}" }
+    func rejectGatewayCertificate(_ incident: UInt64) -> Bool { ac_oc_record_gateway_rejection(handle, incident) }
+    func hasVerifiedTunnel(_ incident: UInt64) -> Bool { ac_oc_verified_tunnel(handle, incident) }
+    func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_split_status(handle)) ?? "{}" }
 
     /// The connections page for this session (§28.7); `fallbackGateways`
     /// when the session has none (a Cisco session).
@@ -306,8 +330,20 @@ func ac_oc_new(_ config: UnsafePointer<CChar>, _ hooks: UnsafePointer<AcEngineHo
 @_silgen_name("ac_oc_kill_child") func ac_oc_kill_child(_ e: OpaquePointer)
 @_silgen_name("ac_oc_update_direct_domains") func ac_oc_update_direct_domains(_ e: OpaquePointer, _ d: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_update_drop_protection") func ac_oc_update_drop_protection(_ e: OpaquePointer, _ on: Bool)
+@_silgen_name("ac_oc_set_egress_probe")
+func ac_oc_set_egress_probe(_ e: OpaquePointer, _ ctx: UnsafeMutableRawPointer?,
+    _ probe: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int>?) -> UnsafeMutablePointer<UInt8>?)
+@_silgen_name("ac_oc_update_egress")
+func ac_oc_update_egress(_ e: OpaquePointer, _ json: UnsafePointer<CChar>)
+@_silgen_name("ac_oc_egress_status")
+func ac_oc_egress_status(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_oc_egress_probe_host")
+func ac_oc_egress_probe_host(_ e: OpaquePointer, _ host: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_egress_config_valid")
+func ac_egress_config_valid(_ json: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_oc_update_allow_networks") func ac_oc_update_allow_networks(_ e: OpaquePointer, _ n: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_holder") func ac_oc_holder(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_oc_split_status") func ac_oc_split_status(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_info") func ac_oc_info(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_connections_json")
 func ac_oc_connections_json(_ e: OpaquePointer?, _ fallback: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -355,3 +391,7 @@ func ac_oc_network_changed(_ engine: OpaquePointer)
 
 @_silgen_name("ac_oc_network_check")
 func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("ac_oc_record_gateway_rejection") private func ac_oc_record_gateway_rejection(_ engine: OpaquePointer, _ incident: UInt64) -> Bool
+
+@_silgen_name("ac_oc_verified_tunnel") private func ac_oc_verified_tunnel(_ engine: OpaquePointer, _ incident: UInt64) -> Bool

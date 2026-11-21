@@ -61,6 +61,9 @@ pub struct RelayConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     pub server: String,
+    pub login_host: String,
+    pub login_port: Option<u16>,
+    pub login_gateways: Vec<String>,
     pub group: String,
     pub username: String,
     pub password: String,
@@ -86,6 +89,13 @@ pub struct Config {
     pub approval_quiet_secs: f64,
     pub approval_expiry_minimum: f64,
     pub push_backoff: Vec<f64>,
+    /// Egress protection (DESIGN §66): when on (and drop protection is on),
+    /// openconnect runs in --script-tun mode through the gate program.
+    pub egress: Option<crate::egress_control::EgressConfig>,
+    /// The platform shell verified the separately signed installed gate.
+    pub gate_signature_verified: bool,
+    /// TestSeam's stand-in gate program, when test_active.
+    pub test_gate: Option<String>,
 }
 
 pub const QUIET_AFTER: f64 = 3600.0;
@@ -155,6 +165,8 @@ enum Event {
     Availability(bool),
     OfflineDeadline(u64),
     Release,
+    Egress(crate::egress_control::EgressConfig),
+    EgressGateLost(u64),
 }
 
 // MARK: - Helpers (pure)
@@ -220,6 +232,16 @@ pub fn bundled_is_trusted(file: &str) -> bool {
 fn is_executable(path: &str) -> bool {
     std::ffi::CString::new(path).map(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0).unwrap_or(false)
         && Path::new(path).is_file()
+}
+
+/// Egress protection runs only with drop protection (§66.8) and at least
+/// one enabled group.
+pub fn egress_active(config: &Config) -> bool {
+    config.drop_protection && config.egress.as_ref().is_some_and(|e| e.active())
+}
+
+pub fn egress_socket(support: &Path) -> PathBuf {
+    support.join("egress.sock")
 }
 
 pub fn route_state_path(support: &Path) -> PathBuf {
@@ -349,6 +371,8 @@ pub struct Info {
     pub split_hits: Vec<String>,
     pub split_addresses: usize,
     pub split_warning: Option<String>,
+    #[serde(skip)]
+    dns_source: std::sync::Weak<dns_forwarder::Inner>,
     pub direct_networks: Vec<String>,
     pub tail: Vec<String>,
 }
@@ -371,8 +395,11 @@ fn interface_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+mod cstp_dns;
+
 struct Core {
     config: Config,
+    protected_routes: Option<Arc<crate::egress_control::ProtectedRoutes>>,
     driver: SessionDriver,
     child: Option<Child>,
     generation: u64,
@@ -380,6 +407,9 @@ struct Core {
     network: crate::offline::Gate,
     resume_after_exit: bool,
     hook_fired: bool,
+    certificate_incident: u64,
+    direct_certificate_error: Option<bool>,
+    gate_lost: bool,
     saw_login_failed: bool,
     fed: Credential,
     cookie_fallback_used: bool,
@@ -415,6 +445,7 @@ struct Core {
     last_pf: Option<(String, Vec<String>)>,
     last_allow_direct_egress: bool,
     tunnel_dns: Vec<String>,
+    cstp_dns: cstp_dns::CstpDns,
     tunnel_if: Option<String>,
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
@@ -444,6 +475,10 @@ pub struct Shared {
     /// What the service reads, published before every callback: the
     /// callbacks may read it, and must never wait for the core.
     info: Mutex<Info>,
+    /// The gate's controller while egress protection runs (§66.5), outside
+    /// the core so status and set-up probes never wait for it.
+    egress: Mutex<Option<crate::egress_control::Controller>>,
+    egress_probe: Mutex<Option<crate::egress_control::ProbeHook>>,
 }
 
 pub struct Engine {
@@ -458,16 +493,22 @@ impl Engine {
         guard.own_engine_started(&holder);
         let (tx, rx) = mpsc::channel();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
+        let protected_routes = egress_active(&config)
+            .then(|| Arc::new(config.egress.as_ref().expect("active").protected_routes()));
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 driver: SessionDriver::new(seed),
                 config,
+                protected_routes,
                 child: None,
                 generation: 0,
                 stop_requested: false,
                 network: crate::offline::Gate::default(),
                 resume_after_exit: false,
                 hook_fired: false,
+                certificate_incident: 0,
+                direct_certificate_error: None,
+                gate_lost: false,
                 saw_login_failed: false,
                 fed: Credential::Password,
                 cookie_fallback_used: false,
@@ -500,6 +541,7 @@ impl Engine {
                 last_pf: None,
                 last_allow_direct_egress: false,
                 tunnel_dns: Vec::new(),
+                cstp_dns: Default::default(),
                 tunnel_if: None,
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
@@ -522,6 +564,8 @@ impl Engine {
             child_pid: Mutex::new(None),
             timer_seq: AtomicU64::new(0),
             info: Mutex::new(Info::default()),
+            egress: Mutex::new(None),
+            egress_probe: Mutex::new(None),
         });
         let s = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -548,6 +592,37 @@ impl Engine {
         self.send(Event::Stop { keep_session, notify });
     }
     pub fn network_changed(&self) { self.send(Event::NetworkChanged); }
+
+    /// The platform's HTTPS-through-the-tunnel probe (§66.4).
+    pub fn set_egress_probe(&self, hook: crate::egress_control::ProbeHook) {
+        *self.shared.egress_probe.lock().expect("probe") = Some(hook);
+    }
+    /// New groups/methods; on/off takes effect at the next connect.
+    pub fn update_egress(&self, cfg: crate::egress_control::EgressConfig) {
+        self.send(Event::Egress(cfg));
+    }
+    /// JSON status for the App; `{"running":false}` when not in use.
+    pub fn egress_status(&self) -> String {
+        let ctl = self.shared.egress.lock().expect("egress");
+        ctl.as_ref().map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
+    }
+    /// Set-up probing also works on the ordinary tunnel before protection
+    /// is enabled. Never run a probe against the physical interface.
+    pub fn egress_probe_host(&self, host: &str) -> Vec<crate::egress_control::Observation> {
+        let marker = self.shared.egress.lock().expect("egress").as_ref().map(|ctl| ctl.marker());
+        let (cfg, iface) = {
+            let c = self.shared.core.lock().expect("engine");
+            if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() {
+                return Vec::new();
+            }
+            (c.config.egress.clone().unwrap_or_default(), c.tunnel_if.clone())
+        };
+        let (Some(iface), Some(hook)) = (iface, self.shared.egress_probe.lock().expect("probe").clone())
+        else { return Vec::new() };
+        if cfg.active() && marker.is_none() { return Vec::new(); }
+        let marker = marker.unwrap_or_default();
+        crate::egress_control::probe_methods(&cfg, host, &hook, &marker, &iface)
+    }
 
     pub fn update_direct_domains(&self, d: Vec<String>) {
         self.send(Event::DirectDomains(d));
@@ -578,14 +653,43 @@ impl Engine {
         }
     }
 
+    pub fn reject_gateway_certificate(&self) -> bool {
+        self.record_gateway_rejection(0)
+    }
+
+    pub fn record_gateway_rejection(&self, incident: u64) -> bool {
+        let mut c = self.shared.core.lock().unwrap();
+        self.shared.reject_certificate(&mut c, incident, false)
+    }
+
+    pub fn verified_tunnel(&self, incident: u64) -> bool {
+        let c = self.shared.core.lock().unwrap();
+        c.certificate_incident == incident && c.direct_certificate_error.is_none() && c.driver.state == SessionStatus::Connected
+            && c.hook_fired && c.tunnel_if.is_some() && c.child_alive()
+            && !c.tunnel_retrying && !c.recovery_suspended() && !c.stop_requested && !c.finished
+            && !(c.config.drop_protection && c.pf_needs_load)
+            && !self.shared.guard.was_superseded(&self.shared.holder)
+    }
+
     pub fn info(&self) -> Info {
         self.shared.info.lock().unwrap().clone()
+    }
+
+    /// Site names from failed lookups belong only in the local status UI.
+    pub fn split_status_json(&self) -> String {
+        let info = self.info();
+        let notice = info.dns_source.upgrade().and_then(|source| source.recent_dns_notice());
+        serde_json::json!({
+            "splitRunning": info.split_running, "splitHits": info.split_hits,
+            "splitAddresses": info.split_addresses, "splitWarning": info.split_warning,
+            "pfError": info.pf_error, "dnsNotice": notice,
+        }).to_string()
     }
 
     fn check_expected(&self) -> crate::network_check::Expected {
         let c = self.shared.core.lock().unwrap();
         crate::network_check::Expected {
-            tunnel: c.last_pf.as_ref().map(|p| p.0.clone()), dns_interface: c.forwarder.as_ref().and_then(|f| f.bound_tunnel_interface()),
+            tunnel: c.tunnel_if.clone(), dns_interface: c.forwarder.as_ref().and_then(|f| f.bound_tunnel_interface()),
             physical: c.config.physical_if.clone(), gateway: c.physical_gateway.clone(),
             vpn_gateways: c.last_pf.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
             dns: c.tunnel_dns.clone(), split: c.forwarder.is_some(), protection: c.config.drop_protection,
@@ -636,7 +740,7 @@ impl Core {
     /// A cancelled child is unavailable even after the physical path returns.
     /// Mandatory protection/retirement continues; optional permissions do not.
     fn recovery_suspended(&self) -> bool {
-        self.network.paused || self.resume_after_exit
+        self.network.paused || self.resume_after_exit || self.gate_lost
     }
     fn direct_retry_ready(&self,ip:&Ipv4Addr,now:Instant)->bool {
         self.direct_retries.get(ip).is_none_or(|retry|now>=retry.until)
@@ -666,7 +770,15 @@ impl Core {
                 out.push(n.clone());
             }
         }
+        if let Some(protected) = &self.protected_routes {
+            out.retain(|range| !protected.overlaps(range));
+        }
         out
+    }
+
+    fn split_rules(&self) -> dns_forwarder::SplitRules {
+        dns_forwarder::SplitRules::new(self.config.direct_domains.as_deref().unwrap_or_default())
+            .with_protection(self.protected_routes.clone())
     }
 
     fn support(&self) -> PathBuf {
@@ -694,6 +806,7 @@ impl Shared {
             pf_error: c.pf_error.clone().or_else(||c.network_routes_error.clone()),
             last_terminal: c.last_terminal.map(|t| t as i32),
             split_running: c.forwarder.is_some(),
+            dns_source: c.forwarder.as_ref().map(|f| Arc::downgrade(f.inner())).unwrap_or_default(),
             split_hits: if c.forwarder.is_some() { c.split_hits.clone() } else { Vec::new() },
             split_warning: if c.split_policy.is_saturated() {Some(SPLIT_CAPACITY_ERROR.into())}else{c.direct_retry_warning.clone()},
             split_addresses: if c.forwarder.is_some() { c.split_addresses.len() } else { 0 },
@@ -762,18 +875,43 @@ impl Shared {
                     }
                 }
                 Event::NetworkChanged => {
+                    self.egress_invalidate();
                     if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
                 }
                 Event::DirectDomains(d) => {
+                    c.config.direct_domains = Some(d);
                     c.reset_direct_retries();
                     if let Some(f) = &c.forwarder {
-                        f.set_rules(&d);
+                        f.set_parsed_rules(c.split_rules());
                     }
-                    c.split_policy.revalidate(&dns_forwarder::SplitRules::new(&d));
+                    let rules = c.split_rules();
+                    c.split_policy.revalidate(&rules);
                     self.sync_split_routes(&mut c);
-                    c.config.direct_domains = Some(d);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
+                Event::EgressGateLost(generation) => self.recover_lost_gate(&mut c, generation),
+                Event::Egress(cfg) => {
+                    if c.config.egress.as_ref() == Some(&cfg) { continue; }
+                    if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+                        ctl.update(cfg.clone());
+                    }
+                    c.config.egress = Some(cfg);
+                    let was_active = c.protected_routes.is_some();
+                    c.protected_routes = egress_active(&c.config)
+                        .then(|| Arc::new(c.config.egress.as_ref().expect("active").protected_routes()));
+                    if was_active || c.protected_routes.is_some() {
+                        if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
+                        let rules = c.split_rules();
+                        c.split_policy.revalidate(&rules);
+                        c.reset_direct_retries();
+                        self.sync_split_routes(&mut c);
+                        self.route_networks_direct(&mut c);
+                        if let Some((tun, gateways)) = c.last_pf.clone() {
+                            let allow = c.last_allow_direct_egress;
+                            self.load_pf(&mut c, Some(tun), gateways, allow);
+                        }
+                    }
+                }
                 Event::AllowNetworks(n) => {
                     c.reset_direct_retries();
                     c.config.allow_networks = n.iter().map(|x| x.trim().to_string()).filter(|x| crate::kill_switch::is_cidr(x)).collect();
@@ -900,12 +1038,30 @@ impl Shared {
         self.report(c, "等待网络恢复");
     }
 
+    fn reject_certificate(&self, c: &mut Core, incident: u64, direct: bool) -> bool {
+        if c.stop_requested || self.guard.was_superseded(&self.holder) { return false; }
+        if c.finished {
+            // The TLS refusal and child exit can arrive in either order.
+            // A terminal engine can attest only to its still-installed hold.
+            return c.config.drop_protection && c.config.login_port.is_some() && self.guard.verify_login(&self.holder).is_ok();
+        }
+        c.certificate_incident = incident;
+        c.tunnel_retrying = true;
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        let held = c.config.drop_protection && c.config.login_port.is_some() && self.require_login_hold(c);
+        if direct { c.direct_certificate_error = Some(held); }
+        self.report(c, "VPN 网关证书校验失败");
+        held
+    }
+
     fn report(&self, c: &Core, detail: &str) {
         let mut state = c.driver.state;
         if c.recovery_suspended() && !c.stop_requested && !c.finished {
             state = SessionStatus::Reconnecting;
         }
-        if (c.tunnel_retrying || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
+        if (c.tunnel_retrying || (c.config.login_port.is_some() && c.config.drop_protection && c.pf_needs_load)
+            || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
             state = SessionStatus::Reconnecting;
         }
         // Re-authenticating inside a drop episode is, to the user, still
@@ -915,6 +1071,11 @@ impl Shared {
             state = SessionStatus::Reconnecting;
         }
         self.publish(c);
+        let detail = match c.direct_certificate_error.filter(|_| !c.stop_requested) {
+            Some(true) if c.config.drop_protection && c.pf_error.is_none() => "VPN 网关证书校验失败，网络已拦截",
+            Some(_) => "VPN 网关证书校验失败",
+            None => detail,
+        };
         (self.hooks.state)(state_code(state), detail);
     }
 
@@ -922,7 +1083,7 @@ impl Shared {
 
     fn begin(self: &Arc<Self>, c: &mut Core) {
         c.driver.start();
-        self.take_over_held_set(c);
+        if c.config.login_port.is_none() { self.take_over_held_set(c); }
         self.report(c, "starting");
         if Self::executable(c).is_none() {
             self.spawn_next(c);
@@ -997,6 +1158,7 @@ impl Shared {
         // Retire the offline intent before guard cleanup and terminal callbacks:
         // queued network events must not revive a completed engine.
         c.network.stop();
+        self.egress.lock().expect("egress").take();
         self.guard.own_engine_finished(&self.holder);
         c.last_terminal = Some(reason);
         c.in_drop_episode = false;
@@ -1023,6 +1185,7 @@ impl Shared {
         });
         let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
             Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
+        if c.protected_routes.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {
@@ -1279,6 +1442,72 @@ impl Shared {
         });
     }
 
+    /// The trusted gate program and a running controller (§66.5). Errors are
+    /// user-facing: egress protection never falls back to an unchecked tunnel.
+    fn start_egress(&self, c: &mut Core) -> Result<String, String> {
+        let gate = if c.config.test_active {
+            c.config.test_gate.clone().filter(|g| !g.is_empty()).ok_or_else(|| "出口保护组件缺失".to_string())?
+        } else {
+            let g = format!("{BUNDLED_DIR}/bin/alwaysconnect-gate");
+            if !c.config.gate_signature_verified || !bundled_is_trusted(&g) {
+                return Err("出口保护组件缺失或不可信，请重新安装后台服务".into());
+            }
+            g
+        };
+        let cfg = c.config.egress.clone().unwrap_or_default();
+        let mut slot = self.egress.lock().expect("egress");
+        match slot.as_ref() {
+            Some(ctl) => ctl.update(cfg),
+            None => {
+                let hook = self.egress_probe.lock().expect("probe").clone().unwrap_or_else(|| std::sync::Arc::new(|_: &crate::egress_control::ProbeRequest| None));
+                let support = c.support();
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let private = std::fs::symlink_metadata(&support).is_ok_and(|meta|
+                        meta.is_dir() && (c.config.test_active || meta.uid() == 0));
+                    if !private || std::fs::set_permissions(&support, std::fs::Permissions::from_mode(0o700)).is_err() {
+                        return Err("出口保护需要后台服务的私有目录，请重新安装后台服务".into());
+                    }
+                }
+                let ctl = crate::egress_control::Controller::start(&egress_socket(&support), cfg, hook).map_err(|e| format!("出口保护无法启动：{e}"))?;
+                *slot = Some(ctl);
+            }
+        }
+        let generation = c.generation + 1;
+        let tx = self.tx.lock().expect("engine sender").clone();
+        slot.as_ref().expect("controller installed").watch_next_launch(Box::new(move || {
+            let _ = tx.send(Event::EgressGateLost(generation));
+        }));
+        Ok(gate)
+    }
+
+    fn recover_lost_gate(self: &Arc<Self>, c: &mut Core, generation: u64) {
+        if generation != c.generation || c.stop_requested || c.recovery_suspended() || !c.child_alive()
+            || self.egress.lock().expect("egress").as_ref().is_none_or(|ctl| ctl.has_peer()) {
+            return;
+        }
+        let pid = c.child.as_ref().expect("live child").pid;
+        c.gate_lost = true;
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        if c.config.drop_protection {
+            if let Some((tun, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tun), gateways, false);
+            }
+        }
+        self.report(c, "出口保护闸门已停止，正在重新连接");
+        // HUP preserves the VPN cookie. The regular child-exit path owns the
+        // retry and backoff. A manual stop still takes precedence.
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        self.after(2.0, Event::StopKill { pid, generation });
+    }
+
+    fn egress_invalidate(&self) {
+        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+            ctl.invalidate();
+        }
+    }
+
     fn stop_split(&self, c: &mut Core) {
         c.watching = false;
         if let Some(stop) = c.watch_stop.take() {
@@ -1375,9 +1604,48 @@ impl Shared {
         Some("/usr/bin/env".into())
     }
 
+    fn require_login_hold(&self, c: &mut Core) -> bool {
+        let Some(port) = c.config.login_port.filter(|_| c.config.drop_protection) else { return true; };
+        let inputs = Inputs::login(&c.config.physical_if, c.config.login_gateways.clone(), port, false);
+        let applied = self.guard.install_login(&self.holder, &inputs).and_then(|()| self.guard.verify_login(&self.holder));
+        if let Err(error) = applied {
+            c.pf_error = Some(error.clone());
+            self.report(c, &error);
+            return false;
+        }
+        c.pf_error = None;
+        !inputs.gateway_ips.is_empty()
+    }
+
     fn spawn_next(self: &Arc<Self>, c: &mut Core) {
         if c.stop_requested || c.network.paused || c.child.is_some() || c.finished {
             return;
+        }
+        if self.guard.was_superseded(&self.holder) {
+            // A delayed backoff timer may outlive the handover to another engine.
+            return;
+        }
+        if !self.require_login_hold(c) {
+            self.respawn_after(5.0);
+            return;
+        }
+        // An inherited or dropped session may have failed to install its
+        // blocking rules. Retry that operation before opening another login.
+        if c.config.login_port.is_none() && c.config.drop_protection && c.last_pf.is_some() && c.pf_needs_load {
+            c.last_allow_direct_egress = false;
+            if !self.apply_base_pf(c) {
+                // The bounded command-line runner must finish even when it
+                // cannot install PF. The resident engine has no attempt limit.
+                if let Some(max) = c.config.max_attempts {
+                    c.attempts = c.attempts.saturating_add(1);
+                    if c.attempts >= max {
+                        self.finish_terminal(c, Terminal::AttemptsExhausted, "attempt limit reached while installing protection");
+                        return;
+                    }
+                }
+                self.respawn_after(5.0);
+                return;
+            }
         }
         if let Some(max) = c.config.max_attempts {
             if c.attempts >= max {
@@ -1392,6 +1660,7 @@ impl Shared {
         c.tunnel_retrying = false;
         c.saw_login_failed = false;
         c.tunnel_dns.clear();
+        c.cstp_dns = Default::default();
         c.tunnel_lease = None;
         c.tunnel_if = None;
         self.update_forwarder(c);
@@ -1427,6 +1696,9 @@ impl Shared {
         }
         if let Some(relay) = &c.config.relay {
             args.extend(relay.arguments.iter().cloned());
+        } else if c.config.drop_protection && c.config.login_port.is_some() && !c.config.login_gateways.is_empty() {
+            let index = c.attempts.saturating_sub(1) as usize % c.config.login_gateways.len();
+            args.push(format!("--resolve={}:{}", c.config.login_host, c.config.login_gateways[index]));
         }
         let mut credential = match cookie {
             Some(cookie) => {
@@ -1442,13 +1714,36 @@ impl Shared {
         };
         // openconnect hands --script to /bin/sh -c as a command line, and
         // the installed path has a space ("Application Support").
-        args.push(format!("--script={}", shell_quoted(&c.config.script_path)));
+        let gate = if egress_active(&c.config) {
+            match self.start_egress(c) {
+                Ok(g) => Some(g),
+                Err(detail) => {
+                    self.stop_split(c);
+                    c.last_error = Some(detail.clone());
+                    c.driver.on_manual_disconnect();
+                    self.finish_terminal(c, Terminal::ComponentMissing, &detail);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(gate) = &gate {
+            // §66.5: the gate owns the utun and runs the same vpnc-script,
+            // whose path stays on openconnect's command line.
+            args.push("--script-tun".into());
+            args.push(format!("--script={} {}", shell_quoted(gate), shell_quoted(&c.config.script_path)));
+        } else {
+            args.push(format!("--script={}", shell_quoted(&c.config.script_path)));
+        }
         args.push("--dump-http-traffic".into());
 
         let support = c.support();
         let mut cmd = Command::new(&executable);
         crate::reset_child_signals(&mut cmd);
         cmd.args(&args)
+            .env("LC_MESSAGES", "C")
+            .env("LANGUAGE", "C")
             .env_remove("ALWAYSCONNECT_MANUAL_DISCONNECT")
             // The script's disconnect branch reads a FILE (stop() creates
             // it before terminating the child); a stale one is removed now.
@@ -1474,6 +1769,10 @@ impl Shared {
         }
         if c.forwarder.is_some() {
             cmd.env("ALWAYSCONNECT_DNS_FIRST", "127.0.0.1");
+        }
+        cmd.env_remove("AC_GATE_CONTROL").env_remove("AC_GATE_TUN").env_remove("AC_GATE_VPNC_SCRIPT");
+        if gate.is_some() {
+            cmd.env("AC_GATE_CONTROL", egress_socket(&support)).env("AC_GATE_TUN", "utun");
         }
         c.driver.on_authenticated();
         let label = if c.fed == Credential::Cookie { "cookie" } else { "password" };
@@ -1564,6 +1863,13 @@ impl Shared {
     }
 
     fn handle_line(self: &Arc<Self>, c: &mut Core, line: &str, stdout: bool) {
+        // The CLI emits this final verification error before aborting the TLS
+        // handshake. A warning alone can precede successful pin verification.
+        if !stdout && c.config.relay.is_none()
+            && line.starts_with("Certificate from VPN server \"") && line.ends_with("\" failed verification.") {
+            self.reject_certificate(c, 0, true);
+            return;
+        }
         let redacted = redact(line);
         if c.config.debug_child_output {
             let _ = std::io::stderr().write_all(format!("CHILD {}: {}\n", if stdout { "out" } else { "err" }, redacted).as_bytes());
@@ -1576,6 +1882,23 @@ impl Shared {
         if let Some(payload) = line.strip_prefix("AC_HOOK ") {
             self.handle_hook(c, payload);
             return;
+        }
+        if stdout && c.forwarder.is_some() && c.cstp_dns.observe(line) && c.hook_fired {
+            // A script-tun gate survives an internal transport reconnect.
+            // Its previous checks no longer describe the new connection.
+            self.egress_invalidate();
+            let servers = c.cstp_dns.accepted().expect("completed CSTP negotiation");
+            if servers != c.tunnel_dns {
+                c.tunnel_dns = servers.to_vec();
+                self.update_forwarder(c);
+                // Script-tun gets no reconnect hook. The gate's confirmed
+                // interface remains the owner; native mode rearms in its hook.
+                if !c.tunnel_retrying && !c.recovery_suspended() && c.child_alive() {
+                    if let (Some(tun), Some((_, gateways))) = (c.tunnel_if.clone(), c.last_pf.clone()) {
+                        self.load_pf(c, Some(tun), gateways, c.last_allow_direct_egress);
+                    }
+                }
+            }
         }
         if let Some(cookie) = capture_cookie(line) {
             cookie_save(&c.config.cookie_store_path, &cookie, &c.config.server);
@@ -1600,6 +1923,7 @@ impl Shared {
         let pairs: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
         match event {
             "connect" => {
+                self.egress_invalidate();
                 c.tunnel_dns.clear();
                 let mut tun = None;
                 let mut gateway = None;
@@ -1627,7 +1951,29 @@ impl Shared {
                         _ => {}
                     }
                 }
+                if c.config.login_port.is_some() {
+                    let peer = c.config.relay.as_ref().map(|relay| relay.gateway_ip.clone()).or_else(|| gateway.clone());
+                    let Some(peer) = peer.filter(|ip| network_guard::is_ip(ip)
+                        && (!c.config.drop_protection || c.config.login_gateways.contains(ip))) else {
+                        c.tunnel_if = None;
+                        c.tunnel_retrying = true;
+                        self.require_login_hold(c);
+                        self.report(c, "网关地址未获准，登录保护保持");
+                        return;
+                    };
+                    if !c.config.login_gateways.contains(&peer) { c.config.login_gateways.push(peer.clone()); }
+                    if !c.config.no_routes && !c.config.test_active && tun.as_deref().is_some_and(|t| t.starts_with("utun")) {
+                        if let Err(error) = crate::login_cache::remember(&c.support(), &c.config.login_host,
+                            c.config.login_port.unwrap(), &peer) {
+                            let _ = writeln!(std::io::stderr(), "gateway cache write failed: {:?}", error.kind());
+                        }
+                    }
+                    gateway = Some(peer);
+                }
                 c.hook_fired = true;
+                if let Some(servers) = c.cstp_dns.accepted() {
+                    c.tunnel_dns = servers.to_vec();
+                }
                 c.tunnel_retrying = false;
                 if c.forwarder.is_some() || c.config.relay.is_some() {
                     c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(&c.config.physical_if) };
@@ -1642,15 +1988,20 @@ impl Shared {
                 c.episode_retries = 0;
                 c.in_drop_episode = false;
                 c.driver.on_auth_outcome(AuthOutcome::Success);
-                self.report(c, "tunnel up");
                 let allow = c.config.allow_direct_egress_when_connected;
                 self.load_pf(c, tun, gateway.into_iter().collect(), allow);
+                if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
+                    c.direct_certificate_error = None;
+                }
+                self.report(c, c.pf_error.as_deref().unwrap_or("tunnel up"));
                 self.route_networks_direct(c);
             }
             "attempt-reconnect" => {
                 // openconnect is retrying inside the same process (§28.1).
                 c.tunnel_retrying = true;
+                c.cstp_dns = Default::default();
                 c.tunnel_if = None;
+                self.require_login_hold(c);
                 self.update_forwarder(c);
                 let phys = pairs.iter().find(|(k, v)| *k == "phys" && !v.is_empty()).map(|(_, v)| v.to_string());
                 let gw = pairs.iter().find(|(k, v)| *k == "physgw" && is_ipv4(v)).map(|(_, v)| v.to_string());
@@ -1667,7 +2018,9 @@ impl Shared {
                 if !c.config.no_routes { self.refresh_network(c); }
                 c.tunnel_if = pairs.iter().find(|(k,v)| *k == "tun" && !v.is_empty()).map(|(_,v)| v.to_string())
                     .or_else(|| c.last_pf.as_ref().map(|p| p.0.clone()));
-                if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
+                if let Some(servers) = c.cstp_dns.for_reconnect_hook() {
+                    c.tunnel_dns = servers.to_vec();
+                } else if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
                     c.tunnel_dns = dns.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
                 }
                 self.remember_tunnel(c);
@@ -1675,6 +2028,9 @@ impl Shared {
                 if let Some((_, gateways)) = c.last_pf.clone() {
                     let allow = c.last_allow_direct_egress;
                     self.load_pf(c, c.tunnel_if.clone(), gateways, allow);
+                }
+                if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
+                    c.direct_certificate_error = None;
                 }
                 self.report(c, "tunnel up");
             }
@@ -1727,10 +2083,15 @@ impl Shared {
     fn child_exited(self: &Arc<Self>, c: &mut Core) {
         // This intent belongs to the exiting child, even when another offline
         // episode currently prevents its requested restart.
+        if !c.stop_requested && c.hook_fired && c.config.drop_protection && c.config.login_port.is_some() {
+            c.tunnel_if = None;
+            self.require_login_hold(c);
+        }
         let resume_after_exit = std::mem::take(&mut c.resume_after_exit);
+        let gate_lost = std::mem::take(&mut c.gate_lost);
         // Partial trailing lines.
         for stdout in [true, false] {
-            if c.network.paused || resume_after_exit {
+            if c.network.paused || resume_after_exit || gate_lost {
                 break;
             }
             let rest = std::mem::take(if stdout { &mut c.out_buffer } else { &mut c.err_buffer });
@@ -1806,7 +2167,7 @@ impl Shared {
             self.finish_terminal(c, Terminal::AuthFailure, &e);
             return;
         }
-        if c.fed == Credential::Cookie && !c.hook_fired {
+        if c.fed == Credential::Cookie && !c.hook_fired && !gate_lost {
             // Cookie refused before any tunnel: drop it, password once.
             let _ = std::fs::remove_file(&c.config.cookie_store_path);
             if !c.cookie_fallback_used {
@@ -1883,13 +2244,18 @@ impl Shared {
     /// either network refresh or DNS acknowledgement can recover it safely.
     fn apply_base_pf(&self, c: &mut Core) -> bool {
         if c.stop_requested {return false;}
+        if c.config.drop_protection && c.config.login_port.is_some()
+            && (c.tunnel_retrying || c.tunnel_if.is_none() || c.recovery_suspended()) {
+            c.pf_needs_load = !self.require_login_hold(c);
+            return !c.pf_needs_load;
+        }
         if !c.config.drop_protection {c.pf_needs_load=false;c.pf_error=None;return true;}
         let Some((tun,gateway_ips))=c.last_pf.clone() else {return false;};
         c.pf_needs_load=true;
         let split=c.forwarder.is_some();
         let own_dns=c.config.direct_domains.is_some()||c.config.relay.is_some()||split;
         let connected=c.last_allow_direct_egress&&!own_dns&&!c.recovery_suspended();
-        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split};
+        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split,login_port:c.config.login_port,..Inputs::default()};
         // The base guard is mandatory. Optional routing, journaling and table
         // failures may disable bypasses, never the physical blocking policy.
         if let Some(error)=self.guard.apply(&self.holder,connected,&inputs) {c.pf_error=Some(error.clone());self.report(c,&error);return false;}
@@ -1900,6 +2266,7 @@ impl Shared {
 
     fn rearm_direct_after_sync(&self,c:&mut Core)->bool {
         if !c.config.drop_protection || c.stop_requested {return true;}
+        if c.config.login_port.is_some() && (c.tunnel_if.is_none() || c.tunnel_retrying) { return true; }
         // Route/PF cleanup may converge while offline; only restoration may
         // reopen optional bypasses. Mandatory base protection still retries.
         if c.recovery_suspended() {return true;}
@@ -2296,6 +2663,67 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(support).unwrap();
     }
+    #[test]
+    fn reconnect_uses_current_cstp_dns_even_if_the_script_reports_the_initial_servers() {
+        let (engine, support) = split_engine("cstp-dns");
+        let mut c = engine.shared.core.lock().unwrap();
+        let upstream = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        upstream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let iface = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
+        c.forwarder = Some(Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), port,
+            Duration::from_millis(400), vec![],
+            Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }, None));
+        let dns = c.forwarder.as_ref().unwrap().inner().clone();
+        let receive = |c: &mut Core, dns: Option<&str>| {
+            for line in ["> CONNECT /CSCOSSLC/tunnel HTTP/1.1", "Got CONNECT response: HTTP/1.1 200 OK"] {
+                engine.shared.handle_line(c, line, true);
+            }
+            if let Some(server) = dns {
+                engine.shared.handle_line(c, &format!("X-CSTP-DNS: {server}"), true);
+            }
+            engine.shared.handle_line(c, "CSTP connected. DPD 30, Keepalive 20", true);
+        };
+        receive(&mut c, Some("192.0.2.11"));
+        engine.shared.handle_hook(&mut c, &format!("connect tun={iface} gateway=198.51.100.1 dns=192.0.2.11"));
+        engine.shared.handle_hook(&mut c, "attempt-reconnect");
+        receive(&mut c, Some("127.0.0.1"));
+        engine.shared.handle_hook(&mut c, &format!("reconnect tun={iface} dns=192.0.2.11"));
+        let refreshed = c.tunnel_dns.clone();
+        let server = std::thread::spawn(move || {
+            let mut bytes = [0; 512];
+            let (len, peer) = upstream.recv_from(&mut bytes).unwrap();
+            let mut answer = bytes[..len].to_vec();
+            answer[2..12].copy_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+            answer.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 29]);
+            upstream.send_to(&answer, peer).unwrap();
+        });
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04site\x07example\x00\x00\x01\x00\x01";
+        let answer = dns.resolve(query);
+        // In script-tun mode the still-running gate gets no second hook.
+        receive(&mut c, Some("192.0.2.33"));
+        let without_hook = c.tunnel_dns.clone();
+        engine.shared.handle_hook(&mut c, "attempt-reconnect");
+        receive(&mut c, None);
+        engine.shared.handle_hook(&mut c, &format!("reconnect tun={iface} dns=192.0.2.11"));
+        let withdrawn = c.tunnel_dns.clone();
+        let after_withdrawal = dns.resolve(query);
+        drop(c);
+        engine.stop(false, false);
+        let (done, stopped) = mpsc::channel();
+        engine.send(Event::Barrier(done));
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+        assert_eq!(refreshed, ["127.0.0.1"], "old hook env replaced the newly negotiated upstream");
+        server.join().unwrap();
+        assert_eq!(dns_forwarder::ipv4_answers(&answer.expect("the new upstream answered")),
+                   [Ipv4Addr::new(203, 0, 113, 29)]);
+        assert!(withdrawn.is_empty(), "an explicitly withdrawn upstream was reinstated");
+        assert!(after_withdrawal.is_none());
+        assert_eq!(without_hook, ["192.0.2.33"]);
+    }
+
     #[test]
     fn reconnect_and_network_change_invalidate_vpn_dns_interface() {
         let (engine, support) = split_engine("reconnect");
@@ -2707,6 +3135,153 @@ mod tests {
         },guard)
     }
     #[test]
+    fn rejection_after_connected_pushes_failure_and_requires_new_tunnel_for_the_current_incident() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let pushed = reports.clone();
+        let (engine, support) = split_engine_with_hooks("rejected-connected", Hooks {
+            state: Box::new(move |code, detail| pushed.lock().unwrap().push((code, detail.to_owned()))),
+            terminal: Box::new(|_| ()), network_available: Box::new(|| true),
+            physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
+            system_roots: Box::new(|| None), stopped: Box::new(|| ()),
+        });
+        let mut child = crate::child_io::spawn(Command::new("/bin/sleep").arg("10")).unwrap();
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.config.drop_protection = false;
+            c.child = Some(Child { pid: child.id() as i32, generation: c.generation, alive: Arc::new(AtomicBool::new(true)) });
+            c.driver.start();
+            c.driver.on_authenticated();
+            engine.shared.handle_hook(&mut c, "connect tun=utun5 gateway=192.0.2.10");
+        }
+        assert!(engine.verified_tunnel(0));
+        assert!(!engine.record_gateway_rejection(11), "protection is off");
+        assert_eq!(reports.lock().unwrap().last().unwrap(), &(state_code(SessionStatus::Reconnecting), "VPN 网关证书校验失败".into()));
+        assert!(!engine.verified_tunnel(11));
+        engine.record_gateway_rejection(12);
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            engine.shared.handle_hook(&mut c, "reconnect tun=utun5 dns=192.0.2.53");
+        }
+        assert!(engine.verified_tunnel(12));
+        assert!(!engine.verified_tunnel(11));
+        engine.shared.core.lock().unwrap().child = None;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    #[test]
+    fn protected_login_checks_loaded_rules_before_the_child_and_holds_after_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let (support, guard, pfctl) = recovery_guard("strict-cold");
+        let script = r#"#!/bin/sh
+d=$(dirname "$0")
+case "$*" in
+    -E) echo 'Token : 99' >&2 ;;
+    "-s info") echo 'Status: Enabled' ;;
+    "-s rules") echo 'anchor "com.apple/300.AlwaysConnect" all' ;;
+    "-vv -s states") cat "$d/states" ;;
+    "-a com.apple/300.AlwaysConnect -f -") cat > "$d/anchor" ;;
+    "-a com.apple/300.AlwaysConnect -s rules") cat "$d/anchor" ;;
+esac
+"#;
+        std::fs::write(&pfctl, script).unwrap();
+        std::fs::write(support.join("states"), "all tcp existing").unwrap();
+        let fake = support.join("openconnect");
+        std::fs::write(&fake, r#"#!/bin/sh
+d=$(dirname "$0")
+cp "$d/anchor" "$d/at-login"
+printf '%s\n' "$@" > "$d/login-args"
+exit 1
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let engine = recovery_engine(&support, guard.clone());
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.config.login_host = "gateway.example".into();
+            c.config.login_port = Some(8443);
+            c.config.login_gateways = vec!["192.0.2.23".into()];
+            c.config.openconnect_path = Some(fake.to_string_lossy().into_owned());
+            c.config.direct_domains = None;
+            engine.shared.spawn_next(&mut c);
+            assert!(c.child.is_none() && c.pf_error.is_some());
+            assert!(guard.is_holding() && !support.join("at-login").exists());
+            std::fs::write(support.join("states"), "").unwrap();
+            c.config.max_attempts = Some(1);
+            engine.shared.spawn_next(&mut c);
+            assert!(c.child.is_some(), "successful guard verification permits login");
+        }
+        for _ in 0..100 {
+            if support.join("login-args").is_file() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let anchor = std::fs::read_to_string(support.join("at-login")).unwrap();
+        assert!(anchor.ends_with("block drop out quick all\n"));
+        assert!(!anchor.contains("utun"));
+        assert!(anchor.contains("to 192.0.2.23 port 8443 no state"));
+        assert!(std::fs::read_to_string(support.join("login-args")).unwrap().contains("--resolve=gateway.example:192.0.2.23"));
+        assert!(engine.record_gateway_rejection(7));
+        assert!(!engine.verified_tunnel(7));
+        assert_eq!(guard.expected_rules().unwrap(), anchor);
+        engine.stop(false, false);
+        for _ in 0..150 {
+            if !guard.is_holding() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!guard.is_holding());
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn login_waits_when_reinstalling_an_existing_guard_fails() {
+        let (support, guard, tool) = recovery_guard("protect-retry");
+        let engine = recovery_engine(&support, guard.clone());
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["192.0.2.20".into()],
+                physical_if: "en0".into(), ..Inputs::default() };
+            assert!(guard.apply("previous", false, &inputs).is_none());
+            std::fs::write(tool.with_extension("fail"), "").unwrap();
+            engine.shared.take_over_held_set(&mut c);
+            assert!(c.pf_needs_load);
+            engine.shared.spawn_next(&mut c);
+            assert!(c.child.is_none() && c.pf_needs_load && c.pf_error.is_some());
+            assert_eq!(c.attempts, 0);
+            assert!(guard.held().is_some());
+
+            std::fs::remove_file(tool.with_extension("fail")).unwrap();
+            // A zero test attempt limit lets us observe recovery without a child.
+            c.config.max_attempts = Some(0);
+            engine.shared.spawn_next(&mut c);
+            assert!(!c.pf_needs_load && c.finished);
+            assert_eq!(guard.holder().as_deref(), Some(engine.shared.holder.as_str()));
+            c.stop_requested = true;
+        }
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_stops_at_its_limit_with_the_guard_still_held() {
+        let (support, guard, tool) = recovery_guard("bounded-protection");
+        let engine = recovery_engine(&support, guard.clone());
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["192.0.2.9".into()],
+                physical_if: "en0".into(), ..Inputs::default() };
+            assert!(guard.apply("previous", false, &inputs).is_none());
+            std::fs::write(tool.with_extension("fail"), "").unwrap();
+            c.config.max_attempts = Some(1);
+            engine.shared.take_over_held_set(&mut c);
+            engine.shared.spawn_next(&mut c);
+            assert!(c.finished && c.child.is_none());
+            assert_eq!(c.last_terminal, Some(Terminal::AttemptsExhausted));
+            assert!(guard.held().is_some());
+        }
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
     fn failed_split_forwarder_keeps_physical_blocking_and_gateway_dns_fallback() {
         let (support,guard,_)=recovery_guard("forwarder-fallback");
         let engine=recovery_engine(&support,guard.clone());
@@ -2937,3 +3512,5 @@ exit 0
 
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod egress_tests;
