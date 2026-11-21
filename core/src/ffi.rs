@@ -1377,6 +1377,15 @@ pub extern "C" fn ac_guard_new_own_holder() -> *mut c_char {
 /// `inputs` is the Inputs JSON. Null = applied (or stale holder); else
 /// the panel's red pf line.
 #[no_mangle]
+pub extern "C" fn ac_guard_login(holder: *const c_char, physical: *const c_char,
+    gateways: *const c_char, port: u16, cisco: bool, verify: bool) -> *mut c_char {
+    let (Some(guard), Some(holder)) = (guard(), c_str(holder)) else { return owned("后台服务尚未就绪".into()); };
+    let inputs = network_guard::Inputs::login(&c_str(physical).unwrap_or_default(), c_list(gateways, ','), port, cisco);
+    let result = guard.install_login(&holder, &inputs).and_then(|()| if verify { guard.verify_login(&holder) } else { Ok(()) });
+    result.err().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_guard_apply(holder: *const c_char, connected: bool, inputs: *const c_char) -> *mut c_char {
     let (Some(g), Some(holder)) = (guard(), c_str(holder)) else { return owned("pf 兜底未生效".into()) };
     let Some(inputs) = c_str(inputs).and_then(|j| serde_json::from_str::<network_guard::Inputs>(&j).ok()) else {

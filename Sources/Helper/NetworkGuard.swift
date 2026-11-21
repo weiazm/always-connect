@@ -23,6 +23,8 @@ final class NetworkGuard {
         var directTable: Bool = false
         var strictDNS: Bool = false
         var blockDirect: Bool = false
+        var loginPort: UInt16?
+        var loginUDP: Bool?
     }
 
     /// guard.json as written (the harness writes records of earlier runs).
@@ -84,6 +86,11 @@ final class NetworkGuard {
     func apply(holder: String, connected: Bool, inputs: Inputs) -> String? {
         guard let json = try? JSONEncoder().encode(inputs) else { return "pf 兜底未生效：规则生成被拒" }
         return Self.take(ac_guard_apply(holder, connected, String(decoding: json, as: UTF8.self)))
+    }
+
+    func installLogin(holder: String, physical: String, gateways: [String],
+                      port: UInt16, cisco: Bool, verify: Bool) -> String? {
+        Self.take(ac_guard_login(holder, physical, gateways.joined(separator: ","), port, cisco, verify))
     }
 
     /// Let go of `holder`'s set; nil = whatever is held.
@@ -213,3 +220,8 @@ func ac_guard_apply(_ holder: UnsafePointer<CChar>, _ connected: Bool, _ inputs:
 @_silgen_name("ac_guard_adopt_at_start") func ac_guard_adopt_at_start()
 @_silgen_name("ac_guard_text")
 func ac_guard_text(_ connected: Bool, _ inputs: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+
+@_silgen_name("ac_guard_login")
+private func ac_guard_login(_ holder: UnsafePointer<CChar>, _ physical: UnsafePointer<CChar>,
+                            _ gateways: UnsafePointer<CChar>, _ port: UInt16, _ cisco: Bool, _ verify: Bool) -> UnsafeMutablePointer<CChar>?

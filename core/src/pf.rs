@@ -167,6 +167,30 @@ fn valid_cidr(s: &str) -> bool {
     }
 }
 
+/// Before authentication there is no trusted tunnel. Keep DNS on loopback and
+/// admit only the selected gateway transport and directly attached private LANs.
+pub fn login_rules(physical: &str, gateways: &[String], port: u16, udp: bool, lans: &[String]) -> Option<String> {
+    if port == 0 || (!valid_iface(physical) && !(physical.is_empty() && gateways.is_empty() && lans.is_empty())) { return None; }
+    let mut out = String::from("pass out quick on lo0 all no state\nblock drop out quick proto { udp tcp } to any port 53\n");
+    let transport = if udp { "{ tcp udp }" } else { "tcp" };
+    for raw in gateways {
+        let ip = raw.parse::<std::net::IpAddr>().ok()?;
+        out.push_str(&format!("pass out quick on {physical} proto {transport} to {ip} port {port} no state\n"));
+    }
+    for lan in lans {
+        if !valid_cidr(lan) { return None; }
+        out.push_str(&format!("pass out quick on {physical} to {lan} no state\n"));
+    }
+    out.push_str("pass out quick inet proto udp from any port 68 to any port 67 no state\n");
+    out.push_str("pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n");
+    out.push_str("pass out quick inet6 proto icmp6 to ff02::/16 no state\n");
+    out.push_str("pass out quick inet6 to fe80::/10 no state\n");
+    out.push_str("pass out quick proto udp to 224.0.0.251 port 5353 no state\n");
+    out.push_str("pass out quick proto udp to ff02::fb port 5353 no state\n");
+    out.push_str("block drop out quick all\n");
+    Some(out)
+}
+
 /// Generate the anchor text. Deterministic: same input, same output
 /// byte for byte (tests pin the exact text).
 pub fn generate(input: &PfInput) -> Result<String, PfError> {
@@ -286,6 +310,21 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unauthenticated_login_has_only_the_carrier_and_lan_exceptions() {
+        let lans = vec!["192.168.2.0/24".into()];
+        let no_gateway = login_rules("en0", &[], 443, false, &lans).unwrap();
+        assert!(!no_gateway.contains(" port 443") && !no_gateway.contains("utun"));
+        assert!(no_gateway.find("to any port 53").unwrap() < no_gateway.find(&lans[0]).unwrap());
+        for udp in [true, false] {
+            let text = login_rules("en0", &["192.0.2.9".into()], 8443, udp, &lans).unwrap();
+            assert!(text.contains("to 192.0.2.9 port 8443 no state"));
+            assert_eq!(text.contains("proto { tcp udp } to 192.0.2.9"), udp);
+            assert!(text.ends_with("block drop out quick all\n"));
+            assert!(!text.contains("user root") && !text.contains("utun") && !text.contains("on en0 all"));
+        }
+    }
 
     #[test]
     fn our_passes_cannot_create_states_that_outlive_a_policy_change() {

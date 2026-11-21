@@ -196,6 +196,25 @@ fn loopback_state(line: &str) -> bool {
         && fields.next().is_some() && fields.next().is_none()
 }
 
+pub(crate) fn confirm_login_rules(pfctl: &str, expected: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut get = |_: &str, args: &[&str]| read_command(pfctl,
+        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400)));
+    let info = get(pfctl, &["-s", "info"]);
+    if !info.ok || !info.text.contains("Status: Enabled") { return Err("系统防火墙状态未确认，已停止登录".into()); }
+    let anchor = get(pfctl, &["-a", crate::pf::ANCHOR, "-s", "rules"]);
+    if !anchor.ok || !expand_loaded_tables(&anchor.text, &mut get).is_some_and(|actual| rules_match(&actual, expected)) {
+        return Err("登录保护规则未确认，已停止登录".into());
+    }
+    if !anchor_chain(&mut get) { return Err("防火墙调用顺序未确认，已停止登录".into()); }
+    let states = get(pfctl, &["-s", "states"]);
+    if !states.ok || !states.text.lines().filter(|s| !s.trim().is_empty()).all(loopback_state) {
+        return Err("已有连接的拦截未确认，已停止登录".into());
+    }
+    Ok(())
+}
+
 /// Confirm the small, unconditional Apple wildcard/direct call chain. Unknown
 /// filter rules and populated sibling anchors are conservatively unconfirmed.
 fn anchor_calls(text: &str) -> Option<Vec<String>> {

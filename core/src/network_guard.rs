@@ -62,6 +62,28 @@ pub struct Inputs {
     pub strict_dns: bool,
     #[serde(default)]
     pub block_direct: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_port: Option<u16>,
+    #[serde(rename = "loginUDP", default)]
+    pub login_udp: bool,
+}
+
+impl Inputs {
+    pub fn login(physical: &str, gateways: Vec<String>, port: u16, udp: bool) -> Self {
+        let mut lans = Vec::new();
+        if !physical.is_empty() {
+            for (interface, (lo, hi)) in crate::direct_routes::attached_interfaces() {
+                if interface != physical { continue; }
+                let (first, last) = (std::net::Ipv4Addr::from(lo), std::net::Ipv4Addr::from(hi));
+                let prefix = (lo ^ hi).leading_zeros();
+                if first.is_private() && last.is_private() && prefix >= 8 {
+                    lans.push(format!("{first}/{prefix}"));
+                }
+            }
+        }
+        Self { physical_if: physical.to_owned(), gateway_ips: gateways, allow_networks: lans,
+            login_port: Some(port), login_udp: udp, strict_dns: true, ..Self::default() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -103,6 +125,9 @@ pub fn is_ip(s: &str) -> bool {
 
 /// The anchor text for a set (core/src/pf.rs), or None when refused.
 pub fn text(connected: bool, i: &Inputs) -> Option<String> {
+    if let Some(port) = i.login_port.filter(|_| !connected && i.tunnel_if.is_empty()) {
+        return pf::login_rules(&i.physical_if, &i.gateway_ips, port, i.login_udp, &i.allow_networks);
+    }
     // As the comma-separated C call did: entries trimmed, empty ones dropped.
     let clean = |v: &Vec<String>| -> Vec<String> {
         v.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && !x.contains(',')).collect()
@@ -290,6 +315,26 @@ impl Guard {
         Self::is_stale(&self.state.lock().unwrap(), holder)
     }
 
+    pub fn install_login(self: &Arc<Self>, holder: &str, inputs: &Inputs) -> Result<(), String> {
+        if inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() { return Err("登录保护规则无效".into()); }
+        let mut state = self.state.lock().unwrap();
+        if Self::is_stale(&state, holder) { return Err("连接请求已过期".into()); }
+        if let Some(error) = self.apply_locked(&mut state, holder, false, inputs) { return Err(error); }
+        Ok(())
+    }
+
+    pub fn verify_login(&self, holder: &str) -> Result<(), String> {
+        let Some((owner, inputs)) = self.held() else { return Err("登录保护未装载".into()); };
+        if owner != holder || inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() || self.was_superseded(holder) {
+            return Err("登录保护已变化".into());
+        }
+        let rules = text(false, &inputs).ok_or("登录保护规则无效")?;
+        let path = self.settings.pfctl.as_deref().ok_or("系统防火墙不可用")?;
+        crate::network_check::confirm_login_rules(path, &rules)?;
+        if self.was_superseded(holder) || self.held() != Some((owner, inputs)) { return Err("检查时登录保护已变化".into()); }
+        Ok(())
+    }
+
     /// Load the connected or blocking set for `holder`. None on success
     /// (or when the holder is stale), else the panel's red pf line.
     pub fn apply(self: &Arc<Self>, holder: &str, connected: bool, inputs: &Inputs) -> Option<String> {
@@ -393,7 +438,7 @@ impl Guard {
     pub fn update_held_allow_networks(self:&Arc<Self>, networks: &[String]) {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return };
-        if current.holder == CISCO_HOLDER || current.inputs.allow_networks == networks {
+        if current.holder == CISCO_HOLDER || current.inputs.login_port.is_some() || current.inputs.allow_networks == networks {
             return;
         }
         current.inputs.allow_networks = networks.to_vec();
@@ -406,7 +451,7 @@ impl Guard {
     pub fn refresh_bootstrap_dns(self:&Arc<Self>, physical: &str, servers: &[String]) -> bool {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return true };
-        if current.holder == CISCO_HOLDER || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
+        if current.holder == CISCO_HOLDER || current.inputs.login_port.is_some() || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
         if s.active_own.as_deref()==Some(current.holder.as_str())&&!Self::is_stale(&s,&current.holder) {
             return current.inputs.physical_if==physical&&current.inputs.local_dns_servers==servers;
         }
@@ -550,7 +595,15 @@ impl Guard {
         }
         s.direct = saved.direct.clone().unwrap_or_default().into_iter().collect();
         // No owner yet and the tunnel's fate unknown: fail closed.
-        if saved.connected || saved.inputs.direct_table {
+        if let Some(port) = saved.inputs.login_port {
+            saved.inputs = Inputs::login(&saved.inputs.physical_if, saved.inputs.gateway_ips.clone(), port, saved.inputs.login_udp);
+            saved.connected = false;
+            saved.direct = None;
+            s.direct.clear();
+            if text(false, &saved.inputs).is_none_or(|rules| s.pf.load(&rules).is_err()) {
+                log("guard: restored login policy could not be confirmed");
+            }
+        } else if saved.connected || saved.inputs.direct_table {
             // A restarted daemon has not reconciled the old session's route
             // ownership or DNS policy. Keep base protection without bypasses.
             if saved.inputs.direct_table { saved.inputs.block_direct=true; }
@@ -680,7 +733,7 @@ mod tests {
         let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
             grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
         let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.1".into()],
-            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], tunnel_dns_servers:vec![], direct_table: true, strict_dns: false, block_direct: false };
+            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], tunnel_dns_servers:vec![], direct_table: true, strict_dns: false, block_direct: false, ..Inputs::default() };
         let holder = guard.new_own_holder();
         assert!(guard.apply(&holder, false, &inputs).is_none());
         assert!(guard.add_direct(&["203.0.113.9".into()]));
@@ -706,7 +759,7 @@ mod tests {
         std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
         let settings=||Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())};
         let guard=Arc::new(Guard::new(settings()));guard.owner_attached();let holder=guard.new_own_holder();
-        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],tunnel_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false};
+        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],tunnel_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false,..Inputs::default()};
         assert!(guard.apply(&holder,false,&inputs).is_none());assert!(guard.add_direct(&["203.0.113.9".into()]));
         let recovered=Arc::new(Guard::new(settings()));recovered.adopt_at_start();recovered.owner_attached();
         assert!(recovered.is_holding());assert!(recovered.held().unwrap().1.block_direct);

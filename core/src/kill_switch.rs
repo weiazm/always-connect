@@ -160,6 +160,7 @@ impl KillSwitch {
             direct_table: false,
             strict_dns: false,
             block_direct: false,
+            ..Inputs::default()
         };
         if let Some(problem) = self.guard.apply(CISCO_HOLDER, !blocking, &inputs) {
             return (false, problem);

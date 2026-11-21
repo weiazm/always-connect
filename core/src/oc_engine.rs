@@ -2145,7 +2145,7 @@ impl Shared {
         let split=c.forwarder.is_some();
         let own_dns=c.config.direct_domains.is_some()||c.config.relay.is_some()||split;
         let connected=c.last_allow_direct_egress&&!own_dns&&!c.recovery_suspended();
-        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split};
+        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split,..Inputs::default()};
         // The base guard is mandatory. Optional routing, journaling and table
         // failures may disable bypasses, never the physical blocking policy.
         if let Some(error)=self.guard.apply(&self.holder,connected,&inputs) {c.pf_error=Some(error.clone());self.report(c,&error);return false;}
