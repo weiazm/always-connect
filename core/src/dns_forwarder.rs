@@ -742,22 +742,45 @@ fn tcp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&
 /// consume the same budget instead of starting another socket timeout.
 pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
     let binding=match interface {Some(name)=>Some(InterfaceBinding::new(name)?),None=>None};
-    exchange_bound(query,servers,port,binding.as_ref(),timeout)
+    exchange_bound(query, servers, port, binding.as_ref(), timeout, 0).map(|(_, reply)| reply)
 }
-fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
-    let attempts=u32::try_from(servers.len().saturating_mul(2)).unwrap_or(u32::MAX);
-    let budget=timeout.saturating_mul(attempts).min(Duration::from_secs(8));
-    exchange_until(query,servers,port,interface,timeout,Instant::now()+budget)
+
+const BACKUP_DELAY: Duration = Duration::from_millis(350);
+const PREFER_BACKUP_FOR: Duration = Duration::from_secs(30);
+
+fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>,
+                  timeout: Duration, first: usize) -> Option<(usize, Vec<u8>)> {
+    let attempts = u32::try_from(servers.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let deadline = Instant::now() + timeout.saturating_mul(attempts).min(Duration::from_secs(8));
+    if servers.len() > 1 && timeout > BACKUP_DELAY {
+        // A silent primary must not exhaust the system resolver's own timeout.
+        // Try only peers in this DNS view, using the same interface binding.
+        for offset in 0..servers.len() {
+            remaining(deadline)?;
+            let index = (first + offset) % servers.len();
+            let server = &servers[index];
+            if let Some(answer) = udp_exchange_until(query, server, port, interface, deadline.min(Instant::now() + BACKUP_DELAY)) {
+                if !is_truncated(&answer) { return Some((index, answer)); }
+                if let Some(full) = tcp_exchange_until(query, server, port, interface, deadline.min(Instant::now() + BACKUP_DELAY)) {
+                    if !is_truncated(&full) { return Some((index, full)); }
+                }
+            }
+        }
+    }
+    // Slow UDP-only and TCP-only resolvers retain the full transport attempts.
+    exchange_until(query, servers, port, interface, timeout, deadline)
 }
-fn exchange_until(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, attempt: Duration, deadline: Instant) -> Option<Vec<u8>> {
-    for server in servers {
+
+fn exchange_until(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>,
+                  attempt: Duration, deadline: Instant) -> Option<(usize, Vec<u8>)> {
+    for (index, server) in servers.iter().enumerate() {
         remaining(deadline)?;
-        if let Some(answer)=udp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
-            if !is_truncated(&answer) { return Some(answer); }
+        if let Some(answer) = udp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
+            if !is_truncated(&answer) { return Some((index, answer)); }
         }
         remaining(deadline)?;
-        if let Some(answer)=tcp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
-            if !is_truncated(&answer) { return Some(answer); }
+        if let Some(answer) = tcp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
+            if !is_truncated(&answer) { return Some((index, answer)); }
         }
     }
     None
@@ -818,7 +841,7 @@ pub(crate) fn resolve_gateway_with(permit: &GatewayPermit, host: &str, servers: 
     let Some(binding)=InterfaceBinding::new(physical_if) else {return vec![]};
     let Some(left)=remaining(permit.deadline) else {return vec![]};
     let slots=(servers.len().max(1)*2) as u32;
-    let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
+    let Some((_, answer))=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
     answer_addresses(&answer,&query).unwrap_or_default().iter().map(ToString::to_string).collect()
 }
 
@@ -902,6 +925,7 @@ pub struct Inner {
     settings: RwLock<Settings>,
     on_answer: Option<AnswerHook>,
     recent_failure: Mutex<Option<DnsFailure>>,
+    preferred_server: [Mutex<Option<(u64, usize, Instant)>>; 2],
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -1006,7 +1030,19 @@ impl Inner {
             return None;
         }
         let slot = PathSlot(path);
-        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout);
+        let preference = &self.preferred_server[usize::from(entry.is_some())];
+        let first = if servers.len() > 1 {
+            preference.lock().unwrap().filter(|(generation, index, since)|
+                *generation == epoch && *index < servers.len() && since.elapsed() < PREFER_BACKUP_FOR
+            ).map_or(0, |(_, index, _)| index)
+        } else { 0 };
+        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout, first)
+            .map(|(index, answer)| {
+                if first != index && self.settings.read().unwrap().epoch == epoch {
+                    *preference.lock().unwrap() = Some((epoch, index, Instant::now()));
+                }
+                answer
+            });
         drop(slot);
         if entry.is_none() && q.qtype == TYPE_A {
             let reason = match answer.as_ref().map(|a| a[3] & 0x0f) {
@@ -1181,6 +1217,7 @@ impl Forwarder {
                     rules: Arc::new(SplitRules::new(&direct)), upstreams, enabled: true, physical_binding, tunnel_binding }),
                 on_answer,
                 recent_failure: Mutex::default(),
+                preferred_server: Default::default(),
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
@@ -1358,6 +1395,49 @@ mod tests {
 
     fn loopback_interface() -> &'static str {
         if cfg!(target_os = "macos") { "lo0" } else { "lo" }
+    }
+
+    #[test]
+    fn silent_primary_does_not_consume_the_clients_deadline() {
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let primary = silent.local_addr().unwrap();
+        let _silent_tcp = TcpListener::bind(primary).unwrap();
+        let (port, _) = fake_udp([192, 0, 2, 5], false);
+        let servers = vec![primary.to_string(), format!("127.0.0.1:{port}")];
+        let q = query("intranet.example", TYPE_A, 13);
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53, Duration::from_secs(1),
+            vec![], Upstreams { tunnel: servers, local: vec![], physical_if: None,
+                tunnel_if: Some(loopback_interface().into()) }, None);
+        let start = Instant::now();
+        let result = forwarder.inner().resolve(&q).unwrap();
+        assert_eq!(ipv4_answers(&result), vec![Ipv4Addr::new(192, 0, 2, 5)]);
+        assert!(start.elapsed() < Duration::from_millis(1500), "backup answered too late");
+        let mut buf = [0; 512];
+        silent.set_nonblocking(true).unwrap();
+        assert!(silent.recv(&mut buf).is_ok());
+        assert!(forwarder.inner().resolve(&q).is_some());
+        assert_eq!(silent.recv(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn complete_negative_answer_does_not_switch_dns_views_or_servers() {
+        let primary = UdpSocket::bind("127.0.0.1:0").unwrap();
+        primary.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let addr = primary.local_addr().unwrap().to_string();
+        let (backup, seen) = fake_udp([192, 0, 2, 8], false);
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, peer) = primary.recv_from(&mut buf).unwrap();
+            let mut negative = empty_answer(&buf[..len]).unwrap();
+            negative[3] |= 3;
+            primary.send_to(&negative, peer).unwrap();
+        });
+        let servers = vec![addr, format!("127.0.0.1:{backup}")];
+        let reply = exchange(&query("missing.example", TYPE_A, 14), &servers, 53,
+            Some(loopback_interface()), Duration::from_secs(1)).unwrap();
+        assert_eq!(reply[3] & 15, 3);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        worker.join().unwrap();
     }
 
     #[test]
