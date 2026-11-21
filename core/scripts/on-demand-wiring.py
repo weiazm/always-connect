@@ -96,7 +96,7 @@ final class KillSwitch {
     }
 }
 enum CLIOrchestrator { static let defaultSupportDir = URL(fileURLWithPath: "/") }
-enum LoginGatewayCache { static func rememberConnected(in dir: URL, target: String, peer: String) {} }
+enum LoginGatewayCache { static func rememberConnected(in dir: URL, target: String, peer: String) -> Bool { true } }
 struct GatewayAddress: Equatable {
     let server: String
     init?(_ server: String) { self.server = server }
@@ -123,6 +123,7 @@ final class LoginGatewayPreparation {
 }
 LOGIN_GATEWAY_READINESS
 final class Service {
+    static func log(_ detail: String) {}
     var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
     let queue = ServiceQueue()
     var userReleased = true
