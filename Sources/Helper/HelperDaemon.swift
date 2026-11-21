@@ -231,6 +231,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// once and must pass the LAN from its first second (§30.1).
     private var allowNetworks: [String] = []
     /// 断线保护 for the own connection (DESIGN.md §26.19), from the App.
+    private var requiresLoginPreparation = !TestSeam.isActive
     private var preparedLogin: (target: GatewayAddress, gateways: [String], physical: String, cisco: Bool)?
     private var dropProtection = true
     private var egress = EgressProtection()
@@ -428,7 +429,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         // A helper upgrade, stale relay or direct XPC caller cannot skip protection.
         // The non-root session harness exercises legacy starts with its private firewall.
         let login = preparedLogin
-        if dropProtection && (!TestSeam.isActive || login != nil) {
+        if dropProtection && requiresLoginPreparation {
             guard let login, !login.cisco, login.target == GatewayAddress(server),
                   relay.map({ login.gateways.contains($0.gatewayIp) }) ?? true else {
                 let firewall = NetworkGuard.shared
@@ -725,6 +726,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 Self.log("protected login paused: " + message)
                 reply(false, [], message)
             }
+            self.requiresLoginPreparation = true
             self.preparedLogin = nil
             self.startGeneration += 1
             self.userReleased = false
@@ -738,12 +740,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             if let error = guardService.installLogin(holder: holder, physical: "", gateways: [], port: port, cisco: cisco, verify: false) {
                 reject(error); return
             }
-            guard let target, let physical = PhysicalNetwork.current(preferring: "")?.interface else {
+            let physical = TestSeam.isActive ? "en0" : PhysicalNetwork.current(preferring: "")?.interface
+            guard let target, let physical else {
                 reject("网关或物理网络不可用，登录已暂停"); return
             }
             var addresses = LoginGatewayCache.lookup(in: CLIOrchestrator.defaultSupportDir, target: target)
-            for address in [target.host, candidate] where NetworkGuard.isIPAddress(address) && !addresses.contains(address) {
-                addresses.insert(address, at: 0)
+            if NetworkGuard.isIPAddress(candidate), !addresses.contains(candidate) {
+                addresses.insert(candidate, at: 0)
             }
             if !cisco { addresses = addresses.filter(isValidIPv4) }
             addresses = Array(addresses.prefix(8))

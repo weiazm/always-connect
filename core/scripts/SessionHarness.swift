@@ -147,6 +147,17 @@ struct SessionHarness {
             session.harnessOwner(attached: true, appPath: app)
         }
         switch scenario {
+        case "cold-protected-login":
+            let server = "https://198.51.100.7:8443"
+            func prepare(_ candidate: String) -> Bool? {
+                sync { reply in session.beginProtectedLogin(server, cisco: false, candidate: candidate) { ok, _, _ in reply(ok) } }
+            }
+            check(prepare("") == false, "a numeric target alone never authorizes a carrier")
+            let held = NetworkGuard.shared.held?.inputs
+            check(held?.loginPort == 8443 && held?.gatewayIps.isEmpty == true, "empty-address policy stays installed (port \(held?.loginPort ?? 0), addresses \(held?.gatewayIps.count ?? -1))")
+            check(connect(session) == false, "failed preparation cannot be followed by an unprotected login")
+            check(prepare("198.51.100.7") == true, "a previously verified candidate may be used")
+            check(disconnect(session) && !NetworkGuard.shared.isHolding, "manual disconnect releases the pre-login hold")
         case "egress-drop-dependency":
             let group = EgressProtection.Group(id: 1, name: "Fixture", enabled: true,
                 members: [.init(pattern: "site.example", method: "trace")], expect: ["ZZ"])

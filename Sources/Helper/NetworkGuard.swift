@@ -177,6 +177,7 @@ extension JSONDecoder {
 
 extension NetworkGuard.Inputs {
     private enum CodingKeys: String, CodingKey {
+        case loginPort, loginUDP
         case tunnelIf, gatewayIps, physicalIf, allowNetworks, allowDNS, localDNSServers, tunnelDNSServers, directTable, strictDNS, blockDirect
     }
 
@@ -194,6 +195,8 @@ extension NetworkGuard.Inputs {
         directTable = try c.decodeIfPresent(Bool.self, forKey: .directTable) ?? false
         strictDNS = try c.decodeIfPresent(Bool.self, forKey: .strictDNS) ?? false
         blockDirect = try c.decodeIfPresent(Bool.self, forKey: .blockDirect) ?? false
+        loginPort = try c.decodeIfPresent(UInt16.self, forKey: .loginPort)
+        loginUDP = try c.decodeIfPresent(Bool.self, forKey: .loginUDP)
     }
 }
 
