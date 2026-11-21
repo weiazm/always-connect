@@ -8,6 +8,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const GATEWAY: &str = "198.51.100.7";
 const CUTOFF: Duration = Duration::from_secs(1);
 
+#[test]
+fn a_ticket_from_another_daemon_cannot_finish_the_current_lookup() {
+    let old = Fixture::new();
+    let current = Fixture::new();
+    let previous = old.arm(CISCO_HOLDER, CUTOFF);
+    let active = current.arm(CISCO_HOLDER, CUTOFF);
+    assert_ne!(previous, 0);
+    assert_ne!(active, 0);
+    assert!(current.finish(previous).is_err());
+    assert_eq!(current.guard.login_deadline_status(active), LoginDeadlineStatus::Pending);
+    old.guard.cancel_login_deadline(previous);
+    current.guard.cancel_login_deadline(active);
+}
+
 struct Fixture {
     dir: PathBuf,
     guard: Arc<Guard>,

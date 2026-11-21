@@ -144,8 +144,14 @@ impl Guard {
             return 0;
         }
 
-        state.deadline_generation = state.deadline_generation.wrapping_add(1).max(1);
-        let token = state.deadline_generation;
+        // XPC may reconnect to a new daemon. A late reply from its predecessor
+        // must not match the new daemon's first preparation.
+        let mut bytes = [0_u8; 8];
+        if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+            return 0;
+        }
+        let token = u64::from_ne_bytes(bytes);
+        if token == 0 { return 0; }
         state.login_deadline = Some(LoginDeadline {
             token,
             holder: holder.into(),
