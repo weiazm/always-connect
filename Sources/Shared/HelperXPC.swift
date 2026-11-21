@@ -111,6 +111,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
     func hasVerifiedRelayTunnel(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
     func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)
+    /// True if this server already has a usable peer from an authenticated session.
+    func hasTrustedLoginGateway(_ server: String, cisco: Bool, withReply reply: @escaping (Bool) -> Void)
     func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
                              withReply reply: @escaping (Bool, [String], String) -> Void)
     func prepareRelay(gatewayIp: String, serverPin: String,

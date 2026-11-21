@@ -147,6 +147,36 @@ struct SessionHarness {
             session.harnessOwner(attached: true, appPath: app)
         }
         switch scenario {
+        case "cached-protected-login":
+            let server = "vpn.example.test"
+            let support = CLIOrchestrator.defaultSupportDir
+            try! FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            try! FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: support.path)
+            let target = GatewayAddress(server)!
+            func hasPeer(_ server: String, cisco: Bool = false) -> Bool? {
+                sync { session.hasTrustedLoginGateway(server, cisco: cisco, withReply: $0) }
+            }
+            let before = pfLog()
+            check(hasPeer(server) == false, "empty cache gives no ready indication")
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: "2001:db8::7"),
+                  "recorded a synthetic IPv6 peer")
+            check(hasPeer(server) == false && hasPeer(server, cisco: true) == true,
+                  "readiness uses the selected engine's address families")
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: "198.51.100.7"),
+                  "recorded a synthetic IPv4 peer")
+            check(hasPeer(server) == true && hasPeer(server + ":8443") == false &&
+                  hasPeer("other.example.test") == false, "readiness is bound to the selected host and port")
+            check(pfLog() == before && status(session) == 0, "readiness neither writes firewall rules nor starts login")
+            let peers: [String]? = sync { reply in
+                session.beginProtectedLogin(server, cisco: false, candidate: "") { ok, addresses, _ in
+                    reply(ok ? addresses : [])
+                }
+            }
+            check(peers == ["198.51.100.7"] && NetworkGuard.shared.held?.inputs.gatewayIps == peers,
+                  "immediate connection with no candidate installs the strict rule for the saved peer")
+            check(connect(session) == true && waitFor(12) { status(session) == SessionDriverClient.State.connected.rawValue },
+                  "cached peer reaches the mock tunnel through the normal login entry")
+            check(disconnect(session), "manual disconnect replied")
         case "cold-protected-login":
             let server = "https://198.51.100.7:8443"
             func prepare(_ candidate: String) -> Bool? {

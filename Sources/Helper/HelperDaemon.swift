@@ -732,6 +732,22 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
+    private func loginAddresses(for target: GatewayAddress, cisco: Bool, candidate: String = "") -> [String] {
+        var addresses = LoginGatewayCache.lookup(in: CLIOrchestrator.defaultSupportDir, target: target)
+        if NetworkGuard.isIPAddress(candidate), !addresses.contains(candidate) {
+            addresses.insert(candidate, at: 0)
+        }
+        if !cisco { addresses = addresses.filter(isValidIPv4) }
+        return Array(addresses.prefix(8))
+    }
+
+    func hasTrustedLoginGateway(_ server: String, cisco: Bool, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard let target = GatewayAddress(server) else { reply(false); return }
+            reply(!self.loginAddresses(for: target, cisco: cisco).isEmpty)
+        }
+    }
+
     func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
                              withReply reply: @escaping (Bool, [String], String) -> Void) {
         queue.async {
@@ -757,12 +773,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             guard let target, let physical else {
                 reject("网关或物理网络不可用，登录已暂停"); return
             }
-            var addresses = LoginGatewayCache.lookup(in: CLIOrchestrator.defaultSupportDir, target: target)
-            if NetworkGuard.isIPAddress(candidate), !addresses.contains(candidate) {
-                addresses.insert(candidate, at: 0)
-            }
-            if !cisco { addresses = addresses.filter(isValidIPv4) }
-            addresses = Array(addresses.prefix(8))
+            let addresses = self.loginAddresses(for: target, cisco: cisco, candidate: candidate)
             if let error = guardService.installLogin(holder: holder, physical: physical, gateways: addresses,
                                                       port: port, cisco: cisco, verify: true) {
                 // Keep the tighter policy if another rule or old state prevents verification.
