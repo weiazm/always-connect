@@ -12,7 +12,8 @@
 #     unloaded and kept unloaded
 #   3 system files: the LaunchDaemon, the background service, the bundled
 #     openconnect copy, /Library/Application Support/AlwaysConnect
-#     (held state, session cookie, relay key, journals), its logs
+#     (held state, session cookie, relay key, verified gateway cache,
+#     and journals), its logs
 #   4 the user's files: logs, caches, the Desktop reset copy; settings
 #     (both preference domains) unless --keep-settings; the keychain
 #     password unless --keep-password (from the App, the App has already

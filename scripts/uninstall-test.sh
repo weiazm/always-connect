@@ -39,6 +39,7 @@ setup() {
         "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate" "$S/egress.sock" \
+        "$S/login-gateway-cache.json" "$S/.login-gateway-cache.interrupted" \
         "$S/direct-routes.pending.crash" "$S/direct-routes.retire-crash" "$S/guard.json" "$S/route-state" "$S/session.json" "$S/relay/client.key" \
         "$R/Library/Logs/AlwaysConnect/helper.log" \
         "$H/Library/Logs/AlwaysConnect/relay.log" "$H/Library/Logs/AlwaysConnect/update.log" \
@@ -64,6 +65,8 @@ system_and_user_files_gone() {
     gone "$R/Library/LaunchDaemons/com.alwaysconnect.app.helper.plist"
     gone "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper"
     gone "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
+    gone "$S/login-gateway-cache.json"
+    gone "$S/.login-gateway-cache.interrupted"
     gone "$R/Library/Application Support/AlwaysConnect"
     gone "$R/Library/Logs/AlwaysConnect"
     gone "$H/Library/Logs/AlwaysConnect"
@@ -157,6 +160,7 @@ echo "== 5 dry-run changes nothing"
 setup
 bash "$UNINSTALL" --dry-run >/dev/null 2>&1
 kept "$R/Library/Application Support/AlwaysConnect"
+kept "$S/login-gateway-cache.json"
 kept "$R/Applications/AlwaysConnect.app"
 kept "$H/Library/Preferences/com.alwaysconnect.app.plist"
 rm -rf "$R"
