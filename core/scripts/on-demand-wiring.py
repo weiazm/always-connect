@@ -34,13 +34,15 @@ methods = [
     'func onDemandSettingsChanged()', 'func prepareForForcedRestore()',
     'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode(',
     'private var mayPrepareLoginGateway:', 'private func resetGatewayPreparation(', 'func expireGatewayPreparation()',
+    'func prepareGatewayForConnection(',
     'func prepareGatewayWhileDirect(', 'private func isGatewayPreparationCurrent(', 'private func prepareUncachedGateway('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
 readiness = block((root / 'Sources/App/LoginGatewayPreparation.swift').read_text(), 'enum LoginGatewayReadiness')
 panel_action = block((root / 'Sources/App/PanelAndSettings.swift').read_text(), 'private var primaryButton:')
-assert panel_action.index('!manager.loginGatewayReadiness.canConnect') < panel_action.index('onStart()')
-assert '.disabled(manager.loginGatewayReadiness.isBusy)' in panel_action
+assert 'manager.loginGatewayReadiness' not in panel_action
+assert 'onStart()' in panel_action and 'ProtectedLoginNotice.preparingGateway' in panel_action
+assert 'Button(preparing ? "取消连接"' in panel_action and 'onStop()' in panel_action
 callbacks = '\n'.join(block(source, marker) for marker in [
     'onDemand.disconnect =', 'onDemand.waiting =', 'onDemand.connect =',
     'onDemand.stopUser =', 'onDemand.recheck =', 'onDemand.changed =', 'onDemand.refreshService ='])
@@ -113,8 +115,14 @@ final class LoginGatewayPreparation {
     func status(for target: GatewayAddress) -> Status { phase }
     func confirmDirect() {}
     func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, completion: @escaping () -> Void) -> Status {
-        checks += 1
+        prepareWhileDirect(target, ipv4Only: ipv4Only, deadline: .now() + 2, completion: completion)
+    }
+    func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, deadline: DispatchTime,
+                            completion: @escaping () -> Void) -> Status {
+        guard DispatchTime.now() < deadline else { return .unavailable }
         self.ipv4Only = ipv4Only
+        if phase == .ready { return .ready }
+        if phase != .preparing { checks += 1 }
         phase = .preparing
         done = completion
         return phase
@@ -191,6 +199,7 @@ final class Client {
     var rejectedLoginHeld = false
     let loginPreparation = LoginGatewayPreparation()
     var loginPreparationRequest: UInt64 = 0
+    var loginPreparationForConnection: UInt64?
     var loginPreparationTarget: GatewayAddress?
     var loginPreparationProfileName: String?
     var loginGatewayReadiness = LoginGatewayReadiness.idle
@@ -468,8 +477,8 @@ final class ViewLifecycle {
 
         let readiness = Client()
         readiness.prepareGatewayWhileDirect()
-        check(readiness.loginGatewayReadiness == .checking && !readiness.loginGatewayReadiness.canConnect
-              && readiness.loginGatewayReadiness.isBusy, "an immediate panel click cannot start login while checking the address")
+        check(readiness.loginGatewayReadiness == .checking && readiness.loginGatewayReadiness.isBusy,
+              "the passive check reports progress while the panel keeps its connect action")
         readiness.cachedReplies.removeFirst()(true)
         check(readiness.loginGatewayReadiness == .cached && readiness.loginGatewayReadiness.canConnect
               && readiness.holdReplies.isEmpty && readiness.loginPreparation.checks == 0,
@@ -504,7 +513,7 @@ final class ViewLifecycle {
               "a fresh verified candidate makes the panel ready")
         readiness.loginPreparation.phase = .idle
         readiness.expireGatewayPreparation()
-        check(readiness.loginGatewayReadiness == .idle, "expired candidate removes the connect action")
+        check(readiness.loginGatewayReadiness == .idle, "expired candidate clears the ready state")
 
         readiness.prepareGatewayWhileDirect()
         readiness.cachedReplies.removeFirst()(false)
@@ -512,14 +521,14 @@ final class ViewLifecycle {
         readiness.loginPreparation.phase = .certificateRejected
         readiness.loginPreparation.done?()
         check(readiness.loginGatewayReadiness == .certificateRejected && !readiness.loginGatewayReadiness.canConnect,
-              "certificate rejection leaves a preparation retry instead of a connection action")
+              "certificate rejection records its own reason without a usable address")
         readiness.prepareGatewayWhileDirect(retry: true)
         readiness.cachedReplies.removeFirst()(false)
         readiness.holdReplies.removeFirst()(false)
         readiness.loginPreparation.phase = .unavailable
         readiness.loginPreparation.done?()
         check(readiness.loginGatewayReadiness == .unavailable && !readiness.loginGatewayReadiness.canConnect,
-              "a preparation timeout leaves a retry without displaying a certificate error")
+              "a preparation timeout does not display a certificate error")
 
         readiness.prepareGatewayWhileDirect()
         let oldReply = readiness.cachedReplies.removeFirst()
@@ -539,6 +548,56 @@ final class ViewLifecycle {
         readiness.resetGatewayPreparation()
         readiness.cachedReplies.removeFirst()(true)
         check(readiness.loginGatewayReadiness == .idle, "a cancelled request cannot change readiness")
+        ProfileStore.profile = Profile()
+
+        let joining = Client()
+        joining.prepareGatewayWhileDirect()
+        joining.cachedReplies.removeFirst()(false)
+        joining.holdReplies.removeFirst()(false)
+        let passiveCompletion = joining.loginPreparation.done
+        joining.loginIntentActive = true
+        var connectionResults: [LoginGatewayReadiness] = []
+        let deadline = DispatchTime.now() + 3
+        joining.prepareGatewayForConnection(deadline: deadline) { connectionResults.append($0) }
+        joining.prepareGatewayForConnection(deadline: deadline) { connectionResults.append($0) }
+        check(joining.loginPreparation.checks == 1 && joining.cachedReplies.isEmpty && joining.holdReplies.isEmpty,
+              "the click joins the selected server check without repeating TLS or service queries")
+        passiveCompletion?()
+        check(connectionResults.isEmpty, "the original passive observer cannot start the connection")
+        joining.loginPreparation.phase = .ready
+        let joinedCompletion = joining.loginPreparation.done
+        joinedCompletion?()
+        joinedCompletion?()
+        check(connectionResults == [.candidate], "joined preparation completes exactly once")
+
+        let expired = Client()
+        expired.loginIntentActive = true
+        var expiredResult: LoginGatewayReadiness?
+        expired.prepareGatewayForConnection(deadline: .now()) { expiredResult = $0 }
+        check(expiredResult == .timedOut && expired.loginPreparation.checks == 0,
+              "an exhausted connection deadline starts no TLS work")
+
+        let heldConnection = Client()
+        heldConnection.loginIntentActive = true
+        heldConnection.networkHeld = true
+        var heldResult: LoginGatewayReadiness?
+        heldConnection.prepareGatewayForConnection(deadline: deadline) { heldResult = $0 }
+        check(heldResult == .networkUnknown && heldConnection.loginPreparation.checks == 0,
+              "a held connection cannot start preparing a gateway")
+
+        let replacement = Client()
+        replacement.loginIntentActive = true
+        var replacementResults: [LoginGatewayReadiness] = []
+        replacement.prepareGatewayForConnection(deadline: deadline) { replacementResults.append($0) }
+        let replaced = replacement.loginPreparation.done
+        ProfileStore.profile.server = "vpn-b.example"
+        replacement.resetGatewayPreparation()
+        replacement.prepareGatewayForConnection(deadline: deadline) { replacementResults.append($0) }
+        replaced?()
+        check(replacementResults.isEmpty, "a replaced server callback cannot continue the new connection")
+        replacement.loginPreparation.phase = .certificateRejected
+        replacement.loginPreparation.done?()
+        check(replacementResults == [.certificateRejected], "only the current trust refusal reaches the common entry")
         ProfileStore.profile = Profile()
 
         let editor = RuleEditor()

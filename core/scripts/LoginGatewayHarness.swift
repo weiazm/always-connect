@@ -11,6 +11,14 @@ enum LoginGatewayHarness {
         print("PASS \(label)")
     }
 
+    static func waitFor(_ condition: () -> Bool) -> Bool {
+        let deadline = DispatchTime.now() + .seconds(2)
+        while !condition() && DispatchTime.now() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        return condition()
+    }
+
     static func prepared(_ target: GatewayAddress, anchor: SecCertificate?, expected: (String?, Bool),
                          intent: GatewayAddress? = nil, ipv4Only: Bool = false, label: String) {
         let preparation = LoginGatewayPreparation()
@@ -83,5 +91,31 @@ enum LoginGatewayHarness {
         preparation.prepareWhileDirect(gateway)
         check(finished.wait(timeout: .now() + 3) == .success, "trusted TLS is ready after cancellation")
         check(preparation.takeForIntent(gateway) == "127.0.0.1", "address-only callers still receive the candidate")
+
+        let joining = LoginGatewayPreparation()
+        var starts = 0
+        var passiveReplies = 0
+        var joinedReplies = 0
+        joining.onTestStart = { starts += 1 }
+        joining.confirmDirect()
+        joining.prepareWhileDirect(stalled) { passiveReplies += 1 }
+        let joinTime = DispatchTime.now()
+        let joined = joining.prepareWhileDirect(stalled, ipv4Only: false,
+                                                deadline: joinTime + .milliseconds(200)) { joinedReplies += 1 }
+        check(joined == .preparing && starts == 1, "joining a live lookup reuses the same TLS transport")
+        check(waitFor { joinedReplies == 1 }, "only the new observer receives completion")
+        check(DispatchTime.now().uptimeNanoseconds - joinTime.uptimeNanoseconds < 1_200_000_000,
+              "joining a lookup can shorten its deadline")
+        check(passiveReplies == 0 && joining.status(for: stalled) == .unavailable,
+              "timeout retires the transport without an address or a passive callback")
+        check(joining.takeResultForIntent(stalled) == (nil, false), "expired transport cannot supply a late result")
+
+        joining.confirmDirect()
+        joining.testAnchor = anchor
+        joining.prepareWhileDirect(stalled) { passiveReplies += 1 }
+        joining.prepareWhileDirect(gateway) { joinedReplies += 1 }
+        check(waitFor { joinedReplies == 2 }, "replacement target completes its own preparation")
+        check(passiveReplies == 0 && starts == 3 && joining.takeForIntent(gateway) == "127.0.0.1",
+              "moving to a different target retires the old callback and returns its own address")
     }
 }

@@ -53,6 +53,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var loginGatewayReadiness: LoginGatewayReadiness = .idle
     private let loginPreparation = LoginGatewayPreparation()
     private var loginPreparationRequest: UInt64 = 0
+    private var loginPreparationForConnection: UInt64?
     private var loginPreparationTarget: GatewayAddress?
     private var loginPreparationProfileName: String?
     private var loginIntentActive = false
@@ -1503,6 +1504,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func resetGatewayPreparation(cancelTransport: Bool = true) {
         loginPreparationRequest &+= 1
+        loginPreparationForConnection = nil
         if cancelTransport { loginPreparation.cancel() }
         loginPreparationTarget = nil
         loginPreparationProfileName = nil
@@ -1513,6 +1515,55 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard loginGatewayReadiness == .candidate, let target = loginPreparationTarget,
               loginPreparation.status(for: target) != .ready else { return }
         loginGatewayReadiness = .idle
+    }
+
+    /// Called by the shared connection entry after it has checked the cache,
+    /// confirmed direct networking, and fixed the absolute protection deadline.
+    func prepareGatewayForConnection(deadline: DispatchTime, completion: @escaping (LoginGatewayReadiness) -> Void) {
+        guard loginPreparationForConnection == nil, !endingApp, !resettingNetwork else { return }
+        guard loginIntentActive, state == .disconnected, protectsDrops, !networkHeld else {
+            completion(.networkUnknown)
+            return
+        }
+        guard DispatchTime.now() < deadline else {
+            resetGatewayPreparation()
+            completion(.timedOut)
+            return
+        }
+        let name = ProfileStore.loadProfile().server
+        guard let target = GatewayAddress(CiscoProfiles.resolve(name)) else {
+            completion(.unavailable)
+            return
+        }
+        if loginPreparationProfileName != name || loginPreparationTarget != target {
+            resetGatewayPreparation()
+        }
+        let native = usesCisco
+        loginPreparationRequest &+= 1
+        let request = loginPreparationRequest
+        loginPreparationForConnection = request
+        loginPreparationTarget = target
+        loginPreparationProfileName = name
+        let finish = { [weak self] in
+            guard let self, self.loginPreparationForConnection == request,
+                  self.loginIntentActive, self.usesCisco == native,
+                  ProfileStore.loadProfile().server == name else { return }
+            self.loginPreparationForConnection = nil
+            let result: LoginGatewayReadiness
+            if DispatchTime.now() >= deadline {
+                result = .timedOut
+            } else if self.networkHeld {
+                result = .networkUnknown
+            } else {
+                result = LoginGatewayReadiness(preparation: self.loginPreparation.status(for: target))
+            }
+            self.loginGatewayReadiness = result
+            completion(result)
+        }
+        loginPreparation.confirmDirect()
+        let status = loginPreparation.prepareWhileDirect(target, ipv4Only: !native, deadline: deadline, completion: finish)
+        if status == .preparing { loginGatewayReadiness = .preparing }
+        else { finish() }
     }
 
     func prepareGatewayWhileDirect(retry: Bool = false) {

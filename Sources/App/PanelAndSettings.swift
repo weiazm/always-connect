@@ -537,16 +537,13 @@ struct PanelView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .frame(maxWidth: .infinity)
-        } else if manager.state == .disconnected, manager.loginProtectionNotice != nil {
-            Button("取消连接并恢复直连") { showConfirmDisconnect = false; onStop() }
-                .buttonStyle(.borderedProminent).controlSize(.large)
-        } else if manager.state == .disconnected, manager.protectsDrops, !manager.loginGatewayReadiness.canConnect {
-            Button { manager.prepareGatewayWhileDirect(retry: true) } label: {
-                Text(manager.loginGatewayReadiness.preparationButtonTitle).frame(maxWidth: .infinity)
+        } else if manager.state == .disconnected, let notice = manager.loginProtectionNotice {
+            let preparing = notice == ProtectedLoginNotice.preparingGateway
+            Button(preparing ? "取消连接" : "取消连接并恢复直连") {
+                showConfirmDisconnect = false
+                onStop()
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(manager.loginGatewayReadiness.isBusy)
+                .buttonStyle(.borderedProminent).controlSize(.large)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
                 Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)

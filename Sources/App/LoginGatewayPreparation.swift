@@ -13,12 +13,14 @@ final class LoginGatewayPreparation {
     private let preparation = ac_login_preparation_new()
     private var connection: NWConnection?
     private var timeout: DispatchWorkItem?
+    private var transportDeadline: DispatchTime?
     private var request: UInt64?
     private var certificateVerified = false
     private var completion: (() -> Void)?
 
     #if LOGIN_GATEWAY_PREPARATION_TEST
     var testAnchor: SecCertificate?
+    var onTestStart: (() -> Void)?
     var onTestFinish: (() -> Void)?
     #endif
 
@@ -38,12 +40,25 @@ final class LoginGatewayPreparation {
     @discardableResult
     func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool = false,
                             completion: (() -> Void)? = nil) -> Status {
+        prepareWhileDirect(target, ipv4Only: ipv4Only, deadline: .now() + .seconds(2), completion: completion)
+    }
+
+    /// Reuse an in-flight check for the same target. A caller can take over
+    /// its completion and shorten its deadline without starting new I/O.
+    @discardableResult
+    func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, deadline: DispatchTime,
+                            completion: (() -> Void)?) -> Status {
         queue.sync {
-            let deadline = DispatchTime.now() + .seconds(2)
+            let now = DispatchTime.now()
+            guard now < deadline else { return .unavailable }
+            let deadline = min(deadline, now + .seconds(2))
             let token = ac_login_preparation_begin(preparation, target.host, target.port)
             guard token != 0 else {
                 let current = statusLocked(for: target)
-                if current == .preparing, let completion { self.completion = completion }
+                if current == .preparing, let request {
+                    if let completion { self.completion = completion }
+                    limitTransport(request, deadline: deadline)
+                }
                 return current
             }
             stopTransport()
@@ -146,10 +161,20 @@ final class LoginGatewayPreparation {
                 break
             }
         }
+        limitTransport(token, deadline: deadline)
+        #if LOGIN_GATEWAY_PREPARATION_TEST
+        onTestStart?()
+        #endif
+        stream.start(queue: queue)
+    }
+
+    private func limitTransport(_ token: UInt64, deadline: DispatchTime) {
+        if let transportDeadline, transportDeadline <= deadline { return }
+        transportDeadline = deadline
+        timeout?.cancel()
         let timeout = DispatchWorkItem { [weak self] in self?.finish(token) }
         self.timeout = timeout
         queue.asyncAfter(deadline: deadline, execute: timeout)
-        stream.start(queue: queue)
     }
 
     private static func isTrustRejection(_ trust: SecTrust) -> Bool {
@@ -174,8 +199,9 @@ final class LoginGatewayPreparation {
     private func finish(_ token: UInt64, address: String? = nil, certificateRejected: Bool = false) {
         guard request == token else { return }
         let completion = self.completion
+        let withinBudget = transportDeadline.map { DispatchTime.now() < $0 } ?? false
         stopTransport()
-        ac_login_preparation_finish(preparation, token, address, certificateRejected)
+        ac_login_preparation_finish(preparation, token, withinBudget ? address : nil, withinBudget && certificateRejected)
         if let completion { DispatchQueue.main.async(execute: completion) }
         #if LOGIN_GATEWAY_PREPARATION_TEST
         onTestFinish?()
@@ -188,6 +214,7 @@ final class LoginGatewayPreparation {
         completion = nil
         timeout?.cancel()
         timeout = nil
+        transportDeadline = nil
         connection?.stateUpdateHandler = nil
         connection?.forceCancel()
         connection = nil
@@ -196,7 +223,7 @@ final class LoginGatewayPreparation {
 
 /// The panel's preparation steps precede any request to connect the VPN.
 enum LoginGatewayReadiness {
-    case idle, checking, preparing, cached, candidate, unavailable, certificateRejected, networkUnknown
+    case idle, checking, preparing, cached, candidate, unavailable, certificateRejected, networkUnknown, timedOut
 
     var canConnect: Bool { self == .cached || self == .candidate }
     var isBusy: Bool { self == .checking || self == .preparing }
@@ -218,16 +245,6 @@ enum LoginGatewayReadiness {
         }
     }
 
-    var preparationButtonTitle: String {
-        switch self {
-        case .checking: return "正在检查服务器地址…"
-        case .preparing: return "正在准备服务器地址…"
-        case .unavailable, .certificateRejected: return "重新准备服务器地址"
-        case .networkUnknown: return "重新检查网络"
-        default: return "准备服务器地址"
-        }
-    }
-
     var caption: String? {
         switch self {
         case .checking: return "正在检查是否有可用的 VPN 服务器地址。"
@@ -236,6 +253,7 @@ enum LoginGatewayReadiness {
         case .unavailable: return "暂时无法验证服务器地址，可以重新准备。"
         case .certificateRejected: return "VPN 服务器证书校验失败，可以重新准备。"
         case .networkUnknown: return "暂未确认可直连。可以先恢复网络，再准备服务器地址。"
+        case .timedOut: return "查找 VPN 服务器超时。"
         case .idle: return nil
         }
     }

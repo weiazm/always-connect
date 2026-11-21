@@ -168,4 +168,5 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 
 enum ProtectedLoginNotice {
     static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
+    static let preparingGateway = "首次连接正在查网关，当前仍直连"
 }
