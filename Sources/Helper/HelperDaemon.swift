@@ -231,6 +231,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// once and must pass the LAN from its first second (§30.1).
     private var allowNetworks: [String] = []
     /// 断线保护 for the own connection (DESIGN.md §26.19), from the App.
+    private var preparedLogin: (target: GatewayAddress, gateways: [String], physical: String, cisco: Bool)?
     private var dropProtection = true
     private var egress = EgressProtection()
     private var probingEgress = false
@@ -424,6 +425,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         server: String, group: String, username: String, password: String,
         parameters: [String], reply: @escaping (Bool) -> Void
     ) {
+        // A helper upgrade, stale relay or direct XPC caller cannot skip protection.
+        // The non-root session harness exercises legacy starts with its private firewall.
+        let login = preparedLogin
+        if dropProtection && (!TestSeam.isActive || login != nil) {
+            guard let login, !login.cisco, login.target == GatewayAddress(server),
+                  relay.map({ login.gateways.contains($0.gatewayIp) }) ?? true else { reply(false); return }
+        }
         lastReasonCode = 0
         lastRetryCount = 0
         let script: String
@@ -452,6 +460,11 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         if relay != nil { config.directDomains = directDomains }
         if relay != nil { config.egress = egress }
         config.dropProtection = dropProtection
+        if !TestSeam.isActive || login != nil {
+            config.loginTarget = GatewayAddress(server)
+            config.loginGateways = login?.gateways ?? []
+            if let login { config.physicalIf = login.physical }
+        }
         // Redacted child output into the daemon's log (launchd
         // StandardErrorPath), only when the plist opts in: the dev
         // install does, to record the real gateway's output shapes
@@ -528,6 +541,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// returns — then the parts that take their time.
     private func releaseEverythingLocked(reason: String) {
         startGeneration += 1 // a replacement waiting to start never does
+        preparedLogin = nil
         if reason == NetworkGuard.Reason.user { userReleased = true }
         NetworkGuard.shared.release(holder: nil, reason: reason)
         // The Cisco kill switch, always: an own-connection engine
@@ -563,6 +577,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             let wasGated = self.dropProtection && self.egress.isActive
             self.dropProtection = on
             if !on {
+                self.preparedLogin = nil
                 self.egress.enabled = false
                 if wasGated && self.restartForEgressChange() { reply(true); return }
             }
@@ -647,9 +662,11 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     }
 
     func updateAllowNetworks(_ networks: [String], withReply reply: @escaping (Bool) -> Void) {
-        KillSwitch.shared.updateAllowNetworks(networks)
         queue.async {
             let valid = networks.map { $0.trimmingCharacters(in: .whitespaces) }.filter { isValidCIDR($0) }
+            if NetworkGuard.shared.held?.inputs.loginPort == nil {
+                KillSwitch.shared.updateAllowNetworks(networks)
+            }
             self.allowNetworks = valid
             guard let engine = self.engine else {
                 // Held with no engine (a refused login, §30.1): the new
@@ -686,6 +703,53 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         current?.killChild()
     }
 
+    func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard !self.userReleased, self.dropProtection, !serverPin.isEmpty, self.relay?.serverPin == serverPin,
+                  self.activeParameters?.last == serverPin, let engine = self.engine else { reply(false); return }
+            reply(engine.rejectGatewayCertificate())
+        }
+    }
+
+    func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
+                             withReply reply: @escaping (Bool, [String], String) -> Void) {
+        queue.async {
+            self.preparedLogin = nil
+            self.startGeneration += 1
+            self.userReleased = false
+            self.dropProtection = true
+            let guardService = NetworkGuard.shared
+            // Retire old engine callbacks before replacing its anchor.
+            guardService.supersedeOwnHolders()
+            let holder = cisco ? NetworkGuard.ciscoHolder : guardService.newOwnHolder()
+            let target = GatewayAddress(server)
+            let port = target?.port ?? 443
+            if let error = guardService.installLogin(holder: holder, physical: "", gateways: [], port: port, cisco: cisco, verify: false) {
+                reply(false, [], error); return
+            }
+            guard let target, let physical = PhysicalNetwork.current(preferring: "")?.interface else {
+                reply(false, [], "网关或物理网络不可用，登录已暂停"); return
+            }
+            var addresses = LoginGatewayCache.lookup(in: CLIOrchestrator.defaultSupportDir, target: target)
+            for address in [target.host, candidate] where NetworkGuard.isIPAddress(address) && !addresses.contains(address) {
+                addresses.insert(address, at: 0)
+            }
+            if !cisco { addresses = addresses.filter(isValidIPv4) }
+            addresses = Array(addresses.prefix(8))
+            if let error = guardService.installLogin(holder: holder, physical: physical, gateways: addresses,
+                                                      port: port, cisco: cisco, verify: true) {
+                // Keep the tighter policy if another rule or old state prevents verification.
+                _ = guardService.installLogin(holder: holder, physical: physical, gateways: [], port: port, cisco: cisco, verify: false)
+                reply(false, [], error); return
+            }
+            guard !addresses.isEmpty else {
+                reply(false, [], "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"); return
+            }
+            self.preparedLogin = (target, addresses, physical, cisco)
+            reply(true, addresses, "")
+        }
+    }
+
     func prepareRelay(gatewayIp: String, serverPin: String,
                       withReply reply: @escaping (String) -> Void) {
         queue.async {
@@ -720,8 +784,15 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         // queued disconnect must never unload a new session's protection.
         queue.async {
             if parsed != .off { self.userReleased = false }
-            KillSwitch.shared.set(mode: parsed, tunnelIf: tunnelIf,
-                                  gatewayIps: gatewayIps, reply: reply)
+            let login = self.preparedLogin
+            KillSwitch.shared.set(mode: parsed, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+                if ok, parsed == .connected, let login, login.cisco, gatewayIps.count == 1,
+                   login.gateways.contains(gatewayIps[0]) {
+                    LoginGatewayCache.rememberConnected(in: CLIOrchestrator.defaultSupportDir,
+                                                       target: login.target, peer: gatewayIps[0])
+                }
+                reply(ok, message)
+            }
         }
     }
 
@@ -740,6 +811,9 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     }
 
     func resolveGatewayIPv4(_ host: String, withReply reply: @escaping ([String]) -> Void) {
+        if let held = NetworkGuard.shared.held, held.inputs.loginPort != nil && held.inputs.tunnelIf.isEmpty {
+            reply([]); return
+        }
         guard let lease = GatewayLookupLease() else { reply([]); return }
         DispatchQueue.global(qos: .utility).async {
             withExtendedLifetime(lease) {

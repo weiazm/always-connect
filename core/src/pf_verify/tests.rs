@@ -173,10 +173,9 @@ fn kill(
 }
 
 #[test]
-fn preserves_bound_local_tunnel_and_exact_outbound_allowances() {
+fn preserves_bound_loopback_and_exact_outbound_allowances() {
     let permitted = [
         "lo0 tcp 127.0.0.1:54000 -> 127.0.0.1:8000 ESTABLISHED:ESTABLISHED",
-        "utun10 tcp 192.0.2.2:54000 -> 198.51.100.1:33 ESTABLISHED:ESTABLISHED",
         "en0 tcp 192.0.2.2:54000 -> 203.0.113.1:443 ESTABLISHED:ESTABLISHED",
         "en0 udp 2001:db8:2::2[54000] -> 2001:db8:1::1[443] MULTIPLE:MULTIPLE",
         "en0 tcp 192.0.2.2:54000 -> 192.0.2.4:22 ESTABLISHED:ESTABLISHED",
@@ -208,7 +207,7 @@ fn preserves_bound_local_tunnel_and_exact_outbound_allowances() {
 fn cleans_only_unique_bound_blocked_state_and_reads_back() {
     let allowed = row(
         1,
-        "utun2 tcp 192.0.2.2:54001 -> 198.51.100.1:443 ESTABLISHED:ESTABLISHED",
+        "lo0 tcp 127.0.0.1:54001 -> 127.0.0.1:443 ESTABLISHED:ESTABLISHED",
     );
     let blocked = row(
         2,
@@ -227,6 +226,13 @@ fn cleans_only_unique_bound_blocked_state_and_reads_back() {
         ),
         Ok(())
     );
+}
+
+#[test]
+fn existing_unverified_tunnel_is_retained_but_never_confirms_a_cold_login() {
+    let active = row(3, "utun2 tcp 192.0.2.2:54001 -> 198.51.100.1:443 ESTABLISHED:ESTABLISHED");
+    assert_eq!(run_steps([states(&active)], |run| clear_states(&policy(false), run)),
+               Err(StateError::UnknownInterface));
 }
 
 #[test]

@@ -86,7 +86,11 @@ final class KillSwitch {
         reply(true, "")
     }
 }
+enum CLIOrchestrator { static let defaultSupportDir = URL(fileURLWithPath: "/") }
+enum LoginGatewayCache { static func rememberConnected(in dir: URL, target: String, peer: String) {} }
+final class Preparation { func cancel() {} }
 final class Service {
+    var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
     let queue = ServiceQueue()
     var userReleased = true
     SERVER_PROTECTION_BODY
@@ -143,6 +147,9 @@ final class Proxy {
     }
 }
 final class Client {
+    var loginIntentActive = false
+    let loginPreparation = Preparation()
+    var loginProtectionNotice: String?
     let onDemand = OnDemandController()
     let onDemandDisconnect = OnDemandDisconnect()
     let protection = OnDemandProtection()

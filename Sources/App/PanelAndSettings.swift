@@ -58,9 +58,14 @@ struct PanelView: View {
                 }
                 Spacer()
             }
+            if let notice = manager.loginProtectionNotice {
+                Label(notice, systemImage: "lock.shield").font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if manager.gatewayTrustFailed {
                 Label(manager.protectsDrops
-                      ? "VPN 网关证书校验失败。网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+                      ? (manager.rejectedLoginHeld ? "VPN 网关证书校验失败，网络已拦截。可点恢复网络回到直连。"
+                         : "VPN 网关证书校验失败。网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。")
                       : "VPN 网关证书校验失败。断线保护已关闭。请联系 VPN 管理员。",
                       systemImage: "exclamationmark.shield.fill")
                     .font(.callout)
@@ -284,6 +289,7 @@ struct PanelView: View {
         .frame(width: 320)
         .toggleStyle(.always)
         .onAppear {
+            manager.prepareGatewayWhileDirect()
             speed.start()
             manager.refreshSplitActivity()
             manager.refreshEgress()

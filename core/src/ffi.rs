@@ -1966,3 +1966,15 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
 pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {
     crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
 }
+
+
+#[no_mangle]
+pub extern "C" fn ac_login_direct_route() -> bool {
+    crate::connections::default_route_interface().is_some_and(|name| name.starts_with("en"))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_oc_certificate_rejected(engine: *const oc_engine::Engine) -> bool {
+    unsafe { engine.as_ref() }.is_some_and(|e| e.reject_gateway_certificate())
+}

@@ -105,6 +105,11 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// openconnect will present to the relay (the relay accepts no
     /// other client); "" when the settings were invalid or the
     /// certificate could not be made, and after a clear.
+    /// Installs the pre-login firewall before any VPN connection or DNS lookup.
+    /// The candidate, if provided, was TLS-verified before this login intent.
+    func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)
+    func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
+                             withReply reply: @escaping (Bool, [String], String) -> Void)
     func prepareRelay(gatewayIp: String, serverPin: String,
                       withReply reply: @escaping (String) -> Void)
     /// Own connection's domain split (DESIGN.md §26.5): the names (and

@@ -63,7 +63,7 @@ impl BlockingPolicy {
     }
 
     fn preserves(&self, state: &State<'_>) -> Result<bool, StateError> {
-        if local_interface(state.interface) {
+        if state.interface == "lo0" {
             return Ok(true);
         }
         if state.interface == "all" {

@@ -158,6 +158,32 @@ struct Pfctl {
 }
 
 impl Pfctl {
+    fn audit(&self, args: &[&str], deadline: std::time::Instant) -> Result<crate::pf_verify::PfOutput, ()> {
+        use std::io::Read;
+        let limit = deadline.saturating_duration_since(std::time::Instant::now());
+        if limit.is_zero() { return Err(()); }
+        let mut cmd = Command::new(self.path.as_deref().ok_or(())?);
+        let mut child = crate::child_io::spawn(cmd.args(args).stdin(Stdio::null())
+            .stdout(Stdio::piped()).stderr(Stdio::piped())).map_err(|_| ())?;
+        fn read(pipe: impl Read) -> Result<String, ()> {
+            let mut bytes = Vec::new();
+            pipe.take(512 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| ())?;
+            if bytes.len() > 512 * 1024 { return Err(()); }
+            String::from_utf8(bytes).map_err(|_| ())
+        }
+        std::thread::scope(|scope| {
+            let out = scope.spawn({let pipe=child.stdout.take().unwrap(); move || read(pipe)});
+            let err = scope.spawn({let pipe=child.stderr.take().unwrap(); move || read(pipe)});
+            let ok = loop {
+                if let Ok(Some(status)) = child.try_wait() { break status.success(); }
+                if std::time::Instant::now() >= deadline { let _=child.kill(); let _=child.wait(); break false; }
+                std::thread::sleep(Duration::from_millis(3));
+            };
+            if !ok { return Err(()); }
+            Ok(crate::pf_verify::PfOutput { stdout: out.join().map_err(|_| ())??, stderr: err.join().map_err(|_| ())?? })
+        })
+    }
+
     /// stderr on success, Err(stderr) on failure.
     fn run(&self, args: &[&str]) -> Result<String, String> {
         self.run_input(args, None)
@@ -328,14 +354,23 @@ impl Guard {
     }
 
     pub fn verify_login(&self, holder: &str) -> Result<(), String> {
-        let Some((owner, inputs)) = self.held() else { return Err("登录保护未装载".into()); };
-        if owner != holder || inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() || self.was_superseded(holder) {
+        let state = self.state.lock().unwrap();
+        let record = state.record.as_ref().ok_or("登录保护未装载")?;
+        let inputs = &record.inputs;
+        if record.holder != holder || record.connected || inputs.login_port.is_none()
+            || !inputs.tunnel_if.is_empty() || Self::is_stale(&state, holder) {
             return Err("登录保护已变化".into());
         }
-        let rules = text(false, &inputs).ok_or("登录保护规则无效")?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        let rules = text(false, inputs).ok_or("登录保护规则无效")?;
         let path = self.settings.pfctl.as_deref().ok_or("系统防火墙不可用")?;
         crate::network_check::confirm_login_rules(path, &rules)?;
-        if self.was_superseded(holder) || self.held() != Some((owner, inputs)) { return Err("检查时登录保护已变化".into()); }
+        crate::pf_verify::verify_rule_chain(|args| state.pf.audit(args, deadline))
+            .map_err(|_| "防火墙调用顺序未确认，已停止登录")?;
+        let policy = crate::pf_verify::BlockingPolicy::new(&inputs.physical_if, &inputs.gateway_ips,
+            inputs.login_port.unwrap(), inputs.login_udp, &inputs.allow_networks).map_err(|_| "登录保护规则无效")?;
+        crate::pf_verify::clear_states(&policy, |args| state.pf.audit(args, deadline))
+            .map_err(|_| "已有连接的拦截未确认，已停止登录")?;
         Ok(())
     }
 

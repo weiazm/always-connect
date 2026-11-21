@@ -38,6 +38,8 @@ final class CLIOrchestrator {
         var directDomains: [String]? = nil
         /// 断线保护 (§26.19). Default on.
         var dropProtection = true
+        var loginTarget: GatewayAddress?
+        var loginGateways: [String] = []
         var egress: EgressProtection?
     }
 
@@ -104,6 +106,11 @@ final class CLIOrchestrator {
         if let cafile = config.cafile { json["cafile"] = cafile }
         if let max = config.maxAttempts { json["maxAttempts"] = max }
         if let tool = TestSeam.tool("openconnect") { json["testOpenconnect"] = tool }
+        if let target = config.loginTarget {
+            json["loginHost"] = target.host
+            json["loginPort"] = Int(target.port)
+            json["loginGateways"] = config.loginGateways
+        }
         if let relay = config.relay {
             json["relay"] = ["gatewayIp": relay.gatewayIp, "arguments": relay.arguments(server: config.server)]
         }
@@ -245,6 +252,7 @@ final class CLIOrchestrator {
         return (info.splitHits, info.splitAddresses)
     }
 
+    func rejectGatewayCertificate() -> Bool { ac_oc_certificate_rejected(handle) }
     func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_split_status(handle)) ?? "{}" }
 
     /// The connections page for this session (§28.7); `fallbackGateways`
@@ -382,3 +390,5 @@ func ac_oc_network_changed(_ engine: OpaquePointer)
 
 @_silgen_name("ac_oc_network_check")
 func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("ac_oc_certificate_rejected") private func ac_oc_certificate_rejected(_ engine: OpaquePointer) -> Bool

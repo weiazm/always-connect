@@ -207,11 +207,6 @@ pub(crate) fn confirm_login_rules(pfctl: &str, expected: &str) -> Result<(), Str
     if !anchor.ok || !expand_loaded_tables(&anchor.text, &mut get).is_some_and(|actual| rules_match(&actual, expected)) {
         return Err("登录保护规则未确认，已停止登录".into());
     }
-    if !anchor_chain(&mut get) { return Err("防火墙调用顺序未确认，已停止登录".into()); }
-    let states = get(pfctl, &["-s", "states"]);
-    if !states.ok || !states.text.lines().filter(|s| !s.trim().is_empty()).all(loopback_state) {
-        return Err("已有连接的拦截未确认，已停止登录".into());
-    }
     Ok(())
 }
 

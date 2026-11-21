@@ -111,8 +111,10 @@ final class OnDemandProtection {
         machine.send(["kind": reason.rawValue])
         return machine.state["session"] as? UInt64 ?? 0
     }
-    func startSession(usesCisco: Bool) {
+    @discardableResult
+    func startSession(usesCisco: Bool) -> UInt64 {
         machine.send(["kind": "session_start", "uses_cisco": usesCisco])
+        return machine.state["session"] as? UInt64 ?? 0
     }
     func restoreAbandoned(managing: Bool, usesCisco: Bool, rearm: () -> Void) {
         machine.send(["kind": "restore_abandoned", "managing": managing, "uses_cisco": usesCisco]) { action in

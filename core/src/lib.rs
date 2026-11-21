@@ -18,6 +18,7 @@ pub mod egress_gate;
 pub mod ffi;
 pub mod kill_switch;
 pub mod leak_probe;
+pub mod login_cache;
 pub mod network_guard;
 pub mod network_check;
 pub mod oc_engine;
