@@ -66,6 +66,8 @@ pub struct Inputs {
     pub login_port: Option<u16>,
     #[serde(rename = "loginUDP", default)]
     pub login_udp: bool,
+    #[serde(default)]
+    pub login_generation: u64,
 }
 
 impl Inputs {
@@ -319,7 +321,9 @@ impl Guard {
         if inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() { return Err("登录保护规则无效".into()); }
         let mut state = self.state.lock().unwrap();
         if Self::is_stale(&state, holder) { return Err("连接请求已过期".into()); }
-        if let Some(error) = self.apply_locked(&mut state, holder, false, inputs) { return Err(error); }
+        let mut next = inputs.clone();
+        next.login_generation = state.own_generation;
+        if let Some(error) = self.apply_locked(&mut state, holder, false, &next) { return Err(error); }
         Ok(())
     }
 
@@ -332,6 +336,17 @@ impl Guard {
         let path = self.settings.pfctl.as_deref().ok_or("系统防火墙不可用")?;
         crate::network_check::confirm_login_rules(path, &rules)?;
         if self.was_superseded(holder) || self.held() != Some((owner, inputs)) { return Err("检查时登录保护已变化".into()); }
+        Ok(())
+    }
+
+    pub fn apply_cisco_if_held(self: &Arc<Self>, expected: &Inputs, connected: bool, inputs: &Inputs) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if !state.record.as_ref().is_some_and(|r| r.holder == CISCO_HOLDER && r.inputs == *expected) {
+            return Err("连接请求已过期".into());
+        }
+        let mut next = inputs.clone();
+        next.login_generation = expected.login_generation;
+        if let Some(error) = self.apply_locked(&mut state, CISCO_HOLDER, connected, &next) { return Err(error); }
         Ok(())
     }
 
@@ -596,7 +611,9 @@ impl Guard {
         s.direct = saved.direct.clone().unwrap_or_default().into_iter().collect();
         // No owner yet and the tunnel's fate unknown: fail closed.
         if let Some(port) = saved.inputs.login_port {
+            s.own_generation = s.own_generation.max(saved.inputs.login_generation);
             saved.inputs = Inputs::login(&saved.inputs.physical_if, saved.inputs.gateway_ips.clone(), port, saved.inputs.login_udp);
+            saved.inputs.login_generation = s.own_generation;
             saved.connected = false;
             saved.direct = None;
             s.direct.clear();
