@@ -42,6 +42,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var loginProtectionNotice: String?
     private let loginPreparation = LoginGatewayPreparation()
     private var loginIntentActive = false
+    private var endingApp = false
     private let connectionCheck = ConnectionCheck()
     @Published private(set) var helperAvailable = false
     /// When the current connection was established (nil when not connected).
@@ -430,7 +431,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// manual disconnect. AwaitingApproval keeps the switch on: the
     /// user is mid-flow, not disconnected.
     var switchIsOn: Bool {
-        state != .disconnected || networkHeld
+        state != .disconnected || networkHeld || loginProtectionNotice != nil
     }
 
     private func connect(server: String, group: String, username: String, password: String, session: UInt64, onAccepted: (() -> Void)? = nil) {
@@ -942,12 +943,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func prepareForNetworkReset() {
         resettingNetwork = true
-        if switchIsOn || networkHeld { disconnect() }
+        loginPreparation.cancel()
+        if loginIntentActive || switchIsOn || networkHeld { disconnect() }
     }
 
     func networkResetFinished() {
         resettingNetwork = false
+        loginIntentActive = false
+        loginProtectionNotice = nil
         refreshStatus()
+        refreshHeld()
     }
 
     /// Quit = VPN off and the plain direct network (DESIGN.md §21.5):
@@ -958,6 +963,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// wind down what the App runs, and drop our XPC connection so the
     /// Helper, with nothing left to do, exits on its own.
     func shutdownForQuit(completion: @escaping () -> Void) {
+        endingApp = true
+        protection.invalidate(.manualStop)
+        loginPreparation.cancel()
         if let record = dropTracker.finishForQuit() {
             appendDrop(record)
         }
@@ -1033,6 +1041,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     @discardableResult
     private func startStoredConnection() -> Bool {
+        guard !endingApp, !resettingNetwork else { return false }
         if AppRole.isSettings {
             guard hasCredentials else { return false }
             SettingsLink.shared.send("connect")
@@ -1054,6 +1063,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             loginProtectionNotice = "请更新后台服务。网络拦截尚未确认，已停止登录。"
             return false
         }
+        loginProtectionNotice = "正在确认登录前的网络拦截"
         let native = usesCisco
         var answered = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -1390,16 +1400,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     func prepareGatewayWhileDirect() {
-        guard !AppRole.isSettings, !loginIntentActive, state == .disconnected else { return }
+        guard !AppRole.isSettings, !endingApp, !resettingNetwork, !loginIntentActive, state == .disconnected else { return }
         let name = ProfileStore.loadProfile().server
         guard let target = GatewayAddress(CiscoProfiles.resolve(name)) else { return }
         fetchNetworkHeld { [weak self] held in
-            guard let self, held == false, !self.loginIntentActive, self.state == .disconnected,
+            guard let self, held == false, !self.endingApp, !self.resettingNetwork, !self.loginIntentActive, self.state == .disconnected,
                   ProfileStore.loadProfile().server == name else { return }
             DispatchQueue.global(qos: .utility).async {
                 guard ac_login_direct_route() else { return }
                 DispatchQueue.main.async {
-                    guard !self.loginIntentActive, self.state == .disconnected,
+                    guard !self.endingApp, !self.resettingNetwork, !self.loginIntentActive, self.state == .disconnected,
                           ProfileStore.loadProfile().server == name else { return }
                     self.loginPreparation.confirmDirect()
                     self.loginPreparation.prepareWhileDirect(target)

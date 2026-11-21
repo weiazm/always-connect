@@ -48,7 +48,7 @@ struct PanelView: View {
                     GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))
                     .frame(width: 40, height: 40)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(manager.gatewayTrustFailed && manager.state == .awaitingApproval ? "VPN 登录受阻" : look.headline)
+                    Text(manager.state == .disconnected && manager.loginProtectionNotice != nil ? "VPN 尚未连接" : (manager.gatewayTrustFailed && manager.state == .awaitingApproval ? "VPN 登录受阻" : look.headline))
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(Color(nsColor: look.color))
                     Text(subtitle)
@@ -58,7 +58,7 @@ struct PanelView: View {
                 }
                 Spacer()
             }
-            if let notice = manager.loginProtectionNotice {
+            if manager.state != .disconnected, let notice = manager.loginProtectionNotice {
                 Label(notice, systemImage: "lock.shield").font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -512,6 +512,7 @@ struct PanelView: View {
     /// The engine's own words under the headline (retry count, last
     /// notice); for a plain disconnect, what "未连接" means.
     private var subtitle: String {
+        if manager.state == .disconnected, let notice = manager.loginProtectionNotice { return notice }
         if !manager.hasCredentials {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
@@ -549,6 +550,9 @@ struct PanelView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .frame(maxWidth: .infinity)
+        } else if manager.state == .disconnected, manager.loginProtectionNotice != nil {
+            Button("取消连接并恢复直连") { showConfirmDisconnect = false; onStop() }
+                .buttonStyle(.borderedProminent).controlSize(.large)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
                 Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
