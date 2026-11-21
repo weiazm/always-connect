@@ -1963,8 +1963,10 @@ impl Shared {
                     };
                     if !c.config.login_gateways.contains(&peer) { c.config.login_gateways.push(peer.clone()); }
                     if !c.config.no_routes && !c.config.test_active && tun.as_deref().is_some_and(|t| t.starts_with("utun")) {
-                        let _ = crate::login_cache::remember(&c.support(), &c.config.login_host,
-                            c.config.login_port.unwrap(), &peer);
+                        if let Err(error) = crate::login_cache::remember(&c.support(), &c.config.login_host,
+                            c.config.login_port.unwrap(), &peer) {
+                            let _ = writeln!(std::io::stderr(), "gateway cache write failed: {:?}", error.kind());
+                        }
                     }
                     gateway = Some(peer);
                 }

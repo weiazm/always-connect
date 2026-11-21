@@ -784,7 +784,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 reject(ProtectedLoginNotice.noTrustedAddress); return
             }
             self.preparedLogin = (target, addresses, physical, cisco)
-            Self.log("protected login verified")
+            Self.log(candidate.isEmpty ? "protected login verified (cache only)" : "protected login verified")
             reply(true, addresses, "")
         }
     }
@@ -827,8 +827,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             KillSwitch.shared.set(mode: parsed, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
                 if ok, parsed == .connected, let login, login.cisco, gatewayIps.count == 1,
                    login.gateways.contains(gatewayIps[0]) {
-                    LoginGatewayCache.rememberConnected(in: CLIOrchestrator.defaultSupportDir,
-                                                       target: login.target, peer: gatewayIps[0])
+                    if !LoginGatewayCache.rememberConnected(in: CLIOrchestrator.defaultSupportDir,
+                                                           target: login.target, peer: gatewayIps[0]) {
+                        Self.log("gateway cache write failed")
+                    }
                 }
                 reply(ok, message)
             }
