@@ -9,6 +9,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=$REPO/.local-build/AlwaysConnectHelper
 pass(){ echo "PASS $1"; }; fail(){ echo "FAIL $1"; FAILS=$((FAILS+1)); }; FAILS=0
+"$REPO/scripts/egress-notification-test.sh" && pass egress-notification || fail egress-notification
 "$REPO/scripts/on-demand-test.sh" && pass on-demand || fail on-demand
 # 1 smoke
 rm -rf /tmp/ac-engine-test && mkdir -p /tmp/ac-engine-test

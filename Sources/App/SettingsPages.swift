@@ -551,7 +551,7 @@ struct CredentialForm: View {
                 }
                 if showsStatus {
                     LabeledContent("当前状态") {
-                        Text(manager.stateLine).foregroundStyle(.secondary)
+                        Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary)
                     }
                 }
             }
@@ -1020,9 +1020,9 @@ struct DiagnosticsPage: View {
             .onChange(of: HelperClient.shared.state) { _ in checkNeighbors() }
 
             Section("当前连接") {
-                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(.secondary) }
+                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary) }
                 LabeledContent("连接时长") {
-                    if let since = manager.connectedSince {
+                    if manager.showsConnected, let since = manager.connectedSince {
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
                             Text(durationText(Date().timeIntervalSince(since))).monospacedDigit()
                         }
@@ -1048,7 +1048,7 @@ struct DiagnosticsPage: View {
                         }
                         .buttonStyle(.borderless)
                         .help("刷新本次 VPN 流量")
-                        .disabled(statsRunning || manager.state != .connected)
+                        .disabled(statsRunning || !manager.showsConnected)
                     }
                 }
             }
@@ -1110,7 +1110,7 @@ struct DiagnosticsPage: View {
                     Text("泄漏自检")
                     Spacer()
                     Button("运行") { runLeakCheck() }
-                        .disabled(manager.state != .connected)
+                        .disabled(!manager.showsConnected)
                 }
                 if let leakMessage {
                     Text(leakMessage).foregroundStyle(.red)
@@ -1152,7 +1152,7 @@ struct DiagnosticsPage: View {
         }
         .formStyle(.grouped)
         .onAppear(perform: refreshStats)
-        .onChange(of: manager.state) { _ in
+        .onChange(of: manager.showsConnected) { _ in
             refreshStats()
             leakItems = nil
             leakMessage = nil
@@ -1172,7 +1172,7 @@ struct DiagnosticsPage: View {
         statsRequest = request
         stats = nil
         statsMessage = nil
-        statsRunning = manager.state == .connected
+        statsRunning = manager.showsConnected
         guard statsRunning else { return }
         HelperClient.shared.fetchStats { result in
             guard statsRequest == request else { return }

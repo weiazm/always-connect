@@ -23,6 +23,20 @@ private struct FixtureSettings: View {
 struct ConnectionsUITest {
     @MainActor static func main() {
         _ = NSApplication.shared
+        // Use the real settings process' snapshot entry. A late engine state
+        // can still say connected while the menu App reports a trust failure.
+        let manager = HelperClient.shared
+        manager.applyRemoteSnapshot(#"{"state":4,"gatewayTrustFailed":true,"rejectedLoginHeld":true,"ownConnection":true}"#)
+        let failed = PanelStatusHeader(client: manager, subtitle: "已连接")
+        let menu = NSButton()
+        StatusLook.updateMenuButton(menu, client: manager)
+        check(!manager.showsConnected && manager.stateLine == "VPN 网关证书校验失败", "settings copy replaces the old success state")
+        check(failed.look.headline == manager.stateLine && failed.badge == .alert
+              && !failed.subtitle.contains("已连接") && menu.toolTip?.contains(manager.stateLine) == true,
+              "menu, tooltip, panel and settings agree on certificate rejection")
+        manager.applyRemoteSnapshot(#"{"state":4,"gatewayTrustFailed":false,"ownConnection":true}"#)
+        check(manager.showsConnected && PanelStatusHeader(client: manager, subtitle: "").badge == .lock, "healthy settings snapshot restores the lock")
+        manager.applyRemoteSnapshot(#"{"state":0}"#)
         CiscoEngine.cliPath = "/nonexistent/connections-ui-test/vpn"
         let fixture = Fixture()
         let controller = NSHostingController(rootView: FixtureSettings(fixture: fixture))

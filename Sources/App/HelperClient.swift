@@ -39,6 +39,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var autoStopNotice: String?
     @Published private(set) var gatewayTrustFailed = false
     @Published private(set) var rejectedLoginHeld = false
+    private var relayIncident: UInt64 = 0
+    private var revalidatedRelayPin: String?
+    private var pendingRecovery: UInt64?
+    private var awaitingCiscoStart = false
+    var showsConnected: Bool { state == .connected && !gatewayTrustFailed }
+    var certificateProtectionText: String {
+        if !protectsDrops { return "断线保护已关闭。请联系 VPN 管理员。" }
+        if rejectedLoginHeld { return "网络已拦截。可点「恢复网络」回到直连。" }
+        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+    }
     @Published private(set) var loginProtectionNotice: String?
     private let loginPreparation = LoginGatewayPreparation()
     private var loginIntentActive = false
@@ -102,9 +112,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// One-line status text (UI-DESIGN.md §三), shared by the panel,
     /// the Credentials page, and Diagnostics.
     var stateLine: String {
-        if gatewayTrustFailed && [.connecting, .authenticating, .awaitingApproval].contains(state) {
-            return "VPN 网关证书校验失败"
-        }
+        if gatewayTrustFailed { return StatusLook.certificateHeadline }
         switch state {
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }
@@ -361,8 +369,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         // A Cisco engine still winding down after the switch to the own
         // connection must not speak for the session any more.
-        cisco.onState = { [weak self] state, detail in
+        cisco.onStatus = { [weak self] state, detail, rejected in
             guard let self, self.usesCisco else { return }
+            self.updateCiscoTrust(rejected: rejected, state: state)
             if state == .reconnecting {
                 self.dropRetryCount = cisco.episodeRetries
             }
@@ -392,6 +401,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String],
                                completion: @escaping (Bool) -> Void = { _ in }) {
         guard let ticket = protection.request(mode) else { completion(false); return }
+        rejectedLoginHeld = false
         var finished = false
         func finish(_ ok: Bool) {
             guard !finished else { return }
@@ -414,6 +424,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         guard !finished, self.protection.isCurrent(ticket) else { finish(false); return }
                         self.markHelperReachable()
                         self.pfWarning = ok || !self.usesCisco ? nil : message
+                        self.rejectedLoginHeld = ok && matches && enabled && requested == 2 && self.usesCisco
                         // A legacy session can retain its previous kill switch. A new
                         // protected login requires a matching service and verified rule set.
                         finish(ok && (!enabled || (matches && requested == mode)))
@@ -586,6 +597,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     ) {
         loginIntentActive = false
         loginPreparation.cancel()
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
         loginProtectionNotice = nil
         let protectionSession = protection.invalidate(.disconnect)
         dropTracker.noteUserStop()
@@ -690,9 +703,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Detaches the current relay (and cancels one being prepared); the
     /// caller stops it once the Helper has let go of the tunnel.
-    private func takeRelay() -> CertificateRelay? {
+    private func takeRelay(clearTrustNotice: Bool = true) -> CertificateRelay? {
         relayGeneration += 1
-        gatewayTrustFailed = false
+        relayIncident = 0
+        revalidatedRelayPin = nil
+        pendingRecovery = nil
+        if clearTrustNotice { gatewayTrustFailed = false }
         rejectedLoginHeld = false
         let current = relay
         relay = nil
@@ -709,6 +725,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         settings.connectionMode = own ? "own" : "cisco"
         ProfileStore.saveAppSettings(settings)
         ownConnection = own
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
         pfWarning = nil
         splitActivity = nil
     }
@@ -1052,9 +1070,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         splitWarning = nil
         loginProtectionNotice = nil
         loginIntentActive = true
+        awaitingCiscoStart = usesCisco
         let session = protection.startSession(usesCisco: usesCisco)
         let server = CiscoProfiles.resolve(profile.server)
-        let candidate = loginPreparation.takeForIntent(GatewayAddress(server))
+        let preparation = loginPreparation.takeResultForIntent(GatewayAddress(server))
+        let candidate = preparation.address
+        if preparation.certificateRejected {
+            showGatewayRejection()
+            rejectedLoginHeld = false
+        }
         if !protectsDrops {
             return continueStoredConnection(profile, username: username, server: server,
                                             addresses: nil, session: session)
@@ -1080,6 +1104,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     answered = true
                     guard ok else {
                         self.loginProtectionNotice = notice
+                        if preparation.certificateRejected {
+                            self.rejectedLoginHeld = notice == ProtectedLoginNotice.noTrustedAddress
+                        }
                         self.refreshHeld()
                         return
                     }
@@ -1100,6 +1127,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // The engine reads the password itself, once, when it logs in.
             // Allowlist first, so the kill switch's first load has it.
             updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+            awaitingCiscoStart = false
             cisco.connect()
             return true
         }
@@ -1190,7 +1218,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// go straight to the gateway. Completion on main: nil = ready to
     /// connect, else what to show the user.
     private func prepareRelay(server: String, authorisedAddresses: [String]? = nil, completion: @escaping (String?) -> Void) {
-        takeRelay()?.stop()
+        takeRelay(clearTrustNotice: false)?.stop()
         retiringRelay?.stop()
         retiringRelay = nil
         let generation = relayGeneration
@@ -1215,6 +1243,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     return
                 }
                 DispatchQueue.main.async {
+                    guard self.relayGeneration == generation else { return }
+                    if self.gatewayTrustFailed { self.revalidatedRelayPin = "" }
                     self.sendPrepareRelay(gatewayIp: "", serverPin: "") { _ in finish(nil) }
                 }
                 return
@@ -1245,16 +1275,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
                         relay.onGatewayTrustChanged = { [weak self] trusted in
                             DispatchQueue.main.async {
-                                guard let self, self.relayGeneration == generation, !self.usesCisco else { return }
-                                self.gatewayTrustFailed = !trusted
-                                self.rejectedLoginHeld = false
-                                if !trusted && self.protectsDrops && HelperInstaller.installedHelperMatchesBundle {
-                                    self.egressRPC({ $0.gatewayCertificateRejected(prepared.serverPin, withReply: $1) }) { ok in
-                                        guard generation == self.relayGeneration && self.gatewayTrustFailed else { return }
-                                        self.rejectedLoginHeld = ok == true
-                                        self.loginProtectionNotice = nil
-                                    }
-                                }
+                                self?.observeRelayTrust(trusted, pin: prepared.serverPin, generation: generation)
                             }
                         }
                         relay.onGatewayUnreachable = { [weak self] silent in
@@ -1289,6 +1310,66 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 }
                 if let authorisedAddresses { prepare(authorisedAddresses) }
                 else { self.resolveGatewayIPv4(address.host, completion: prepare) }
+            }
+        }
+    }
+
+    private func showGatewayRejection() {
+        guard !gatewayTrustFailed else { return }
+        gatewayTrustFailed = true
+        Notifier.shared.notifyGatewayCertificateFailure()
+    }
+
+    private func updateCiscoTrust(rejected: Bool, state: State) {
+        if rejected {
+            showGatewayRejection()
+            loginProtectionNotice = nil
+        } else if state == .connected && gatewayTrustFailed && !awaitingCiscoStart {
+            // Cisco sends this clean state only after confirming the current native session.
+            gatewayTrustFailed = false
+            rejectedLoginHeld = false
+        }
+    }
+
+    private func observeRelayTrust(_ trusted: Bool, pin: String, generation: Int) {
+        guard generation == relayGeneration, !usesCisco else { return }
+        if trusted {
+            guard gatewayTrustFailed else { return }
+            revalidatedRelayPin = pin
+            confirmRelayRecovery()
+            return
+        }
+        relayIncident &+= 1
+        let incident = relayIncident
+        revalidatedRelayPin = nil
+        pendingRecovery = nil
+        showGatewayRejection()
+        rejectedLoginHeld = false
+        loginProtectionNotice = nil
+        egressRPC({ $0.recordGatewayRejection(pin, incident: incident, withReply: $1) }) { held in
+            guard generation == self.relayGeneration, self.relayIncident == incident, self.gatewayTrustFailed else { return }
+            self.rejectedLoginHeld = held == true && self.protectsDrops
+            self.confirmRelayRecovery()
+        }
+    }
+
+    private func confirmRelayRecovery() {
+        let incident = relayIncident
+        guard state == .connected, gatewayTrustFailed, !usesCisco,
+              let pin = revalidatedRelayPin, pendingRecovery != incident else { return }
+        let generation = relayGeneration
+        pendingRecovery = incident
+        egressRPC({ $0.hasVerifiedRelayTunnel(pin, incident: incident, withReply: $1) }) { verified in
+            guard generation == self.relayGeneration, incident == self.relayIncident else { return }
+            self.pendingRecovery = nil
+            guard verified == true, self.state == .connected, self.revalidatedRelayPin == pin else { return }
+            self.gatewayTrustFailed = false
+            self.rejectedLoginHeld = false
+            self.revalidatedRelayPin = nil
+            self.connectedSince = Date()
+            if !self.sessionProven {
+                self.sessionProven = true
+                self.startConnectionCheck()
             }
         }
     }
@@ -1521,6 +1602,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // the drop (it read as 断了 2 秒，没恢复, §30.4).
             return
         }
+        let rejectedWithHold = detail == "VPN 网关证书校验失败，网络已拦截"
+        if !usesCisco && relay == nil && (detail == StatusLook.certificateHeadline || rejectedWithHold) {
+            showGatewayRejection()
+            rejectedLoginHeld = rejectedWithHold && protectsDrops
+            revalidatedRelayPin = ""
+            loginProtectionNotice = nil
+        }
         state = parsed
         if parsed != old { updateEgressMonitoring() }
         self.detail = detail
@@ -1547,6 +1635,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             recordAwaitingTerminal = parsed == .disconnected ? id.map { ($0, record.retries ?? 0) } : nil
         }
         if parsed == .connected {
+            confirmRelayRecovery()
             loginProtectionNotice = nil
             if old != .connected {
                 connectedSince = Date()
@@ -1554,7 +1643,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // that comes back after a drop, a wake or a service
                 // restart was proven before, and 30 quiet seconds there
                 // must not turn the VPN off (§30.4).
-                if !usesCisco, !sessionProven {
+                if !usesCisco, !sessionProven, !gatewayTrustFailed {
                     sessionProven = true
                     startConnectionCheck()
                 }
@@ -1572,7 +1661,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         } else {
             networkHeld = false
         }
-        Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops)
+        if !gatewayTrustFailed {
+            Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops)
+        }
         updateHoldReminder()
         // Session info (DESIGN.md §十九): the retry count is live
         // during a drop episode; the terminal reason is fetched once
@@ -2142,6 +2233,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // The panel's "后台服务未运行" row already says it;
                 // no second red line.
                 self.helperAvailable = false
+                self.rejectedLoginHeld = false
                 self.onDemandDisconnect.transportLost(
                     active: self.state != .disconnected, resetting: self.resettingNetwork, invalidated: false)
             }
@@ -2152,6 +2244,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 self.connection = nil
                 if !AppRole.isSettings {
                     self.helperAvailable = false
+                    self.rejectedLoginHeld = false
                     self.onDemandDisconnect.transportLost(
                         active: self.state != .disconnected, resetting: self.resettingNetwork, invalidated: true)
                 }

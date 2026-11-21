@@ -107,6 +107,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// certificate could not be made, and after a clear.
     /// Installs the pre-login firewall before any VPN connection or DNS lookup.
     /// The candidate, if provided, was TLS-verified before this login intent.
+    /// Scope a rejected handshake and its later tunnel verification to the same relay and incident.
+    func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
+    func hasVerifiedRelayTunnel(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
     func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)
     func beginProtectedLogin(_ server: String, cisco: Bool, candidate: String,
                              withReply reply: @escaping (Bool, [String], String) -> Void)
@@ -158,4 +161,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 /// polls.
 @objc protocol AlwaysConnectHelperClientProtocol {
     func statusChanged(state: Int, detail: String)
+}
+
+
+enum ProtectedLoginNotice {
+    static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
 }

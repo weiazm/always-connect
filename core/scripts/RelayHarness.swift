@@ -90,6 +90,10 @@ struct RelayHarness {
         let relay = CertificateRelay(host: "localhost", port: listen, identity: first,
                                      expires: renewal == nil ? nil : Date(timeIntervalSinceNow: -60),
                                      renewal: renewal, upstreamPort: upstream, anchor: ca)
+        relay.onGatewayTrustChanged = { trusted in
+            print("GATEWAY_TRUST \(trusted ? "accepted" : "rejected")")
+            fflush(stdout)
+        }
         let prepared: CertificateRelay.Prepared
         do {
             prepared = try relay.prepare()

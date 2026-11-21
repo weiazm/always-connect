@@ -71,7 +71,7 @@ final class CertificateRelay {
     /// found the gateway address silent (§30.6), with that address.
     var onGatewayUnreachable: ((String) -> Void)?
     var onGatewayTrustChanged: ((Bool) -> Void)?
-    private var gatewayTrusted = true
+    private var gatewayTrusted: Bool?
     private var silentHandshakes = 0
 
     enum RelayError: LocalizedError {

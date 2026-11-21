@@ -483,6 +483,27 @@ fn invalidate_forces_a_fresh_check() {
 }
 
 #[test]
+fn policy_refresh_keeps_the_existing_connection_and_rechecks_the_next_one() {
+    let mut g = gate();
+    let now = Instant::now();
+    let initial = hello(Some("protected.example"), &[], false, 0);
+    let (_, original) = connect_and_send(&mut g, 57010, SITE, &initial, now);
+    assert_eq!(checks(&g.drain()).len(), 1);
+    g.verdict(1, true, now);
+    assert!(g.drain().iter().any(|o| matches!(o, Out::ToTunnel(p) if p == &original)));
+    g.reconfigure(vec![], Box::new(Rules));
+    let established = tcp4(MAC, 57010, SITE, 443, 1001 + initial.len() as u32, 5001, PA, b"next");
+    assert_eq!(g.outbound(&established, now), Step::Forward);
+    assert!(g.drain().is_empty());
+    connect_and_send(&mut g, 57011, SITE, &initial, now);
+    assert_eq!(checks(&g.drain()).len(), 1);
+    g.verdict(1, false, now);
+    let output = g.drain();
+    assert!(!output.iter().any(|o| matches!(o, Out::ToTunnel(_))));
+    assert!(output.iter().any(|o| matches!(o, Out::ToHost(_))));
+}
+
+#[test]
 fn eviction_never_drops_held_connections() {
     let cfg = GateConfig { max_flows: 16, ..GateConfig::default() };
     let mut g = Gate::new(cfg, Box::new(Rules));

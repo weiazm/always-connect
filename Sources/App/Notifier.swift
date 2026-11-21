@@ -117,6 +117,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
              body: "连上后 30 秒都上不了网，已断开 VPN、恢复直连。可在设置里改用「经 Cisco」连接。")
     }
 
+    func notifyGatewayCertificateFailure() {
+        post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
+    }
+
     func egressBlocked(_ record: EgressProtection.BlockRecord) {
         let observed = record.observed.filter { item in
             item.country.map { !record.expected.contains($0) } ?? true

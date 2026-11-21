@@ -41,45 +41,19 @@ struct PanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            let look = StatusLook.of(manager.state, held: manager.networkHeld,
-                                     hasCredentials: manager.hasCredentials, onDemand: manager.onDemandPaused)
-            HStack(spacing: 12) {
-                Image(nsImage: GlobeIcon.image(
-                    GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))
-                    .frame(width: 40, height: 40)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(manager.state == .disconnected && manager.loginProtectionNotice != nil ? "VPN 尚未连接" : (manager.gatewayTrustFailed && manager.state == .awaitingApproval ? "VPN 登录受阻" : look.headline))
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(Color(nsColor: look.color))
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                Spacer()
-            }
-            if manager.state != .disconnected, let notice = manager.loginProtectionNotice {
+            PanelStatusHeader(client: manager, subtitle: subtitle)
+            if !manager.gatewayTrustFailed, manager.state != .disconnected, let notice = manager.loginProtectionNotice {
                 Label(notice, systemImage: "lock.shield").font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if manager.gatewayTrustFailed {
-                Label(manager.protectsDrops
-                      ? (manager.rejectedLoginHeld ? "VPN 网关证书校验失败，网络已拦截。可点恢复网络回到直连。"
-                         : "VPN 网关证书校验失败。网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。")
-                      : "VPN 网关证书校验失败。断线保护已关闭。请联系 VPN 管理员。",
-                      systemImage: "exclamationmark.shield.fill")
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if manager.state == .connected, let notice = manager.dnsNotice {
+            if manager.showsConnected, let notice = manager.dnsNotice {
                 Label(notice, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             primaryButton
-            if manager.state == .connected {
+            if manager.showsConnected {
                 speedCard
             }
             quickSettings
@@ -176,7 +150,7 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-            if let warning = manager.splitWarning, manager.state == .connected {
+            if let warning = manager.splitWarning, manager.showsConnected {
                 Text(warning)
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -394,7 +368,7 @@ struct PanelView: View {
         if manager.splitSwitchPending { return "正在切换，稍候会重新连接…" }
         guard manager.ownConnection else { return "关：全部走 VPN（经 Cisco）" }
         if siteCount == 0 { return "名单还是空的，点「名单」添加" }
-        guard manager.state == .connected, let activity = manager.splitActivity else {
+        guard manager.showsConnected, let activity = manager.splitActivity else {
             return "名单里 \(siteCount) 条不走 VPN"
         }
         if activity.entries.isEmpty { return "还没打开名单里的网站" }
@@ -472,7 +446,7 @@ struct PanelView: View {
             .padding(.vertical, 9)
             Divider()
             splitRow
-            if let line = manager.egressLine {
+            if !manager.gatewayTrustFailed, let line = manager.egressLine {
                 Divider()
                 Button { onOpenSettings("split") } label: {
                     rowLabel("shield.lefthalf.filled", "出口保护", line)
@@ -517,11 +491,10 @@ struct PanelView: View {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }
-        if manager.gatewayTrustFailed, [.connecting, .authenticating, .awaitingApproval].contains(manager.state) { return "尚未建立新的安全连接" }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
-        if manager.state == .connected {
+        if manager.showsConnected {
             // Which server and for how long (§45.4), not the engine's words.
             let server = servers.first { $0.target == selectedServer }?.name ?? selectedServer
             guard let since = manager.connectedSince else { return server }
@@ -542,8 +515,17 @@ struct PanelView: View {
 
     /// One button, labelled with what it does next.
     @ViewBuilder private var primaryButton: some View {
-        let red = manager.state == .reconnecting || manager.networkHeld
-        if !manager.hasCredentials {
+        let red = manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+        if red {
+            // Never trapped behind drop protection: one click, no
+            // confirm, back to the direct network.
+            Button { showConfirmDisconnect = false; onStop() } label: {
+                Text("断开 VPN，恢复直连网络").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .controlSize(.large)
+        } else if !manager.hasCredentials {
             Button(ProfileStore.loadProfile().servers.isEmpty ? "填写服务器与账号" : "填写账号与密码") {
                 onOpenSettings("credentials")
             }
@@ -559,18 +541,9 @@ struct PanelView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-        } else if red {
-            // Never trapped behind drop protection: one click, no
-            // confirm, back to the direct network.
-            Button { showConfirmDisconnect = false; onStop() } label: {
-                Text("断开 VPN，恢复直连网络").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .controlSize(.large)
         } else {
             Button { showConfirmDisconnect = true } label: {
-                Text(manager.state == .connected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
+                Text(manager.showsConnected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)

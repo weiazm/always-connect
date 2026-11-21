@@ -252,7 +252,8 @@ final class CLIOrchestrator {
         return (info.splitHits, info.splitAddresses)
     }
 
-    func rejectGatewayCertificate() -> Bool { ac_oc_certificate_rejected(handle) }
+    func rejectGatewayCertificate(_ incident: UInt64) -> Bool { ac_oc_record_gateway_rejection(handle, incident) }
+    func hasVerifiedTunnel(_ incident: UInt64) -> Bool { ac_oc_verified_tunnel(handle, incident) }
     func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_split_status(handle)) ?? "{}" }
 
     /// The connections page for this session (§28.7); `fallbackGateways`
@@ -391,4 +392,6 @@ func ac_oc_network_changed(_ engine: OpaquePointer)
 @_silgen_name("ac_oc_network_check")
 func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 
-@_silgen_name("ac_oc_certificate_rejected") private func ac_oc_certificate_rejected(_ engine: OpaquePointer) -> Bool
+@_silgen_name("ac_oc_record_gateway_rejection") private func ac_oc_record_gateway_rejection(_ engine: OpaquePointer, _ incident: UInt64) -> Bool
+
+@_silgen_name("ac_oc_verified_tunnel") private func ac_oc_verified_tunnel(_ engine: OpaquePointer, _ incident: UInt64) -> Bool

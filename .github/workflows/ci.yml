@@ -395,6 +395,8 @@ jobs:
         run: scripts/list-rules-test.sh
       - name: On-demand policy and connection orchestration
         run: scripts/on-demand-test.sh
+      - name: Egress notification actions and recovery (mock settings and delivery)
+        run: scripts/egress-notification-test.sh
 
   # Real openconnect against the mock gateway; needs the Xcode-built
   # background service, so it builds it too.

@@ -1976,5 +1976,16 @@ pub extern "C" fn ac_login_direct_route() -> bool {
 
 #[no_mangle]
 pub extern "C" fn ac_oc_certificate_rejected(engine: *const oc_engine::Engine) -> bool {
-    unsafe { engine.as_ref() }.is_some_and(|e| e.reject_gateway_certificate())
+    ac_oc_record_gateway_rejection(engine, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engine, incident: u64) -> bool {
+    unsafe { engine.as_ref() }.is_some_and(|e| e.record_gateway_rejection(incident))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
+    unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
 }

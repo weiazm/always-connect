@@ -118,6 +118,7 @@ struct EgressProtectionSection: View {
         }
         .onAppear { config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection(); refresh() }
         .onChange(of: manager.egressLine) { _ in refresh() }
+        .onChange(of: manager.showsConnected) { _ in refresh() }
         .onReceive(timer) { _ in if config.isActive { refresh() } }
         .sheet(item: $editing) { group in
             EgressGroupEditor(group: group, config: config) { candidate, done in
@@ -203,8 +204,9 @@ struct EgressProtectionSection: View {
     }
 
     private func refresh() {
-        guard config.isActive, manager.state == .connected else { status = nil; return }
+        guard config.isActive, manager.showsConnected else { status = nil; return }
         manager.fetchEgressJSON { json in
+            guard config.isActive, manager.showsConnected else { status = nil; return }
             status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
         }
     }

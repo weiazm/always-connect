@@ -58,10 +58,13 @@ ssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Relay Test CA" \
 ssl x509 -in ca.pem -outform DER -out ca.der
 issue() { # name usage
     ssl req -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout "$1.key" -out "$1.csr"
-    printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=%s\n' "$2" > "$1.ext"
+    printf 'subjectAltName=%s\nextendedKeyUsage=%s\n' "${3:-DNS:localhost,IP:127.0.0.1}" "$2" > "$1.ext"
     ssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile "$1.ext" -out "$1.pem"
 }
 issue gateway serverAuth
+issue wrong-name serverAuth DNS:other.example
+ssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
+    -addext subjectAltName=DNS:localhost -keyout untrusted.key -out untrusted.pem
 issue company clientAuth
 issue stranger clientAuth
 for who in company stranger; do
@@ -85,6 +88,8 @@ start_relay() { # listen upstream [identity.p12 [renewal.p12]] -> sets RELAY_IP 
 
 # 2 + 3
 start_relay 4461 4462
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" trust 4461 4462 "$D" || fail "gateway trust sequence"
+if ! "$ROOT/scripts/gateway-status-test.sh" "$W/relay-4461.out"; then fail "certificate failure presentation"; fi
 python3 -I "$ROOT/core/scripts/relay-framing-check.py" frames 4461 4462 "$D" || FAILS=$((FAILS + 1))
 python3 -I "$ROOT/core/scripts/relay-framing-check.py" dtls 4461 4462 "$D" || FAILS=$((FAILS + 1))
 for who in relay-client none stranger company; do
@@ -111,6 +116,14 @@ start_relay 4463 4464
 # ALWAYSCONNECT_TEST_OPENCONNECT: run the engine with that openconnect
 # (CI points it at the App's bundled copy, DESIGN.md §27.3).
 OCARG=(); [ -n "${ALWAYSCONNECT_TEST_OPENCONNECT:-}" ] && OCARG=(--openconnect "$ALWAYSCONNECT_TEST_OPENCONNECT")
+# Direct OpenConnect, using a test CA which did not sign this gateway.
+printf 'testpass\n' | "$HELPER" run-once --server https://localhost:4464 --user testuser ${OCARG[@]+"${OCARG[@]}"} \
+    --cafile untrusted.pem --max-attempts 1 --no-routes --cookie-store "$W/rejected.json" --support-dir "$W/direct-rejected" > "$W/rejected.out" 2>&1
+if grep -q '^STATE .*VPN 网关证书校验失败' "$W/rejected.out" && ! grep -q '^STATE connected ' "$W/rejected.out"; then
+    pass "direct engine reports the gateway certificate failure before connection"
+else
+    fail "direct engine certificate failure status"
+fi
 printf 'testpass\n' | "$HELPER" run-once --server https://localhost:4463 --user testuser ${OCARG[@]+"${OCARG[@]}"} \
     --relay-ip "$RELAY_IP" --relay-pin "$RELAY_PIN" --max-attempts 3 --no-routes --debug-child-output \
     --cookie-store "$W/session.json" --support-dir "$W/support" > "$W/engine.out" 2>&1 &

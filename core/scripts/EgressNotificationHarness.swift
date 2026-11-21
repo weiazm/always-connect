@@ -164,5 +164,9 @@ struct EgressNotificationHarness {
               && recovered.content.userInfo.isEmpty, "recovery identifies the group and carries no trust payload")
         respond(trust, to: recovered)
         check(actions.trusted.count == 1 && actions.disconnects == 0, "missing action metadata cannot change the policy")
+        notifier.notifyGatewayCertificateFailure()
+        let certificate = center.requests.last!.content
+        check(certificate.title == "VPN 网关证书校验失败" && certificate.body.contains("网络拦截状态")
+              && certificate.userInfo.isEmpty && certificate.categoryIdentifier.isEmpty, "certificate notice names the cause and offers no trust override")
     }
 }

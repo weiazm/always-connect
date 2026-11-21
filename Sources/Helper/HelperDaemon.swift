@@ -711,11 +711,24 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         current?.killChild()
     }
 
+    private func activeRelayEngine(_ pin: String) -> CLIOrchestrator? {
+        guard !userReleased, !pin.isEmpty, relay?.serverPin == pin, activeParameters?.last == pin else { return nil }
+        return engine
+    }
+
     func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void) {
+        recordGatewayRejection(serverPin, incident: 0, withReply: reply)
+    }
+
+    func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void) {
+        queue.async { reply(self.activeRelayEngine(serverPin)?.rejectGatewayCertificate(incident) ?? false) }
+    }
+
+    func hasVerifiedRelayTunnel(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void) {
         queue.async {
-            guard !self.userReleased, self.dropProtection, !serverPin.isEmpty, self.relay?.serverPin == serverPin,
-                  self.activeParameters?.last == serverPin, let engine = self.engine else { reply(false); return }
-            reply(engine.rejectGatewayCertificate())
+            let direct = serverPin.isEmpty && !self.userReleased && self.relay == nil && self.activeParameters?.last == ""
+            let engine = direct ? self.engine : self.activeRelayEngine(serverPin)
+            reply(engine?.hasVerifiedTunnel(incident) ?? false)
         }
     }
 
@@ -757,7 +770,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 reject(error); return
             }
             guard !addresses.isEmpty else {
-                reject("网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"); return
+                reject(ProtectedLoginNotice.noTrustedAddress); return
             }
             self.preparedLogin = (target, addresses, physical, cisco)
             Self.log("protected login verified")

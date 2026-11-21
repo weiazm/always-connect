@@ -148,6 +148,8 @@ final class Proxy {
 }
 final class Client {
     var loginIntentActive = false
+    var gatewayTrustFailed = false
+    var rejectedLoginHeld = false
     let loginPreparation = Preparation()
     var loginProtectionNotice: String?
     let onDemand = OnDemandController()

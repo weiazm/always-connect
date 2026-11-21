@@ -407,6 +407,8 @@ struct Core {
     network: crate::offline::Gate,
     resume_after_exit: bool,
     hook_fired: bool,
+    certificate_incident: u64,
+    direct_certificate_error: Option<bool>,
     gate_lost: bool,
     saw_login_failed: bool,
     fed: Credential,
@@ -504,6 +506,8 @@ impl Engine {
                 network: crate::offline::Gate::default(),
                 resume_after_exit: false,
                 hook_fired: false,
+                certificate_incident: 0,
+                direct_certificate_error: None,
                 gate_lost: false,
                 saw_login_failed: false,
                 fed: Credential::Password,
@@ -650,15 +654,21 @@ impl Engine {
     }
 
     pub fn reject_gateway_certificate(&self) -> bool {
+        self.record_gateway_rejection(0)
+    }
+
+    pub fn record_gateway_rejection(&self, incident: u64) -> bool {
         let mut c = self.shared.core.lock().unwrap();
-        if c.stop_requested || c.config.login_port.is_none() || !c.config.drop_protection
-            || self.shared.guard.was_superseded(&self.shared.holder) { return false; }
-        c.tunnel_retrying = true;
-        c.tunnel_if = None;
-        self.shared.update_forwarder(&c);
-        let held = self.shared.require_login_hold(&mut c);
-        self.shared.publish(&c);
-        held
+        self.shared.reject_certificate(&mut c, incident, false)
+    }
+
+    pub fn verified_tunnel(&self, incident: u64) -> bool {
+        let c = self.shared.core.lock().unwrap();
+        c.certificate_incident == incident && c.direct_certificate_error.is_none() && c.driver.state == SessionStatus::Connected
+            && c.hook_fired && c.tunnel_if.is_some() && c.child_alive()
+            && !c.tunnel_retrying && !c.recovery_suspended() && !c.stop_requested && !c.finished
+            && !(c.config.drop_protection && c.pf_needs_load)
+            && !self.shared.guard.was_superseded(&self.shared.holder)
     }
 
     pub fn info(&self) -> Info {
@@ -1028,6 +1038,23 @@ impl Shared {
         self.report(c, "等待网络恢复");
     }
 
+    fn reject_certificate(&self, c: &mut Core, incident: u64, direct: bool) -> bool {
+        if c.stop_requested || self.guard.was_superseded(&self.holder) { return false; }
+        if c.finished {
+            // The TLS refusal and child exit can arrive in either order.
+            // A terminal engine can attest only to its still-installed hold.
+            return c.config.drop_protection && c.config.login_port.is_some() && self.guard.verify_login(&self.holder).is_ok();
+        }
+        c.certificate_incident = incident;
+        c.tunnel_retrying = true;
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        let held = c.config.drop_protection && c.config.login_port.is_some() && self.require_login_hold(c);
+        if direct { c.direct_certificate_error = Some(held); }
+        self.report(c, "VPN 网关证书校验失败");
+        held
+    }
+
     fn report(&self, c: &Core, detail: &str) {
         let mut state = c.driver.state;
         if c.recovery_suspended() && !c.stop_requested && !c.finished {
@@ -1044,6 +1071,11 @@ impl Shared {
             state = SessionStatus::Reconnecting;
         }
         self.publish(c);
+        let detail = match c.direct_certificate_error.filter(|_| !c.stop_requested) {
+            Some(true) if c.config.drop_protection && c.pf_error.is_none() => "VPN 网关证书校验失败，网络已拦截",
+            Some(_) => "VPN 网关证书校验失败",
+            None => detail,
+        };
         (self.hooks.state)(state_code(state), detail);
     }
 
@@ -1831,6 +1863,13 @@ impl Shared {
     }
 
     fn handle_line(self: &Arc<Self>, c: &mut Core, line: &str, stdout: bool) {
+        // The CLI emits this final verification error before aborting the TLS
+        // handshake. A warning alone can precede successful pin verification.
+        if !stdout && c.config.relay.is_none()
+            && line.starts_with("Certificate from VPN server \"") && line.ends_with("\" failed verification.") {
+            self.reject_certificate(c, 0, true);
+            return;
+        }
         let redacted = redact(line);
         if c.config.debug_child_output {
             let _ = std::io::stderr().write_all(format!("CHILD {}: {}\n", if stdout { "out" } else { "err" }, redacted).as_bytes());
@@ -1949,6 +1988,9 @@ impl Shared {
                 c.driver.on_auth_outcome(AuthOutcome::Success);
                 let allow = c.config.allow_direct_egress_when_connected;
                 self.load_pf(c, tun, gateway.into_iter().collect(), allow);
+                if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
+                    c.direct_certificate_error = None;
+                }
                 self.report(c, c.pf_error.as_deref().unwrap_or("tunnel up"));
                 self.route_networks_direct(c);
             }
@@ -1984,6 +2026,9 @@ impl Shared {
                 if let Some((_, gateways)) = c.last_pf.clone() {
                     let allow = c.last_allow_direct_egress;
                     self.load_pf(c, c.tunnel_if.clone(), gateways, allow);
+                }
+                if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
+                    c.direct_certificate_error = None;
                 }
                 self.report(c, "tunnel up");
             }
@@ -3088,6 +3133,43 @@ mod tests {
         },guard)
     }
     #[test]
+    fn rejection_after_connected_pushes_failure_and_requires_new_tunnel_for_the_current_incident() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let pushed = reports.clone();
+        let (engine, support) = split_engine_with_hooks("rejected-connected", Hooks {
+            state: Box::new(move |code, detail| pushed.lock().unwrap().push((code, detail.to_owned()))),
+            terminal: Box::new(|_| ()), network_available: Box::new(|| true),
+            physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
+            system_roots: Box::new(|| None), stopped: Box::new(|| ()),
+        });
+        let mut child = crate::child_io::spawn(Command::new("/bin/sleep").arg("10")).unwrap();
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.config.drop_protection = false;
+            c.child = Some(Child { pid: child.id() as i32, generation: c.generation, alive: Arc::new(AtomicBool::new(true)) });
+            c.driver.start();
+            c.driver.on_authenticated();
+            engine.shared.handle_hook(&mut c, "connect tun=utun5 gateway=192.0.2.10");
+        }
+        assert!(engine.verified_tunnel(0));
+        assert!(!engine.record_gateway_rejection(11), "protection is off");
+        assert_eq!(reports.lock().unwrap().last().unwrap(), &(state_code(SessionStatus::Reconnecting), "VPN 网关证书校验失败".into()));
+        assert!(!engine.verified_tunnel(11));
+        engine.record_gateway_rejection(12);
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            engine.shared.handle_hook(&mut c, "reconnect tun=utun5 dns=192.0.2.53");
+        }
+        assert!(engine.verified_tunnel(12));
+        assert!(!engine.verified_tunnel(11));
+        engine.shared.core.lock().unwrap().child = None;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    #[test]
     fn protected_login_checks_loaded_rules_before_the_child_and_holds_after_failure() {
         use std::os::unix::fs::PermissionsExt;
         let (support, guard, pfctl) = recovery_guard("strict-cold");
@@ -3137,7 +3219,8 @@ exit 1
         assert!(!anchor.contains("utun"));
         assert!(anchor.contains("to 192.0.2.23 port 8443 no state"));
         assert!(std::fs::read_to_string(support.join("login-args")).unwrap().contains("--resolve=gateway.example:192.0.2.23"));
-        assert!(engine.reject_gateway_certificate());
+        assert!(engine.record_gateway_rejection(7));
+        assert!(!engine.verified_tunnel(7));
         assert_eq!(guard.expected_rules().unwrap(), anchor);
         engine.stop(false, false);
         for _ in 0..150 {
