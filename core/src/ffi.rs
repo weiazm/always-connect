@@ -1687,6 +1687,11 @@ pub extern "C" fn ac_oc_info(e: *const oc_engine::Engine) -> *mut c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
+pub extern "C" fn ac_oc_split_status(e: *const oc_engine::Engine) -> *mut c_char {
+    unsafe { e.as_ref() }.map(|e| owned(e.split_status_json())).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_oc_connections_json(e: *const oc_engine::Engine, fallback_gateways: *const c_char) -> *mut c_char {
     let fallback = c_list(fallback_gateways, ',');
     let json = match unsafe { e.as_ref() } {

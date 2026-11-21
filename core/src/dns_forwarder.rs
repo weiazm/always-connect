@@ -886,6 +886,14 @@ struct Settings {
     tunnel_binding: Option<InterfaceBinding>,
 }
 
+// Only the latest failed VPN A lookup is shown in the local panel.
+struct DnsFailure {
+    epoch: u64,
+    observed: Instant,
+    name: String,
+    reason: &'static str,
+}
+
 type Acknowledged = (u64, Vec<Ipv4Addr>, Vec<Ipv4Addr>);
 
 pub struct Inner {
@@ -893,6 +901,7 @@ pub struct Inner {
     timeout: Duration,
     settings: RwLock<Settings>,
     on_answer: Option<AnswerHook>,
+    recent_failure: Mutex<Option<DnsFailure>>,
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -948,6 +957,28 @@ impl Inner {
         self.resolve_in_session(query, None)
     }
 
+    fn record_dns_failure(&self, epoch: u64, name: &str, reason: &'static str) {
+        let settings = self.settings.read().unwrap();
+        if !settings.enabled || settings.epoch != epoch || name.is_empty()
+            || !name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_')) {
+            return;
+        }
+        *self.recent_failure.lock().unwrap() = Some(DnsFailure {
+            epoch, observed: Instant::now(), name: name.to_owned(), reason,
+        });
+    }
+
+    pub(crate) fn recent_dns_notice(&self) -> Option<String> {
+        let settings = self.settings.read().unwrap();
+        let mut recent = self.recent_failure.lock().unwrap();
+        let issue = recent.as_ref()?;
+        if !settings.enabled || settings.epoch != issue.epoch || issue.observed.elapsed() >= Duration::from_secs(60) {
+            *recent = None;
+            return None;
+        }
+        Some(format!("最近一分钟，{} 查询失败：{}", issue.name, issue.reason))
+    }
+
     fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
@@ -963,6 +994,10 @@ impl Inner {
         } else {
             // Never create an unbound VPN socket, including before connect,
             // after a drop, or while an interface change is being confirmed.
+            if q.qtype == TYPE_A && (up.tunnel.is_empty() || tunnel_binding.is_none()) {
+                self.record_dns_failure(epoch, &q.name, "VPN DNS 尚未就绪");
+                return None;
+            }
             (&up.tunnel, Some(tunnel_binding.as_ref()?))
         };
         let path = &self.path_inflight[usize::from(entry.is_some())];
@@ -973,6 +1008,16 @@ impl Inner {
         let slot = PathSlot(path);
         let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout);
         drop(slot);
+        if entry.is_none() && q.qtype == TYPE_A {
+            let reason = match answer.as_ref().map(|a| a[3] & 0x0f) {
+                None => Some("VPN DNS 未返回有效应答"),
+                Some(3) => Some("VPN DNS 返回域名不存在（NXDOMAIN）"),
+                Some(2) => Some("VPN DNS 解析失败（SERVFAIL）"),
+                Some(5) => Some("VPN DNS 拒绝查询（REFUSED）"),
+                _ => None,
+            };
+            if let Some(reason) = reason { self.record_dns_failure(epoch, &q.name, reason); }
+        }
         let answer = answer?;
         let mut addresses = if q.qtype == TYPE_A && answer[3] & 0x0f == 0 {
             answer_addresses(&answer, query)?
@@ -1135,6 +1180,7 @@ impl Forwarder {
                 settings: RwLock::new(Settings { epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
                     rules: Arc::new(SplitRules::new(&direct)), upstreams, enabled: true, physical_binding, tunnel_binding }),
                 on_answer,
+                recent_failure: Mutex::default(),
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
@@ -1312,6 +1358,40 @@ mod tests {
 
     fn loopback_interface() -> &'static str {
         if cfg!(target_os = "macos") { "lo0" } else { "lo" }
+    }
+
+    #[test]
+    fn vpn_dns_notice_distinguishes_missing_upstream_and_negative_answer() {
+        let query = query("intranet.example", TYPE_A, 901);
+        let up = Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None };
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53,
+            Duration::from_millis(50), vec![], up.clone(), None);
+        assert!(forwarder.inner().resolve(&query).is_none());
+        assert!(forwarder.inner().recent_dns_notice().unwrap().contains("尚未就绪"));
+        let previous = forwarder.epoch();
+        forwarder.set_upstreams(up);
+        forwarder.inner().record_dns_failure(previous, "old.example", "域名不存在");
+        assert!(forwarder.inner().recent_dns_notice().is_none());
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let reply = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (len, peer) = socket.recv_from(&mut buf).unwrap();
+            let mut response = empty_answer(&buf[..len]).unwrap();
+            response[3] |= 3;
+            socket.send_to(&response, peer).unwrap();
+        });
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), port,
+            Duration::from_millis(500), vec![], Upstreams { tunnel: vec!["127.0.0.1".into()],
+                local: vec![], physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        assert_eq!(forwarder.inner().resolve(&query).unwrap()[3] & 15, 3);
+        reply.join().unwrap();
+        let notice = forwarder.inner().recent_dns_notice().unwrap();
+        assert!(notice.contains("intranet.example") && notice.contains("域名不存在"));
+        forwarder.inner().recent_failure.lock().unwrap().as_mut().unwrap().observed -= Duration::from_secs(61);
+        assert!(forwarder.inner().recent_dns_notice().is_none());
     }
 
     fn query(name: &str, qtype: u16, id: u16) -> Vec<u8> {

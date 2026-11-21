@@ -368,6 +368,8 @@ pub struct Info {
     pub split_hits: Vec<String>,
     pub split_addresses: usize,
     pub split_warning: Option<String>,
+    #[serde(skip)]
+    dns_source: std::sync::Weak<dns_forwarder::Inner>,
     pub direct_networks: Vec<String>,
     pub tail: Vec<String>,
 }
@@ -648,6 +650,17 @@ impl Engine {
         self.shared.info.lock().unwrap().clone()
     }
 
+    /// Site names from failed lookups belong only in the local status UI.
+    pub fn split_status_json(&self) -> String {
+        let info = self.info();
+        let notice = info.dns_source.upgrade().and_then(|source| source.recent_dns_notice());
+        serde_json::json!({
+            "splitRunning": info.split_running, "splitHits": info.split_hits,
+            "splitAddresses": info.split_addresses, "splitWarning": info.split_warning,
+            "pfError": info.pf_error, "dnsNotice": notice,
+        }).to_string()
+    }
+
     fn check_expected(&self) -> crate::network_check::Expected {
         let c = self.shared.core.lock().unwrap();
         crate::network_check::Expected {
@@ -768,6 +781,7 @@ impl Shared {
             pf_error: c.pf_error.clone().or_else(||c.network_routes_error.clone()),
             last_terminal: c.last_terminal.map(|t| t as i32),
             split_running: c.forwarder.is_some(),
+            dns_source: c.forwarder.as_ref().map(|f| Arc::downgrade(f.inner())).unwrap_or_default(),
             split_hits: if c.forwarder.is_some() { c.split_hits.clone() } else { Vec::new() },
             split_warning: if c.split_policy.is_saturated() {Some(SPLIT_CAPACITY_ERROR.into())}else{c.direct_retry_warning.clone()},
             split_addresses: if c.forwarder.is_some() { c.split_addresses.len() } else { 0 },

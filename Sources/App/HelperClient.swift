@@ -37,6 +37,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// The own connection stopped itself after its self-check found no
     /// usable network (§26.11); shown on the panel until the next connect.
     @Published private(set) var autoStopNotice: String?
+    @Published private(set) var gatewayTrustFailed = false
     private let connectionCheck = ConnectionCheck()
     @Published private(set) var helperAvailable = false
     /// When the current connection was established (nil when not connected).
@@ -96,6 +97,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// One-line status text (UI-DESIGN.md §三), shared by the panel,
     /// the Credentials page, and Diagnostics.
     var stateLine: String {
+        if gatewayTrustFailed && [.connecting, .authenticating, .awaitingApproval].contains(state) {
+            return "VPN 网关证书校验失败"
+        }
         switch state {
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }
@@ -677,6 +681,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// caller stops it once the Helper has let go of the tunnel.
     private func takeRelay() -> CertificateRelay? {
         relayGeneration += 1
+        gatewayTrustFailed = false
         let current = relay
         relay = nil
         return current
@@ -842,29 +847,36 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// open panel: list entries looked up and addresses sent direct.
     @Published private(set) var splitActivity: (entries: [String], addresses: Int)?
     @Published private(set) var splitWarning: String?
+    @Published private(set) var dnsNotice: String?
 
     func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; return }
+        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
+        let sessionStarted = connectedSince
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if !finished { finished = true; self.splitWarning = nil }
+                guard !finished, self.connectedSince == sessionStarted else { return }
+                finished = true
+                self.splitWarning = nil
+                self.dnsNotice = nil
             }
             if HelperInstaller.installedHelperMatchesBundle {
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
-                        guard !finished else { return }; finished = true
+                        guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
+                        finished = true
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
-                            var splitRunning: Bool; var splitWarning: String?; var pfError: String?
+                            var splitRunning: Bool; var splitWarning: String?; var pfError: String?; var dnsNotice: String?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        self.dnsNotice = status?.dnsNotice
                         self.splitWarning = status?.splitWarning
                         if let status { self.pfWarning = status.pfError }
                     }
@@ -873,8 +885,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             proxy.getSplitActivity { entries, addresses, running in
                 DispatchQueue.main.async {
-                    guard !finished else { return }
+                    guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                     finished = true
+                    self.dnsNotice = nil
                     self.splitActivity = running ? (entries, addresses) : nil
                     self.splitWarning = nil
                 }
@@ -1153,6 +1166,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         }
                         GatewayMemory.save(address.host, last: prepared.gatewayIp,
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onGatewayTrustChanged = { [weak self] trusted in
+                            DispatchQueue.main.async {
+                                guard let self, self.relayGeneration == generation, !self.usesCisco else { return }
+                                self.gatewayTrustFailed = !trusted
+                            }
+                        }
                         relay.onGatewayUnreachable = { [weak self] silent in
                             DispatchQueue.main.async { self?.gatewayUnreachable(silent, host: address.host, generation: generation) }
                         }
@@ -1398,7 +1417,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         state = parsed
         if parsed != old { updateEgressMonitoring() }
         self.detail = detail
-        if parsed != .connected { splitWarning = nil }
+        if parsed != .connected { splitWarning = nil; dnsNotice = nil }
         if parsed != old, !usesCisco {
             // Next to the relay's login trace (§30.9): what the App showed
             // and when, readable without administrator rights.
@@ -1939,6 +1958,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             "helperUpdatePending": helperUpdatePending, "drops": dropHistory.count,
             "lastDropId": lastDrop?.id.uuidString ?? "", "lastDropSignature": Self.dropSignature(lastDrop),
         ]
+        json["gatewayTrustFailed"] = gatewayTrustFailed
         if let lastError { json["lastError"] = lastError }
         if let autoStopNotice { json["autoStopNotice"] = autoStopNotice }
         if let pfWarning { json["pfWarning"] = pfWarning }
@@ -1963,6 +1983,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         splitSwitchPending = json["splitSwitchPending"] as? Bool ?? false
         helperUpdatePending = json["helperUpdatePending"] as? Bool ?? false
         splitWarning = json["splitWarning"] as? String
+        gatewayTrustFailed = json["gatewayTrustFailed"] as? Bool ?? false
         lastError = json["lastError"] as? String
         autoStopNotice = json["autoStopNotice"] as? String
         pfWarning = json["pfWarning"] as? String

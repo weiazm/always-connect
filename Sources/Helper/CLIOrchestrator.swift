@@ -245,7 +245,7 @@ final class CLIOrchestrator {
         return (info.splitHits, info.splitAddresses)
     }
 
-    func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_info(handle)) ?? "{}" }
+    func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_split_status(handle)) ?? "{}" }
 
     /// The connections page for this session (§28.7); `fallbackGateways`
     /// when the session has none (a Cisco session).
@@ -334,6 +334,7 @@ func ac_oc_egress_probe_host(_ e: OpaquePointer, _ host: UnsafePointer<CChar>) -
 func ac_egress_config_valid(_ json: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_oc_update_allow_networks") func ac_oc_update_allow_networks(_ e: OpaquePointer, _ n: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_holder") func ac_oc_holder(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_oc_split_status") func ac_oc_split_status(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_info") func ac_oc_info(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_connections_json")
 func ac_oc_connections_json(_ e: OpaquePointer?, _ fallback: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

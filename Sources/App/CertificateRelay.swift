@@ -70,6 +70,8 @@ final class CertificateRelay {
     /// Called on the relay queue after several connections in a row
     /// found the gateway address silent (§30.6), with that address.
     var onGatewayUnreachable: ((String) -> Void)?
+    var onGatewayTrustChanged: ((Bool) -> Void)?
+    private var gatewayTrusted = true
     private var silentHandshakes = 0
 
     enum RelayError: LocalizedError {
@@ -360,7 +362,7 @@ final class CertificateRelay {
         sec_protocol_options_set_local_identity(options, sec_identity_create(identityForNextConnection())!)
         sec_protocol_options_set_tls_server_name(options, host)
         let anchor = self.anchor
-        sec_protocol_options_set_verify_block(options, { _, trust, complete in
+        sec_protocol_options_set_verify_block(options, { [weak self] _, trust, complete in
             let object = sec_trust_copy_ref(trust).takeRetainedValue()
             var configured = true
             if let anchor {
@@ -371,6 +373,10 @@ final class CertificateRelay {
             // System trust and the gateway's host name, as any client.
             let accepted = configured && SecTrustEvaluateWithError(object, nil)
             if !accepted { Self.log.error("relay: gateway certificate rejected") }
+            if let self, self.gatewayTrusted != accepted {
+                self.gatewayTrusted = accepted
+                self.onGatewayTrustChanged?(accepted)
+            }
             complete(accepted)
         }, queue)
         let parameters = NWParameters(tls: tls)

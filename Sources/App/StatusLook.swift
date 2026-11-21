@@ -12,7 +12,7 @@ struct StatusLook {
     static func of(_ state: HelperClient.State, held: Bool, hasCredentials: Bool, onDemand: Bool = false) -> StatusLook {
         switch state {
         case .connected:
-            return StatusLook(symbol: "checkmark.shield.fill", color: .systemGreen, headline: "已连接")
+            return StatusLook(symbol: "checkmark.shield.fill", color: .systemGreen, headline: "VPN 已连接")
         case .connecting, .authenticating:
             return StatusLook(symbol: "shield.lefthalf.fill", color: .systemYellow, headline: "正在连接…")
         case .awaitingApproval:

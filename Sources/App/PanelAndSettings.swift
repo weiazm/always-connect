@@ -48,7 +48,7 @@ struct PanelView: View {
                     GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))
                     .frame(width: 40, height: 40)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(look.headline)
+                    Text(manager.gatewayTrustFailed && manager.state == .awaitingApproval ? "VPN 登录受阻" : look.headline)
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(Color(nsColor: look.color))
                     Text(subtitle)
@@ -57,6 +57,18 @@ struct PanelView: View {
                         .lineLimit(2)
                 }
                 Spacer()
+            }
+            if manager.gatewayTrustFailed {
+                Label("VPN 网关证书校验失败，新的连接未建立。请联系 VPN 管理员。", systemImage: "exclamationmark.shield.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if manager.state == .connected, let notice = manager.dnsNotice {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             primaryButton
             if manager.state == .connected {
@@ -495,6 +507,7 @@ struct PanelView: View {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }
+        if manager.gatewayTrustFailed, [.connecting, .authenticating, .awaitingApproval].contains(manager.state) { return "尚未建立新的安全连接" }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
