@@ -266,10 +266,12 @@ final class ViewLifecycle {
             cisco.cisco = Cisco()
             cisco.onDemandSettingsChanged()
             cisco.prepareForForcedRestore()
+            cisco.gatewayTrustFailed = true
             _ = cisco.connectWithStoredCredentials(manual: true)
             CiscoEngine.observedState = "Connected"
             cisco.cisco?.completion?()
             if finished { cisco.forcedRestoreDone() } else { cisco.forcedRestoreAbandoned() }
+            check(cisco.gatewayTrustFailed != finished, "only a completed manual restore clears the certificate error")
             check(cisco.starts == 0, "forced restore forwards raw Cisco state without declaring idle")
             CiscoEngine.observedState = "Disconnected"
             cisco.refreshStatus()

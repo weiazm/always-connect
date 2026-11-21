@@ -442,7 +442,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// manual disconnect. AwaitingApproval keeps the switch on: the
     /// user is mid-flow, not disconnected.
     var switchIsOn: Bool {
-        state != .disconnected || networkHeld || loginProtectionNotice != nil
+        state != .disconnected || networkHeld || loginProtectionNotice != nil || gatewayTrustFailed
     }
 
     private func connect(server: String, group: String, username: String, password: String, session: UInt64, onAccepted: (() -> Void)? = nil) {
@@ -576,6 +576,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Panel: the forced restore went through (or the service is back).
     func forcedRestoreDone() {
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
         loginIntentActive = false
         loginProtectionNotice = nil
         helperUnresponsive = false
@@ -676,7 +678,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
         connectionCheck.start { [weak self] in
             guard let self, self.state == .connected, !self.usesCisco,
-                  !(self.protectsDrops && self.gatewayTrustFailed),
+                  !self.gatewayTrustFailed,
                   ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
             self.autoStopNotice = "自建连接连上后 30 秒都上不了网，已自动断开并恢复直连。"
                 + "可以先在设置里改用「经 Cisco」连接。"
@@ -967,6 +969,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func networkResetFinished() {
         resettingNetwork = false
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
         loginIntentActive = false
         loginProtectionNotice = nil
         refreshStatus()
