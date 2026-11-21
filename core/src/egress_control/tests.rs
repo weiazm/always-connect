@@ -198,12 +198,14 @@ fn controller_answers_a_gate() {
     assert_eq!(st["running"], true);
     assert_eq!(st["groups"][0]["state"], "blocked");
     assert_eq!(st["records"][0]["host"], "c.example");
+    assert!(st["records"][0]["ended"].is_null());
     // A disabled or unknown group is refused.
     gate.write_all(b"{\"check\":{\"group\":2,\"host\":\"d.example\"}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
-    // Live update reaches the gate.
+    // Trust the observed country. The live update reaches the gate.
+    config.groups[0].expect.push("YY".into());
     ctl.update(config);
     line.clear();
     reader.read_line(&mut line).unwrap();
@@ -211,6 +213,17 @@ fn controller_answers_a_gate() {
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("invalidate"));
+    // The next flow on the same connection is released after trusting the
+    // observed country. Read back the original record rather than a new one.
+    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\"}}\n").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], true);
+    let recovered: serde_json::Value = serde_json::from_str(&ctl.status_json()).unwrap();
+    assert_eq!(recovered["groups"][0]["state"], "ok");
+    assert_eq!(recovered["records"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["records"][0]["started"], st["records"][0]["started"]);
+    assert!(recovered["records"][0]["ended"].is_number());
     // Set-up probing runs every method.
     let all = probe_methods(&cfg(), "a.example", &hook, &ctl.marker(), "utun9");
     assert_eq!(all.len(), preset_methods().len() + 1);
