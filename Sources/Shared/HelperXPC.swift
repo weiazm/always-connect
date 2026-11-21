@@ -113,6 +113,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)
     /// True if this server already has a usable peer from an authenticated session.
     func hasTrustedLoginGateway(_ server: String, cisco: Bool, withReply reply: @escaping (Bool) -> Void)
+    /// 1 = usable peer, 0 = confirmed miss, -1 = unreadable or invalid.
+    func getLoginGatewayReadiness(_ server: String, cisco: Bool, withReply reply: @escaping (Int) -> Void)
     /// A nonzero ticket permits one bounded TLS preparation. A zero ticket returns the protection result.
     func requestProtectedLogin(_ server: String, cisco: Bool, candidate: String, rejected: Bool,
                                allowPreparation: Bool, deadline: UInt64,

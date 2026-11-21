@@ -172,16 +172,17 @@ impl Cache {
 /// Ordered addresses for the configured TLS host and carrier port. A missing,
 /// inaccessible or invalid cache is a miss. This function never resolves DNS.
 pub fn lookup(dir: &Path, host: &str, port: u16) -> Vec<String> {
-    let Some(gateway) = Gateway::new(host, port) else {
-        return Vec::new();
-    };
-    let Ok(now) = unix_time() else {
-        return Vec::new();
-    };
-    open_private_directory(dir)
-        .and_then(|dir| read_cache(&dir))
-        .map(|cache| cache.addresses(&gateway, now))
-        .unwrap_or_default()
+    checked_lookup(dir, host, port).unwrap_or_default()
+}
+
+fn checked_lookup(dir: &Path, host: &str, port: u16) -> io::Result<Vec<String>> {
+    let gateway = Gateway::new(host, port).ok_or(io::ErrorKind::InvalidInput)?;
+    let now = unix_time()?;
+    match open_private_directory(dir).and_then(|dir| read_cache(&dir)) {
+        Ok(cache) => Ok(cache.addresses(&gateway, now)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Persist the actual peer after an authenticated session establishes. The

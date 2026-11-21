@@ -2237,7 +2237,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Read-only panel query. An unavailable or outdated service gives an unknown result.
     func fetchTrustedLoginGateway(_ server: String, cisco: Bool, completion: @escaping (Bool?) -> Void) {
-        egressRPC({ $0.hasTrustedLoginGateway(server, cisco: cisco, withReply: $1) }, completion: completion)
+        egressRPC({ $0.getLoginGatewayReadiness(server, cisco: cisco, withReply: $1) }) { state in
+            switch state {
+            case 1: completion(true)
+            case 0: completion(false)
+            default: completion(nil)
+            }
+        }
     }
 
     /// Held-network flag (DESIGN.md §20.9). Completion nil on 3s

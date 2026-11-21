@@ -4,7 +4,11 @@ import Foundation
 /// directory and records only the actual peer of an established session.
 enum LoginGatewayCache {
     static func lookup(in supportDir: URL, target: GatewayAddress) -> [String] {
-        guard let raw = ac_login_cache_lookup(supportDir.path, target.host, target.port) else { return [] }
+        read(in: supportDir, target: target) ?? []
+    }
+
+    static func read(in supportDir: URL, target: GatewayAddress) -> [String]? {
+        guard let raw = ac_login_cache_lookup(supportDir.path, target.host, target.port) else { return nil }
         defer { ac_login_cache_freeString(raw) }
         return String(cString: raw).split(separator: ",").map(String.init)
     }

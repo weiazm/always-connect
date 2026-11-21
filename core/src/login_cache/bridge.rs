@@ -31,11 +31,10 @@ extern "C" fn ac_login_cache_lookup(
     port: u16,
 ) -> *mut c_char {
     let peers = string_ptr(dir, |dir| {
-        string_ptr(host, |host| lookup(Path::new(dir), host, port))
+        string_ptr(host, |host| checked_lookup(Path::new(dir), host, port).ok()).flatten()
     })
-    .flatten()
-    .unwrap_or_default();
-    into_string(peers.join(","))
+    .flatten();
+    peers.map(|values| into_string(values.join(","))).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]

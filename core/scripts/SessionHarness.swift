@@ -211,6 +211,13 @@ struct SessionHarness {
             check(cached?.0 == 0 && cached?.1 == true && firewall.isHolding && !firewall.hasPendingLoginDeadline,
                   "a cached connection applies protection immediately without a lookup window")
             check(disconnect(session), "cached session released")
+            let file = support.appendingPathComponent("login-gateway-cache.json")
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+            let unreadable: Int? = sync { session.getLoginGatewayReadiness(server, cisco: false, withReply: $0) }
+            let refused = open()
+            check(unreadable == -1 && refused?.0 == 0 && refused?.1 == false && firewall.isHolding,
+                  "an unsafe cache reports unknown and never authorizes a direct lookup")
+            check(disconnect(session), "unreadable cache hold released")
         case "cached-protected-login":
             let server = "vpn.example.test"
             let support = CLIOrchestrator.defaultSupportDir

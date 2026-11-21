@@ -748,9 +748,18 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     }
 
     func hasTrustedLoginGateway(_ server: String, cisco: Bool, withReply reply: @escaping (Bool) -> Void) {
+        getLoginGatewayReadiness(server, cisco: cisco) { reply($0 == 1) }
+    }
+
+    private func savedGatewayReadiness(_ target: GatewayAddress, cisco: Bool) -> Int {
+        guard let peers = LoginGatewayCache.read(in: CLIOrchestrator.defaultSupportDir, target: target) else { return -1 }
+        return peers.contains(where: { cisco || isValidIPv4($0) }) ? 1 : 0
+    }
+
+    func getLoginGatewayReadiness(_ server: String, cisco: Bool, withReply reply: @escaping (Int) -> Void) {
         queue.async {
-            guard let target = GatewayAddress(server) else { reply(false); return }
-            reply(!self.loginAddresses(for: target, cisco: cisco).isEmpty)
+            guard let target = GatewayAddress(server) else { reply(-1); return }
+            reply(self.savedGatewayReadiness(target, cisco: cisco))
         }
     }
 
@@ -822,9 +831,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 self.installProtectedLogin(target: target, holder: holder, cisco: cisco, candidate: candidate,
                                            blockOnly: blockOnly, emptyNotice: notice) { reply(0, $0, $1, $2) }
             }
-            guard canPrepare, let target,
-                  self.loginAddresses(for: target, cisco: cisco).isEmpty else {
+            guard canPrepare, let target else {
                 protect(blockOnly: rejected); return
+            }
+            switch self.savedGatewayReadiness(target, cisco: cisco) {
+            case 0: break
+            case 1: protect(blockOnly: false); return
+            default: protect(blockOnly: true, notice: "网络已拦截。后台服务无法核实已保存的网关地址。"); return
             }
             guard DispatchTime.now().uptimeNanoseconds < deadline else {
                 protect(blockOnly: true, notice: ProtectedLoginNotice.preparationTimedOut); return
