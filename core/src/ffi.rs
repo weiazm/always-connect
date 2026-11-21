@@ -1374,8 +1374,7 @@ pub extern "C" fn ac_guard_new_own_holder() -> *mut c_char {
     guard().map(|g| owned(g.new_own_holder())).unwrap_or(std::ptr::null_mut())
 }
 
-/// `inputs` is the Inputs JSON. Null = applied (or stale holder); else
-/// the panel's red pf line.
+/// Synchronous protected login using the cached or prepared gateway list.
 #[no_mangle]
 pub extern "C" fn ac_guard_login(holder: *const c_char, physical: *const c_char,
     gateways: *const c_char, port: u16, cisco: bool, verify: bool) -> *mut c_char {
@@ -1385,6 +1384,41 @@ pub extern "C" fn ac_guard_login(holder: *const c_char, physical: *const c_char,
     result.err().map(owned).unwrap_or(std::ptr::null_mut())
 }
 
+#[no_mangle]
+pub extern "C" fn ac_guard_arm_login_deadline(holder: *const c_char, physical: *const c_char,
+    port: u16, cisco: bool, deadline: u64) -> u64 {
+    let (Some(guard), Some(holder), Some(physical)) = (guard(), c_str(holder), c_str(physical)) else { return 0; };
+    guard.arm_login_deadline(&holder, &physical, port, cisco, deadline)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_finish_login_deadline(token: u64, gateways: *const c_char) -> *mut c_char {
+    let Some(guard) = guard() else { return owned("后台服务尚未就绪".into()); };
+    guard.finish_login_deadline(token, c_list(gateways, ',')).err().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_login_deadline_status(token: u64) -> i32 {
+    guard().map_or(network_guard::LoginDeadlineStatus::Stale, |g| g.login_deadline_status(token)) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_login_deadline_error(token: u64) -> *mut c_char {
+    guard().and_then(|g| g.login_deadline_error(token)).map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_has_pending_login_deadline() -> bool {
+    guard().is_some_and(|g| g.has_pending_login_deadline())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_cancel_login_deadline(token: u64) {
+    if let Some(guard) = guard() { guard.cancel_login_deadline(token); }
+}
+
+/// `inputs` is the Inputs JSON. Null = applied (or stale holder); else
+/// the panel's red pf line.
 #[no_mangle]
 pub extern "C" fn ac_guard_apply(holder: *const c_char, connected: bool, inputs: *const c_char) -> *mut c_char {
     let (Some(g), Some(holder)) = (guard(), c_str(holder)) else { return owned("pf 兜底未生效".into()) };

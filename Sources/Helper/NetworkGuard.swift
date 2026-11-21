@@ -93,6 +93,36 @@ final class NetworkGuard {
         Self.take(ac_guard_login(holder, physical, gateways.joined(separator: ","), port, cisco, verify))
     }
 
+    enum LoginDeadlineStatus: Int32 {
+        // A finished ticket can still have stopped login under verified empty rules.
+        case stale = 0, pending, timedOutBlocked, protectionUnconfirmed, finished
+    }
+
+    /// `deadline` is the connection intent's absolute DispatchTime uptime.
+    /// Zero requires the service to skip preparation while direct.
+    func armLoginDeadline(holder: String, physical: String, port: UInt16, cisco: Bool, deadline: UInt64) -> UInt64 {
+        ac_guard_arm_login_deadline(holder, physical, port, cisco, deadline)
+    }
+
+    /// Nil confirms the strict rules and old state for this live ticket.
+    /// An empty list commits protection after a failed preparation.
+    func finishLoginDeadline(_ token: UInt64, gateways: [String]) -> String? {
+        Self.take(ac_guard_finish_login_deadline(token, gateways.joined(separator: ",")))
+    }
+
+    func loginDeadlineStatus(_ token: UInt64) -> LoginDeadlineStatus {
+        LoginDeadlineStatus(rawValue: ac_guard_login_deadline_status(token)) ?? .stale
+    }
+
+    func loginDeadlineError(_ token: UInt64) -> String? {
+        Self.take(ac_guard_login_deadline_error(token))
+    }
+
+    var hasPendingLoginDeadline: Bool { ac_guard_has_pending_login_deadline() }
+
+    /// Cancel the matching deadline without changing any installed rules.
+    func cancelLoginDeadline(_ token: UInt64) { ac_guard_cancel_login_deadline(token) }
+
     /// Let go of `holder`'s set; nil = whatever is held.
     func release(holder: String?, reason: String) { ac_guard_release(holder, reason) }
 
@@ -204,6 +234,15 @@ extension NetworkGuard.Inputs {
 func ac_guard_init(_ supportDir: UnsafePointer<CChar>, _ boot: UnsafePointer<CChar>, _ graceMs: UInt64,
                    _ pfctl: UnsafePointer<CChar>?, _ graceExpired: (@convention(c) () -> Void)?)
 @_silgen_name("ac_guard_new_own_holder") func ac_guard_new_own_holder() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_guard_arm_login_deadline")
+func ac_guard_arm_login_deadline(_ holder: UnsafePointer<CChar>, _ physical: UnsafePointer<CChar>,
+                                 _ port: UInt16, _ cisco: Bool, _ deadline: UInt64) -> UInt64
+@_silgen_name("ac_guard_finish_login_deadline")
+func ac_guard_finish_login_deadline(_ token: UInt64, _ gateways: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_guard_login_deadline_status") func ac_guard_login_deadline_status(_ token: UInt64) -> Int32
+@_silgen_name("ac_guard_login_deadline_error") func ac_guard_login_deadline_error(_ token: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_guard_has_pending_login_deadline") func ac_guard_has_pending_login_deadline() -> Bool
+@_silgen_name("ac_guard_cancel_login_deadline") func ac_guard_cancel_login_deadline(_ token: UInt64)
 @_silgen_name("ac_guard_apply")
 func ac_guard_apply(_ holder: UnsafePointer<CChar>, _ connected: Bool, _ inputs: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_release") func ac_guard_release(_ holder: UnsafePointer<CChar>?, _ reason: UnsafePointer<CChar>)

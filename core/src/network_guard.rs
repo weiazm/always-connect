@@ -28,7 +28,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod login_deadline;
+pub use login_deadline::LoginDeadlineStatus;
+use login_deadline::LoginDeadline;
 
 pub const ANCHOR: &str = "com.apple/300.AlwaysConnect";
 pub const DIRECT_TABLE: &str = "ac_direct";
@@ -158,12 +162,16 @@ struct Pfctl {
 }
 
 impl Pfctl {
-    fn audit(&self, args: &[&str], deadline: std::time::Instant) -> Result<crate::pf_verify::PfOutput, ()> {
+    fn audit(&self, args: &[&str], deadline: Instant) -> Result<crate::pf_verify::PfOutput, ()> {
+        self.audit_input(args, None, deadline)
+    }
+
+    fn audit_input(&self, args: &[&str], input: Option<&str>, deadline: Instant) -> Result<crate::pf_verify::PfOutput, ()> {
         use std::io::Read;
-        let limit = deadline.saturating_duration_since(std::time::Instant::now());
-        if limit.is_zero() { return Err(()); }
+        if Instant::now() >= deadline { return Err(()); }
         let mut cmd = Command::new(self.path.as_deref().ok_or(())?);
-        let mut child = crate::child_io::spawn(cmd.args(args).stdin(Stdio::null())
+        let mut child = crate::child_io::spawn(cmd.args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped()).stderr(Stdio::piped())).map_err(|_| ())?;
         fn read(pipe: impl Read) -> Result<String, ()> {
             let mut bytes = Vec::new();
@@ -172,14 +180,24 @@ impl Pfctl {
             String::from_utf8(bytes).map_err(|_| ())
         }
         std::thread::scope(|scope| {
+            let writer = child.stdin.take().zip(input).map(|(mut pipe, input)| {
+                scope.spawn(move || pipe.write_all(input.as_bytes()).map_err(|_| ()))
+            });
             let out = scope.spawn({let pipe=child.stdout.take().unwrap(); move || read(pipe)});
             let err = scope.spawn({let pipe=child.stderr.take().unwrap(); move || read(pipe)});
             let ok = loop {
-                if let Ok(Some(status)) = child.try_wait() { break status.success(); }
-                if std::time::Instant::now() >= deadline { let _=child.kill(); let _=child.wait(); break false; }
-                std::thread::sleep(Duration::from_millis(3));
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(3)),
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
             };
             if !ok { return Err(()); }
+            if let Some(writer) = writer { writer.join().map_err(|_| ())??; }
             Ok(crate::pf_verify::PfOutput { stdout: out.join().map_err(|_| ())??, stderr: err.join().map_err(|_| ())?? })
         })
     }
@@ -246,6 +264,19 @@ impl Pfctl {
         self.run_input(&["-a", ANCHOR, "-f", "-"], Some(anchor_text)).map(|_| ())
     }
 
+    fn load_before(&mut self, anchor_text: &str, deadline: Instant) -> Result<(), ()> {
+        if self.token.is_none() {
+            let out = self.audit(&["-E"], deadline)?;
+            self.token = Self::parse_token(&out.stderr);
+            if self.token.is_none() {
+                log("guard: pfctl -E did not return a releasable reference");
+                return Err(());
+            }
+        }
+        self.audit_input(&["-a", ANCHOR, "-f", "-"], Some(anchor_text), deadline)?;
+        Ok(())
+    }
+
     fn unload(&mut self) -> Result<(), String> {
         self.run(&["-a", ANCHOR, "-F", "rules"])?;
         // The anchor's tables too, scoped to our anchor; never `-F all`.
@@ -271,6 +302,9 @@ struct State {
     /// Grace clock: Some(generation) while one runs.
     grace: Option<u64>,
     grace_generation: u64,
+    login_deadline: Option<LoginDeadline>,
+    deadline_generation: u64,
+    login_deadline_needs_recovery: bool,
     direct: BTreeSet<String>,
     pf: Pfctl,
 }
@@ -279,6 +313,7 @@ pub struct Guard {
     settings: Settings,
     state: Mutex<State>,
     grace_wake: Condvar,
+    login_wake: Condvar,
     on_grace_expired: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -305,10 +340,14 @@ impl Guard {
                 owner_present: false,
                 grace: None,
                 grace_generation: 0,
+                login_deadline: None,
+                deadline_generation: 0,
+                login_deadline_needs_recovery: false,
                 direct: BTreeSet::new(),
                 pf,
             }),
             grace_wake: Condvar::new(),
+            login_wake: Condvar::new(),
             on_grace_expired: Mutex::new(None),
         }
     }
@@ -328,6 +367,7 @@ impl Guard {
     /// A new own-connection engine: every earlier one becomes stale.
     pub fn new_own_holder(&self) -> String {
         let mut s = self.state.lock().unwrap();
+        self.clear_login_deadline(&mut s);
         s.own_generation += 1;
         format!("own:{}", s.own_generation)
     }
@@ -347,6 +387,7 @@ impl Guard {
         if inputs.login_port.is_none() || !inputs.tunnel_if.is_empty() { return Err("登录保护规则无效".into()); }
         let mut state = self.state.lock().unwrap();
         if Self::is_stale(&state, holder) { return Err("连接请求已过期".into()); }
+        self.clear_login_deadline(&mut state);
         let mut next = inputs.clone();
         next.login_generation = state.own_generation;
         if let Some(error) = self.apply_locked(&mut state, holder, false, &next) { return Err(error); }
@@ -355,13 +396,16 @@ impl Guard {
 
     pub fn verify_login(&self, holder: &str) -> Result<(), String> {
         let state = self.state.lock().unwrap();
+        self.verify_login_locked(&state, holder, Instant::now() + Duration::from_secs(2))
+    }
+
+    fn verify_login_locked(&self, state: &State, holder: &str, deadline: Instant) -> Result<(), String> {
         let record = state.record.as_ref().ok_or("登录保护未装载")?;
         let inputs = &record.inputs;
         if record.holder != holder || record.connected || inputs.login_port.is_none()
             || !inputs.tunnel_if.is_empty() || Self::is_stale(&state, holder) {
             return Err("登录保护已变化".into());
         }
-        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         let rules = text(false, inputs).ok_or("登录保护规则无效")?;
         let path = self.settings.pfctl.as_deref().ok_or("系统防火墙不可用")?;
         crate::network_check::confirm_login_rules(path, &rules)?;
@@ -376,7 +420,7 @@ impl Guard {
 
     pub fn apply_cisco_if_held(self: &Arc<Self>, expected: &Inputs, connected: bool, inputs: &Inputs) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
-        if !state.record.as_ref().is_some_and(|r| r.holder == CISCO_HOLDER && r.inputs == *expected) {
+        if self.deadline_owns_rules(&state) || !state.record.as_ref().is_some_and(|r| r.holder == CISCO_HOLDER && r.inputs == *expected) {
             return Err("连接请求已过期".into());
         }
         let mut next = inputs.clone();
@@ -392,6 +436,7 @@ impl Guard {
         if Self::is_stale(&s, holder) {
             return None;
         }
+        self.clear_login_deadline(&mut s);
         self.apply_locked(&mut s,holder,connected,inputs)
     }
 
@@ -444,6 +489,9 @@ impl Guard {
             if s.record.as_ref().is_some_and(|r| r.holder != h) {
                 return;
             }
+            if s.record.is_none() && s.login_deadline.as_ref().is_some_and(|task| task.holder != h) {
+                return;
+            }
         }
         self.release_locked(&mut s, why);
     }
@@ -467,12 +515,17 @@ impl Guard {
     /// An engine is being replaced while a set is held (§30.1): every own
     /// engine so far goes stale; the record stays.
     pub fn supersede_own_holders(&self) {
-        self.state.lock().unwrap().own_generation += 1;
+        let mut state = self.state.lock().unwrap();
+        self.clear_login_deadline(&mut state);
+        state.own_generation += 1;
     }
 
     pub fn own_engine_started(&self,holder:&str) {
         let mut s=self.state.lock().unwrap();
-        if !Self::is_stale(&s,holder) {s.active_own=Some(holder.into());}
+        if !Self::is_stale(&s,holder) {
+            self.clear_login_deadline(&mut s);
+            s.active_own=Some(holder.into());
+        }
     }
     pub fn own_engine_finished(&self,holder:&str) {
         let mut s=self.state.lock().unwrap();
@@ -678,12 +731,13 @@ impl Guard {
     // MARK: Internals
 
     fn release_locked(self: &Arc<Self>, s: &mut State, why: &str) {
+        self.clear_login_deadline(s);
         s.grace = None;
         s.grace_generation += 1;
         self.grace_wake.notify_all();
         if s.record.is_none() && !self.record_path().exists() {
             // Nothing recorded; still make sure our anchor is empty.
-            let _ = s.pf.unload();
+            if s.pf.unload().is_ok() { s.login_deadline_needs_recovery = false; }
             return;
         }
         if s.pf.unload().is_err() {
@@ -696,6 +750,7 @@ impl Guard {
             return;
         }
         s.record = None;
+        s.login_deadline_needs_recovery = false;
         s.direct.clear();
         let _ = std::fs::remove_file(self.record_path());
         if why != reason::USER {
