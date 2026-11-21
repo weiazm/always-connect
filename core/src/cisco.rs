@@ -53,10 +53,13 @@ pub const MONITOR: Duration = Duration::from_secs(15);
 const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 mod timeline;
-use timeline::{Operation, Outcome, Phase, Recorder};
+use timeline::{is_certificate_rejection, Operation, Outcome, Phase, Recorder};
 use crate::kill_switch::{BLOCKING, CONNECTED as GUARD_CONNECTED};
 
 const PROTECTION_TIMEOUT: Duration = Duration::from_secs(4);
+// Local Cisco callback only. The low bits still carry HelperClient.State.
+const CERTIFICATE_REJECTED: i32 = 1 << 8;
+const CERTIFICATE_FAILURE_DETAIL: &str = "VPN 证书校验失败";
 
 /// Closed error categories reused by the whole diagnostic export.
 pub(crate) fn diagnostic_detail(text: &str) -> &'static str {
@@ -316,7 +319,7 @@ impl Drop for Credentials {
 type KillSwitchHook = dyn Fn(i32, &str, &[String], u64) + Send + Sync;
 
 pub struct Hooks {
-    /// (state, detail). The App moves it to its main queue.
+    /// (state with failure flags, detail). The App moves it to its main queue.
     pub state: Box<dyn Fn(i32, &str) + Send + Sync>,
     /// 1 = manual, 2 = rejected.
     pub terminal: Box<dyn Fn(i32) + Send + Sync>,
@@ -400,6 +403,7 @@ struct State {
     intent: u32,
     wanted: bool,
     ever_connected: bool,
+    certificate_rejected: bool,
     tunnel_if: String,
     monitor_at: Option<Instant>,
     retry_at: Option<Instant>,
@@ -408,6 +412,12 @@ struct State {
     unanswered_since: Option<Instant>,
     last_kill_switch: Option<i32>,
     last_tick: Option<Instant>,
+}
+
+impl State {
+    fn login_state(&self) -> i32 {
+        if self.ever_connected { RECONNECTING } else { AUTHENTICATING }
+    }
 }
 
 fn jitter() -> f64 {
@@ -441,6 +451,7 @@ impl Engine {
                     intent: 0,
                     wanted: false,
                     ever_connected: false,
+                    certificate_rejected: false,
                     tunnel_if: String::new(),
                     monitor_at: None,
                     retry_at: None,
@@ -543,7 +554,7 @@ impl Engine {
         }
         (self.shared.hooks.log)("disconnect requested");
         if self.shared.is_current(intent) {
-            self.shared.post(DISCONNECTED, "正在断开…");
+            self.shared.post(DISCONNECTED, "正在断开…", false);
         }
     }
 
@@ -833,16 +844,17 @@ impl Shared {
         (state.status == 0).then(|| parse_state(&state.output)).flatten()
     }
 
-    fn post(&self, state: i32, detail: &str) {
+    fn post(&self, state: i32, detail: &str, certificate_rejected: bool) {
         if state != DISCONNECTED && self.stop_requested.load(Ordering::SeqCst) { return; }
         if state != DISCONNECTED && self.offline.load(Ordering::SeqCst) && detail != "等待网络恢复" { return; }
-        (self.hooks.state)(state, detail);
+        let flags = if certificate_rejected { CERTIFICATE_REJECTED } else { 0 };
+        (self.hooks.state)(state | flags, detail);
     }
 
-    fn report(&self, state: i32, detail: &str) {
+    fn report(&self, st: &State, state: i32, detail: &str) {
         self.reported.store(state, Ordering::SeqCst);
         (self.hooks.log)(&format!("state={state} {detail}"));
-        self.post(state, detail);
+        self.post(state, detail, st.certificate_rejected);
     }
 
     fn reported(&self) -> i32 {
@@ -892,9 +904,9 @@ impl Shared {
         let protected = self.block(st);
         if self.permits_attempt(st.intent) {
             if protected {
-                self.report(RECONNECTING, detail);
+                self.report(st, RECONNECTING, detail);
             } else {
-                self.report(RECONNECTING, &format!("{detail}，断线保护未确认"));
+                self.report(st, RECONNECTING, &format!("{detail}，断线保护未确认"));
             }
         }
     }
@@ -924,7 +936,7 @@ impl Shared {
                 st.wanted = true;
                 st.retry_at = None;
                 if self.offline.load(Ordering::SeqCst) {
-                    self.report(RECONNECTING, "等待网络恢复");
+                    self.report(st, RECONNECTING, "等待网络恢复");
                     return;
                 }
                 st.backoff_index = 0;
@@ -969,7 +981,7 @@ impl Shared {
                         );
                     }
                     if self.is_current(intent) {
-                        self.report(RECONNECTING, "等待网络恢复");
+                        self.report(st, RECONNECTING, "等待网络恢复");
                     }
                 } else if !self.stopped() {
                     st.backoff_index = 0;
@@ -993,9 +1005,10 @@ impl Shared {
                     &mut |_| {},
                 );
                 st.ever_connected = false;
+                st.certificate_rejected = false;
                 self.episode_retries.store(0, Ordering::SeqCst);
                 if self.is_current(intent) {
-                    self.report(DISCONNECTED, "manual disconnect");
+                    self.report(st, DISCONNECTED, "manual disconnect");
                     (self.hooks.terminal)(1);
                 }
                 // Every stop still acknowledges its FIFO cleanup barrier.
@@ -1006,6 +1019,13 @@ impl Shared {
                 let _ = done.send(());
             }
             Command_::Rearm => {
+                if st.certificate_rejected {
+                    self.block(st);
+                    if self.permits_attempt(st.intent) {
+                        self.report(st, st.login_state(), CERTIFICATE_FAILURE_DETAIL);
+                    }
+                    return;
+                }
                 match st.last_kill_switch {
                     Some(GUARD_CONNECTED) if self.permits_attempt(st.intent) => self.adopt_connected(st),
                     Some(_) => { self.block(st); }
@@ -1052,7 +1072,14 @@ impl Shared {
             return;
         }
         match self.state_now(intent).as_deref() {
-            Some("Connected") => { self.adopt_connected(st); return; }
+            Some("Connected") => {
+                if st.certificate_rejected {
+                    self.schedule_retry(st, CERTIFICATE_FAILURE_DETAIL, false, false);
+                } else {
+                    self.adopt_connected(st);
+                }
+                return;
+            }
             Some("Reconnecting") => {
                 st.ever_connected = true;
                 self.report_reconnecting(st, "Cisco 正在重连");
@@ -1086,7 +1113,7 @@ impl Shared {
             return;
         }
         let Some(credentials) = credentials else {
-            self.report(DISCONNECTED, "未设置凭据");
+            self.report(st, DISCONNECTED, "未设置凭据");
             return;
         };
         self.stage(Operation::GuiWait, intent, || (self.hooks.before_login)());
@@ -1096,11 +1123,8 @@ impl Shared {
             return;
         }
         self.report(
-            if st.ever_connected {
-                RECONNECTING
-            } else {
-                AUTHENTICATING
-            },
+            st,
+            st.login_state(),
             &format!("正在登录 {}", credentials.entry),
         );
         let mut input = format!(
@@ -1109,6 +1133,7 @@ impl Shared {
         );
         let mut pushed: Option<Instant> = None;
         let mut failed_at: Option<Instant> = None;
+        let mut rejected_this_login = false;
         let result = self.cli(
             intent,
             &["-s"],
@@ -1116,6 +1141,17 @@ impl Shared {
             Duration::from_secs(180),
             &mut |line: &str| {
                 if !self.permits_attempt(intent) {
+                    return;
+                }
+                if is_certificate_rejection(line) {
+                    if !rejected_this_login {
+                        rejected_this_login = true;
+                        st.certificate_rejected = true;
+                        self.report(st, st.login_state(), CERTIFICATE_FAILURE_DETAIL);
+                    }
+                    return;
+                }
+                if rejected_this_login {
                     return;
                 }
                 if line.contains("Login failed") || line.contains("Login error") {
@@ -1130,9 +1166,9 @@ impl Shared {
                     if pushed.is_none() {
                         pushed = Some(Instant::now());
                     }
-                    self.post(AWAITING_APPROVAL, "已提交密码，等你在手机上确认登录");
+                    self.post(AWAITING_APPROVAL, "已提交密码，等你在手机上确认登录", st.certificate_rejected);
                 } else if line.contains(">> notice: Establishing VPN") {
-                    self.post(CONNECTING, &line.replace("  >> notice: ", ""));
+                    self.post(CONNECTING, &line.replace("  >> notice: ", ""), st.certificate_rejected);
                 }
             },
         );
@@ -1146,8 +1182,19 @@ impl Shared {
             return;
         }
         let output = result.output;
+        // A refusal wins over any success or generic Login error in the same
+        // invocation, including details found only in the final partial line.
+        if rejected_this_login || output.lines().any(is_certificate_rejection) {
+            st.certificate_rejected = true;
+            self.schedule_retry(st, CERTIFICATE_FAILURE_DETAIL, pushed.is_some(), false);
+            return;
+        }
         if result.status == 0 && parse_state(&output).as_deref() == Some("Connected") {
-            self.adopt_connected(st);
+            if st.certificate_rejected && !output.contains(">> notice: Establishing VPN") {
+                self.schedule_retry(st, CERTIFICATE_FAILURE_DETAIL, pushed.is_some(), false);
+                return;
+            }
+            self.confirm_connected(st);
             return;
         }
         let approval_expired = approval_expired_at_response(
@@ -1171,7 +1218,7 @@ impl Shared {
             self.set_owned(false);
             st.wanted = false;
             st.monitor_at = None;
-            self.report(DISCONNECTED, "账号或密码被拒绝，请检查凭据");
+            self.report(st, DISCONNECTED, "账号或密码被拒绝，请检查凭据");
             (self.hooks.terminal)(2);
             return;
         }
@@ -1212,21 +1259,22 @@ impl Shared {
         } else {
             format!("{error}；{when}后重试")
         };
-        self.report(
-            if st.ever_connected {
-                RECONNECTING
-            } else {
-                AUTHENTICATING
-            },
-            &detail,
-        );
+        self.report(st, st.login_state(), &detail);
         st.retry_at = Some(Instant::now() + Duration::from_secs_f64(delay));
     }
 
     fn adopt_connected(&self, st: &mut State) {
+        // Only a subsequent authenticated CLI attempt can resolve a refusal.
+        // State, stats or a restarted service can still refer to the old tunnel.
+        if !st.certificate_rejected {
+            self.confirm_connected(st);
+        }
+    }
+
+    fn confirm_connected(&self, st: &mut State) {
         if st.last_kill_switch != Some(BLOCKING) && !self.block(st) {
             if self.permits_attempt(st.intent) {
-                self.report(RECONNECTING, "Cisco 已连上，断线保护未确认");
+                self.report(st, RECONNECTING, "Cisco 已连上，断线保护未确认");
             }
             return;
         }
@@ -1266,7 +1314,8 @@ impl Shared {
         st.push_backoff_index = 0;
         st.unanswered_since = None;
         st.retry_at = None;
-        self.report(CONNECTED, "已连接（经 Cisco）");
+        st.certificate_rejected = false;
+        self.report(st, CONNECTED, "已连接（经 Cisco）");
     }
 
     fn tick(&self, st: &mut State) {

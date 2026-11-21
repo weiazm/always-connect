@@ -29,7 +29,9 @@ struct Harness {
             fflush(stdout)
         }
         engine.credentialsProvider = { .init(entry: "VPN-A", username: "u", password: password) }
-        engine.onState = { state, detail in log("EVENT state=\(state) \(detail)") }
+        engine.onStatus = { state, detail, rejected in
+            log("EVENT state=\(state) \(detail) certificateRejected=\(rejected)")
+        }
         engine.onTerminal = { log("EVENT terminal=\($0)") }
         engine.onProtectionRequest = { mode, _, gws, done in
             log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))")
@@ -44,6 +46,66 @@ struct Harness {
         func loginCount() -> Int {
             (try? String(contentsOfFile: dir + "/commands", encoding: .utf8))?.split(separator: "\n").count ?? 0
         }
+        func until(_ observed: () -> Bool) {
+            let deadline = Date().addingTimeInterval(18)
+            while !observed() && Date() < deadline { wait(0.05) }
+            precondition(observed(), "expected fake CLI event was not observed")
+        }
+        if CommandLine.arguments.last == "4" {
+            var connected = false
+            var feedbackBeforeExit = false
+            var reportedRetries = 0
+            var rejectionCount = 0
+            var blockingCount = 0
+            engine.onStatus = { state, detail, rejected in
+                log("EVENT state=\(state) \(detail) certificateRejected=\(rejected)")
+                connected = state == .connected && !rejected
+                if rejected {
+                    rejectionCount += 1
+                    if detail.contains("后重试") { reportedRetries += 1 }
+                    if !FileManager.default.fileExists(atPath: dir + "/certificate-complete") {
+                        feedbackBeforeExit = true
+                    }
+                }
+            }
+            engine.onProtectionRequest = { mode, _, _, done in
+                log("EVENT killswitch=\(mode)")
+                if mode == 2 { blockingCount += 1 }
+                done(true)
+            }
+            log("STEP feedback-seed")
+            engine.connect()
+            until { connected }
+            log("STEP feedback-reconnect")
+            password = "certfail-conflicting"
+            setState("Disconnected")
+            engine.networkChanged()
+            until { reportedRetries > 0 }
+            log("certificate-feedback-before-cli-exit=\(feedbackBeforeExit)")
+            log("STEP feedback-restart")
+            let beforeRearmBlocks = blockingCount
+            let beforeRearmFeedback = rejectionCount
+            engine.rearm()
+            until { blockingCount > beforeRearmBlocks && rejectionCount > beforeRearmFeedback }
+            let beforeRefresh = reportedRetries
+            engine.refresh()
+            until { reportedRetries > beforeRefresh }
+            log("STEP feedback-still-stale")
+            let beforeStaleLogin = loginCount()
+            let beforeStaleReport = reportedRetries
+            password = "stale-after-rejection"
+            setState("Disconnected")
+            until { loginCount() > beforeStaleLogin && reportedRetries > beforeStaleReport }
+            log("STEP feedback-recovery")
+            password = "good"
+            setState("Disconnected")
+            until { connected }
+            var disconnected = false
+            engine.disconnect { disconnected = true }
+            until { disconnected }
+            log("DONE")
+            return
+        }
         if CommandLine.arguments.last == "3" {
             log("STEP certificate-failure")
             password = "certfail"
@@ -51,11 +113,6 @@ struct Harness {
             engine.onProtectionRequest = { mode, _, gws, done in
                 log("EVENT killswitch=\(mode) gw=\(gws.joined(separator: ","))")
                 replies.append(done)
-            }
-            func until(_ observed: () -> Bool) {
-                let deadline = Date().addingTimeInterval(18)
-                while !observed() && Date() < deadline { wait(0.05) }
-                precondition(observed(), "expected fake CLI event was not observed")
             }
             engine.connect()
             until { replies.count == 1 }
@@ -84,8 +141,8 @@ struct Harness {
                 done(true)
             }
             var sawUnconfirmedSession = false
-            engine.onState = { state, detail in
-                log("EVENT state=\(state) \(detail)")
+            engine.onStatus = { state, detail, rejected in
+                log("EVENT state=\(state) \(detail) certificateRejected=\(rejected)")
                 if detail == "Cisco 会话尚未确认" { sawUnconfirmedSession = true }
             }
             password = "stale-success"
@@ -97,9 +154,7 @@ struct Harness {
             log("DONE")
             return
         }
-        // Part "1" = connect..pushed-failure, "2" = adopt-on-refresh..end.
-        // The two parts share no state, so the test script runs them as two
-        // processes at once (own fake-CLI directory and defaults domain).
+        // Parts 1 and 2 run independently with separate fake-CLI state and defaults domains.
         let part = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "all"
         if part != "2" {
             log("STEP connect")

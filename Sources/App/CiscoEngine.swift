@@ -54,6 +54,9 @@ final class CiscoEngine {
 
     /// (state, detail) on the main queue.
     var onState: ((HelperClient.State, String) -> Void)?
+    /// One main-queue update with state, detail and any unresolved certificate refusal.
+    var onStatus: ((HelperClient.State, String, Bool) -> Void)?
+    private static let certificateRejectedFlag: Int32 = 1 << 8
     /// Terminal reason on the main queue: 1 = manual, 2 = rejected.
     var onTerminal: ((Int) -> Void)?
     /// Legacy blocking notification for callers without an acknowledgement channel.
@@ -144,8 +147,15 @@ final class CiscoEngine {
             state: { ctx, state, detail in
                 guard let engine = WeakBox.engine(ctx), let detail else { return }
                 let text = String(cString: detail)
-                let value = HelperClient.State(rawValue: Int(state)) ?? .disconnected
-                DispatchQueue.main.async { engine.onState?(value, text) }
+                let rejected = state & CiscoEngine.certificateRejectedFlag != 0
+                let value = HelperClient.State(rawValue: Int(state & ~CiscoEngine.certificateRejectedFlag)) ?? .disconnected
+                DispatchQueue.main.async {
+                    if let status = engine.onStatus {
+                        status(value, text, rejected)
+                    } else {
+                        engine.onState?(value, text)
+                    }
+                }
             },
             terminal: { ctx, code in
                 guard let engine = WeakBox.engine(ctx) else { return }
