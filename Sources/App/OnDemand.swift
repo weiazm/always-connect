@@ -146,6 +146,7 @@ final class OnDemandController {
     var probe: (OnDemandProbe, OnDemandFacts, @escaping (Bool) -> Void) -> Void = { _, _, done in done(false) }
     var disconnect: () -> Void = {}
     var connect: () -> Void = {}
+    var connectAtLaunch: (() -> Void)?
     var stopUser: () -> Void = {}
     var changed: () -> Void = {}
     var cancelProbe: () -> Void = {}
@@ -203,11 +204,12 @@ final class OnDemandController {
         case "cancel_probe": cancelProbe()
         case "update_ui": changed()
         case "disconnect": disconnect()
-        case "start": connect()
-        case "start_auto":
-            let body = automaticBody
-            automaticBody = nil
-            body?()
+        case "start", "start_auto":
+            let automatic = action["kind"] as? String == "start_auto"
+            let body = automatic ? automaticBody : connect
+            if automatic { automaticBody = nil }
+            if action["at_launch"] as? Bool == true, let connectAtLaunch { connectAtLaunch() }
+            else { body?() }
         case "stop_user": stopUser()
         case "recheck": recheck()
         case "refresh_service": refreshService()

@@ -6,7 +6,7 @@ import Security
 /// the result lifetime and its binding to the selected host and port.
 final class LoginGatewayPreparation {
     enum Status: Int32 {
-        case idle, preparing, ready, certificateRejected, unavailable
+        case idle, preparing, ready, certificateRejected, unavailable, timedOut, dnsFailed
     }
 
     private let queue = DispatchQueue(label: "com.alwaysconnect.login-gateway")
@@ -30,9 +30,8 @@ final class LoginGatewayPreparation {
         ac_login_preparation_free(preparation)
     }
 
-    /// The caller has confirmed that direct networking was explicitly allowed
-    /// and no connection intent is active. An unknown firewall state cannot
-    /// start preparation.
+    /// The caller confirmed direct networking for an idle check or received
+    /// the service's bounded preparation ticket for this connection intent.
     func confirmDirect() {
         queue.sync { ac_login_preparation_confirm_direct(preparation) }
     }
@@ -47,12 +46,14 @@ final class LoginGatewayPreparation {
     /// its completion and shorten its deadline without starting new I/O.
     @discardableResult
     func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, deadline: DispatchTime,
-                            completion: (() -> Void)?) -> Status {
+                            joinOnly: Bool = false, completion: (() -> Void)?) -> Status {
         queue.sync {
             let now = DispatchTime.now()
             guard now < deadline else { return .unavailable }
             let deadline = min(deadline, now + .seconds(2))
-            let token = ac_login_preparation_begin(preparation, target.host, target.port)
+            // A probe already running at click time may have failed during the service round trip.
+            // Read that result under the transport queue without issuing a second lookup.
+            let token = joinOnly ? 0 : ac_login_preparation_begin(preparation, target.host, target.port)
             guard token != 0 else {
                 let current = statusLocked(for: target)
                 if current == .preparing, let request {
@@ -155,6 +156,8 @@ final class LoginGatewayPreparation {
             case .ready:
                 let peer = self.certificateVerified ? Self.remoteAddress(of: stream, port: port, ipv4Only: ipv4Only) : nil
                 self.finish(token, address: peer)
+            case .failed(.dns):
+                self.finish(token, dnsFailed: true)
             case .failed, .cancelled:
                 self.finish(token)
             default:
@@ -196,12 +199,16 @@ final class LoginGatewayPreparation {
         }
     }
 
-    private func finish(_ token: UInt64, address: String? = nil, certificateRejected: Bool = false) {
+    private func finish(_ token: UInt64, address: String? = nil, certificateRejected: Bool = false, dnsFailed: Bool = false) {
         guard request == token else { return }
         let completion = self.completion
         let withinBudget = transportDeadline.map { DispatchTime.now() < $0 } ?? false
         stopTransport()
-        ac_login_preparation_finish(preparation, token, withinBudget ? address : nil, withinBudget && certificateRejected)
+        if !withinBudget || dnsFailed {
+            ac_login_preparation_transport_failure(preparation, token, !withinBudget)
+        } else {
+            ac_login_preparation_finish(preparation, token, address, certificateRejected)
+        }
         if let completion { DispatchQueue.main.async(execute: completion) }
         #if LOGIN_GATEWAY_PREPARATION_TEST
         onTestFinish?()
@@ -223,7 +230,7 @@ final class LoginGatewayPreparation {
 
 /// The panel's preparation steps precede any request to connect the VPN.
 enum LoginGatewayReadiness {
-    case idle, checking, preparing, cached, candidate, unavailable, certificateRejected, networkUnknown, timedOut
+    case idle, checking, preparing, cached, candidate, unavailable, certificateRejected, networkUnknown, timedOut, dnsFailed
 
     var canConnect: Bool { self == .cached || self == .candidate }
     var isBusy: Bool { self == .checking || self == .preparing }
@@ -241,6 +248,8 @@ enum LoginGatewayReadiness {
         case .preparing: self = .preparing
         case .ready: self = .candidate
         case .unavailable: self = .unavailable
+        case .timedOut: self = .timedOut
+        case .dnsFailed: self = .dnsFailed
         case .certificateRejected: self = .certificateRejected
         }
     }
@@ -254,11 +263,14 @@ enum LoginGatewayReadiness {
         case .certificateRejected: return "VPN 服务器证书校验失败，可以重新准备。"
         case .networkUnknown: return "暂未确认可直连。可以先恢复网络，再准备服务器地址。"
         case .timedOut: return "查找 VPN 服务器超时。"
+        case .dnsFailed: return "无法解析 VPN 服务器的名称。"
         case .idle: return nil
         }
     }
 }
 
+@_silgen_name("ac_login_preparation_transport_failure")
+private func ac_login_preparation_transport_failure(_ preparation: OpaquePointer, _ token: UInt64, _ timedOut: Bool)
 @_silgen_name("ac_login_preparation_new")
 private func ac_login_preparation_new() -> OpaquePointer
 @_silgen_name("ac_login_preparation_free")

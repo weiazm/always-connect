@@ -20,7 +20,7 @@ swiftc -O -parse-as-library -module-name SessionHarness "${SOURCES[@]}" \
 [ -x "$WORK/harness" ] || { echo "FAIL build"; exit 1; }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cold-protected-login cached-protected-login cisco-disconnect protection-off own-disconnect own-then-cisco
+[ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cold-protected-login cached-protected-login bounded-gateway-lookup cisco-disconnect protection-off own-disconnect own-then-cisco
     own-protection-off own-protection-toggle egress-drop-dependency
     grace-expiry grace-cancelled quit-no-relaunch restart-same-boot restart-other-boot legacy-pf-state
     own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal

@@ -4,6 +4,14 @@ fn into_string(text: String) -> *mut c_char {
     CString::new(text).map_or(std::ptr::null_mut(), CString::into_raw)
 }
 
+#[no_mangle]
+extern "C" fn ac_login_direct_interface() -> *mut c_char {
+    crate::connections::default_route_interface()
+        .filter(|name| name.starts_with("en"))
+        .map(into_string)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 // The Swift declarations pass borrowed, NUL-terminated UTF-8 strings.
 fn string_ptr<T>(pointer: *const c_char, f: impl FnOnce(&str) -> T) -> Option<T> {
     if pointer.is_null() {
@@ -108,6 +116,14 @@ extern "C" fn ac_login_preparation_finish(
                 .map(PreparedGateway::Address)
         };
         preparation.finish(request, result, Instant::now());
+    }
+}
+
+#[no_mangle]
+extern "C" fn ac_login_preparation_transport_failure(preparation: *mut Preparation, request: u64, timed_out: bool) {
+    if let Some(preparation) = unsafe { preparation.as_mut() } {
+        let reason = if timed_out { PreparedGateway::TimedOut } else { PreparedGateway::DnsFailed };
+        preparation.finish(request, Some(reason), Instant::now());
     }
 }
 

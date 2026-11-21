@@ -247,7 +247,7 @@ fn preparation_status_distinguishes_rejection_from_unavailable() {
     assert_eq!(prep.status(&key, now), PreparationStatus::Preparing);
     assert_eq!(
         prep.status(&key, now + PROBE_BUDGET),
-        PreparationStatus::Unavailable
+        PreparationStatus::TimedOut
     );
     prep.finish(retry, None, now + PROBE_BUDGET);
     assert_eq!(

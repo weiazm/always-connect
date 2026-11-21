@@ -147,6 +147,70 @@ struct SessionHarness {
             session.harnessOwner(attached: true, appPath: app)
         }
         switch scenario {
+        case "bounded-gateway-lookup":
+            let server = "vpn.example.test"
+            let peer = "198.51.100.7"
+            let firewall = NetworkGuard.shared
+            func open(_ budget: Int = 2500, cisco: Bool = false) -> (UInt64, Bool)? {
+                let cutoff = DispatchTime.now() + .milliseconds(budget)
+                return sync { reply in
+                    session.requestProtectedLogin(server, cisco: cisco, candidate: "", rejected: false,
+                                                  allowPreparation: true, deadline: cutoff.uptimeNanoseconds) {
+                        ticket, ok, _, _ in reply((ticket, ok))
+                    }
+                }
+            }
+            func finish(_ ticket: UInt64, _ candidate: String) -> Bool? {
+                sync { reply in session.finishProtectedLogin(ticket, candidate: candidate) { ok, _, _ in reply(ok) } }
+            }
+            // The fake pfctl reads the anchor from this private file.
+            try! Data().write(to: root.appendingPathComponent("current.rules"))
+            for cisco in [false, true] {
+                let ticket = open(cisco: cisco)?.0 ?? 0
+                check(ticket != 0 && !firewall.isHolding && firewall.hasPendingLoginDeadline,
+                      "empty cache grants a bounded lookup for the selected engine")
+                check(finish(ticket, peer) == true && firewall.held?.inputs.gatewayIps == [peer],
+                      "only a current result can open the verified carrier")
+                check(disconnect(session) && !firewall.isHolding, "explicit release clears the session")
+            }
+            let failed = open()?.0 ?? 0
+            check(failed != 0 && finish(failed, "") == false && firewall.held?.inputs.gatewayIps.isEmpty == true,
+                  "failed TLS leaves an empty-gateway hold")
+            check(open()?.0 == 0 && firewall.isHolding, "an existing hold never grants a new lookup")
+            check(disconnect(session), "released the failure hold")
+            let started = DispatchTime.now()
+            let abandoned = open()?.0 ?? 0
+            let ruleFile = root.appendingPathComponent("current.rules")
+            let installed = waitFor(3) {
+                (try? String(contentsOf: ruleFile, encoding: .utf8))?.contains("block drop out quick all") == true
+            }
+            let elapsed = (DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+            check(installed && elapsed <= 3000, "stub received the blocking rule within three seconds (\(elapsed) ms)")
+            check(abandoned != 0 && waitFor(3) { firewall.loginDeadlineStatus(abandoned) == .timedOutBlocked },
+                  "the service blocks even if the App never returns a TLS result")
+            check(finish(abandoned, peer) == false && firewall.held?.inputs.gatewayIps.isEmpty == true,
+                  "late success cannot widen the timed-out hold")
+            check(disconnect(session), "released the expired hold")
+            let cancelled = open()?.0 ?? 0
+            check(cancelled != 0 && disconnect(session) && finish(cancelled, peer) == false && !firewall.isHolding,
+                  "manual release rejects the previous ticket")
+            let disabled = open(cisco: true)?.0 ?? 0
+            let off: Bool? = sync { session.setDropProtection(false, withReply: $0) }
+            check(disabled != 0 && off == true && finish(disabled, peer) == false && !firewall.isHolding,
+                  "turning off protection cancels an uninstalled Cisco deadline")
+            try! Data("block drop out quick all\n".utf8).write(to: ruleFile)
+            let unknown = open()
+            check(unknown?.0 == 0 && unknown?.1 == false && firewall.isHolding,
+                  "unaccounted anchor content refuses direct preparation")
+            check(disconnect(session), "unconfirmed direct path released manually")
+            let target = GatewayAddress(server)!
+            let support = CLIOrchestrator.defaultSupportDir
+            try! FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: support.path)
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: peer), "fixture peer saved")
+            let cached = open()
+            check(cached?.0 == 0 && cached?.1 == true && firewall.isHolding && !firewall.hasPendingLoginDeadline,
+                  "a cached connection applies protection immediately without a lookup window")
+            check(disconnect(session), "cached session released")
         case "cached-protected-login":
             let server = "vpn.example.test"
             let support = CLIOrchestrator.defaultSupportDir

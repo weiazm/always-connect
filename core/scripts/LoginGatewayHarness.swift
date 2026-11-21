@@ -20,7 +20,8 @@ enum LoginGatewayHarness {
     }
 
     static func prepared(_ target: GatewayAddress, anchor: SecCertificate?, expected: (String?, Bool),
-                         intent: GatewayAddress? = nil, ipv4Only: Bool = false, label: String) {
+                         intent: GatewayAddress? = nil, ipv4Only: Bool = false,
+                         failures: [LoginGatewayPreparation.Status] = [.unavailable], label: String) {
         let preparation = LoginGatewayPreparation()
         let finished = DispatchSemaphore(value: 0)
         preparation.onTestFinish = { finished.signal() }
@@ -28,9 +29,10 @@ enum LoginGatewayHarness {
         preparation.confirmDirect()
         check(preparation.prepareWhileDirect(target, ipv4Only: ipv4Only) == .preparing, "\(label) starts preparing")
         check(finished.wait(timeout: .now() + 3) == .success, "\(label) finishes")
-        let status: LoginGatewayPreparation.Status = expected.0 != nil ? .ready
-            : expected.1 || intent != nil ? .certificateRejected : .unavailable
-        check(preparation.status(for: target) == status, "\(label) reports the right preparation state")
+        let states: [LoginGatewayPreparation.Status] = expected.0 != nil ? [.ready]
+            : expected.1 || intent != nil ? [.certificateRejected] : failures
+        let observed = preparation.status(for: target)
+        check(states.contains(observed), "\(label) reports the right preparation state (\(observed))")
         check(preparation.takeResultForIntent(intent ?? target) == expected, label)
         check(preparation.takeResultForIntent(target) == (nil, false), "\(label) cannot be reused")
     }
@@ -54,9 +56,9 @@ enum LoginGatewayHarness {
                  label: "a rejection is unavailable to a different hostname")
         prepared(wrongName, anchor: anchor, expected: (nil, false), intent: stalled,
                  label: "a rejection is unavailable to a different port")
-        prepared(mutualTLS, anchor: anchor, expected: (nil, false),
+        prepared(mutualTLS, anchor: anchor, expected: (nil, false), failures: [.unavailable, .timedOut],
                  label: "failure to present a client certificate is not a server trust rejection")
-        prepared(delayed, anchor: nil, expected: (nil, false),
+        prepared(delayed, anchor: nil, expected: (nil, false), failures: [.timedOut],
                  label: "a server responding with TLS after the deadline does not report rejection")
         check(LoginGatewayCache.lookup(in: support, target: gateway).isEmpty, "preparation has no persistent side effect")
         check(LoginGatewayCache.rememberConnected(in: support, target: gateway, peer: "192.0.2.8"), "service records a synthetic connected peer")
@@ -106,7 +108,7 @@ enum LoginGatewayHarness {
         check(waitFor { joinedReplies == 1 }, "only the new observer receives completion")
         check(DispatchTime.now().uptimeNanoseconds - joinTime.uptimeNanoseconds < 1_200_000_000,
               "joining a lookup can shorten its deadline")
-        check(passiveReplies == 0 && joining.status(for: stalled) == .unavailable,
+        check(passiveReplies == 0 && joining.status(for: stalled) == .timedOut,
               "timeout retires the transport without an address or a passive callback")
         check(joining.takeResultForIntent(stalled) == (nil, false), "expired transport cannot supply a late result")
 

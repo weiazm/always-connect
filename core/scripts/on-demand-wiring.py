@@ -30,7 +30,7 @@ def block(text, marker):
 
 methods = [
     'private func setupOnDemandDisconnection()', 'private func verifyOnDemandIdle(',
-    'func connectWithStoredCredentials(', 'func disconnect(\n', 'private func watchRestore(',
+    'func connectWithStoredCredentials(', 'private func startStoredConnection(', 'func disconnect(\n', 'private func watchRestore(',
     'func onDemandSettingsChanged()', 'func prepareForForcedRestore()',
     'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode(',
     'private var mayPrepareLoginGateway:', 'private func resetGatewayPreparation(', 'func expireGatewayPreparation()',
@@ -38,13 +38,15 @@ methods = [
     'func prepareGatewayWhileDirect(', 'private func isGatewayPreparationCurrent(', 'private func prepareUncachedGateway('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
+# The ordering fixtures use a synthetic engine start. Entry fixtures opt in to the complete production method.
+body = body.replace('func startStoredConnection(allowLookup:', 'func exerciseStoredConnection(allowLookup:', 1)
 readiness = block((root / 'Sources/App/LoginGatewayPreparation.swift').read_text(), 'enum LoginGatewayReadiness')
 panel_action = block((root / 'Sources/App/PanelAndSettings.swift').read_text(), 'private var primaryButton:')
 assert 'manager.loginGatewayReadiness' not in panel_action
 assert 'onStart()' in panel_action and 'ProtectedLoginNotice.preparingGateway' in panel_action
 assert 'Button(preparing ? "取消连接"' in panel_action and 'onStop()' in panel_action
 callbacks = '\n'.join(block(source, marker) for marker in [
-    'onDemand.disconnect =', 'onDemand.waiting =', 'onDemand.connect =',
+    'onDemand.disconnect =', 'onDemand.waiting =', 'onDemand.connect =', 'onDemand.connectAtLaunch =',
     'onDemand.stopUser =', 'onDemand.recheck =', 'onDemand.changed =', 'onDemand.refreshService ='])
 view = (root / 'Sources/App/OnDemandSettings.swift').read_text()
 editor = view[view.index('private struct OnDemandRuleEditor'):]
@@ -79,6 +81,7 @@ enum ProfileStore {
     static func loadAppSettings() -> Settings { settings }
     static func saveAppSettings(_ value: Settings) { settings = value }
     static func loadProfile() -> Profile { profile }
+    static func loadUsername() -> String? { "fixture-user" }
 }
 enum HelperInstaller { static var installedHelperMatchesBundle = true }
 struct Tracker { func noteUserStop() {} }
@@ -107,7 +110,7 @@ enum CiscoProfiles { static func resolve(_ name: String) -> String { name } }
 var directRoute = true
 func ac_login_direct_route() -> Bool { directRoute }
 final class LoginGatewayPreparation {
-    enum Status { case idle, preparing, ready, unavailable, certificateRejected }
+    enum Status { case idle, preparing, ready, unavailable, certificateRejected, timedOut, dnsFailed }
     var phase: Status = .idle
     var checks = 0
     var ipv4Only = false
@@ -118,7 +121,8 @@ final class LoginGatewayPreparation {
         prepareWhileDirect(target, ipv4Only: ipv4Only, deadline: .now() + 2, completion: completion)
     }
     func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, deadline: DispatchTime,
-                            completion: @escaping () -> Void) -> Status {
+                            joinOnly: Bool = false, completion: @escaping () -> Void) -> Status {
+        if joinOnly && phase != .preparing { return phase }
         guard DispatchTime.now() < deadline else { return .unavailable }
         self.ipv4Only = ipv4Only
         if phase == .ready { return .ready }
@@ -127,9 +131,15 @@ final class LoginGatewayPreparation {
         done = completion
         return phase
     }
+    func takeResultForIntent(_ target: GatewayAddress?) -> (address: String?, certificateRejected: Bool) {
+        let result = (phase == .ready ? "192.0.2.7" : nil, phase == .certificateRejected)
+        cancel()
+        return result
+    }
     func cancel() { phase = .idle; done = nil }
 }
 LOGIN_GATEWAY_READINESS
+PROTECTED_NOTICE
 final class Service {
     static func log(_ detail: String) {}
     var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
@@ -166,6 +176,25 @@ enum CiscoEngine {
 final class Proxy {
     var code = 1
     var held = false
+    var cachedGateway = true
+    var opens = 0
+    var finishPeers: [String] = []
+    func requestProtectedLogin(_ server: String, cisco: Bool, candidate: String, rejected: Bool,
+                               allowPreparation: Bool, deadline: UInt64,
+                               withReply reply: @escaping (UInt64, Bool, [String], String) -> Void) {
+        opens += 1
+        enqueue {
+            if rejected { reply(0, false, [], ProtectedLoginNotice.noTrustedAddress) }
+            else if self.cachedGateway || !candidate.isEmpty { reply(0, true, ["192.0.2.7"], "") }
+            else if allowPreparation && !self.held { reply(1, false, [], "") }
+            else { reply(0, false, [], ProtectedLoginNotice.preparationUnavailable) }
+        }
+    }
+    func finishProtectedLogin(_ ticket: UInt64, candidate: String, withReply reply: @escaping (Bool, [String], String) -> Void) {
+        finishPeers.append(candidate)
+        held = true
+        reply(!candidate.isEmpty, candidate.isEmpty ? [] : [candidate], candidate.isEmpty ? ProtectedLoginNotice.noTrustedAddress : "")
+    }
     var blocked = false
     var dropsStatus = false
     var delayedStatus: [() -> Void] = []
@@ -194,6 +223,9 @@ final class Client {
     var networkHeld = false
     var endingApp = false
     var protectsDrops: Bool { ProfileStore.loadAppSettings().isDropProtectionOn }
+    var pendingProtectedStart: UInt64?
+    var splitWarning: String?
+    var awaitingCiscoStart = false
     var loginIntentActive = false
     var gatewayTrustFailed = false
     var rejectedLoginHeld = false
@@ -247,8 +279,20 @@ final class Client {
     func refreshStatus() { onDemandDisconnect.recheck() }
     func markHelperReachable() { helperUnresponsive = false }
     func scheduleRestartRecovery(wasActive: Bool) {}
-    func startStoredConnection() -> Bool {
+    func egressRPC<Value>(_ call: @escaping (Proxy, @escaping (Value) -> Void) -> Void, completion: @escaping (Value?) -> Void) {
+        call(proxy) { completion($0) }
+    }
+    var exerciseCommonLogin = false
+    func startStoredConnection(allowLookup: Bool = false) -> Bool {
+        if exerciseCommonLogin { return exerciseStoredConnection(allowLookup: allowLookup) }
         protection.startSession(usesCisco: usesCisco)
+        cisco?.isManaging = true
+        starts += 1
+        proxy.code = 1
+        return true
+    }
+    func showGatewayRejection() { gatewayTrustFailed = true }
+    func continueStoredConnection(_ profile: Profile, username: String, server: String, addresses: [String]?, session: UInt64) -> Bool {
         cisco?.isManaging = true
         starts += 1
         proxy.code = 1
@@ -600,6 +644,56 @@ final class ViewLifecycle {
         check(replacementResults == [.certificateRejected], "only the current trust refusal reaches the common entry")
         ProfileStore.profile = Profile()
 
+        for manual in [true, false] {
+            let first = Client()
+            first.exerciseCommonLogin = true
+            first.proxy.cachedGateway = false
+            if manual { _ = first.connectWithStoredCredentials(manual: true) }
+            else {
+                first.onDemand.configure(enabled: false, rules: [])
+                first.onDemand.holdLaunch()
+                first.onDemand.launchFinished(true)
+            }
+            check(first.proxy.opens == 1 && first.starts == 0 && first.loginPreparation.checks == 1,
+                  "both entry points prepare exactly once after a service grant")
+            _ = first.connectWithStoredCredentials(manual: manual)
+            check(first.proxy.opens == 1 && first.loginProtectionNotice == ProtectedLoginNotice.preparingGateway,
+                  "a repeated intent cannot extend the window")
+            first.loginPreparation.phase = .ready
+            first.loginPreparation.done?()
+            check(first.proxy.finishPeers == ["192.0.2.7"] && first.starts == 1 && first.networkHeld,
+                  "verified peer is consumed only after protection confirms")
+        }
+        let wake = Client()
+        wake.exerciseCommonLogin = true
+        wake.proxy.cachedGateway = false
+        wake.onDemand.configure(enabled: false, rules: [])
+        _ = wake.connectWithStoredCredentials()
+        check(wake.proxy.opens == 1 && wake.loginPreparation.checks == 0 && wake.starts == 0,
+              "a non-launch automatic request never opens a direct lookup window")
+        let failedJoin = Client()
+        failedJoin.exerciseCommonLogin = true
+        failedJoin.proxy.cachedGateway = false
+        failedJoin.loginPreparationTarget = GatewayAddress(ProfileStore.profile.server)
+        failedJoin.loginPreparationProfileName = ProfileStore.profile.server
+        failedJoin.loginPreparation.phase = .preparing
+        failedJoin.proxy.blocked = true
+        _ = failedJoin.connectWithStoredCredentials(manual: true)
+        failedJoin.loginPreparation.phase = .certificateRejected
+        failedJoin.proxy.blocked = false
+        failedJoin.proxy.drain()
+        check(failedJoin.starts == 0 && failedJoin.loginPreparation.checks == 0 &&
+              failedJoin.proxy.finishPeers == [""] && failedJoin.gatewayTrustFailed && failedJoin.rejectedLoginHeld,
+              "rejection during the service round trip blocks without a second lookup")
+        let restored = Client()
+        restored.exerciseCommonLogin = true
+        restored.proxy.cachedGateway = false
+        _ = restored.connectWithStoredCredentials(manual: true)
+        let late = restored.loginPreparation.done
+        restored.disconnectByUser()
+        late?()
+        check(restored.starts == 0 && restored.proxy.finishPeers.isEmpty,
+              "manual disconnect discards a late preparation result")
         let editor = RuleEditor()
         editor.fillCurrentNetwork()
         let monitor = NWPathMonitor.latest!
@@ -625,6 +719,6 @@ final class ViewLifecycle {
     }
 }
 '''
-for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods), ('SERVER_PROTECTION_BODY', service_protection), ('LOGIN_GATEWAY_READINESS', readiness)]:
+for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods), ('SERVER_PROTECTION_BODY', service_protection), ('LOGIN_GATEWAY_READINESS', readiness), ('PROTECTED_NOTICE', block((root/'Sources/Shared/HelperXPC.swift').read_text(), 'enum ProtectedLoginNotice'))]:
     fixture = fixture.replace(key, value)
 output.write_text(fixture)

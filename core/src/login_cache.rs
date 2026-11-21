@@ -308,8 +308,8 @@ fn write_cache(dir: &File, cache: &Cache) -> io::Result<()> {
     result
 }
 
-/// A single selected gateway can be prepared while the owner has confirmed
-/// direct networking and has no connection intent. Its TLS result applies
+/// A selected gateway can be prepared while idle on a confirmed direct path
+/// or under the service's first-login deadline. Its TLS result applies
 /// only to that host and port and has no path to the disk cache.
 #[derive(Default)]
 struct Preparation {
@@ -339,6 +339,8 @@ enum PreparationState {
 enum PreparedGateway {
     Address(IpAddr),
     CertificateRejected,
+    TimedOut,
+    DnsFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +351,8 @@ enum PreparationStatus {
     Ready = 2,
     CertificateRejected = 3,
     Unavailable = 4,
+    TimedOut = 5,
+    DnsFailed = 6,
 }
 
 impl Preparation {
@@ -397,7 +401,7 @@ impl Preparation {
         {
             self.state = PreparationState::Ready {
                 gateway,
-                result: result.filter(|_| now < deadline),
+                result: result.filter(|value| now < deadline || *value == PreparedGateway::TimedOut),
                 expires: now + PREPARATION_TTL,
                 verified_at: SystemTime::now(),
             };
@@ -412,7 +416,7 @@ impl Preparation {
                 if now < *deadline {
                     PreparationStatus::Preparing
                 } else {
-                    PreparationStatus::Unavailable
+                    PreparationStatus::TimedOut
                 }
             }
             PreparationState::Ready {
@@ -423,6 +427,8 @@ impl Preparation {
             } if gateway == target && preparation_fresh(now, *expires, *verified_at) => {
                 match result {
                     Some(PreparedGateway::Address(_)) => PreparationStatus::Ready,
+                    Some(PreparedGateway::TimedOut) => PreparationStatus::TimedOut,
+                    Some(PreparedGateway::DnsFailed) => PreparationStatus::DnsFailed,
                     Some(PreparedGateway::CertificateRejected) => {
                         PreparationStatus::CertificateRejected
                     }
