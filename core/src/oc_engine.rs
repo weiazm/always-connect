@@ -664,7 +664,7 @@ impl Engine {
     fn check_expected(&self) -> crate::network_check::Expected {
         let c = self.shared.core.lock().unwrap();
         crate::network_check::Expected {
-            tunnel: c.last_pf.as_ref().map(|p| p.0.clone()), dns_interface: c.forwarder.as_ref().and_then(|f| f.bound_tunnel_interface()),
+            tunnel: c.tunnel_if.clone(), dns_interface: c.forwarder.as_ref().and_then(|f| f.bound_tunnel_interface()),
             physical: c.config.physical_if.clone(), gateway: c.physical_gateway.clone(),
             vpn_gateways: c.last_pf.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
             dns: c.tunnel_dns.clone(), split: c.forwarder.is_some(), protection: c.config.drop_protection,
@@ -1559,6 +1559,19 @@ impl Shared {
     fn spawn_next(self: &Arc<Self>, c: &mut Core) {
         if c.stop_requested || c.network.paused || c.child.is_some() || c.finished {
             return;
+        }
+        if self.guard.was_superseded(&self.holder) {
+            // A delayed backoff timer may outlive the handover to another engine.
+            return;
+        }
+        // An inherited or dropped session may have failed to install its
+        // blocking rules. Retry that operation before opening another login.
+        if c.config.drop_protection && c.last_pf.is_some() && c.pf_needs_load {
+            c.last_allow_direct_egress = false;
+            if !self.apply_base_pf(c) {
+                self.respawn_after(5.0);
+                return;
+            }
         }
         if let Some(max) = c.config.max_attempts {
             if c.attempts >= max {
@@ -3001,6 +3014,34 @@ mod tests {
             state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),network_available: Box::new(|| true), physical_network:Box::new(|_|Some(("192.168.1.1".into(),"en0".into()))),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
         },guard)
     }
+    #[test]
+    fn login_waits_when_reinstalling_an_existing_guard_fails() {
+        let (support, guard, tool) = recovery_guard("protect-retry");
+        let engine = recovery_engine(&support, guard.clone());
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["192.0.2.20".into()],
+                physical_if: "en0".into(), ..Inputs::default() };
+            assert!(guard.apply("previous", false, &inputs).is_none());
+            std::fs::write(tool.with_extension("fail"), "").unwrap();
+            engine.shared.take_over_held_set(&mut c);
+            assert!(c.pf_needs_load);
+            engine.shared.spawn_next(&mut c);
+            assert!(c.child.is_none() && c.pf_needs_load && c.pf_error.is_some());
+            assert_eq!(c.attempts, 0);
+            assert!(guard.held().is_some());
+
+            std::fs::remove_file(tool.with_extension("fail")).unwrap();
+            // A zero test attempt limit lets us observe recovery without a child.
+            c.config.max_attempts = Some(0);
+            engine.shared.spawn_next(&mut c);
+            assert!(!c.pf_needs_load && c.finished);
+            assert_eq!(guard.holder().as_deref(), Some(engine.shared.holder.as_str()));
+            c.stop_requested = true;
+        }
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
     #[test]
     fn failed_split_forwarder_keeps_physical_blocking_and_gateway_dns_fallback() {
         let (support,guard,_)=recovery_guard("forwarder-fallback");

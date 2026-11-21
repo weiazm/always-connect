@@ -653,6 +653,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
         connectionCheck.start { [weak self] in
             guard let self, self.state == .connected, !self.usesCisco,
+                  !(self.protectsDrops && self.gatewayTrustFailed),
                   ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
             self.autoStopNotice = "自建连接连上后 30 秒都上不了网，已自动断开并恢复直连。"
                 + "可以先在设置里改用「经 Cisco」连接。"

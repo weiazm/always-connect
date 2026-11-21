@@ -59,7 +59,10 @@ struct PanelView: View {
                 Spacer()
             }
             if manager.gatewayTrustFailed {
-                Label("VPN 网关证书校验失败，新的连接未建立。请联系 VPN 管理员。", systemImage: "exclamationmark.shield.fill")
+                Label(manager.protectsDrops
+                      ? "VPN 网关证书校验失败。网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+                      : "VPN 网关证书校验失败。断线保护已关闭。请联系 VPN 管理员。",
+                      systemImage: "exclamationmark.shield.fill")
                     .font(.callout)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)

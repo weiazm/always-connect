@@ -286,6 +286,10 @@ impl Guard {
         }
     }
 
+    pub(crate) fn was_superseded(&self, holder: &str) -> bool {
+        Self::is_stale(&self.state.lock().unwrap(), holder)
+    }
+
     /// Load the connected or blocking set for `holder`. None on success
     /// (or when the holder is stale), else the panel's red pf line.
     pub fn apply(self: &Arc<Self>, holder: &str, connected: bool, inputs: &Inputs) -> Option<String> {

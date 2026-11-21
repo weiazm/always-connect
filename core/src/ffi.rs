@@ -696,7 +696,7 @@ mod tests {
         );
         assert!(!out.is_null());
         let text = unsafe { CStr::from_ptr(out).to_str().unwrap().to_owned() };
-        assert!(text.ends_with("pass out quick on en0 all\n"));
+        assert!(text.ends_with("pass out quick on en0 all no state\n"));
         ac_string_free(out);
         // Bad input yields null, never a crash.
         assert!(ac_pf_generate(
