@@ -31,13 +31,13 @@ O=/tmp/ac-engine-test/out.txt
 grep -q 'testpass' $O && fail "password leaked into output" || pass "no-password-in-output"
 # 2b established tunnel: hook -> connected, drop -> reconnecting, cookie reuse
 rm -rf /tmp/ac-drop && mkdir -p /tmp/ac-drop
-OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1); E=$?
+OUT=$(printf 'pw\n' | "$REPO/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1); E=$?
 [ $E -eq 3 ] && echo "$OUT" | grep -q "^STATE connected tunnel up" \
   && echo "$OUT" | grep -q "^STATE reconnecting dropped, retrying" \
   && echo "$OUT" | grep -q "^STATE reconnecting spawning openconnect (attempt 2, credential cookie)" \
   && grep -q fakecookie42 /tmp/ac-drop/session.json && pass drop-episode || { fail drop-episode; echo "$OUT" | grep -E "^(STATE|TERMINAL)"; }
 # 2b an internal reconnect is reported as reconnecting, then connected (§28.1)
-rm -rf /tmp/ac-irc; OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1)
+rm -rf /tmp/ac-irc; OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$REPO/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1)
 echo "$OUT" | awk '/^STATE reconnecting 隧道断了，正在重连/ { waiting=1; next }
   waiting && /^STATE connected tunnel up/ { recovered=1; exit }
   END { exit !recovered }' \

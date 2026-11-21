@@ -203,7 +203,7 @@ jobs:
           test -n "$HELPER"
           rm -rf /tmp/ac-drop && mkdir -p /tmp/ac-drop
           set +e
-          OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1)
+          OUT=$(printf 'pw\n' | "$PWD/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1)
           RUN_EXIT=$?
           set -e
           echo "$OUT" | grep -E '^(STATE|TERMINAL)' || true
@@ -214,7 +214,7 @@ jobs:
           grep -q fakecookie42 /tmp/ac-drop/session.json
           # An internal reconnect (network change, DESIGN.md §28.1) is
           # reported as reconnecting, then connected again.
-          OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
+          OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$PWD/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
           echo "$OUT" | grep -E '^STATE' || true
           echo "$OUT" | grep -q '^STATE reconnecting 隧道断了，正在重连'
           # Status notices may appear between reconnecting and tunnel-up.
