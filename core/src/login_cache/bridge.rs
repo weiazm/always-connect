@@ -80,6 +80,19 @@ extern "C" fn ac_login_preparation_begin(
 }
 
 #[no_mangle]
+extern "C" fn ac_login_preparation_status(
+    preparation: *const Preparation,
+    host: *const c_char,
+    port: u16,
+) -> i32 {
+    let (Some(preparation), Some(gateway)) = (unsafe { preparation.as_ref() }, gateway(host, port))
+    else {
+        return PreparationStatus::Idle as i32;
+    };
+    preparation.status(&gateway, Instant::now()) as i32
+}
+
+#[no_mangle]
 extern "C" fn ac_login_preparation_finish(
     preparation: *mut Preparation,
     request: u64,

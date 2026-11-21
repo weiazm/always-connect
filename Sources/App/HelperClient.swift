@@ -50,7 +50,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         return "网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
     }
     @Published private(set) var loginProtectionNotice: String?
+    @Published private(set) var loginGatewayReadiness: LoginGatewayReadiness = .idle
     private let loginPreparation = LoginGatewayPreparation()
+    private var loginPreparationRequest: UInt64 = 0
+    private var loginPreparationTarget: GatewayAddress?
+    private var loginPreparationProfileName: String?
     private var loginIntentActive = false
     private var endingApp = false
     private let connectionCheck = ConnectionCheck()
@@ -297,6 +301,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         profile.server = target
         ProfileStore.saveProfile(profile)
         protection.invalidate(.serverChanged)
+        resetGatewayPreparation()
         if !loginIntentActive { prepareGatewayWhileDirect() }
         guard state != .disconnected || networkHeld else { return }
         if let cisco {
@@ -576,6 +581,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Panel: the forced restore went through (or the service is back).
     func forcedRestoreDone() {
+        resetGatewayPreparation()
         gatewayTrustFailed = false
         rejectedLoginHeld = false
         loginIntentActive = false
@@ -598,7 +604,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         isCurrent: @escaping () -> Bool = { true }
     ) {
         loginIntentActive = false
-        loginPreparation.cancel()
+        resetGatewayPreparation()
         gatewayTrustFailed = false
         rejectedLoginHeld = false
         loginProtectionNotice = nil
@@ -723,6 +729,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard own != ownConnection else { return }
         if switchIsOn { disconnect() }
         protection.invalidate(.modeChanged)
+        resetGatewayPreparation()
         var settings = ProfileStore.loadAppSettings()
         settings.connectionMode = own ? "own" : "cisco"
         ProfileStore.saveAppSettings(settings)
@@ -731,6 +738,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         rejectedLoginHeld = false
         pfWarning = nil
         splitActivity = nil
+        prepareGatewayWhileDirect()
     }
 
     /// 按网站分流 (DESIGN.md §26.12): one switch for the user; on = the
@@ -933,6 +941,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Own connection: tell the background service (§26.19).
     func dropProtectionChanged() {
         if AppRole.isSettings { SettingsLink.shared.send("dropProtectionChanged"); return }
+        resetGatewayPreparation()
         updateEgressMonitoring()
         if !ProfileStore.loadAppSettings().isDropProtectionOn {
             rejectedLoginHeld = false
@@ -951,6 +960,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if !ProfileStore.loadAppSettings().isDropProtectionOn {
                 setKillSwitch(0, tunnelIf: "", gatewayIps: [])
             }
+            prepareGatewayWhileDirect()
         } else {
             pushDropProtection { [weak self] in self?.refreshAfterDropSetting() }
         }
@@ -963,7 +973,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func prepareForNetworkReset() {
         resettingNetwork = true
-        loginPreparation.cancel()
+        resetGatewayPreparation()
         if loginIntentActive || switchIsOn || networkHeld { disconnect() }
     }
 
@@ -987,7 +997,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     func shutdownForQuit(completion: @escaping () -> Void) {
         endingApp = true
         protection.invalidate(.manualStop)
-        loginPreparation.cancel()
+        resetGatewayPreparation()
         if let record = dropTracker.finishForQuit() {
             appendDrop(record)
         }
@@ -1078,6 +1088,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let session = protection.startSession(usesCisco: usesCisco)
         let server = CiscoProfiles.resolve(profile.server)
         let preparation = loginPreparation.takeResultForIntent(GatewayAddress(server))
+        resetGatewayPreparation(cancelTransport: false)
         let candidate = preparation.address
         if preparation.certificateRejected {
             showGatewayRejection()
@@ -1480,24 +1491,89 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         fetchNetworkHeld { [weak self] held in
             guard let self, self.state == .disconnected else { return }
             self.networkHeld = held ?? false
+            if held == true { self.resetGatewayPreparation() }
             if held == false { self.prepareGatewayWhileDirect() }
         }
     }
 
-    func prepareGatewayWhileDirect() {
-        guard !AppRole.isSettings, !endingApp, !resettingNetwork, !loginIntentActive, state == .disconnected else { return }
+    private var mayPrepareLoginGateway: Bool {
+        protectsDrops && !AppRole.isSettings && !endingApp && !resettingNetwork && !loginIntentActive
+            && state == .disconnected && !networkHeld && !gatewayTrustFailed && loginProtectionNotice == nil
+    }
+
+    private func resetGatewayPreparation(cancelTransport: Bool = true) {
+        loginPreparationRequest &+= 1
+        if cancelTransport { loginPreparation.cancel() }
+        loginPreparationTarget = nil
+        loginPreparationProfileName = nil
+        if loginGatewayReadiness != .idle { loginGatewayReadiness = .idle }
+    }
+
+    func expireGatewayPreparation() {
+        guard loginGatewayReadiness == .candidate, let target = loginPreparationTarget,
+              loginPreparation.status(for: target) != .ready else { return }
+        loginGatewayReadiness = .idle
+    }
+
+    func prepareGatewayWhileDirect(retry: Bool = false) {
+        guard mayPrepareLoginGateway else { return }
         let name = ProfileStore.loadProfile().server
-        guard let target = GatewayAddress(CiscoProfiles.resolve(name)) else { return }
+        let server = CiscoProfiles.resolve(name)
+        guard let target = GatewayAddress(server) else {
+            resetGatewayPreparation()
+            loginGatewayReadiness = .unavailable
+            return
+        }
+        if let previous = loginPreparationProfileName, previous != name || loginPreparationTarget != target {
+            resetGatewayPreparation()
+        }
+        guard !loginGatewayReadiness.isBusy else { return }
+        let native = usesCisco
+        loginPreparationRequest &+= 1
+        let request = loginPreparationRequest
+        loginPreparationTarget = target
+        loginPreparationProfileName = name
+        loginGatewayReadiness = .checking
+        fetchTrustedLoginGateway(server, cisco: native) { [weak self] cached in
+            guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+            let candidate = self.loginPreparation.status(for: target)
+            if let readiness = LoginGatewayReadiness.afterCacheCheck(cached, candidate: candidate) {
+                self.loginGatewayReadiness = readiness
+            } else if !retry && (candidate == .unavailable || candidate == .certificateRejected) {
+                self.loginGatewayReadiness = LoginGatewayReadiness(preparation: candidate)
+            } else {
+                self.prepareUncachedGateway(target, request: request, name: name, native: native)
+            }
+        }
+    }
+
+    private func isGatewayPreparationCurrent(_ request: UInt64, name: String, native: Bool) -> Bool {
+        request == loginPreparationRequest && mayPrepareLoginGateway && usesCisco == native
+            && ProfileStore.loadProfile().server == name
+    }
+
+    private func prepareUncachedGateway(_ target: GatewayAddress, request: UInt64, name: String, native: Bool) {
         fetchNetworkHeld { [weak self] held in
-            guard let self, held == false, !self.endingApp, !self.resettingNetwork, !self.loginIntentActive, self.state == .disconnected,
-                  ProfileStore.loadProfile().server == name else { return }
-            DispatchQueue.global(qos: .utility).async {
-                guard ac_login_direct_route() else { return }
+            guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+            guard held == false else {
+                if held == true { self.networkHeld = true }
+                self.loginGatewayReadiness = .networkUnknown
+                return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let direct = ac_login_direct_route()
                 DispatchQueue.main.async {
-                    guard !self.endingApp, !self.resettingNetwork, !self.loginIntentActive, self.state == .disconnected,
-                          ProfileStore.loadProfile().server == name else { return }
+                    guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+                    guard direct else {
+                        self.loginGatewayReadiness = .networkUnknown
+                        return
+                    }
                     self.loginPreparation.confirmDirect()
-                    self.loginPreparation.prepareWhileDirect(target)
+                    let status = self.loginPreparation.prepareWhileDirect(target, ipv4Only: !native) { [weak self] in
+                        guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+                        self.loginGatewayReadiness = LoginGatewayReadiness(preparation: self.loginPreparation.status(for: target))
+                    }
+                    self.loginGatewayReadiness = LoginGatewayReadiness(preparation: status)
                 }
             }
         }
@@ -1614,6 +1690,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             loginProtectionNotice = nil
         }
         state = parsed
+        if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
         self.detail = detail
         if parsed != .connected { splitWarning = nil; dnsNotice = nil }
@@ -1661,6 +1738,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             fetchNetworkHeld { [weak self] held in
                 guard let self, self.state == .disconnected else { return }
                 self.networkHeld = held ?? false
+                if held == true && self.loginGatewayReadiness != .idle { self.resetGatewayPreparation() }
+                if held == false && self.loginGatewayReadiness == .idle { self.prepareGatewayWhileDirect() }
             }
         } else {
             networkHeld = false

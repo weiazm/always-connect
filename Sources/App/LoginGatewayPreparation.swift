@@ -5,12 +5,17 @@ import Security
 /// One TLS connection during explicitly confirmed direct networking. Rust owns
 /// the result lifetime and its binding to the selected host and port.
 final class LoginGatewayPreparation {
+    enum Status: Int32 {
+        case idle, preparing, ready, certificateRejected, unavailable
+    }
+
     private let queue = DispatchQueue(label: "com.alwaysconnect.login-gateway")
     private let preparation = ac_login_preparation_new()
     private var connection: NWConnection?
     private var timeout: DispatchWorkItem?
     private var request: UInt64?
     private var certificateVerified = false
+    private var completion: (() -> Void)?
 
     #if LOGIN_GATEWAY_PREPARATION_TEST
     var testAnchor: SecCertificate?
@@ -30,15 +35,31 @@ final class LoginGatewayPreparation {
         queue.sync { ac_login_preparation_confirm_direct(preparation) }
     }
 
-    func prepareWhileDirect(_ target: GatewayAddress) {
+    @discardableResult
+    func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool = false,
+                            completion: (() -> Void)? = nil) -> Status {
         queue.sync {
             let deadline = DispatchTime.now() + .seconds(2)
             let token = ac_login_preparation_begin(preparation, target.host, target.port)
-            guard token != 0 else { return }
+            guard token != 0 else {
+                let current = statusLocked(for: target)
+                if current == .preparing, let completion { self.completion = completion }
+                return current
+            }
             stopTransport()
             request = token
-            startTransport(target, token: token, deadline: deadline)
+            self.completion = completion
+            startTransport(target, ipv4Only: ipv4Only, token: token, deadline: deadline)
+            return statusLocked(for: target)
         }
+    }
+
+    func status(for target: GatewayAddress) -> Status {
+        queue.sync { statusLocked(for: target) }
+    }
+
+    private func statusLocked(for target: GatewayAddress) -> Status {
+        Status(rawValue: ac_login_preparation_status(preparation, target.host, target.port)) ?? .idle
     }
 
     func takeForIntent(_ target: GatewayAddress?) -> String? {
@@ -63,7 +84,7 @@ final class LoginGatewayPreparation {
         _ = takeForIntent(nil)
     }
 
-    private func startTransport(_ target: GatewayAddress, token: UInt64, deadline: DispatchTime) {
+    private func startTransport(_ target: GatewayAddress, ipv4Only: Bool, token: UInt64, deadline: DispatchTime) {
         guard let port = NWEndpoint.Port(rawValue: target.port) else {
             finish(token)
             return
@@ -107,13 +128,17 @@ final class LoginGatewayPreparation {
 
         // Network.framework resolves the configured host and reports the
         // numeric remote endpoint of the connection that completed TLS.
-        let stream = NWConnection(host: NWEndpoint.Host(endpointHost), port: port, using: NWParameters(tls: tls))
+        let parameters = NWParameters(tls: tls)
+        if ipv4Only, let ip = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
+        let stream = NWConnection(host: NWEndpoint.Host(endpointHost), port: port, using: parameters)
         connection = stream
         stream.stateUpdateHandler = { [weak self, weak stream] state in
             guard let self, self.request == token else { return }
             switch state {
             case .ready:
-                let peer = self.certificateVerified ? Self.remoteAddress(of: stream, port: port) : nil
+                let peer = self.certificateVerified ? Self.remoteAddress(of: stream, port: port, ipv4Only: ipv4Only) : nil
                 self.finish(token, address: peer)
             case .failed, .cancelled:
                 self.finish(token)
@@ -136,20 +161,22 @@ final class LoginGatewayPreparation {
         }
     }
 
-    private static func remoteAddress(of stream: NWConnection?, port: NWEndpoint.Port) -> String? {
+    private static func remoteAddress(of stream: NWConnection?, port: NWEndpoint.Port, ipv4Only: Bool) -> String? {
         guard case .hostPort(let host, let remotePort) = stream?.currentPath?.remoteEndpoint,
               remotePort == port else { return nil }
         switch host {
         case .ipv4(let address): return address.debugDescription
-        case .ipv6(let address): return address.debugDescription
+        case .ipv6(let address) where !ipv4Only: return address.debugDescription
         default: return nil
         }
     }
 
     private func finish(_ token: UInt64, address: String? = nil, certificateRejected: Bool = false) {
         guard request == token else { return }
+        let completion = self.completion
         stopTransport()
         ac_login_preparation_finish(preparation, token, address, certificateRejected)
+        if let completion { DispatchQueue.main.async(execute: completion) }
         #if LOGIN_GATEWAY_PREPARATION_TEST
         onTestFinish?()
         #endif
@@ -158,11 +185,59 @@ final class LoginGatewayPreparation {
     private func stopTransport() {
         request = nil
         certificateVerified = false
+        completion = nil
         timeout?.cancel()
         timeout = nil
         connection?.stateUpdateHandler = nil
         connection?.forceCancel()
         connection = nil
+    }
+}
+
+/// The panel's preparation steps precede any request to connect the VPN.
+enum LoginGatewayReadiness {
+    case idle, checking, preparing, cached, candidate, unavailable, certificateRejected, networkUnknown
+
+    var canConnect: Bool { self == .cached || self == .candidate }
+    var isBusy: Bool { self == .checking || self == .preparing }
+
+    /// Nil asks the caller to verify a direct route before doing any TLS I/O.
+    static func afterCacheCheck(_ cached: Bool?, candidate: LoginGatewayPreparation.Status) -> Self? {
+        if cached == true { return .cached }
+        if candidate == .ready { return .candidate }
+        return cached == nil ? .networkUnknown : nil
+    }
+
+    init(preparation: LoginGatewayPreparation.Status) {
+        switch preparation {
+        case .idle: self = .idle
+        case .preparing: self = .preparing
+        case .ready: self = .candidate
+        case .unavailable: self = .unavailable
+        case .certificateRejected: self = .certificateRejected
+        }
+    }
+
+    var preparationButtonTitle: String {
+        switch self {
+        case .checking: return "正在检查服务器地址…"
+        case .preparing: return "正在准备服务器地址…"
+        case .unavailable, .certificateRejected: return "重新准备服务器地址"
+        case .networkUnknown: return "重新检查网络"
+        default: return "准备服务器地址"
+        }
+    }
+
+    var caption: String? {
+        switch self {
+        case .checking: return "正在检查是否有可用的 VPN 服务器地址。"
+        case .preparing: return "正在验证 VPN 服务器，准备期间保持直连。"
+        case .cached, .candidate: return "服务器地址已准备好，可以连接。"
+        case .unavailable: return "暂时无法验证服务器地址，可以重新准备。"
+        case .certificateRejected: return "VPN 服务器证书校验失败，可以重新准备。"
+        case .networkUnknown: return "暂未确认可直连。可以先恢复网络，再准备服务器地址。"
+        case .idle: return nil
+        }
     }
 }
 
@@ -174,6 +249,8 @@ private func ac_login_preparation_free(_ preparation: OpaquePointer)
 private func ac_login_preparation_confirm_direct(_ preparation: OpaquePointer)
 @_silgen_name("ac_login_preparation_begin")
 private func ac_login_preparation_begin(_ preparation: OpaquePointer, _ host: UnsafePointer<CChar>, _ port: UInt16) -> UInt64
+@_silgen_name("ac_login_preparation_status")
+private func ac_login_preparation_status(_ preparation: OpaquePointer, _ host: UnsafePointer<CChar>, _ port: UInt16) -> Int32
 @_silgen_name("ac_login_preparation_finish")
 private func ac_login_preparation_finish(_ preparation: OpaquePointer, _ token: UInt64,
                                          _ address: UnsafePointer<CChar>?, _ certificateRejected: Bool)

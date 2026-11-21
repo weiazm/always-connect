@@ -207,3 +207,56 @@ fn fresh_preparation_replaces_prior_trust_rejection() {
     prep.finish(new, Some(address), now);
     assert_eq!(prep.take_for_intent(Some(&key), now), Some(address));
 }
+
+#[test]
+fn preparation_status_observes_the_target_without_consuming_the_result() {
+    let now = Instant::now();
+    let key = Gateway::new(HOST, 443).unwrap();
+    let other = Gateway::new(HOST, 8443).unwrap();
+    let mut prep = Preparation::default();
+    assert_eq!(prep.status(&key, now), PreparationStatus::Idle);
+
+    prep.confirm_direct();
+    let request = prep.begin(key.clone(), now).unwrap();
+    assert_eq!(prep.status(&key, now), PreparationStatus::Preparing);
+    assert_eq!(prep.status(&other, now), PreparationStatus::Idle);
+    let address = PreparedGateway::Address(parse_address(FIRST).unwrap());
+    prep.finish(request, Some(address), now);
+    assert_eq!(prep.status(&key, now), PreparationStatus::Ready);
+    assert_eq!(
+        prep.status(&key, now + PREPARATION_TTL),
+        PreparationStatus::Idle
+    );
+    assert_eq!(prep.take_for_intent(Some(&key), now), Some(address));
+    assert_eq!(prep.status(&key, now), PreparationStatus::Idle);
+}
+
+#[test]
+fn preparation_status_distinguishes_rejection_from_unavailable() {
+    let now = Instant::now();
+    let key = Gateway::new(HOST, 443).unwrap();
+    let mut prep = Preparation::default();
+    prep.confirm_direct();
+    let request = prep.begin(key.clone(), now).unwrap();
+    prep.finish(request, Some(PreparedGateway::CertificateRejected), now);
+    assert_eq!(
+        prep.status(&key, now),
+        PreparationStatus::CertificateRejected
+    );
+    let retry = prep.begin(key.clone(), now).unwrap();
+    assert_eq!(prep.status(&key, now), PreparationStatus::Preparing);
+    assert_eq!(
+        prep.status(&key, now + PROBE_BUDGET),
+        PreparationStatus::Unavailable
+    );
+    prep.finish(retry, None, now + PROBE_BUDGET);
+    assert_eq!(
+        prep.status(&key, now + PROBE_BUDGET),
+        PreparationStatus::Unavailable
+    );
+    assert_eq!(prep.take_for_intent(Some(&key), now + PROBE_BUDGET), None);
+    assert_eq!(
+        prep.status(&key, now + PROBE_BUDGET),
+        PreparationStatus::Idle
+    );
+}

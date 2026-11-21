@@ -329,7 +329,7 @@ enum PreparationState {
     },
     Ready {
         gateway: Gateway,
-        result: PreparedGateway,
+        result: Option<PreparedGateway>,
         expires: Instant,
         verified_at: SystemTime,
     },
@@ -339,6 +339,16 @@ enum PreparationState {
 enum PreparedGateway {
     Address(IpAddr),
     CertificateRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+enum PreparationStatus {
+    Idle = 0,
+    Preparing = 1,
+    Ready = 2,
+    CertificateRejected = 3,
+    Unavailable = 4,
 }
 
 impl Preparation {
@@ -360,7 +370,7 @@ impl Preparation {
                 gateway: active,
                 expires,
                 verified_at,
-                result: PreparedGateway::Address(_),
+                result: Some(PreparedGateway::Address(_)),
             } if *active == gateway && preparation_fresh(now, *expires, *verified_at) => {
                 return None
             }
@@ -385,14 +395,41 @@ impl Preparation {
             gateway, deadline, ..
         } = previous
         {
-            if let Some(result) = result.filter(|_| now < deadline) {
-                self.state = PreparationState::Ready {
-                    gateway,
-                    result,
-                    expires: now + PREPARATION_TTL,
-                    verified_at: SystemTime::now(),
-                };
+            self.state = PreparationState::Ready {
+                gateway,
+                result: result.filter(|_| now < deadline),
+                expires: now + PREPARATION_TTL,
+                verified_at: SystemTime::now(),
+            };
+        }
+    }
+
+    fn status(&self, target: &Gateway, now: Instant) -> PreparationStatus {
+        match &self.state {
+            PreparationState::Checking {
+                gateway, deadline, ..
+            } if gateway == target => {
+                if now < *deadline {
+                    PreparationStatus::Preparing
+                } else {
+                    PreparationStatus::Unavailable
+                }
             }
+            PreparationState::Ready {
+                gateway,
+                result,
+                expires,
+                verified_at,
+            } if gateway == target && preparation_fresh(now, *expires, *verified_at) => {
+                match result {
+                    Some(PreparedGateway::Address(_)) => PreparationStatus::Ready,
+                    Some(PreparedGateway::CertificateRejected) => {
+                        PreparationStatus::CertificateRejected
+                    }
+                    None => PreparationStatus::Unavailable,
+                }
+            }
+            _ => PreparationStatus::Idle,
         }
     }
 
@@ -407,9 +444,7 @@ impl Preparation {
                 result,
                 expires,
                 verified_at,
-            } if Some(&gateway) == target && preparation_fresh(now, expires, verified_at) => {
-                Some(result)
-            }
+            } if Some(&gateway) == target && preparation_fresh(now, expires, verified_at) => result,
             _ => None,
         }
     }

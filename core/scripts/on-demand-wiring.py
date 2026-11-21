@@ -32,9 +32,15 @@ methods = [
     'private func setupOnDemandDisconnection()', 'private func verifyOnDemandIdle(',
     'func connectWithStoredCredentials(', 'func disconnect(\n', 'private func watchRestore(',
     'func onDemandSettingsChanged()', 'func prepareForForcedRestore()',
-    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode('
+    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode(',
+    'private var mayPrepareLoginGateway:', 'private func resetGatewayPreparation(', 'func expireGatewayPreparation()',
+    'func prepareGatewayWhileDirect(', 'private func isGatewayPreparationCurrent(', 'private func prepareUncachedGateway('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
+readiness = block((root / 'Sources/App/LoginGatewayPreparation.swift').read_text(), 'enum LoginGatewayReadiness')
+panel_action = block((root / 'Sources/App/PanelAndSettings.swift').read_text(), 'private var primaryButton:')
+assert panel_action.index('!manager.loginGatewayReadiness.canConnect') < panel_action.index('onStart()')
+assert '.disabled(manager.loginGatewayReadiness.isBusy)' in panel_action
 callbacks = '\n'.join(block(source, marker) for marker in [
     'onDemand.disconnect =', 'onDemand.waiting =', 'onDemand.connect =',
     'onDemand.stopUser =', 'onDemand.recheck =', 'onDemand.changed =', 'onDemand.refreshService ='])
@@ -64,10 +70,13 @@ final class Queue {
 struct AppRole { static let isSettings = false }
 final class SettingsLink { static let shared = SettingsLink(); func send(_ action: String) {} }
 struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]?; var isDropProtectionOn = true; var connectionMode = "cisco" }
+struct Profile { var server = "vpn-a.example" }
 enum ProfileStore {
     static var settings = Settings(onDemandEnabled: true, onDemandRules: [])
+    static var profile = Profile()
     static func loadAppSettings() -> Settings { settings }
     static func saveAppSettings(_ value: Settings) { settings = value }
+    static func loadProfile() -> Profile { profile }
 }
 enum HelperInstaller { static var installedHelperMatchesBundle = true }
 struct Tracker { func noteUserStop() {} }
@@ -88,7 +97,31 @@ final class KillSwitch {
 }
 enum CLIOrchestrator { static let defaultSupportDir = URL(fileURLWithPath: "/") }
 enum LoginGatewayCache { static func rememberConnected(in dir: URL, target: String, peer: String) {} }
-final class Preparation { func cancel() {} }
+struct GatewayAddress: Equatable {
+    let server: String
+    init?(_ server: String) { self.server = server }
+}
+enum CiscoProfiles { static func resolve(_ name: String) -> String { name } }
+var directRoute = true
+func ac_login_direct_route() -> Bool { directRoute }
+final class LoginGatewayPreparation {
+    enum Status { case idle, preparing, ready, unavailable, certificateRejected }
+    var phase: Status = .idle
+    var checks = 0
+    var ipv4Only = false
+    var done: (() -> Void)?
+    func status(for target: GatewayAddress) -> Status { phase }
+    func confirmDirect() {}
+    func prepareWhileDirect(_ target: GatewayAddress, ipv4Only: Bool, completion: @escaping () -> Void) -> Status {
+        checks += 1
+        self.ipv4Only = ipv4Only
+        phase = .preparing
+        done = completion
+        return phase
+    }
+    func cancel() { phase = .idle; done = nil }
+}
+LOGIN_GATEWAY_READINESS
 final class Service {
     var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
     let queue = ServiceQueue()
@@ -147,10 +180,21 @@ final class Proxy {
     }
 }
 final class Client {
+    enum State { case disconnected }
+    var state = State.disconnected
+    var networkHeld = false
+    var endingApp = false
+    var protectsDrops: Bool { ProfileStore.loadAppSettings().isDropProtectionOn }
     var loginIntentActive = false
     var gatewayTrustFailed = false
     var rejectedLoginHeld = false
-    let loginPreparation = Preparation()
+    let loginPreparation = LoginGatewayPreparation()
+    var loginPreparationRequest: UInt64 = 0
+    var loginPreparationTarget: GatewayAddress?
+    var loginPreparationProfileName: String?
+    var loginGatewayReadiness = LoginGatewayReadiness.idle
+    var cachedReplies: [(Bool?) -> Void] = []
+    var holdReplies: [(Bool?) -> Void] = []
     var loginProtectionNotice: String?
     let onDemand = OnDemandController()
     let onDemandDisconnect = OnDemandDisconnect()
@@ -186,6 +230,10 @@ final class Client {
     func takeRelay() -> Relay? { Relay() }
     func retire(_ relay: Relay?) {}
     func refreshHeld() {}
+    func fetchNetworkHeld(completion: @escaping (Bool?) -> Void) { holdReplies.append(completion) }
+    func fetchTrustedLoginGateway(_ server: String, cisco: Bool, completion: @escaping (Bool?) -> Void) {
+        cachedReplies.append(completion)
+    }
     func refreshStatus() { onDemandDisconnect.recheck() }
     func markHelperReachable() { helperUnresponsive = false }
     func scheduleRestartRecovery(wasActive: Bool) {}
@@ -417,6 +465,81 @@ final class ViewLifecycle {
         fresh.proxy.drain()
         check(!fresh.proxy.held, "new-service FIFO arm then manual disconnect still leaves direct networking")
 
+        let readiness = Client()
+        readiness.prepareGatewayWhileDirect()
+        check(readiness.loginGatewayReadiness == .checking && !readiness.loginGatewayReadiness.canConnect
+              && readiness.loginGatewayReadiness.isBusy, "an immediate panel click cannot start login while checking the address")
+        readiness.cachedReplies.removeFirst()(true)
+        check(readiness.loginGatewayReadiness == .cached && readiness.loginGatewayReadiness.canConnect
+              && readiness.holdReplies.isEmpty && readiness.loginPreparation.checks == 0,
+              "verified cache makes the panel ready without preparing TLS")
+
+        readiness.prepareGatewayWhileDirect()
+        readiness.cachedReplies.removeFirst()(nil)
+        check(readiness.loginGatewayReadiness == .networkUnknown && readiness.holdReplies.isEmpty,
+              "missing cache reply does not become a cache miss or start preparation")
+        readiness.prepareGatewayWhileDirect(retry: true)
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(nil)
+        check(readiness.loginGatewayReadiness == .networkUnknown && readiness.loginPreparation.checks == 0,
+              "unknown firewall status cannot start preparation")
+        directRoute = false
+        readiness.prepareGatewayWhileDirect(retry: true)
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(false)
+        check(readiness.loginGatewayReadiness == .networkUnknown && readiness.loginPreparation.checks == 0,
+              "a non-direct route cannot start preparation")
+        directRoute = true
+        readiness.prepareGatewayWhileDirect(retry: true)
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(false)
+        check(readiness.loginGatewayReadiness == .preparing && readiness.loginPreparation.checks == 1
+              && readiness.loginPreparation.ipv4Only, "confirmed direct own mode begins one IPv4 preparation")
+        readiness.prepareGatewayWhileDirect()
+        check(readiness.cachedReplies.isEmpty, "reopening while preparing does not submit another request")
+        readiness.loginPreparation.phase = .ready
+        readiness.loginPreparation.done?()
+        check(readiness.loginGatewayReadiness == .candidate && readiness.loginGatewayReadiness.canConnect,
+              "a fresh verified candidate makes the panel ready")
+        readiness.loginPreparation.phase = .idle
+        readiness.expireGatewayPreparation()
+        check(readiness.loginGatewayReadiness == .idle, "expired candidate removes the connect action")
+
+        readiness.prepareGatewayWhileDirect()
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(false)
+        readiness.loginPreparation.phase = .certificateRejected
+        readiness.loginPreparation.done?()
+        check(readiness.loginGatewayReadiness == .certificateRejected && !readiness.loginGatewayReadiness.canConnect,
+              "certificate rejection leaves a preparation retry instead of a connection action")
+        readiness.prepareGatewayWhileDirect(retry: true)
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(false)
+        readiness.loginPreparation.phase = .unavailable
+        readiness.loginPreparation.done?()
+        check(readiness.loginGatewayReadiness == .unavailable && !readiness.loginGatewayReadiness.canConnect,
+              "a preparation timeout leaves a retry without displaying a certificate error")
+
+        readiness.prepareGatewayWhileDirect()
+        let oldReply = readiness.cachedReplies.removeFirst()
+        ProfileStore.profile.server = "vpn-b.example"
+        readiness.prepareGatewayWhileDirect()
+        oldReply(true)
+        check(readiness.loginGatewayReadiness == .checking, "a late cache hit for the previous server is ignored")
+        readiness.cachedReplies.removeFirst()(false)
+        readiness.holdReplies.removeFirst()(false)
+        let oldPreparation = readiness.loginPreparation.done
+        readiness.cisco = Cisco()
+        readiness.resetGatewayPreparation()
+        readiness.prepareGatewayWhileDirect()
+        readiness.loginPreparation.phase = .ready
+        oldPreparation?()
+        check(readiness.loginGatewayReadiness == .checking, "a late TLS result from the previous mode is ignored")
+        readiness.resetGatewayPreparation()
+        readiness.cachedReplies.removeFirst()(true)
+        check(readiness.loginGatewayReadiness == .idle, "a cancelled request cannot change readiness")
+        ProfileStore.profile = Profile()
+
         let editor = RuleEditor()
         editor.fillCurrentNetwork()
         let monitor = NWPathMonitor.latest!
@@ -442,6 +565,6 @@ final class ViewLifecycle {
     }
 }
 '''
-for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods), ('SERVER_PROTECTION_BODY', service_protection)]:
+for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods), ('SERVER_PROTECTION_BODY', service_protection), ('LOGIN_GATEWAY_READINESS', readiness)]:
     fixture = fixture.replace(key, value)
 output.write_text(fixture)

@@ -12,14 +12,17 @@ enum LoginGatewayHarness {
     }
 
     static func prepared(_ target: GatewayAddress, anchor: SecCertificate?, expected: (String?, Bool),
-                         intent: GatewayAddress? = nil, label: String) {
+                         intent: GatewayAddress? = nil, ipv4Only: Bool = false, label: String) {
         let preparation = LoginGatewayPreparation()
         let finished = DispatchSemaphore(value: 0)
         preparation.onTestFinish = { finished.signal() }
         preparation.testAnchor = anchor
         preparation.confirmDirect()
-        preparation.prepareWhileDirect(target)
+        check(preparation.prepareWhileDirect(target, ipv4Only: ipv4Only) == .preparing, "\(label) starts preparing")
         check(finished.wait(timeout: .now() + 3) == .success, "\(label) finishes")
+        let status: LoginGatewayPreparation.Status = expected.0 != nil ? .ready
+            : expected.1 || intent != nil ? .certificateRejected : .unavailable
+        check(preparation.status(for: target) == status, "\(label) reports the right preparation state")
         check(preparation.takeResultForIntent(intent ?? target) == expected, label)
         check(preparation.takeResultForIntent(target) == (nil, false), "\(label) cannot be reused")
     }
@@ -35,7 +38,8 @@ enum LoginGatewayHarness {
         let delayed = GatewayAddress("https://localhost:\(args[5])")!
         let support = URL(fileURLWithPath: args[6])
 
-        prepared(gateway, anchor: anchor, expected: ("127.0.0.1", false), label: "trusted hostname gives the numeric TLS peer")
+        prepared(gateway, anchor: anchor, expected: ("127.0.0.1", false), ipv4Only: true,
+                 label: "trusted hostname gives the numeric IPv4 TLS peer")
         prepared(wrongName, anchor: anchor, expected: (nil, true), label: "wrong hostname reports trust rejection without an address")
         prepared(gateway, anchor: nil, expected: (nil, true), label: "untrusted issuer reports trust rejection without an address")
         prepared(wrongName, anchor: anchor, expected: (nil, false), intent: gateway,

@@ -276,7 +276,10 @@ struct PanelView: View {
                 DispatchQueue.main.async { neighbors = found }
             }
         }
-        .onReceive(activityTimer) { _ in manager.refreshSplitActivity() }
+        .onReceive(activityTimer) { _ in
+            manager.refreshSplitActivity()
+            manager.expireGatewayPreparation()
+        }
         .onDisappear { speed.stop() }
     }
 
@@ -491,6 +494,8 @@ struct PanelView: View {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }
+        if manager.state == .disconnected, !manager.networkHeld, manager.protectsDrops,
+           let preparation = manager.loginGatewayReadiness.caption { return preparation }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
@@ -535,6 +540,13 @@ struct PanelView: View {
         } else if manager.state == .disconnected, manager.loginProtectionNotice != nil {
             Button("取消连接并恢复直连") { showConfirmDisconnect = false; onStop() }
                 .buttonStyle(.borderedProminent).controlSize(.large)
+        } else if manager.state == .disconnected, manager.protectsDrops, !manager.loginGatewayReadiness.canConnect {
+            Button { manager.prepareGatewayWhileDirect(retry: true) } label: {
+                Text(manager.loginGatewayReadiness.preparationButtonTitle).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(manager.loginGatewayReadiness.isBusy)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
                 Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
