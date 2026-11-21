@@ -23,6 +23,7 @@ pub mod network_check;
 pub mod oc_engine;
 pub mod offline;
 pub mod pf;
+pub mod pf_verify;
 pub mod relay;
 pub mod relay_log;
 pub mod route_watch;
