@@ -72,6 +72,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/recovery-shortcut-test.sh" && pass recovery-shortcut || fail recovery-shortcut
 "$REPO/scripts/gateway-resolution-test.sh" && pass gateway-resolution || fail gateway-resolution
 "$REPO/scripts/login-gateway-test.sh" && pass login-gateway || fail login-gateway
+"$REPO/scripts/egress-peer-probe-test.sh" && pass egress-peer-probe || fail egress-peer-probe
 python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sample || fail connectivity-sample
 "$REPO/scripts/private-descriptors-test.sh" && pass private-descriptors || fail private-descriptors
 # 4b vpnc-script route plan (stubbed route/ifconfig/scutil, routes ON)

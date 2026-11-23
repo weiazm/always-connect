@@ -93,6 +93,8 @@ jobs:
         run: scripts/gateway-resolution-test.sh
       - name: Protected login gateway preparation (loopback TLS)
         run: scripts/login-gateway-test.sh
+      - name: Egress probe over a numeric peer with a DNS-name certificate
+        run: scripts/egress-peer-probe-test.sh
       - name: DNS and fixed-address connectivity sampler (fixtures)
         run: python3 core/scripts/connectivity-sample-test.py
       - name: Emergency recovery route plan (stubbed, no network changes)

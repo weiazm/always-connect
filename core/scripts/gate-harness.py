@@ -129,7 +129,7 @@ def cmd_controller(a):
     conn.sendall((json.dumps(cfg) + "\n").encode())
     lock = threading.Lock()
 
-    def check(group, host):
+    def check(group, host, dest, request_id):
         t0 = time.time()
         g = GROUPS[group]
         if host in g["members"] and g["members"][host] == "probe":
@@ -140,7 +140,7 @@ def cmd_controller(a):
         for h in targets:
             try:
                 out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", h,
-                                      "--ip", a.site_ip, "--alpn", marker, "--ca", a.ca],
+                                      "--ip", dest if h == host else a.site_ip, "--alpn", marker, "--ca", a.ca],
                                      capture_output=True, text=True, timeout=3)
                 locs.append(out.stdout.strip() or None)
             except Exception:
@@ -148,7 +148,7 @@ def cmd_controller(a):
         ok = bool(targets) and all(l in g["expect"] for l in locs)
         jlog(a.log, kind="check", group=group, host=host, probed=targets, locs=locs, ok=ok, ms=int((time.time() - t0) * 1000))
         with lock:
-            conn.sendall((json.dumps({"verdict": {"group": group, "ok": ok}}) + "\n").encode())
+            conn.sendall((json.dumps({"verdict": {"group": group, "requestId": request_id, "ok": ok, "direct": bool(ok and host in g["members"] and g["members"][host] == "probe")}}) + "\n").encode())
 
     buf = b""
     while True:
@@ -161,7 +161,7 @@ def cmd_controller(a):
             msg = json.loads(line)
             if "check" in msg:
                 c = msg["check"]
-                threading.Thread(target=check, args=(c["group"], c.get("host")), daemon=True).start()
+                threading.Thread(target=check, args=(c["group"], c.get("host"), c["ip"], c["requestId"]), daemon=True).start()
 
 
 def cmd_probe(a):

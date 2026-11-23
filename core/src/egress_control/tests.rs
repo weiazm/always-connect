@@ -87,7 +87,7 @@ fn requests_are_https_only_and_name_the_site() {
 fn setup_probe_reports_each_method_without_forwarding_a_redirect_or_identity() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
-    let hook: ProbeHook = Arc::new(move |request| {
+    let hook: ProbeHook = Arc::new(move |request, _peer| {
         captured.lock().unwrap().push(request.clone());
         let line = request.request.lines().next().unwrap();
         let reply: &[u8] = match line {
@@ -197,7 +197,7 @@ fn controller_answers_a_gate() {
     let sock = dir.join("egress.sock");
     let seen: Arc<Mutex<Vec<ProbeRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
-    let hook: ProbeHook = Arc::new(move |r: &ProbeRequest| {
+    let hook: ProbeHook = Arc::new(move |r: &ProbeRequest, _peer| {
         s2.lock().unwrap().push(r.clone());
         let loc = if r.host == "a.example" { "ZZ" } else { "YY" };
         Some(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=198.51.100.7\nloc={loc}\n").into_bytes())
@@ -213,10 +213,10 @@ fn controller_answers_a_gate() {
     reader.read_line(&mut line).unwrap();
     let first: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(first["probe_alpn"], ctl.marker());
-    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\"}}\n").unwrap();
+    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":1}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({"verdict":{"group":1,"ok":true}}));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({"verdict":{"group":1,"requestId":1,"ok":true,"direct":true}}));
     {
         let r = &seen.lock().unwrap()[0];
         assert_eq!(r.alpn, vec!["http/1.1".to_string(), ctl.marker()]);
@@ -226,7 +226,7 @@ fn controller_answers_a_gate() {
     config.groups[0].expect.pop();
     ctl.update(config.clone());
     for _ in 0..2 { line.clear(); reader.read_line(&mut line).unwrap(); }
-    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\"}}\n").unwrap();
+    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":2}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
@@ -236,7 +236,7 @@ fn controller_answers_a_gate() {
     assert_eq!(st["records"][0]["host"], "c.example");
     assert!(st["records"][0]["ended"].is_null());
     // A disabled or unknown group is refused.
-    gate.write_all(b"{\"check\":{\"group\":2,\"host\":\"d.example\"}}\n").unwrap();
+    gate.write_all(b"{\"check\":{\"group\":2,\"host\":\"d.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":3}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
@@ -251,7 +251,7 @@ fn controller_answers_a_gate() {
     assert!(line.contains("invalidate"));
     // The next flow on the same connection is released after trusting the
     // observed country. Read back the original record rather than a new one.
-    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\"}}\n").unwrap();
+    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":4}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], true);
@@ -276,7 +276,7 @@ fn a_probe_started_before_rule_change_cannot_release_a_flow() {
     let (entered, started) = std::sync::mpsc::channel();
     let (finish, released) = std::sync::mpsc::channel();
     let released = Mutex::new(released);
-    let hook: ProbeHook = Arc::new(move |_| {
+    let hook: ProbeHook = Arc::new(move |_, _peer| {
         entered.send(()).unwrap();
         released.lock().unwrap().recv_timeout(Duration::from_secs(3)).ok()?;
         Some(b"HTTP/1.1 200 OK\r\n\r\nloc=ZZ\n".to_vec())
@@ -289,7 +289,7 @@ fn a_probe_started_before_rule_change_cannot_release_a_flow() {
     let mut reader = BufReader::new(gate.try_clone().unwrap());
     let mut line = String::new();
     assert!(reader.read_line(&mut line).unwrap() > 0);
-    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\"}}\n").unwrap();
+    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":5}}\n").unwrap();
     started.recv_timeout(Duration::from_secs(3)).unwrap();
     config.groups[0].expect = vec!["YY".into()];
     ctl.update(config);
@@ -301,4 +301,167 @@ fn a_probe_started_before_rule_change_cannot_release_a_flow() {
     assert!(ctl.shared.state.lock().unwrap().status.records.is_empty());
     drop(ctl);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn target_check(id: u64, ip: &str, host: Option<&str>) -> CheckMsg {
+    CheckMsg { group: 1, host: host.map(str::to_owned), ip: ip.parse().unwrap(), port: 443.try_into().unwrap(),
+        request_id: id.try_into().unwrap() }
+}
+
+fn observations(plan: &[Target], wrong: &[IpAddr]) -> Vec<(Target, Observation)> {
+    plan.iter().cloned().map(|target| {
+        let bad = target.peer.is_some_and(|(ip, _)| wrong.contains(&ip));
+        let obs = Observation { country: Some(if bad { "YY" } else { "ZZ" }.into()), ..Default::default() };
+        (target, obs)
+    }).collect()
+}
+
+#[test]
+fn pinned_failure_must_itself_recover_even_if_another_address_passes() {
+    let mut cfg = cfg();
+    cfg.groups[0].members.truncate(1);
+    let group = &cfg.groups[0];
+    let a = target_check(1, "192.0.2.10", Some("a.example"));
+    let b = target_check(2, "192.0.2.11", Some("a.example"));
+    let mut state = Failures::default();
+    let old_b = state.plan(&cfg, group, &b);
+    let plan_a = state.plan(&cfg, group, &a);
+    assert_eq!(plan_a[0].peer, Some((a.ip, 443)));
+    assert!(!state.evaluate(group, 0, &observations(&plan_a, &[a.ip])));
+    assert!(state.evaluate(group, 0, &observations(&old_b, &[])), "B can pass independently of A");
+    assert!(!state.evaluate(group, 0, &observations(&plan_a, &[])), "old A cannot clear newer A failure");
+    let direct_b = state.plan(&cfg, group, &b);
+    assert_eq!(direct_b.len(), 1);
+    assert_eq!(direct_b[0].peer.unwrap().0, b.ip);
+    assert_eq!(state.observed_failures().len(), 1);
+    let follow = target_check(3, "192.0.2.13", Some("follow.example"));
+    let retry = state.plan(&cfg, group, &follow);
+    assert!(retry.iter().any(|t| t.peer == Some((a.ip, 443))));
+    assert!(!state.evaluate(group, state.generation, &observations(&retry, &[a.ip])));
+    assert!(state.evaluate(group, state.generation, &observations(&retry, &[])));
+    assert!(state.observed_failures().is_empty());
+}
+
+#[test]
+fn failed_target_limit_never_drops_a_failure_to_authorize_a_healthy_site() {
+    let mut cfg = cfg();
+    cfg.groups[0].members.truncate(1);
+    let group = &cfg.groups[0];
+    let mut state = Failures::default();
+    for last in 1..=9 {
+        let request = target_check(last as u64, &format!("192.0.2.{last}"), Some("a.example"));
+        let plan = state.plan(&cfg, group, &request);
+        assert!(!state.evaluate(group, state.generation, &recheck::unconfirmed(&plan, "timeout")));
+    }
+    assert!(state.overflowed());
+    let mut edited = cfg.clone();
+    edited.groups[0].name = "Renamed".into();
+    state.reset_if_edited(&cfg, &edited, &edited.groups[0]);
+    assert!(state.overflowed());
+    edited.groups[0].expect = vec!["YY".into()];
+    state.reset_if_edited(&cfg, &edited, &edited.groups[0]);
+    assert!(!state.overflowed());
+    assert_eq!(state.plan(&cfg, group, &target_check(10, "192.0.2.10", Some("a.example"))).len(), 1);
+}
+
+#[test]
+fn third_party_results_cannot_authorize_or_block_and_unnamed_checks_keep_their_tls_identity() {
+    let mut cfg = cfg();
+    cfg.groups[0].members[2].method = Some("json".into());
+    assert!(!custom_json().is_direct());
+    let mut embedded = custom_json();
+    embedded.url = "https://{host}.example.invalid/check".into();
+    assert!(!embedded.is_direct());
+    embedded.url = "https://{host}:8443/check".into();
+    assert!(embedded.is_direct());
+    let check = target_check(1, "2001:db8::a", None);
+    let state = Failures::default();
+    let plan = state.plan(&cfg, &cfg.groups[0], &check);
+    assert!(plan.iter().all(|t| t.method.id != "json"));
+    let proxy = plan.iter().find(|t| t.peer.is_some()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let output = seen.clone();
+    let hook: ProbeHook = Arc::new(move |r, _peer| {
+        output.lock().unwrap().push((r.host.clone(), r.connect_ip, r.request.clone()));
+        if r.host == "a.example" { None } else { Some(b"HTTP/1.1 200 OK\r\ncf-ray: abc-SIN\r\n\r\n".to_vec()) }
+    });
+    let obs = proxy.observe(&hook, "marker", "utun42");
+    assert_eq!(obs.evidence.as_deref(), Some("proxy"));
+    assert_eq!(obs.peer_address, Some(check.ip));
+    assert_eq!(obs.host, "www.b.example");
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(name, peer, bytes)| *peer == Some(check.ip)
+        && bytes.contains(&format!("Host: {name}\r\n"))));
+    cfg.groups[0].members.retain(|m| m.method.as_deref() == Some("json"));
+    assert!(!cfg.has_direct_method(&cfg.groups[0]));
+    assert!(state.plan(&cfg, &cfg.groups[0], &check).is_empty());
+}
+
+#[test]
+fn late_permission_cannot_override_a_gate_timeout_and_a_new_destination_rechecks_the_old_one() {
+    let dir = std::env::temp_dir().join(format!("ac-path-verdict-{:x}", random_u64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("controller");
+    let a: IpAddr = "192.0.2.10".parse().unwrap();
+    let b: IpAddr = "192.0.2.20".parse().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let wrong_a = Arc::new(AtomicBool::new(false));
+    let log = seen.clone();
+    let bad = wrong_a.clone();
+    let hook: ProbeHook = Arc::new(move |req, _peer| {
+        assert_eq!(req.host, "a.example");
+        assert!(req.request.contains("Host: a.example\r\n"));
+        let ip = req.connect_ip.unwrap_or("192.0.2.22".parse().unwrap());
+        log.lock().unwrap().push(ip);
+        let loc = if ip == a && bad.load(Ordering::SeqCst) { "YY" } else { "ZZ" };
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={loc}\n").into_bytes())
+    });
+    let mut cfg = cfg();
+    cfg.groups[0].members.truncate(1);
+    let ctl = Controller::start(&sock, cfg.clone(), hook).unwrap();
+    let attach = || {
+        let gate = UnixStream::connect(&sock).unwrap();
+        gate.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut r = BufReader::new(gate);
+        let mut text = String::new();
+        r.read_line(&mut text).unwrap();
+        writeln!(r.get_mut(), "{}", serde_json::json!({"up":{"ifname":"utun9"}})).unwrap();
+        r
+    };
+    fn send(r: &mut BufReader<UnixStream>, kind: &str, ip: IpAddr, id: u64, host: &str) {
+        writeln!(r.get_mut(), "{}", serde_json::json!({kind:{"group":1,"host":host,"ip":ip,
+                 "port":443,"requestId":id}})).unwrap();
+    }
+    fn verdict_for(r: &mut BufReader<UnixStream>, ip: IpAddr, id: u64, host: &str) -> bool {
+        send(r, "check", ip, id, host);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["verdict"]["requestId"], id);
+        v["verdict"]["ok"].as_bool().unwrap()
+    }
+    let mut r = attach();
+    assert!(verdict_for(&mut r, a, 1, "a.example"));
+    // The accept reply and the gate's timeout may cross on the control socket.
+    send(&mut r, "timedOut", a, 1, "a.example");
+    wrong_a.store(true, Ordering::SeqCst);
+    assert!(verdict_for(&mut r, b, 2, "a.example"));
+    assert!(!verdict_for(&mut r, b, 3, "follow.example"));
+    assert!(seen.lock().unwrap().contains(&b));
+    drop(r);
+    let mut r = attach();
+    assert!(!verdict_for(&mut r, b, 1, "follow.example"), "gate restart alone cannot clear the failed peer");
+    wrong_a.store(false, Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+    assert!(verdict_for(&mut r, b, 2, "follow.example"));
+    let mut checked = seen.lock().unwrap().clone();
+    checked.sort();
+    assert_eq!(checked, [a,"192.0.2.22".parse::<IpAddr>().unwrap()]);
+    let st: serde_json::Value = serde_json::from_str(&ctl.status_json()).unwrap();
+    assert_eq!(st["groups"][0]["state"], "ok");
+    assert!(st["records"][0]["ended"].is_number());
+    drop(r);
+    drop(ctl);
+    std::fs::remove_dir_all(dir).unwrap();
 }

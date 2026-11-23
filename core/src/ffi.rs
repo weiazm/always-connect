@@ -1672,13 +1672,30 @@ type EgressProbe = extern "C" fn(*mut c_void, *const c_char, *mut usize) -> *mut
 pub extern "C" fn ac_oc_set_egress_probe(
     e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbe,
 ) {
+    let address = ctx as usize;
+    install_egress_probe(e, move |json, length, _| probe(address as *mut c_void, json, length));
+}
+
+type EgressProbeWithPeer = extern "C" fn(*mut c_void, *const c_char, *mut usize, *mut u8, usize) -> *mut u8;
+
+#[no_mangle]
+pub extern "C" fn ac_oc_set_egress_probe_with_peer(
+    e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbeWithPeer,
+) {
+    let address = ctx as usize;
+    install_egress_probe(e, move |json, length, peer| probe(address as *mut c_void, json, length, peer.as_mut_ptr(), peer.len()));
+}
+
+fn install_egress_probe(e: *const oc_engine::Engine,
+    probe: impl Fn(*const c_char, &mut usize, &mut [u8; 64]) -> *mut u8 + Send + Sync + 'static) {
     let Some(e) = (unsafe { e.as_ref() }) else { return };
-    // The macOS hook is stateless. Any context must outlive in-flight calls.
-    let ctx = ctx as usize;
-    e.set_egress_probe(std::sync::Arc::new(move |req| {
+    e.set_egress_probe(std::sync::Arc::new(move |req, actual_peer| {
         let json = CString::new(serde_json::to_string(req).ok()?).ok()?;
         let mut len = 0;
-        let bytes = probe(ctx as *mut c_void, json.as_ptr(), &mut len);
+        let mut peer = [0u8; 64];
+        let bytes = probe(json.as_ptr(), &mut len, &mut peer);
+        *actual_peer = CStr::from_bytes_until_nul(&peer).ok()
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
         if bytes.is_null() { return None; }
         let result = (len <= 65_536).then(|| unsafe { std::slice::from_raw_parts(bytes, len).to_vec() });
         unsafe { libc::free(bytes.cast()) };

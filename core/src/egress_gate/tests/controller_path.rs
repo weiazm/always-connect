@@ -56,23 +56,26 @@ fn decide_held_flow(
     now: Instant,
 ) -> Vec<Out> {
     let actions = gate.drain();
-    assert_eq!(
-        actions,
-        vec![Out::Check {
-            group,
-            host: host.map(str::to_owned)
-        }]
-    );
+    let [Out::Check { group: requested, host: name, destination, request_id }] = actions.as_slice()
+        else { panic!("expected one destination check") };
+    assert_eq!(*requested, group);
+    assert_eq!(name.as_deref(), host);
     writeln!(
         socket.get_mut(),
         "{}",
-        json!({"check":{"group":group,"host":host}})
+        json!({"check":{"group":group,"host":host,"ip":destination.ip(),"port":destination.port(),"requestId":request_id}})
     )
     .unwrap();
     let response = control_read(socket);
     let verdict = &response["verdict"];
     assert_eq!(verdict["group"], group);
-    gate.verdict(group, verdict["ok"].as_bool().unwrap(), now);
+    assert_eq!(verdict["requestId"].as_u64(), Some(request_id.get()));
+    let answer = match (verdict["ok"].as_bool().unwrap(), verdict["direct"].as_bool()) {
+        (false, _) => Verdict::Block,
+        (true, Some(true)) => Verdict::AllowDirect,
+        (true, _) => Verdict::AllowDependent,
+    };
+    gate.verdict(group, *request_id, answer, now);
     gate.drain()
 }
 
@@ -118,7 +121,7 @@ fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
     };
     let outcome = Arc::new(Mutex::new(ProbeResult::Normal));
     let fixture = outcome.clone();
-    let hook: ProbeHook = Arc::new(move |request| {
+    let hook: ProbeHook = Arc::new(move |request, _peer| {
         assert_eq!(request.interface, "utun42");
         assert_eq!(request.timeout_ms, 2400);
         assert!(request

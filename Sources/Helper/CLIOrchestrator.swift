@@ -159,9 +159,9 @@ final class CLIOrchestrator {
             },
             release: { ctx in if let ctx { Unmanaged<Box>.fromOpaque(ctx).release() } })
         handle = ac_oc_new(text, &hooks)!
-        ac_oc_set_egress_probe(handle, nil) { _, request, length in
+        ac_oc_set_egress_probe_with_peer(handle, nil) { _, request, length, peer, capacity in
             guard let request, let length else { return nil }
-            return EgressProbe.exchange(request, length: length)
+            return EgressProbe.exchange(request, length: length, peerBuffer: peer, capacity: capacity)
         }
         text = String(repeating: " ", count: text.count)
     }
@@ -330,9 +330,9 @@ func ac_oc_new(_ config: UnsafePointer<CChar>, _ hooks: UnsafePointer<AcEngineHo
 @_silgen_name("ac_oc_kill_child") func ac_oc_kill_child(_ e: OpaquePointer)
 @_silgen_name("ac_oc_update_direct_domains") func ac_oc_update_direct_domains(_ e: OpaquePointer, _ d: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_update_drop_protection") func ac_oc_update_drop_protection(_ e: OpaquePointer, _ on: Bool)
-@_silgen_name("ac_oc_set_egress_probe")
-func ac_oc_set_egress_probe(_ e: OpaquePointer, _ ctx: UnsafeMutableRawPointer?,
-    _ probe: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int>?) -> UnsafeMutablePointer<UInt8>?)
+@_silgen_name("ac_oc_set_egress_probe_with_peer")
+func ac_oc_set_egress_probe_with_peer(_ e: OpaquePointer, _ ctx: UnsafeMutableRawPointer?,
+    _ probe: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int>?, UnsafeMutablePointer<UInt8>?, Int) -> UnsafeMutablePointer<UInt8>?)
 @_silgen_name("ac_oc_update_egress")
 func ac_oc_update_egress(_ e: OpaquePointer, _ json: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_egress_status")

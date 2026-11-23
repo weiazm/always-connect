@@ -1459,7 +1459,7 @@ impl Shared {
         match slot.as_ref() {
             Some(ctl) => ctl.update(cfg),
             None => {
-                let hook = self.egress_probe.lock().expect("probe").clone().unwrap_or_else(|| std::sync::Arc::new(|_: &crate::egress_control::ProbeRequest| None));
+                let hook = self.egress_probe.lock().expect("probe").clone().unwrap_or_else(|| std::sync::Arc::new(|_: &crate::egress_control::ProbeRequest, _| None));
                 let support = c.support();
                 {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
