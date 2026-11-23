@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const MAX_ENTRIES: usize = 8;
 const MAX_RUNNING: usize = 2;
@@ -21,7 +21,7 @@ const JOIN_BUDGET: Duration = Duration::from_millis(100);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WarmMsg {
-    group: u32,
+    pub(super) group: u32,
     host: String,
     ip: IpAddr,
     port: NonZeroU16,
@@ -172,12 +172,7 @@ impl WarmProbes {
         {
             return;
         }
-        let Ok(since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-            return;
-        };
-        let Ok(evidence_at_ms) = since_epoch.as_millis().try_into() else {
-            return;
-        };
+        let Some(evidence_at_ms) = crate::egress_gate::evidence_clock_ms() else { return };
         let started = Instant::now();
         msg.host = host;
         let attempt = Arc::new(Attempt {

@@ -140,6 +140,10 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
+    func confirmEgressRangeSetup(_ proposed: String, previous: String, group: UInt32, proof: String,
+                                withReply reply: @escaping (Bool) -> Void)
+    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
+                          withReply reply: @escaping (Bool, [String]) -> Void)
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void)
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             withReply reply: @escaping (Bool, [String]) -> Void)

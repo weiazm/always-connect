@@ -240,3 +240,25 @@ fn explicit_method_uses_loopback_dns_and_reports_when_no_peer_has_country_data()
     assert_eq!(json["coverageIncomplete"], false);
     assert_eq!(json["probedAddressCount"], 2);
 }
+
+#[test]
+fn setup_receipt_requires_sampled_exit_ip_and_preserves_the_original_country_choice() {
+    let method = super::super::preset_methods().remove(0);
+    let mut summary = Summary::request("a.example",&method.id);
+    summary.status=Status::Ok;
+    summary.results=vec![AddressResult{address:"192.0.2.10".parse().unwrap(),method:method.id.clone(),
+        status:Status::Ok,country:Some("ZZ".into()),exit_ip:Some("198.51.100.7".parse().unwrap()),error:None}];
+    let receipt=summary.issue_receipt(&method).unwrap();
+    assert!(receipt.is_current(summary.proof_id.as_ref().unwrap()));
+    assert!(!receipt.is_current("unrelated"));
+    let old=EgressConfig::default();
+    let mut new=old.clone(); new.enabled=true;
+    new.groups.push(crate::egress_control::Group{id:9,enabled:true,exit_range_check:true,
+        members:vec![crate::egress_control::Member{pattern:"a.example".into(),method:Some(method.id),..Default::default()}],
+        expect:vec!["ZZ".into()],exit_ranges:vec!["198.51.100.0/24".into()],..Default::default()});
+    assert!(receipt.approves(&old,&new,9));
+    new.groups[0].exit_ranges=vec!["192.0.2.0/24".into()];assert!(!receipt.approves(&old,&new,9));
+    new.groups[0].exit_ranges=vec!["198.51.0.0/16".into()];assert!(!receipt.approves(&old,&new,9));
+    new.groups[0].exit_ranges=vec!["198.51.100.7/32".into()];
+    new.groups[0].expect=vec!["YY".into()];assert!(!receipt.approves(&old,&new,9));
+}

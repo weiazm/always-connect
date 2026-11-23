@@ -27,6 +27,8 @@ enum Status {
 #[serde(rename_all = "camelCase")]
 struct AddressResult {
     address: IpAddr,
+    #[serde(rename = "exitIP", skip_serializing_if = "Option::is_none")]
+    exit_ip: Option<IpAddr>,
     method: String,
     status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,9 +50,60 @@ pub(crate) struct Summary {
     truncated: bool,
     coverage_incomplete: bool,
     results: Vec<AddressResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_id: Option<String>,
+}
+
+pub(crate) struct SetupReceipt {
+    id: String,
+    issued: std::time::SystemTime,
+    host: String,
+    method: ProbeMethod,
+    exits: Vec<(String, IpAddr)>,
+}
+
+impl SetupReceipt {
+    pub(crate) fn is_current(&self, id: &str) -> bool {
+        self.id == id && self.issued.elapsed().is_ok_and(|age| age < Duration::from_secs(300))
+    }
+
+    pub(crate) fn approves(&self, old: &EgressConfig, new: &EgressConfig, id: u32) -> bool {
+        if !new.valid() || !new.active() || old.methods != new.methods {
+            return false;
+        }
+        let old_other: Vec<_> = old.groups.iter().filter(|g|g.id!=id).collect();
+        let new_other: Vec<_> = new.groups.iter().filter(|g|g.id!=id).collect();
+        if old_other.len()!=new_other.len() || !old_other.into_iter().zip(new_other).all(|(before,after)| {
+            if before==after {return true}
+            // Starting a rule may leave legacy groups, formerly under an off master switch, disabled.
+            let mut inert=before.clone();
+            inert.enabled=false;
+            !old.enabled && inert==*after
+        }) { return false; }
+        let Some(group) = new.group(id).filter(|g|g.enabled && g.exit_range_check && !g.exit_ranges.is_empty()) else { return false };
+        if !group.members.iter().any(|m| m.method.as_deref()==Some(&self.method.id) && super::pattern_matches(&m.pattern,&self.host))
+            || new.method(&self.method.id).as_ref()!=Some(&self.method) { return false; }
+        let old_ranges = old.group(id).filter(|g|g.exit_range_check).map(|g|g.exit_ranges.as_slice()).unwrap_or_default();
+        let supports = |range: &str| self.exits.iter().any(|(country,ip)|
+            group.expect.iter().any(|c| c.eq_ignore_ascii_case(country)) && super::approvable_source(range,*ip));
+        group.exit_ranges.iter().all(|r| old_ranges.contains(r) || supports(r))
+            && group.exit_ranges.iter().any(|r| supports(r))
+    }
 }
 
 impl Summary {
+    pub(crate) fn issue_receipt(&mut self, method: &ProbeMethod) -> Option<SetupReceipt> {
+        if self.status != Status::Ok || !method.is_direct() { return None; }
+        let exits: Vec<_> = self.results.iter().filter(|r|r.status==Status::Ok)
+            .filter_map(|r| Some((r.country.clone()?,r.exit_ip?))).collect();
+        if exits.is_empty() { return None; }
+        let mut bytes = [0u8; 16];
+        if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(),bytes.len()) } != 0 { return None; }
+        let id = format!("{:032x}",u128::from_be_bytes(bytes));
+        self.proof_id = Some(id.clone());
+        Some(SetupReceipt { id, issued:std::time::SystemTime::now(), host:self.host.clone(), method:method.clone(), exits })
+    }
+
     pub(crate) fn request(host: &str, method: &str) -> Self {
         let host = host.strip_suffix('.').unwrap_or(host);
         let mut summary = Self {
@@ -67,6 +120,7 @@ impl Summary {
             truncated: false,
             coverage_incomplete: true,
             results: Vec::new(),
+            proof_id: None,
         };
         if !valid_host(host) || host.ends_with('.') || host.parse::<IpAddr>().is_ok() {
             summary.status = Status::Invalid;
@@ -185,6 +239,7 @@ impl Summary {
                         };
                         AddressResult {
                             address,
+                            exit_ip: observation.ip.as_deref().and_then(|ip| ip.parse().ok()),
                             method: method.id.clone(),
                             status,
                             error,
@@ -260,6 +315,7 @@ fn usable_destination(address: IpAddr) -> bool {
 fn unavailable_address(address: IpAddr, method: &ProbeMethod) -> AddressResult {
     AddressResult {
         address,
+        exit_ip: None,
         method: method.id.clone(),
         status: Status::Unavailable,
         country: None,

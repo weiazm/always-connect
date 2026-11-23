@@ -23,6 +23,7 @@ mod airports;
 mod activity;
 use activity::{Denied, SiteStatus};
 mod recheck;
+mod warm;
 pub(crate) mod setup_probe;
 use recheck::{Failures, Target};
 
@@ -50,6 +51,8 @@ pub struct Group {
     /// Expected countries (ISO 3166 alpha-2). Empty: not locked yet, every
     /// check fails closed.
     pub expect: Vec<String>,
+    pub exit_range_check: bool,
+    pub exit_ranges: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -228,7 +231,8 @@ impl EgressConfig {
             && self.methods.len() <= MAX_METHODS && self.groups.len() <= MAX_GROUPS
             && self.groups.iter().all(|g| {
                 let checkable = g.members.iter().filter(|m| m.method.is_some()).count();
-                g.members.len() <= 2_048 && g.cidrs.len() <= 256
+                g.members.len() <= 2_048 && g.cidrs.len() <= 256 && g.exit_ranges.len() <= 256
+                    && crate::egress_source::SourcePolicy::from_config(g.exit_range_check, &g.exit_ranges).is_ok()
                     && g.cidrs.iter().all(|range| parse_cidr(range).is_some())
                     && g.expect.iter().all(|country| country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()))
                     && checkable <= MAX_PROBES_PER_GROUP
@@ -300,6 +304,12 @@ pub struct Observation {
     pub evidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_address: Option<IpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(skip)]
+    pub evidence_at_ms: Option<u64>,
     pub host: String,
     pub method: String,
     pub country: Option<String>,
@@ -464,6 +474,7 @@ fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str, in
         None => obs.error = Some("连不上或没有回答".into()),
         Some(resp) => match extract(method, &resp) {
             Ok((c, ip)) => {
+                obs.evidence_at_ms = crate::egress_gate::evidence_clock_ms();
                 obs.country = Some(c);
                 obs.ip = ip;
             }
@@ -515,7 +526,7 @@ pub fn probe_methods(cfg: &EgressConfig, host: &str, hook: &ProbeHook, marker: &
 pub fn decide(group: &Group, obs: &[Observation]) -> bool {
     !obs.is_empty()
         && !group.expect.is_empty()
-        && obs.iter().all(|o| o.country.as_deref().is_some_and(|c| group.expect.iter().any(|e| e.eq_ignore_ascii_case(c))))
+        && obs.iter().all(|o| o.failure_reason.is_none() && o.error.is_none() && o.country.as_deref().is_some_and(|c| group.expect.iter().any(|e| e.eq_ignore_ascii_case(c))))
 }
 
 // ------------------------------------------------------------ status/records
@@ -611,6 +622,8 @@ struct ControlState {
     checks: HashMap<(u64, u64), ActiveCheck>,
     failures: HashMap<u32, Failures>,
     peer_counts: HashMap<u32, Denied>,
+    source_policies: HashMap<u32, crate::egress_source::SourcePolicy>,
+    warm: warm::WarmProbes,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -620,6 +633,31 @@ struct ActiveCheck {
     generation: u64,
     trigger: Option<String>,
     targets: Vec<Target>,
+}
+
+fn source_policies(cfg: &EgressConfig) -> HashMap<u32, crate::egress_source::SourcePolicy> {
+    cfg.groups.iter().filter(|g| g.enabled && g.exit_range_check).filter_map(|g|
+        crate::egress_source::SourcePolicy::from_config(true, &g.exit_ranges).ok().map(|p| (g.id,p))).collect()
+}
+
+fn failure_reason(group: &Group, policy: Option<&crate::egress_source::SourcePolicy>, obs: &Observation) -> Option<&'static str> {
+    use crate::egress_source::SourceEvidence;
+    if obs.error.is_some() || obs.country.is_none() { return Some("unconfirmed"); }
+    if !group.expect.iter().any(|c| obs.country.as_ref().is_some_and(|country| c.eq_ignore_ascii_case(country))) { return Some("country-mismatch"); }
+    if !group.exit_range_check { return None; }
+    let evidence = if matches!(obs.evidence.as_deref(), Some("direct" | "member")) && obs.peer_address.is_some() {
+        obs.ip.as_deref().and_then(|v| v.parse().ok()).map_or(SourceEvidence::Unverified, SourceEvidence::Direct)
+    } else { SourceEvidence::Unverified };
+    match policy { Some(p) => p.evaluate(evidence).failure_reason(), None => Some("exit-ip-unavailable") }
+}
+
+pub(crate) fn approvable_source(prefix: &str, ip: IpAddr) -> bool {
+    use crate::egress_source::{SourceEvidence, SourceSuggestion};
+    let Some(choice) = SourceSuggestion::from_evidence(SourceEvidence::Direct(ip), true) else { return false };
+    let exact = format!("{}/{}", choice.address, if choice.address.is_ipv4() { 32 } else { 128 });
+    let explicit_v6 = ip.is_ipv6() && ip.to_canonical().is_ipv6() && prefix.ends_with("/64")
+        && prefix.parse::<crate::egress_source::SourcePrefix>().is_ok_and(|p| p.to_string()==prefix && p.contains(ip));
+    prefix == exact || explicit_v6 || choice.suggested_prefix.is_some_and(|p| p.to_string() == prefix)
 }
 
 impl ControlState {
@@ -632,8 +670,18 @@ impl ControlState {
     }
 
     fn record(&mut self, group: &Group, host: Option<&str>, generation: u64,
-              results: Vec<(Target, Observation)>) -> bool {
+              mut results: Vec<(Target, Observation)>) -> bool {
+        let policy = self.source_policies.get(&group.id);
+        for (_, obs) in &mut results {
+            obs.failure_reason = failure_reason(group, policy, obs).map(str::to_owned);
+        }
         let failures = self.failures.entry(group.id).or_default();
+        for (_, obs) in &mut results {
+            if obs.evidence.as_deref()==Some("direct") && obs.peer_address.is_some()
+                && matches!(obs.failure_reason.as_deref(), Some("country-mismatch" | "exit-range-mismatch")) {
+                obs.approval_id = failures.approval_for(obs);
+            }
+        }
         let was_overflowed = failures.overflowed();
         let ok = failures.evaluate(group, generation, &results);
         let unresolved = failures.observed_failures();
@@ -662,9 +710,10 @@ impl ControlState {
     }
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
-        let line = config_line(&cfg, marker);
+        self.warm.invalidate();
         self.epoch = self.epoch.wrapping_add(1);
         self.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
+        self.source_policies = source_policies(&cfg);
         let previous = std::mem::replace(&mut self.config, cfg);
         let ControlState { failures, config, .. } = self;
         failures.retain(|id, failed| {
@@ -674,11 +723,12 @@ impl ControlState {
             failed.invalidate_dns();
             true
         });
-        self.send(&line);
+        self.send(&config_line(&self.config, marker));
         self.send("{\"invalidate\":true}");
     }
 
     fn retire_checks(&mut self) {
+        self.warm.invalidate();
         let checks: Vec<_> = self.checks.values().filter(|c| c.epoch == self.epoch).map(|c|
             (c.group, c.trigger.clone(), c.generation, recheck::unconfirmed(&c.targets, "出口检查被中断"))).collect();
         for (id, host, generation, observed) in checks {
@@ -720,7 +770,7 @@ impl Controller {
         let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
-                config: cfg, status: Status::default(), peer: None, peer_id: 0,
+                warm: Default::default(), source_policies: source_policies(&cfg), config: cfg, status: Status::default(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
@@ -803,25 +853,40 @@ impl Controller {
         let iface = state.status.interface.clone();
         state.checks.insert(key, ActiveCheck { group: id, epoch, generation, trigger: None, targets: targets.clone() });
         let shared = self.shared.clone();
-        Some(move || run_check(&shared, group, None, targets, iface, key))
+        Some(move || run_check(&shared, group, None, targets, iface, key, None))
     }
 
     pub fn allow_country(&self, expected: &EgressConfig, group_id: u32, started: f64, country: &str,
                          evidence: &Observation) -> Option<EgressConfig> {
-        if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) || !started.is_finite()
-            || evidence.evidence.as_deref() != Some("direct") || evidence.peer_address.is_none()
-            || evidence.error.is_some() || evidence.country.as_deref() != Some(country) { return None; }
+        self.approve(expected, group_id, started, country, false, evidence)
+    }
+
+    pub(crate) fn approve(&self, expected: &EgressConfig, group_id: u32, started: f64, value: &str,
+                          range: bool, evidence: &Observation) -> Option<EgressConfig> {
+        if !started.is_finite() || evidence.evidence.as_deref()!=Some("direct") || evidence.peer_address.is_none()
+            || evidence.error.is_some() { return None; }
+        let reason = if range { "exit-range-mismatch" } else { "country-mismatch" };
         let matches = |o: &Observation| o.evidence == evidence.evidence && o.peer_address == evidence.peer_address
             && o.method == evidence.method && o.host.eq_ignore_ascii_case(&evidence.host)
-            && o.country == evidence.country && o.error.is_none();
+            && o.country == evidence.country && o.ip == evidence.ip && o.error.is_none()
+            && o.approval_id.is_some() && o.approval_id == evidence.approval_id;
         let mut state = self.shared.state.lock().ok()?;
-        let record = state.status.records.iter().find(|r| r.group == group_id && r.started == started && r.ended.is_none())?;
+        state.status.records.iter().find(|r| r.group == group_id && r.started == started && r.ended.is_none())?;
         let failed = state.failures.get(&group_id)?;
         if &state.config != expected || state.peer.is_none() || state.status.interface.is_empty() || failed.overflowed()
-            || !record.observed.iter().any(&matches) || !failed.observed_failures().iter().any(matches) { return None; }
+            || !failed.observed_failures().iter().any(|o| matches(o) && o.failure_reason.as_deref()==Some(reason)) { return None; }
         let mut config = state.config.clone();
-        let group = config.groups.iter_mut().find(|g| g.enabled && g.id == group_id)?;
-        if !group.expect.iter().any(|v| v.eq_ignore_ascii_case(country)) { group.expect.push(country.to_owned()); }
+        let group = config.groups.iter_mut().find(|g| g.enabled && g.id==group_id)?;
+        if range {
+            let address = evidence.ip.as_deref()?.parse().ok()?;
+            if !group.exit_range_check || group.exit_ranges.len() >= 256 || !approvable_source(value,address)
+                || !group.expect.iter().any(|c| Some(c) == evidence.country.as_ref()) { return None; }
+            if !group.exit_ranges.iter().any(|r|r==value) { group.exit_ranges.push(value.to_owned()); }
+        } else {
+            if value.len()!=2 || !value.bytes().all(|b|b.is_ascii_uppercase()) || evidence.country.as_deref()!=Some(value)
+                || group.expect.iter().any(|v|v.eq_ignore_ascii_case(value)) { return None; }
+            group.expect.push(value.to_owned());
+        }
         state.replace_config(config.clone(), &self.shared.marker);
         Some(config)
     }
@@ -900,6 +965,7 @@ fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
 
 #[derive(Deserialize)]
 struct GateMsg {
+    warm: Option<warm::WarmMsg>,
     check: Option<CheckMsg>,
     #[serde(rename = "timedOut")]
     timed_out: Option<CheckMsg>,
@@ -909,6 +975,8 @@ struct GateMsg {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckMsg {
+    #[serde(default)]
+    host_confirmed: bool,
     group: u32,
     host: Option<String>,
     ip: IpAddr,
@@ -920,8 +988,10 @@ struct UpMsg {
     ifname: String,
 }
 
-fn verdict(group: u32, request_id: u64, ok: bool, direct: bool) -> String {
-    serde_json::json!({ "verdict": { "group": group, "requestId": request_id, "ok": ok, "direct": ok && direct } }).to_string()
+fn verdict(group: u32, request_id: u64, ok: bool, direct: bool, at: Option<u64>) -> String {
+    let mut value = serde_json::json!({"group":group, "requestId":request_id, "ok":ok, "direct":ok && direct});
+    if ok { value["evidenceAtMs"] = serde_json::json!(at); }
+    serde_json::json!({"verdict":value}).to_string()
 }
 
 fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
@@ -931,7 +1001,17 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         let mut state = shared.state.lock().expect("controller");
         if state.peer_id != peer_id { return; }
         if let Some(up) = msg.up {
+            if !state.status.interface.is_empty() && state.status.interface != up.ifname { state.retire_checks(); }
             state.status.interface = up.ifname;
+        }
+        if let Some(hint) = msg.warm {
+            let scope = warm::Scope { peer_id, epoch: state.epoch, interface: state.status.interface.clone() };
+            let failed = state.failures.get(&hint.group);
+            let generation = failed.map_or(0,|f| f.generation);
+            if !failed.is_some_and(Failures::overflowed) {
+                let ControlState { config, warm, .. } = &mut *state;
+                warm.start(config, scope, generation, hint, &shared.hook, &shared.marker);
+            }
         }
         if let Some(reports) = msg.denied { state.denied_counts(reports); }
         let timed_out = msg.timed_out.is_some();
@@ -940,13 +1020,13 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
             let key = (peer_id, id);
             if !timed_out && state.checks.contains_key(&key) { continue; }
             let Some(group) = state.config.group(check.group).filter(|g| g.enabled && state.config.active()).cloned() else {
-                state.send(&verdict(check.group, id, false, false));
+                state.send(&verdict(check.group, id, false, false, None));
                 continue;
             };
             let generation = state.failures.get(&group.id).map_or(0, |f| f.generation);
             if !state.config.has_direct_method(&group) || state.failures.get(&group.id).is_some_and(Failures::overflowed) {
                 state.send(&serde_json::json!({"blockGroup":group.id}).to_string());
-                if !timed_out { state.send(&verdict(group.id, id, false, false)); }
+                if !timed_out { state.send(&verdict(group.id, id, false, false, None)); }
                 continue;
             }
             let targets = state.failures.get(&group.id).unwrap_or(&Failures::default()).plan(&state.config, &group, &check);
@@ -956,23 +1036,25 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
             {
                 let reason = if timed_out { "出口检查超时" } else { "出口检查暂不可用" };
                 state.record(&group, check.host.as_deref(), generation, recheck::unconfirmed(&targets, reason));
-                if !timed_out { state.send(&verdict(group.id, id, false, false)); }
+                if !timed_out { state.send(&verdict(group.id, id, false, false, None)); }
                 continue;
             }
             let epoch = state.epoch;
             let iface = state.status.interface.clone();
             let group_id = group.id;
+            let scope = warm::Scope { peer_id, epoch, interface: iface.clone() };
+            let warm = state.warm.for_check(&scope,generation,&check,check.host_confirmed,&targets);
             state.checks.insert(key, ActiveCheck { group: group_id, epoch, generation,
                 trigger: check.host.clone(), targets: targets.clone() });
             let worker = shared.clone();
             if std::thread::Builder::new().name("egress-check".into()).spawn(move ||
-                run_check(&worker, group, check.host, targets, iface, key)).is_err()
+                run_check(&worker, group, check.host, targets, iface, key, warm)).is_err()
             {
                 let pending = state.checks.remove(&key).expect("inserted");
                 let group = state.config.group(group_id).expect("existing group").clone();
                 state.record(&group, pending.trigger.as_deref(), generation,
                              recheck::unconfirmed(&pending.targets, "无法启动出口检查"));
-                state.send(&verdict(group_id, id, false, false));
+                state.send(&verdict(group_id, id, false, false, None));
             }
         }
     }
@@ -981,7 +1063,22 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
 }
 
 fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<Target>,
-             iface: String, key: (u64, u64)) -> bool {
+             iface: String, key: (u64, u64), warm: Option<warm::Candidate>) -> bool {
+    if let (Some(candidate), [target]) = (warm, targets.as_slice()) {
+        if let Some(mut evidence) = candidate.wait() {
+            let mut state = shared.state.lock().expect("controller");
+            let scope = warm::Scope { peer_id:state.peer_id, epoch:state.epoch, interface:state.status.interface.clone() };
+            let generation = state.failures.get(&group.id).map_or(0,|f| f.generation);
+            if candidate.is_current(&scope,generation) && fresh_evidence(evidence.evidence_at_ms) {
+                evidence.observation.evidence_at_ms = Some(evidence.evidence_at_ms);
+                return finish_check(&mut state,&group,host.as_deref(),key,true,vec![(target.clone(),evidence.observation)]);
+            }
+            if !state.checks.get(&key).is_some_and(|c|c.epoch==state.epoch) {
+                state.checks.remove(&key);
+                return false;
+            }
+        }
+    }
     let results = std::thread::scope(|scope| {
         let workers: Vec<_> = targets.iter().map(|target| {
             let worker = std::thread::Builder::new().spawn_scoped(scope, || target.observe(&shared.hook, &shared.marker, &iface));
@@ -995,11 +1092,26 @@ fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<T
         }).collect()
     });
     let mut state = shared.state.lock().expect("controller");
+    let direct = !targets.is_empty() && targets.iter().all(Target::direct_flow);
+    finish_check(&mut state,&group,host.as_deref(),key,direct,results)
+}
+
+fn fresh_evidence(at: u64) -> bool {
+    crate::egress_gate::evidence_clock_ms().and_then(|now|now.checked_sub(at)).is_some_and(|age| age < 1000)
+}
+
+fn finish_check(state: &mut ControlState, group: &Group, host: Option<&str>, key: (u64,u64),
+                direct: bool, mut results: Vec<(Target,Observation)>) -> bool {
     let Some(active) = state.checks.remove(&key) else { return false };
     if active.epoch != state.epoch || (key.0 != 0 && state.peer_id != key.0) { return false; }
-    let direct = !targets.is_empty() && targets.iter().all(Target::direct_flow);
-    let ok = state.record(&group, host.as_deref(), active.generation, results);
-    if key.0 != 0 { state.send(&verdict(group.id, key.1, ok, direct)); }
+    let earliest = results.iter().filter_map(|(_,o)|o.evidence_at_ms).min();
+    for (_,o) in &mut results {
+        if o.country.is_some() && !o.evidence_at_ms.is_some_and(fresh_evidence) {
+            o.error=Some("出口观测已过期，需要重新核验".into());
+        }
+    }
+    let ok = state.record(group, host, active.generation, results);
+    if key.0 != 0 { state.send(&verdict(group.id,key.1,ok,direct,earliest)); }
     true
 }
 

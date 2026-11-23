@@ -205,7 +205,16 @@ final class CLIOrchestrator {
 
     func updateEgress(_ json: String) { ac_oc_update_egress(handle, json) }
     func recheckEgressFailures(_ group: UInt32) -> Bool { ac_oc_recheck_egress(handle, group) }
-
+    func confirmRangeSetup(_ previous: String, proposed: String, group: UInt32, proof: String) -> Bool {
+        ac_oc_confirm_range_setup(handle, previous, proposed, group, proof)
+    }
+    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
+                          expected: EgressProtection) -> [String]? {
+        guard let cfg = try? JSONEncoder().encode(expected),
+              let json = NetworkGuard.take(ac_oc_allow_egress_range(handle, String(decoding: cfg, as: UTF8.self),
+                                                                    group, started, cidr, evidence)) else { return nil }
+        return try? JSONDecoder().decode([String].self, from: Data(json.utf8))
+    }
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             expected: EgressProtection) -> [String]? {
         guard let cfg = try? JSONEncoder().encode(expected),
@@ -347,6 +356,12 @@ func ac_oc_set_egress_probe_with_peer(_ e: OpaquePointer, _ ctx: UnsafeMutableRa
     _ probe: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int>?, UnsafeMutablePointer<UInt8>?, Int) -> UnsafeMutablePointer<UInt8>?)
 @_silgen_name("ac_oc_recheck_egress")
 private func ac_oc_recheck_egress(_ e: OpaquePointer, _ group: UInt32) -> Bool
+@_silgen_name("ac_oc_confirm_range_setup")
+private func ac_oc_confirm_range_setup(_ e: OpaquePointer, _ previous: UnsafePointer<CChar>, _ proposed: UnsafePointer<CChar>,
+                                       _ group: UInt32, _ proof: UnsafePointer<CChar>) -> Bool
+@_silgen_name("ac_oc_allow_egress_range")
+private func ac_oc_allow_egress_range(_ e: OpaquePointer, _ cfg: UnsafePointer<CChar>, _ group: UInt32, _ started: Double,
+                                      _ cidr: UnsafePointer<CChar>, _ evidence: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_allow_egress_country")
 private func ac_oc_allow_egress_country(_ e: OpaquePointer, _ cfg: UnsafePointer<CChar>, _ group: UInt32, _ started: Double,
                                         _ country: UnsafePointer<CChar>, _ evidence: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

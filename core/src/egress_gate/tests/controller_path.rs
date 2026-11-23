@@ -55,17 +55,23 @@ fn decide_held_flow(
     host: Option<&str>,
     now: Instant,
 ) -> Vec<Out> {
-    let actions = gate.drain();
-    let [Out::Check { group: requested, host: name, destination, request_id }] = actions.as_slice()
-        else { panic!("expected one destination check") };
-    assert_eq!(*requested, group);
-    assert_eq!(name.as_deref(), host);
-    writeln!(
-        socket.get_mut(),
-        "{}",
-        json!({"check":{"group":group,"host":host,"ip":destination.ip(),"port":destination.port(),"requestId":request_id}})
-    )
-    .unwrap();
+    let mut id = None;
+    for action in gate.drain() {
+        let frame = match action {
+            Out::Warm {group,host,destination} => json!({"warm":{"group":group,"host":host,
+                "ip":destination.ip(),"port":destination.port()}}),
+            Out::Check { group: requested, host: name, host_confirmed, destination, request_id } => {
+                assert_eq!(requested, group);
+                assert_eq!(name.as_deref(), host);
+                assert!(id.replace(request_id).is_none());
+                json!({"check":{"group":group,"host":host,"hostConfirmed":host_confirmed,
+                    "ip":destination.ip(),"port":destination.port(),"requestId":request_id}})
+            }
+            other => panic!("unexpected action {other:?}"),
+        };
+        writeln!(socket.get_mut(), "{}",frame).unwrap();
+    }
+    let request_id=id.expect("expected a destination check");
     let response = control_read(socket);
     let verdict = &response["verdict"];
     assert_eq!(verdict["group"], group);
@@ -75,8 +81,8 @@ fn decide_held_flow(
         (true, Some(true)) => Verdict::AllowDirect,
         (true, _) => Verdict::AllowDependent,
     };
-    gate.verdict(group, *request_id, answer, now);
-    gate.drain()
+    gate.verdict(group, request_id, answer, verdict["evidenceAtMs"].as_u64(), now);
+    drain(gate)
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +114,7 @@ fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
                 ],
                 cidrs: vec!["2001:db8:1::/64".into()],
                 expect: vec!["ZZ".into()],
+                ..Group::default()
             },
             Group {
                 id: 2,
@@ -116,6 +123,7 @@ fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
                 members: vec![member(INDEPENDENT, true)],
                 cidrs: vec![],
                 expect: vec!["ZZ".into()],
+                ..Group::default()
             },
         ],
     };
@@ -123,7 +131,7 @@ fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
     let fixture = outcome.clone();
     let hook: ProbeHook = Arc::new(move |request, _peer| {
         assert_eq!(request.interface, "utun42");
-        assert_eq!(request.timeout_ms, 2400);
+        assert!((1..=2400).contains(&request.timeout_ms));
         assert!(request
             .request
             .starts_with("GET /cdn-cgi/trace HTTP/1.1\r\n"));
@@ -261,7 +269,10 @@ fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
             blocked_at,
         );
         assert_eq!(free, Step::Forward);
-        assert!(gate.drain().is_empty());
+        for action in gate.drain() {
+            let Out::Warm { group, host, destination } = action else { panic!("unexpected action {action:?}") };
+            writeln!(socket.get_mut(),"{}",json!({"warm":{"group":group,"host":host,"ip":destination.ip(),"port":destination.port()}})).unwrap();
+        }
 
         *outcome.lock().unwrap() = ProbeResult::Normal;
         let recovered_at = blocked_at + Duration::from_secs(2);

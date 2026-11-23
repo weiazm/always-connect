@@ -29,8 +29,9 @@ fn cfg() -> EgressConfig {
                 ],
                 cidrs: vec!["203.0.113.0/24".into()],
                 expect: vec!["ZZ".into()],
+                ..Group::default()
             },
-            Group { id: 2, name: "Off".into(), enabled: false, members: vec![Member { pattern: "d.example".into(), method: Some(PRESET_TRACE.into()), probe_host: None }], cidrs: vec![], expect: vec!["ZZ".into()] },
+            Group { id: 2, name: "Off".into(), enabled: false, members: vec![Member { pattern: "d.example".into(), method: Some(PRESET_TRACE.into()), probe_host: None }], cidrs: vec![], expect: vec!["ZZ".into()], ..Group::default() },
         ],
     }
 }
@@ -216,7 +217,10 @@ fn controller_answers_a_gate() {
     gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":1}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({"verdict":{"group":1,"requestId":1,"ok":true,"direct":true}}));
+    let v:serde_json::Value=serde_json::from_str(&line).unwrap();
+    assert_eq!(v["verdict"]["ok"],true); assert_eq!(v["verdict"]["direct"],true);
+    assert_eq!(v["verdict"]["group"],1);assert_eq!(v["verdict"]["requestId"],1);
+    assert!(v["verdict"]["evidenceAtMs"].as_u64().is_some());
     {
         let r = &seen.lock().unwrap()[0];
         assert_eq!(r.alpn, vec!["http/1.1".to_string(), ctl.marker()]);
@@ -304,7 +308,7 @@ fn a_probe_started_before_rule_change_cannot_release_a_flow() {
 }
 
 fn target_check(id: u64, ip: &str, host: Option<&str>) -> CheckMsg {
-    CheckMsg { group: 1, host: host.map(str::to_owned), ip: ip.parse().unwrap(), port: 443.try_into().unwrap(),
+    CheckMsg { host_confirmed:true, group: 1, host: host.map(str::to_owned), ip: ip.parse().unwrap(), port: 443.try_into().unwrap(),
         request_id: id.try_into().unwrap() }
 }
 
@@ -576,7 +580,7 @@ fn only_current_direct_wrong_country_evidence_can_hint_dns() {
 #[test]
 fn denial_totals_are_idempotent_and_accumulate_across_gate_peers() {
     let mut state = ControlState {
-        config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
+        warm:Default::default(), source_policies: HashMap::new(), config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
         checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
     };
     let report = |n| serde_json::from_value(serde_json::json!({"group":1,"count":n,"hosts":[{"host":"a.example","count":n}],
@@ -592,4 +596,25 @@ fn denial_totals_are_idempotent_and_accumulate_across_gate_peers() {
     assert_eq!(j["sites"][0]["blockedCount"],7);
     assert_eq!(j["lastBlockedHost"],"a.example");
     assert!(j["lastBlockedCountry"].is_null());
+}
+
+#[test]
+fn approval_never_confuses_the_site_peer_with_the_reported_exit_range() {
+    let cfg=cfg();
+    let mut group=cfg.groups[0].clone();
+    group.exit_range_check=true;
+    group.exit_ranges=vec!["198.51.100.0/24".into()];
+    let pol=crate::egress_source::SourcePolicy::from_config(true,&group.exit_ranges).unwrap();
+    let mut v=Observation { host:"a.example".into(), method:"trace".into(), evidence:Some("direct".into()),
+        country:Some("ZZ".into()), ip:Some("203.0.113.8".into()),peer_address:Some("198.51.100.21".parse().unwrap()),..Default::default() };
+    assert_eq!(failure_reason(&group,Some(&pol),&v),Some("exit-range-mismatch"));
+    v.ip=Some("198.51.100.99".into());
+    assert_eq!(failure_reason(&group,Some(&pol),&v),None);
+    v.evidence=Some("proxy".into());
+    assert_eq!(failure_reason(&group,Some(&pol),&v),Some("exit-ip-unavailable"));
+    v.country=Some("YY".into());
+    assert_eq!(failure_reason(&group,Some(&pol),&v),Some("country-mismatch"));
+    assert!(!approvable_source("198.51.0.0/16","198.51.100.99".parse().unwrap()));
+    assert!(approvable_source("2001:db8:1::/64","2001:db8:1::a".parse().unwrap()));
+    assert!(!approvable_source("2001:db8::/32","2001:db8:1::a".parse().unwrap()));
 }

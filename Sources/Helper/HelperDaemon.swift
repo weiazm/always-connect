@@ -236,6 +236,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var pendingLogin: (ticket: UInt64, target: GatewayAddress, physical: String, cisco: Bool)?
     private var dropProtection = true
     private var egress = EgressProtection()
+    private var egressConfigured = false
     private var probingEgress = false
     private var lastStateCode = 0
     private var lastDetail = ""
@@ -624,12 +625,52 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             guard ac_egress_config_valid(json),
                   let config = try? JSONDecoder().decode(EgressProtection.self, from: Data(json.utf8)),
                   !config.enabled || self.dropProtection else { reply(false); return }
-            let modeChanged = config.isActive != self.egress.isActive
-            self.egress = config
-            if self.relay != nil && !(modeChanged && self.restartForEgressChange()) {
-                self.engine?.updateEgress(json)
-            }
+            // The first profile hydration may restore already confirmed prefixes. A live
+            // edit that enables or expands source trust must use a confirmation endpoint.
+            if (self.egressConfigured || self.engine != nil) && config.groups.contains(where: { next in
+                guard next.exitRangeCheck else { return false }
+                let old = self.egress.groups.first { $0.id == next.id }
+                return old?.exitRangeCheck != true || !Set(next.exitRanges).isSubset(of: Set(old?.exitRanges ?? []))
+            }) { reply(false); return }
+            self.applyEgressConfiguration(config, json: json)
             reply(true)
+        }
+    }
+
+    private func applyEgressConfiguration(_ config: EgressProtection, json: String) {
+        let modeChanged = config.isActive != egress.isActive
+        egress = config
+        egressConfigured = true
+        if relay != nil && !(modeChanged && restartForEgressChange()) { engine?.updateEgress(json) }
+    }
+
+    func confirmEgressRangeSetup(_ proposed: String, previous: String, group: UInt32, proof: String,
+                                withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard self.dropProtection, !self.userReleased, self.relay != nil,
+                  ac_egress_config_valid(proposed),
+                  let old = try? JSONDecoder().decode(EgressProtection.self, from: Data(previous.utf8)),
+                  let new = try? JSONDecoder().decode(EgressProtection.self, from: Data(proposed.utf8)),
+                  self.egress == old,
+                  self.engine?.confirmRangeSetup(previous, proposed: proposed, group: group, proof: proof) == true else {
+                reply(false); return
+            }
+            self.applyEgressConfiguration(new, json: proposed)
+            reply(true)
+        }
+    }
+
+    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
+                          withReply reply: @escaping (Bool, [String]) -> Void) {
+        queue.async {
+            guard self.dropProtection, self.egress.isActive,
+                  let index = self.egress.groups.firstIndex(where: { $0.id == group && $0.enabled && $0.exitRangeCheck }),
+                  let ranges = self.engine?.allowEgressRange(cidr, group: group, started: started,
+                                                             evidence: evidence, expected: self.egress) else {
+                reply(false, []); return
+            }
+            self.egress.groups[index].exitRanges = ranges
+            reply(true, ranges)
         }
     }
 

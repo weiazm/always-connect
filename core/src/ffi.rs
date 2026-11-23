@@ -1711,11 +1711,30 @@ pub extern "C" fn ac_oc_recheck_egress(e: *const oc_engine::Engine, group: u32) 
 #[no_mangle]
 pub extern "C" fn ac_oc_allow_egress_country(e: *const oc_engine::Engine, expected: *const c_char,
     group: u32, started: f64, country: *const c_char, evidence: *const c_char) -> *mut c_char {
+    approve_egress(e, expected, group, started, country, false, evidence)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_allow_egress_range(e: *const oc_engine::Engine, expected: *const c_char,
+    group: u32, started: f64, range: *const c_char, evidence: *const c_char) -> *mut c_char {
+    approve_egress(e, expected, group, started, range, true, evidence)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_confirm_range_setup(e: *const oc_engine::Engine, old: *const c_char,
+    new: *const c_char, group: u32, proof: *const c_char) -> bool {
+    let (Some(engine), Some(old), Some(new), Some(proof)) = (unsafe { e.as_ref() },c_str(old),c_str(new),c_str(proof)) else {return false};
+    let (Ok(old), Ok(new)) = (serde_json::from_str(&old),serde_json::from_str(&new)) else { return false };
+    engine.confirm_range_setup(&old,&new,group,&proof)
+}
+
+fn approve_egress(e: *const oc_engine::Engine, expected: *const c_char, group: u32, started: f64,
+                  value: *const c_char, range: bool, evidence: *const c_char) -> *mut c_char {
     let apply = || {
         let engine = unsafe { e.as_ref() }?;
         let cfg = serde_json::from_str(&c_str(expected)?).ok()?;
         let observed = serde_json::from_str(&c_str(evidence)?).ok()?;
-        let result = engine.allow_egress_country(&cfg, group, started, &c_str(country)?, &observed)?;
+        let result = engine.approve_egress(&cfg, group, started, &c_str(value)?, range, &observed)?;
         serde_json::to_string(&result).ok()
     };
     apply().map(owned).unwrap_or(std::ptr::null_mut())

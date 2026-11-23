@@ -22,7 +22,7 @@ fn egress(enabled: bool) -> crate::egress_control::EgressConfig {
     EgressConfig {
         enabled,
         methods: vec![],
-        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, members: vec![Member { pattern: "a.example".into(), method: Some(PRESET_TRACE.into()), probe_host: None }], cidrs: vec![], expect: vec!["ZZ".into()] }],
+        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, members: vec![Member { pattern: "a.example".into(), method: Some(PRESET_TRACE.into()), probe_host: None }], cidrs: vec![], expect: vec!["ZZ".into()], ..Group::default() }],
     }
 }
 

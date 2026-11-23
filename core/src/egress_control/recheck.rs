@@ -129,7 +129,13 @@ impl Failures {
                 (None, None) => false,
                 _ => true,
             });
-        if names_changed || countries_changed || ranges_changed || methods_changed {
+        if names_changed
+            || countries_changed
+            || ranges_changed
+            || methods_changed
+            || previous.exit_range_check != group.exit_range_check
+            || previous.exit_ranges != group.exit_ranges
+        {
             *self = Self::default();
         }
     }
@@ -181,12 +187,14 @@ impl Failures {
         let current = generation == self.generation;
         let direct = !results.is_empty() && results.iter().all(|(t, _)| t.direct_flow());
         let passed = |o: &Observation| {
-            o.country.as_ref().is_some_and(|country| {
-                group
-                    .expect
-                    .iter()
-                    .any(|expected| expected.eq_ignore_ascii_case(country))
-            })
+            o.failure_reason.is_none()
+                && o.error.is_none()
+                && o.country.as_ref().is_some_and(|country| {
+                    group
+                        .expect
+                        .iter()
+                        .any(|expected| expected.eq_ignore_ascii_case(country))
+                })
         };
         if current || direct {
             self.targets.retain(|old| {
@@ -237,20 +245,65 @@ impl Failures {
         self.targets.iter().map(|f| f.target.clone()).collect()
     }
 
-    pub fn invalidate_dns(&mut self) {
-        for entry in &mut self.targets { entry.dns_current = false; }
+    pub fn approval_for(&self, obs: &Observation) -> Option<String> {
+        if let Some(id) = self
+            .targets
+            .iter()
+            .map(|f| &f.observation)
+            .find(|old| {
+                old.approval_id.is_some()
+                    && old.host.eq_ignore_ascii_case(&obs.host)
+                    && old.method == obs.method
+                    && old.evidence == obs.evidence
+                    && old.peer_address == obs.peer_address
+                    && old.ip == obs.ip
+                    && old.country == obs.country
+                    && old.failure_reason == obs.failure_reason
+            })
+            .and_then(|old| old.approval_id.clone())
+        {
+            return Some(id);
+        }
+        let mut bytes = [0u8; 16];
+        (unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0)
+            .then(|| format!("{:032x}", u128::from_be_bytes(bytes)))
     }
 
-    pub fn wrong_ipv4(&self, group: &Group, name: &str, candidates: &[std::net::Ipv4Addr]) -> Vec<std::net::Ipv4Addr> {
-        self.targets.iter().filter_map(|f| {
-            let obs = &f.observation;
-            let country = obs.country.as_deref()?;
-            if !f.dns_current || !f.target.direct_flow() || obs.evidence.as_deref() != Some("direct")
-                || !obs.host.trim_end_matches('.').eq_ignore_ascii_case(name) || obs.error.is_some()
-                || group.expect.is_empty() || group.expect.iter().any(|v| v.eq_ignore_ascii_case(country)) { return None; }
-            let IpAddr::V4(ip) = obs.peer_address? else { return None };
-            (f.target.peer.map(|p| p.0) == Some(IpAddr::V4(ip)) && candidates.contains(&ip)).then_some(ip)
-        }).collect()
+    pub fn invalidate_dns(&mut self) {
+        for entry in &mut self.targets {
+            entry.dns_current = false;
+            entry.observation.approval_id = None;
+        }
+    }
+
+    pub fn wrong_ipv4(
+        &self,
+        group: &Group,
+        name: &str,
+        candidates: &[std::net::Ipv4Addr],
+    ) -> Vec<std::net::Ipv4Addr> {
+        self.targets
+            .iter()
+            .filter_map(|f| {
+                let obs = &f.observation;
+                let country = obs.country.as_deref()?;
+                if !f.dns_current
+                    || !f.target.direct_flow()
+                    || obs.evidence.as_deref() != Some("direct")
+                    || !obs.host.trim_end_matches('.').eq_ignore_ascii_case(name)
+                    || obs.error.is_some()
+                    || group.expect.is_empty()
+                    || group.expect.iter().any(|v| v.eq_ignore_ascii_case(country))
+                {
+                    return None;
+                }
+                let IpAddr::V4(ip) = obs.peer_address? else {
+                    return None;
+                };
+                (f.target.peer.map(|p| p.0) == Some(IpAddr::V4(ip)) && candidates.contains(&ip))
+                    .then_some(ip)
+            })
+            .collect()
     }
 
     pub fn observed_failures(&self) -> Vec<Observation> {

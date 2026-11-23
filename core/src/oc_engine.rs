@@ -455,6 +455,7 @@ struct Core {
     tunnel_dns: Vec<String>,
     cstp_dns: cstp_dns::CstpDns,
     tunnel_if: Option<String>,
+    setup_receipts: std::collections::VecDeque<(SetupProbeTunnel, crate::egress_control::setup_probe::SetupReceipt)>,
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
     split_needs_sync: bool,
@@ -551,6 +552,7 @@ impl Engine {
                 tunnel_dns: Vec::new(),
                 cstp_dns: Default::default(),
                 tunnel_if: None,
+                setup_receipts: Default::default(),
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
                 split_needs_sync: false,
@@ -620,14 +622,15 @@ impl Engine {
         job.is_some_and(|run| run())
     }
 
-    pub fn allow_egress_country(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
-                                country: &str, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
+    pub fn approve_egress(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
+                                value: &str, range: bool, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
         let mut c = self.shared.core.lock().ok()?;
         if c.stop_requested || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none()
             || c.recovery_suspended() || c.config.egress.as_ref() != Some(expected) { return None; }
         let controller = self.shared.egress.lock().ok()?;
-        let cfg = controller.as_ref()?.allow_country(expected, group, started, country, evidence)?;
-        let result = cfg.group(group)?.expect.clone();
+        let cfg = controller.as_ref()?.approve(expected, group, started, value, range, evidence)?;
+        let updated = cfg.group(group)?;
+        let result = if range { updated.exit_ranges.clone() } else { updated.expect.clone() };
         c.config.egress = Some(cfg);
         if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
         Some(result)
@@ -674,7 +677,26 @@ impl Engine {
             same_method && self.setup_probe_tunnel(&c).as_ref() == Some(&tunnel)
         };
         let marker = tunnel.gate.as_ref().map_or("", |(marker, _)| marker.as_str());
-        summary.probe(&method, &hook, marker, &tunnel.lease.name, query, still_current)
+        let mut summary = summary.probe(&method, &hook, marker, &tunnel.lease.name, query, still_current);
+        let mut c = self.shared.core.lock().expect("engine");
+        if self.setup_probe_tunnel(&c).as_ref() == Some(&tunnel) {
+            if let Some(receipt) = summary.issue_receipt(&method) {
+                if c.setup_receipts.len() >= 8 { c.setup_receipts.pop_front(); }
+                c.setup_receipts.push_back((tunnel,receipt));
+            }
+        }
+        summary
+    }
+
+    pub fn confirm_range_setup(&self, previous: &crate::egress_control::EgressConfig,
+                               proposed: &crate::egress_control::EgressConfig, group: u32, proof: &str) -> bool {
+        let mut c = self.shared.core.lock().expect("engine");
+        let Some(tunnel) = self.setup_probe_tunnel(&c) else { return false };
+        if c.config.egress.as_ref().cloned().unwrap_or_default() != *previous { return false; }
+        let Some(index) = c.setup_receipts.iter().position(|(session,receipt)|
+            session == &tunnel && receipt.is_current(proof) && receipt.approves(previous,proposed,group)) else { return false };
+        c.setup_receipts.remove(index);
+        true
     }
 
     fn setup_probe_tunnel(&self, c: &Core) -> Option<SetupProbeTunnel> {

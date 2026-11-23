@@ -137,18 +137,20 @@ def cmd_controller(a):
         else:
             targets = [m for m, mode in g["members"].items() if mode == "probe"]
         locs = []
+        evidence_times = []
         for h in targets:
             try:
                 out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", h,
                                       "--ip", dest if h == host else a.site_ip, "--alpn", marker, "--ca", a.ca],
                                      capture_output=True, text=True, timeout=3)
+                evidence_times.append(time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000)
                 locs.append(out.stdout.strip() or None)
             except Exception:
                 locs.append(None)
         ok = bool(targets) and all(l in g["expect"] for l in locs)
         jlog(a.log, kind="check", group=group, host=host, probed=targets, locs=locs, ok=ok, ms=int((time.time() - t0) * 1000))
         with lock:
-            conn.sendall((json.dumps({"verdict": {"group": group, "requestId": request_id, "ok": ok, "direct": bool(ok and host in g["members"] and g["members"][host] == "probe")}}) + "\n").encode())
+            conn.sendall((json.dumps({"verdict": {"group": group, "requestId": request_id, "ok": ok, "evidenceAtMs": min(evidence_times) if ok else None, "direct": bool(ok and host in g["members"] and g["members"][host] == "probe")}}) + "\n").encode())
 
     buf = b""
     while True:
