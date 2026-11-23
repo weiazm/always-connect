@@ -9,11 +9,12 @@
 //! one JSON object per line:
 //!
 //! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"names":["a.example","*.a.example"],"cidrs":["203.0.113.0/24"]}]}`
-//! - gate -> controller: `{"check":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443,"requestId":1}}`
+//! - gate -> controller: `{"check":{"group":1,"host":"a.example","hostConfirmed":true,"ip":"192.0.2.1","port":443,"requestId":1}}`
+//! - gate -> controller, advisory: `{"warm":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443}}`
 //! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
 //! - gate -> controller statistics: `{"denied":[{"group":1,"count":2,"hosts":[{"host":"a.example","count":2}],"hostsTruncated":false,"lastHost":"a.example"}]}`
 //!   Cumulative for this peer and sent only after a real denial.
-//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true}}`,
+//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true,"evidenceAtMs":1234}}`,
 //!   `{"blockGroup":1}` or `{"invalidate":true}`
 //!
 //! Without a controller every check times out and protected connections
@@ -53,6 +54,8 @@ struct ControlVerdict {
     ok: bool,
     #[serde(default)]
     direct: bool,
+    #[serde(rename = "evidenceAtMs")]
+    evidence_at_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -244,12 +247,12 @@ fn open_tun() -> std::io::Result<(Box<dyn Tun>, String)> {
 struct Control {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
-    partial_report: bool,
+    partial_optional: bool,
 }
 
 impl Control {
     fn separated_frame(&self, mut frame: String) -> String {
-        if self.partial_report {
+        if self.partial_optional {
             frame.insert(0, '\n');
         }
         frame
@@ -258,18 +261,22 @@ impl Control {
     fn write_required(&mut self, frame: String) -> std::io::Result<()> {
         let frame = self.separated_frame(frame);
         self.stream.write_all(frame.as_bytes())?;
-        self.partial_report = false;
+        self.partial_optional = false;
         Ok(())
     }
 
     fn report_denied(&mut self, denied: &DeniedGroup) {
         let line = serde_json::json!({ "denied": [denied] }).to_string() + "\n";
+        self.write_optional(line);
+    }
+
+    fn write_optional(&mut self, line: String) {
         let frame = self.separated_frame(line);
         if let Ok(written) = self.stream.write(frame.as_bytes()) {
             if written > 0 {
                 // Incomplete optional frames are discarded by the line
                 // reader. Terminate the fragment before any subsequent frame.
-                self.partial_report = frame.as_bytes()[written - 1] != b'\n';
+                self.partial_optional = frame.as_bytes()[written - 1] != b'\n';
             }
         }
     }
@@ -285,7 +292,7 @@ fn connect_control() -> Option<(Control, ControllerCfg)> {
     let cfg: ControllerCfg = serde_json::from_str(&first).map_err(|e| log(&format!("bad config: {e}"))).ok()?;
     stream.set_read_timeout(None).ok()?;
     stream.set_nonblocking(true).ok()?;
-    Some((Control { stream, reader, partial_report: false }, cfg))
+    Some((Control { stream, reader, partial_optional: false }, cfg))
 }
 
 fn main() {
@@ -368,9 +375,8 @@ fn main() {
                                     (true, false) => Verdict::AllowDependent,
                                     (true, true) => Verdict::AllowDirect,
                                 };
-                                gate.verdict(v.group, v.request_id, verdict, Instant::now());
+                                gate.verdict(v.group, v.request_id, verdict, v.evidence_at_ms, Instant::now());
                             }
-                            apply(&mut gate, &vpn, tun.as_ref(), &mut control);
                         }
                         Err(e) => log(&format!("bad control line: {e}")),
                     },
@@ -389,6 +395,8 @@ fn main() {
                 gate.invalidate();
                 control = None;
             }
+            // Apply only after buffered invalidations and group blocks have
+            // had a chance to retire permits from earlier frames.
             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
         }
         let now = Instant::now();
@@ -449,11 +457,27 @@ fn send(vpn: &OwnedFd, pkt: &[u8]) -> std::io::Result<usize> {
     sys(unsafe { libc::send(vpn.as_raw_fd(), pkt.as_ptr().cast(), pkt.len(), 0) })
 }
 
-fn check_line(kind: &str, group: GroupId, host: Option<&str>, destination: SocketAddr, request_id: RequestId) -> String {
+fn send_checked(vpn: &OwnedFd, packets: &[Vec<u8>]) -> bool {
+    let mut packets = packets.iter();
+    let send = |pkt: &[u8]| {
+        sys(unsafe { libc::send(vpn.as_raw_fd(), pkt.as_ptr().cast(), pkt.len(), libc::MSG_DONTWAIT) })
+            .is_ok_and(|written| written == pkt.len())
+    };
+    if !packets.next().is_some_and(|first| send(first)) {
+        return false;
+    }
+    for pkt in packets {
+        let _ = send(pkt);
+    }
+    true
+}
+
+fn check_line(kind: &str, group: GroupId, host: Option<&str>, host_confirmed: bool, destination: SocketAddr, request_id: RequestId) -> String {
     serde_json::json!({
         (kind): {
             "group": group,
             "host": host,
+            "hostConfirmed": host_confirmed,
             "ip": destination.ip(),
             "port": destination.port(),
             "requestId": request_id,
@@ -461,10 +485,20 @@ fn check_line(kind: &str, group: GroupId, host: Option<&str>, destination: Socke
     }).to_string() + "\n"
 }
 
+fn warm_line(group: GroupId, host: &str, destination: SocketAddr) -> String {
+    serde_json::json!({
+        "warm": { "group": group, "host": host, "ip": destination.ip(), "port": destination.port() },
+    }).to_string() + "\n"
+}
+
 fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Control>) {
     let had_controller = control.is_some();
-    for o in gate.drain() {
-        let (kind, group, host, destination, request_id) = match o {
+    let mut actions = gate.drain().into_iter();
+    while let Some(o) = actions.next().or_else(|| {
+        actions = gate.drain().into_iter();
+        actions.next()
+    }) {
+        let (kind, group, host, host_confirmed, destination, request_id) = match o {
             Out::ToTunnel(p) => {
                 let _ = send(vpn, &p);
                 continue;
@@ -473,12 +507,24 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
                 let _ = tun.write(&p);
                 continue;
             }
-            Out::Check { group, host, destination, request_id } => ("check", group, host, destination, request_id),
-            Out::TimedOut { group, host, destination, request_id } => ("timedOut", group, host, destination, request_id),
+            Out::SendChecked(id) => {
+                gate.send_checked(id, Instant::now(), |packets| control.is_some() && send_checked(vpn, packets));
+                continue;
+            }
+            Out::Warm { group, host, destination } => {
+                if let Some(c) = control {
+                    c.write_optional(warm_line(group, &host, destination));
+                }
+                continue;
+            }
+            Out::Check { group, host, host_confirmed, destination, request_id } =>
+                ("check", group, host, host_confirmed, destination, request_id),
+            Out::TimedOut { group, host, host_confirmed, destination, request_id } =>
+                ("timedOut", group, host, host_confirmed, destination, request_id),
         };
         if let Some(c) = control {
             log(&format!("{kind} group={group} request={request_id}"));
-            let line = check_line(kind, group, host.as_deref(), destination, request_id);
+            let line = check_line(kind, group, host.as_deref(), host_confirmed, destination, request_id);
             if let Err(error) = c.write_required(line) {
                 log(&format!("controller write failed: {error}"));
                 *control = None;
@@ -543,12 +589,12 @@ mod tests {
     fn check_carries_the_numeric_destination_and_request_id() {
         let destination = "[2001:db8::1]:8443".parse().unwrap();
         let id = RequestId::new(u64::MAX).unwrap();
-        let line = check_line("check", 7, Some("a.example"), destination, id);
+        let line = check_line("check", 7, Some("a.example"), true, destination, id);
         assert!(line.ends_with('\n'));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&line).unwrap(),
             serde_json::json!({
-                "check": {"group": 7, "host": "a.example", "ip": "2001:db8::1", "port": 8443, "requestId": u64::MAX},
+                "check": {"group": 7, "host": "a.example", "hostConfirmed": true, "ip": "2001:db8::1", "port": 8443, "requestId": u64::MAX},
             })
         );
     }
@@ -568,23 +614,35 @@ mod tests {
     #[test]
     fn control_frames_distinguish_direct_evidence_from_group_dependent_results() {
         let legacy = r#"{"verdict":{"group":7,"requestId":42,"ok":true}}"#;
-        let direct = r#"{"verdict":{"group":7,"requestId":42,"ok":true,"direct":true}}"#;
-        assert!(!serde_json::from_str::<ControlMsg>(legacy).unwrap().verdict.unwrap().direct);
-        assert!(serde_json::from_str::<ControlMsg>(direct).unwrap().verdict.unwrap().direct);
+        let direct = r#"{"verdict":{"group":7,"requestId":42,"ok":true,"direct":true,"evidenceAtMs":81234}}"#;
+        let legacy = serde_json::from_str::<ControlMsg>(legacy).unwrap().verdict.unwrap();
+        assert!(!legacy.direct);
+        assert_eq!(legacy.evidence_at_ms, None);
+        let direct = serde_json::from_str::<ControlMsg>(direct).unwrap().verdict.unwrap();
+        assert!(direct.direct);
+        assert_eq!(direct.evidence_at_ms, Some(81234));
         let blocked = serde_json::from_str::<ControlMsg>(r#"{"blockGroup":7}"#).unwrap();
         assert_eq!(blocked.block_group, Some(7));
         assert!(blocked.verdict.is_none());
     }
 
     #[test]
+    fn advisory_warm_requests_carry_no_permission_ticket() {
+        let line = warm_line(1, "a.example", "192.0.2.1:443".parse().unwrap());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({
+            "warm": {"group":1,"host":"a.example","ip":"192.0.2.1","port":443},
+        }));
+    }
+
+    #[test]
     fn a_partial_denial_frame_is_separated_before_later_policy_frames() {
         let (stream, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut control = Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: true };
+        let mut control = Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_optional: true };
         control.stream.write_all(b"{\"denied\":[").unwrap();
         control.report_denied(&DeniedGroup { group: 7, count: 2, ..Default::default() });
-        assert!(!control.partial_report);
-        let check = check_line("check", 7, None, "192.0.2.1:443".parse().unwrap(), RequestId::new(42).unwrap());
+        assert!(!control.partial_optional);
+        let check = check_line("check", 7, None, false, "192.0.2.1:443".parse().unwrap(), RequestId::new(42).unwrap());
         control.write_required(check).unwrap();
 
         let mut lines = BufReader::new(peer).lines();
@@ -603,7 +661,7 @@ mod tests {
         let (stream, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut peer = BufReader::new(peer);
-        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: false });
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_optional: false });
         let (vpn, _remote) = UnixDatagram::pair().unwrap();
         let vpn = vpn.into();
         let tun = TestTun::default();
@@ -630,7 +688,7 @@ mod tests {
     #[test]
     fn a_failed_deadline_write_retires_the_other_pending_results() {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: false });
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_optional: false });
         let (vpn, remote) = UnixDatagram::pair().unwrap();
         remote.set_nonblocking(true).unwrap();
         let vpn = vpn.into();
@@ -648,7 +706,7 @@ mod tests {
         apply(&mut gate, &vpn, &tun, &mut control);
         assert!(control.is_none());
         assert_eq!(tun.0.borrow().len(), 2);
-        gate.verdict(2, RequestId::new(2).unwrap(), Verdict::AllowDirect, now + deadline);
+        gate.verdict(2, RequestId::new(2).unwrap(), Verdict::AllowDirect, None, now + deadline);
         apply(&mut gate, &vpn, &tun, &mut control);
         assert_eq!(remote.recv(&mut [0; 128]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }

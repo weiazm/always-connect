@@ -32,6 +32,31 @@ fn gate() -> Gate {
     Gate::new(cfg, Box::new(Rules))
 }
 
+fn verdict(gate: &mut Gate, group: GroupId, request: RequestId, value: Verdict, now: Instant) {
+    let evidence = (gate.clock)();
+    gate.verdict(group, request, value, evidence, now);
+}
+
+fn drain(gate: &mut Gate) -> Vec<Out> {
+    let mut output = Vec::new();
+    loop {
+        let actions = gate.drain();
+        if actions.is_empty() {
+            return output;
+        }
+        for action in actions {
+            if let Out::SendChecked(id) = action {
+                gate.send_checked(id, Instant::now(), |packets| {
+                    output.extend(packets.iter().cloned().map(Out::ToTunnel));
+                    true
+                });
+            } else if !matches!(action, Out::Warm { .. }) {
+                output.push(action);
+            }
+        }
+    }
+}
+
 fn tcp4(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut t = vec![0u8; 20];
     t[0..2].copy_from_slice(&sport.to_be_bytes());
@@ -182,6 +207,23 @@ fn request_for(out: &[Out], group: GroupId) -> RequestId {
     *id
 }
 
+thread_local! {
+    static PROOF_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(Some(10_000)) };
+}
+
+fn proof_gate() -> Gate {
+    PROOF_CLOCK.set(Some(10_000));
+    let mut gate = gate();
+    gate.clock = || PROOF_CLOCK.get();
+    gate
+}
+
+fn release_id(gate: &mut Gate) -> u64 {
+    let out = gate.drain();
+    let [Out::SendChecked(id)] = out.as_slice() else { panic!("{out:?}") };
+    *id
+}
+
 fn verify_checksums(p: &[u8]) {
     let q = parse_ip(p).expect("parses");
     match q.src {
@@ -205,7 +247,7 @@ fn unprotected_tls_passes_without_holding() {
     let now = Instant::now();
     let (step, _) = connect_and_send(&mut g, 40000, OTHER, &hello(Some("www.example.org"), &[b"h2"], false, 0), now);
     assert_eq!(step, Step::Forward);
-    assert!(g.drain().is_empty());
+    assert!(drain(&mut g).is_empty());
     // Later packets take the fast path.
     assert_eq!(g.outbound(&tcp4(MAC, 40000, OTHER, 443, 1300, 5001, PA, b"more"), now), Step::Forward);
 }
@@ -216,15 +258,15 @@ fn protected_sni_is_held_until_the_check_passes() {
     let now = Instant::now();
     let (step, data) = connect_and_send(&mut g, 40001, SITE, &hello(Some("api.protected.example"), &[b"h2"], false, 0), now);
     assert_eq!(step, Step::Consumed);
-    let out = g.drain();
+    let out = drain(&mut g);
     assert_eq!(checks(&out), vec![(1, Some("api.protected.example".into()))]);
     let [Out::Check { destination, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(*destination, SocketAddr::from((SITE, 443)));
     // More data while waiting stays held, in order.
     let more = tcp4(MAC, 40001, SITE, 443, 1001 + (data.len() as u32 - 40), 5001, PA, b"x");
     assert_eq!(g.outbound(&more, now), Step::Consumed);
-    g.verdict(1, request_for(&out, 1), Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(data), Out::ToTunnel(more)]);
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(data), Out::ToTunnel(more)]);
     assert_eq!(g.outbound(&tcp4(MAC, 40001, SITE, 443, 2000, 5001, PA, b"y"), now), Step::Forward);
 }
 
@@ -235,9 +277,9 @@ fn failed_check_drops_and_resets_the_application() {
     let payload = hello(Some("protected.example"), &[], false, 0);
     let (step, _) = connect_and_send(&mut g, 40002, SITE, &payload, now);
     assert_eq!(step, Step::Consumed);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::Block, now);
-    let out = g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::Block, now);
+    let out = drain(&mut g);
     assert_eq!(out.len(), 1);
     let Out::ToHost(rst) = &out[0] else { panic!("expected a RST, got {out:?}") };
     verify_checksums(rst);
@@ -250,7 +292,7 @@ fn failed_check_drops_and_resets_the_application() {
     assert_eq!(t.ack, 1001 + payload.len() as u32);
     // Nothing of this connection reaches the tunnel afterwards.
     assert_eq!(g.outbound(&tcp4(MAC, 40002, SITE, 443, 1001, 5001, PA, &payload), now), Step::Consumed);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
 }
 
 #[test]
@@ -260,9 +302,9 @@ fn concurrent_connections_share_one_check() {
     let (a, da) = connect_and_send(&mut g, 41000, SITE, &hello(Some("a.protected.example"), &[], false, 0), now);
     let (b, db) = connect_and_send(&mut g, 41001, SITE, &hello(Some("A.Protected.Example."), &[], false, 0), now);
     assert_eq!((a, b), (Step::Consumed, Step::Consumed));
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::AllowDirect, now);
-    let out = g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDirect, now);
+    let out = drain(&mut g);
     assert_eq!(out.len(), 2);
     assert!(out.contains(&Out::ToTunnel(da)) && out.contains(&Out::ToTunnel(db)));
 }
@@ -272,15 +314,15 @@ fn a_verdict_younger_than_a_second_is_reused() {
     let mut g = gate();
     let t0 = Instant::now();
     connect_and_send(&mut g, 42000, SITE, &hello(Some("protected.example"), &[], false, 0), t0);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::AllowDirect, t0);
-    g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDirect, t0);
+    drain(&mut g);
     let (step, data) = connect_and_send(&mut g, 42001, SITE, &hello(Some("protected.example"), &[], false, 0), t0 + Duration::from_millis(500));
     assert_eq!(step, Step::Consumed);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(data)], "released at once, no new check");
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(data)], "released at once, no new check");
     let (step, _) = connect_and_send(&mut g, 42002, SITE, &hello(Some("protected.example"), &[], false, 0), t0 + Duration::from_millis(1500));
     assert_eq!(step, Step::Consumed);
-    assert_eq!(checks(&g.drain()).len(), 1, "stale verdict: check again");
+    assert_eq!(checks(&drain(&mut g)).len(), 1, "stale verdict: check again");
 }
 
 #[test]
@@ -290,20 +332,20 @@ fn a_pass_only_releases_connections_to_the_same_host_ip_and_port() {
     let protected = hello(Some("protected.example"), &[], false, 0);
     let other_name = hello(Some("other.protected.example"), &[], false, 0);
     let (_, first) = connect_and_send(&mut g, 42010, SITE, &protected, now);
-    let id_first = request_for(&g.drain(), 1);
+    let id_first = request_for(&drain(&mut g), 1);
     let (_, other_ip) = connect_and_send(&mut g, 42011, OTHER, &protected, now);
-    let id_ip = request_for(&g.drain(), 1);
+    let id_ip = request_for(&drain(&mut g), 1);
     let (_, other_port) = connect_to_port(&mut g, 42012, SITE, 8443, &protected, now);
-    let id_port = request_for(&g.drain(), 1);
+    let id_port = request_for(&drain(&mut g), 1);
     let (_, other_host) = connect_and_send(&mut g, 42013, SITE, &other_name, now);
-    let id_host = request_for(&g.drain(), 1);
+    let id_host = request_for(&drain(&mut g), 1);
     assert!(id_first < id_ip && id_ip < id_port && id_port < id_host);
 
-    g.verdict(1, id_first, Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(first)]);
+    verdict(&mut g, 1, id_first, Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(first)]);
     for (id, packet) in [(id_port, other_port), (id_host, other_host), (id_ip, other_ip)] {
-        g.verdict(1, id, Verdict::AllowDirect, now);
-        assert_eq!(g.drain(), vec![Out::ToTunnel(packet)]);
+        verdict(&mut g, 1, id, Verdict::AllowDirect, now);
+        assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
     }
 }
 
@@ -313,15 +355,99 @@ fn a_cached_pass_does_not_admit_a_different_destination() {
     let now = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 42020, SITE, &payload, now);
-    let first = request_for(&g.drain(), 1);
-    g.verdict(1, first, Verdict::AllowDirect, now);
-    g.drain();
+    let first = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, first, Verdict::AllowDirect, now);
+    drain(&mut g);
 
     connect_and_send(&mut g, 42021, OTHER, &payload, now);
-    let out = g.drain();
+    let out = drain(&mut g);
     let [Out::Check { request_id, destination, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_ne!(*request_id, first);
     assert_eq!(*destination, SocketAddr::from((OTHER, 443)));
+}
+
+#[test]
+fn evidence_must_still_be_fresh_when_the_first_packet_is_written() {
+    let mut g = proof_gate();
+    let now = Instant::now();
+    let payload = hello(Some("protected.example"), &[], false, 0);
+    let (_, packet) = connect_and_send(&mut g, 42022, SITE, &payload, now);
+    let original = request_for(&drain(&mut g), 1);
+    g.verdict(1, original, Verdict::AllowDirect, Some(9_001), now);
+    let release = release_id(&mut g);
+
+    PROOF_CLOCK.set(Some(10_001));
+    g.send_checked(release, now, |_| panic!("aged proof wrote a packet"));
+    let retry = request_for(&drain(&mut g), 1);
+    assert!(retry > original);
+    verdict(&mut g, 1, original, Verdict::AllowDirect, now);
+    assert!(drain(&mut g).is_empty());
+    verdict(&mut g, 1, retry, Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
+}
+
+#[test]
+fn a_delayed_result_rechecks_once_and_cache_keeps_the_original_evidence_time() {
+    let mut g = proof_gate();
+    let now = Instant::now();
+    let payload = hello(Some("protected.example"), &[], false, 0);
+    let (_, packet) = connect_and_send(&mut g, 42023, SITE, &payload, now);
+    let original = request_for(&drain(&mut g), 1);
+    g.verdict(1, original, Verdict::AllowDirect, Some(9_000), now);
+    let retry = request_for(&drain(&mut g), 1);
+    g.verdict(1, retry, Verdict::AllowDirect, Some(9_200), now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
+
+    let later = now + Duration::from_millis(300);
+    PROOF_CLOCK.set(Some(10_300));
+    connect_and_send(&mut g, 42024, SITE, &payload, later);
+    let new = request_for(&drain(&mut g), 1);
+    g.verdict(1, new, Verdict::AllowDirect, Some(9_000), later);
+    let retry = request_for(&drain(&mut g), 1);
+    g.verdict(1, retry, Verdict::AllowDirect, Some(9_000), later);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+}
+
+#[test]
+fn invalid_evidence_cannot_release_or_seed_the_cache() {
+    for evidence in [None, Some(0), Some(10_001)] {
+        let mut g = proof_gate();
+        let now = Instant::now();
+        let payload = hello(Some("protected.example"), &[], false, 0);
+        connect_and_send(&mut g, 42025, SITE, &payload, now);
+        let invalid = request_for(&drain(&mut g), 1);
+        g.verdict(1, invalid, Verdict::AllowDirect, evidence, now);
+        assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+        connect_and_send(&mut g, 42026, SITE, &payload, now);
+        assert!(request_for(&drain(&mut g), 1) > invalid);
+    }
+}
+
+#[test]
+fn reconfiguration_group_block_or_failed_write_cannot_commit_a_queued_permit() {
+    for revoke in [Gate::invalidate, |gate: &mut Gate| gate.reconfigure(vec![], Box::new(Rules)),
+                   |gate: &mut Gate| gate.block_group(1)] {
+        let mut g = proof_gate();
+        let now = Instant::now();
+        let payload = hello(Some("protected.example"), &[], false, 0);
+        let (_, packet) = connect_and_send(&mut g, 42027, SITE, &payload, now);
+        let old = request_for(&drain(&mut g), 1);
+        verdict(&mut g, 1, old, Verdict::AllowDirect, now);
+        let release = release_id(&mut g);
+        revoke(&mut g);
+        g.send_checked(release, now, |_| panic!("revoked permit wrote a packet"));
+        assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+        assert_eq!(g.outbound(&packet, now), Step::Consumed);
+    }
+    let mut g = proof_gate();
+    let now = Instant::now();
+    let (_, packet) = connect_and_send(&mut g, 42028, SITE, &hello(Some("protected.example"), &[], false, 0), now);
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDirect, now);
+    let release = release_id(&mut g);
+    g.send_checked(release, now, |_| false);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert_eq!(g.outbound(&packet, now), Step::Consumed);
 }
 
 #[test]
@@ -330,38 +456,38 @@ fn failure_removes_the_groups_cached_passes_but_keeps_other_destinations_pending
     let t0 = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     let (_, established) = connect_and_send(&mut g, 42030, SITE, &payload, t0);
-    let first = request_for(&g.drain(), 1);
-    g.verdict(1, first, Verdict::AllowDirect, t0);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(established)]);
+    let first = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, first, Verdict::AllowDirect, t0);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(established)]);
     connect_and_send(&mut g, 42031, OTHER, &payload, t0);
-    let failed = request_for(&g.drain(), 1);
+    let failed = request_for(&drain(&mut g), 1);
     let (_, independent) = connect_and_send(&mut g, 42032, RANGE_IP, &payload, t0);
-    let other = request_for(&g.drain(), 1);
+    let other = request_for(&drain(&mut g), 1);
 
-    g.verdict(1, failed, Verdict::Block, t0);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-    assert!(g.groups[&1].recent.values().all(|(ok, _)| !ok));
-    g.verdict(1, other, Verdict::AllowDirect, t0);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(independent)]);
+    verdict(&mut g, 1, failed, Verdict::Block, t0);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert!(g.groups[&1].recent.values().all(|decision| decision.evidence.is_none()));
+    verdict(&mut g, 1, other, Verdict::AllowDirect, t0);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(independent)]);
 
     connect_and_send(&mut g, 42033, OTHER, &payload, t0);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]), "B's success leaves A's denial in effect");
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]), "B's success leaves A's denial in effect");
     connect_and_send(&mut g, 42034, SITE, &payload, t0);
-    let current = request_for(&g.drain(), 1);
-    g.verdict(1, failed, Verdict::AllowDirect, t0);
-    assert!(g.drain().is_empty());
+    let current = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, failed, Verdict::AllowDirect, t0);
+    assert!(drain(&mut g).is_empty());
 
     let established = tcp4(MAC, 42030, SITE, 443, 2000, 5001, PA, b"next");
     assert_eq!(g.outbound(&established, t0), Step::Forward);
 
     let retry_at = t0 + g.cfg.reuse;
     let (_, retry) = connect_and_send(&mut g, 42035, OTHER, &payload, retry_at);
-    let output = g.drain();
+    let output = drain(&mut g);
     let [Out::Check { request_id, destination, .. }] = output.as_slice() else { panic!("{output:?}") };
     assert!(*request_id > current);
     assert_eq!(*destination, SocketAddr::from((OTHER, 443)));
-    g.verdict(1, *request_id, Verdict::AllowDirect, retry_at);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(retry)]);
+    verdict(&mut g, 1, *request_id, Verdict::AllowDirect, retry_at);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(retry)]);
 }
 
 #[test]
@@ -369,11 +495,11 @@ fn a_recent_failure_resets_new_connections_at_once() {
     let mut g = gate();
     let t0 = Instant::now();
     connect_and_send(&mut g, 42100, SITE, &hello(Some("protected.example"), &[], false, 0), t0);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::Block, t0);
-    g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::Block, t0);
+    drain(&mut g);
     connect_and_send(&mut g, 42101, SITE, &hello(Some("protected.example"), &[], false, 0), t0 + Duration::from_millis(200));
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
 }
 
 #[test]
@@ -384,10 +510,10 @@ fn denial_counts_follow_new_flows_and_include_cached_denials() {
     let next = hello(Some("protected.example"), &[], false, 0);
     let (_, packet) = connect_and_send(&mut g, 42130, SITE, &first, now);
     connect_and_send(&mut g, 42131, SITE, &next, now);
-    let request = request_for(&g.drain(), 1);
+    let request = request_for(&drain(&mut g), 1);
     assert!(g.take_denied_group().is_none());
-    g.verdict(1, request, Verdict::Block, now);
-    assert_eq!(g.drain().len(), 2);
+    verdict(&mut g, 1, request, Verdict::Block, now);
+    assert_eq!(drain(&mut g).len(), 2);
     let report = g.take_denied_group().unwrap();
     assert_eq!((report.group, report.count), (1, 2));
     assert_eq!(report.hosts, vec![DeniedHost { host: "protected.example".into(), count: 2 }]);
@@ -396,9 +522,9 @@ fn denial_counts_follow_new_flows_and_include_cached_denials() {
 
     assert_eq!(g.outbound(&packet, now), Step::Consumed);
     assert!(g.take_denied_group().is_none());
-    g.drain();
+    drain(&mut g);
     connect_and_send(&mut g, 42132, SITE, &next, now);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
     let report = g.take_denied_group().unwrap();
     assert_eq!(report.count, 3);
     assert_eq!(report.hosts[0].count, 3);
@@ -410,26 +536,26 @@ fn only_rule_denials_of_new_flows_enter_the_counts() {
     let now = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 42140, SITE, &payload, now);
-    let revoked = request_for(&g.drain(), 1);
+    let revoked = request_for(&drain(&mut g), 1);
     g.invalidate();
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-    g.verdict(1, revoked, Verdict::Block, now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    verdict(&mut g, 1, revoked, Verdict::Block, now);
     assert!(g.take_denied_group().is_none());
 
     let midstream = tcp4(MAC, 42141, RANGE_IP, 443, 9000, 0, PA, b"midstream");
     assert_eq!(g.outbound(&midstream, now), Step::Consumed);
-    let old_flow = request_for(&g.drain(), 1);
-    g.verdict(1, old_flow, Verdict::Block, now);
+    let old_flow = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, old_flow, Verdict::Block, now);
     assert!(g.take_denied_group().is_none());
 
     assert_eq!(g.outbound(&udp4(MAC, 42142, RANGE_IP, 443, b"quic"), now), Step::Consumed);
     assert!(g.take_denied_group().is_none());
-    g.drain();
+    drain(&mut g);
     let udp = udp4(MAC, 42143, RANGE_IP, 3478, b"test");
     assert_eq!(g.outbound(&udp, now), Step::Consumed);
-    let datagram_flow = request_for(&g.drain(), 1);
+    let datagram_flow = request_for(&drain(&mut g), 1);
     assert_eq!(g.outbound(&udp, now), Step::Consumed);
-    g.verdict(1, datagram_flow, Verdict::Block, now);
+    verdict(&mut g, 1, datagram_flow, Verdict::Block, now);
     let report = g.take_denied_group().unwrap();
     assert_eq!(report.count, 1);
     assert!(report.hosts.is_empty());
@@ -445,18 +571,18 @@ fn actual_deadline_denials_are_counted_without_recounting_retransmissions_after_
     let now = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 42150, SITE, &payload, now);
-    let request = request_for(&g.drain(), 1);
+    let request = request_for(&drain(&mut g), 1);
     let deadline = now + g.cfg.check_timeout;
     g.tick(deadline);
     assert!(matches!(
-        g.drain().as_slice(),
+        drain(&mut g).as_slice(),
         [Out::TimedOut { request_id, .. }, Out::ToHost(_)] if *request_id == request
     ));
     assert_eq!(g.take_denied_group().unwrap().count, 1);
     connect_and_send(&mut g, 42151, OTHER, &hello(Some("www.example.org"), &[], false, 0), deadline);
-    g.drain();
+    drain(&mut g);
     connect_and_send(&mut g, 42150, SITE, &payload, deadline);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
     assert!(g.take_denied_group().is_none());
 }
 
@@ -513,38 +639,38 @@ fn earlier_dependent_results_cannot_release_packets_across_a_failure() {
         let t0 = Instant::now();
         let payload = hello(Some("protected.example"), &[], false, 0);
         connect_and_send(&mut g, 42110, SITE, &payload, t0);
-        let failed = request_for(&g.drain(), 1);
+        let failed = request_for(&drain(&mut g), 1);
 
         let later = t0 + Duration::from_secs(1);
         let dependent = hello(Some("follow.protected.example"), &[], false, 0);
         connect_and_send(&mut g, 42111, OTHER, &dependent, later);
-        let old_dependent = request_for(&g.drain(), 1);
+        let old_dependent = request_for(&drain(&mut g), 1);
         let (_, direct_packet) = connect_and_send(&mut g, 42112, OTHER, &payload, later);
-        let direct = request_for(&g.drain(), 1);
+        let direct = request_for(&drain(&mut g), 1);
 
         let now = if local_deadline {
             let deadline = t0 + g.cfg.check_timeout;
             // The dependent verdict was already on the wire at the deadline.
-            g.verdict(1, old_dependent, Verdict::AllowDependent, deadline);
+            verdict(&mut g, 1, old_dependent, Verdict::AllowDependent, deadline);
             assert!(matches!(
-                g.drain().as_slice(),
+                drain(&mut g).as_slice(),
                 [Out::TimedOut { request_id, .. }, Out::ToHost(_), Out::ToHost(_)] if *request_id == failed
             ));
             deadline
         } else {
-            g.verdict(1, failed, Verdict::Block, later);
-            assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-            g.verdict(1, old_dependent, Verdict::AllowDependent, later);
-            assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+            verdict(&mut g, 1, failed, Verdict::Block, later);
+            assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+            verdict(&mut g, 1, old_dependent, Verdict::AllowDependent, later);
+            assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
             later
         };
 
-        g.verdict(1, direct, Verdict::AllowDirect, now);
-        assert_eq!(g.drain(), vec![Out::ToTunnel(direct_packet)]);
+        verdict(&mut g, 1, direct, Verdict::AllowDirect, now);
+        assert_eq!(drain(&mut g), vec![Out::ToTunnel(direct_packet)]);
         let (_, retry) = connect_and_send(&mut g, 42113, OTHER, &dependent, now);
-        let current = request_for(&g.drain(), 1);
-        g.verdict(1, current, Verdict::AllowDependent, now);
-        assert_eq!(g.drain(), vec![Out::ToTunnel(retry)]);
+        let current = request_for(&drain(&mut g), 1);
+        verdict(&mut g, 1, current, Verdict::AllowDependent, now);
+        assert_eq!(drain(&mut g), vec![Out::ToTunnel(retry)]);
     }
 }
 
@@ -554,39 +680,39 @@ fn controller_group_block_discards_passes_and_pending_checks_even_after_a_deadli
     let t0 = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 42120, SITE, &payload, t0);
-    let expired = request_for(&g.drain(), 1);
+    let expired = request_for(&drain(&mut g), 1);
     let later = t0 + Duration::from_secs(1);
     connect_and_send(&mut g, 42121, OTHER, &payload, later);
-    let pending = request_for(&g.drain(), 1);
+    let pending = request_for(&drain(&mut g), 1);
     let (_, outside) = connect_and_send(&mut g, 42122, SITE, &hello(Some("second.example"), &[], false, 0), later);
-    let outside_id = request_for(&g.drain(), 2);
+    let outside_id = request_for(&drain(&mut g), 2);
 
     let deadline = t0 + g.cfg.check_timeout;
     g.tick(deadline);
     assert!(matches!(
-        g.drain().as_slice(),
+        drain(&mut g).as_slice(),
         [Out::TimedOut { request_id, .. }, Out::ToHost(_)] if *request_id == expired
     ));
     let (_, already_released) = connect_to_port(&mut g, 42123, OTHER, 8443, &payload, deadline);
-    let released_id = request_for(&g.drain(), 1);
-    g.verdict(1, released_id, Verdict::AllowDirect, deadline);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(already_released)]);
+    let released_id = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, released_id, Verdict::AllowDirect, deadline);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(already_released)]);
 
     g.block_group(1);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-    g.verdict(1, pending, Verdict::AllowDirect, deadline);
-    g.verdict(1, expired, Verdict::AllowDirect, deadline);
-    assert!(g.drain().is_empty());
-    g.verdict(2, outside_id, Verdict::AllowDirect, deadline);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(outside)]);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    verdict(&mut g, 1, pending, Verdict::AllowDirect, deadline);
+    verdict(&mut g, 1, expired, Verdict::AllowDirect, deadline);
+    assert!(drain(&mut g).is_empty());
+    verdict(&mut g, 2, outside_id, Verdict::AllowDirect, deadline);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(outside)]);
 
     let established = tcp4(MAC, 42123, OTHER, 8443, 2000, 5001, PA, b"next");
     assert_eq!(g.outbound(&established, deadline), Step::Forward);
     connect_to_port(&mut g, 42124, OTHER, 8443, &payload, deadline);
-    let current = request_for(&g.drain(), 1);
+    let current = request_for(&drain(&mut g), 1);
     assert!(current > released_id);
-    g.verdict(1, current, Verdict::Block, deadline);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    verdict(&mut g, 1, current, Verdict::Block, deadline);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
 }
 
 #[test]
@@ -597,15 +723,15 @@ fn hello_split_across_segments_waits_for_the_name() {
     let (first, second) = rec.split_at(1200);
     let (step, d1) = connect_and_send(&mut g, 43000, SITE, first, now);
     assert_eq!(step, Step::Consumed);
-    assert!(g.drain().is_empty(), "no decision before the name arrives");
+    assert!(drain(&mut g).is_empty(), "no decision before the name arrives");
     // A retransmission of the first part is not held twice.
     assert_eq!(g.outbound(&d1, now), Step::Consumed);
     let d2 = tcp4(MAC, 43000, SITE, 443, 1001 + 1200, 5001, PA, second);
     assert_eq!(g.outbound(&d2, now), Step::Consumed);
-    let out = g.drain();
+    let out = drain(&mut g);
     assert_eq!(checks(&out), vec![(1, Some("protected.example".into()))]);
-    g.verdict(1, request_for(&out, 1), Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(d1), Out::ToTunnel(d2)]);
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(d1), Out::ToTunnel(d2)]);
 }
 
 #[test]
@@ -617,7 +743,7 @@ fn split_unprotected_hello_is_released_in_order() {
     let (_, d1) = connect_and_send(&mut g, 43100, OTHER, first, now);
     let d2 = tcp4(MAC, 43100, OTHER, 443, 1001 + 1200, 5001, PA, second);
     assert_eq!(g.outbound(&d2, now), Step::Consumed);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(d1), Out::ToTunnel(d2)]);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(d1), Out::ToTunnel(d2)]);
 }
 
 #[test]
@@ -626,7 +752,7 @@ fn plain_http_is_decided_by_host() {
     let now = Instant::now();
     let (step, _) = connect_and_send(&mut g, 44000, OTHER, b"GET / HTTP/1.1\r\nHost: Protected.Example:8080\r\n\r\n", now);
     assert_eq!(step, Step::Consumed);
-    assert_eq!(checks(&g.drain()), vec![(1, Some("protected.example".into()))]);
+    assert_eq!(checks(&drain(&mut g)), vec![(1, Some("protected.example".into()))]);
     let (step, _) = connect_and_send(&mut g, 44001, OTHER, b"GET / HTTP/1.1\r\nHost: www.example.org\r\n\r\n", now);
     assert_eq!(step, Step::Forward);
 }
@@ -641,13 +767,35 @@ fn hard_coded_addresses_are_decided_by_name_then_by_range() {
     // A protected name on an address nobody resolved: still caught by name.
     let (step, _) = connect_and_send(&mut g, 45001, OTHER, &hello(Some("protected.example"), &[], false, 0), now);
     assert_eq!(step, Step::Consumed);
-    g.drain();
+    drain(&mut g);
     // No name at all: the protected range decides.
     let (step, _) = connect_and_send(&mut g, 45002, RANGE_IP, b"\x00\x01private-protocol", now);
     assert_eq!(step, Step::Consumed);
-    assert_eq!(checks(&g.drain()), vec![(1, None)], "the address gets its own check");
+    assert_eq!(checks(&drain(&mut g)), vec![(1, None)], "the address gets its own check");
     let (step, _) = connect_and_send(&mut g, 45003, OTHER, b"\x00\x01private-protocol", now);
     assert_eq!(step, Step::Forward);
+}
+
+#[test]
+fn an_explicit_range_checks_unidentified_tls_and_http_before_releasing_data() {
+    let payloads = [
+        hello(None, &[], false, 0),
+        hello(Some("outer.example"), &[], true, 0),
+        b"GET / HTTP/1.0\r\n\r\n".to_vec(),
+    ];
+    let now = Instant::now();
+    for payload in payloads {
+        let mut g = gate();
+        let (step, _) = connect_and_send(&mut g, 45100, RANGE_IP, &payload, now);
+        assert_eq!(step, Step::Consumed);
+        let out = drain(&mut g);
+        let [Out::Check { group: 1, host: None, host_confirmed: false, destination, request_id }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(*destination, SocketAddr::from((RANGE_IP, 443)));
+        verdict(&mut g, 1, *request_id, Verdict::Block, now);
+        assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    }
 }
 
 #[test]
@@ -658,9 +806,120 @@ fn tunnel_dns_answers_teach_protected_addresses() {
     g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5354, &dns_answer("www.example.org", &[OTHER])), now);
     let (step, _) = connect_and_send(&mut g, 46000, SITE, b"\x00\x01private-protocol", now);
     assert_eq!(step, Step::Consumed);
-    assert_eq!(checks(&g.drain()), vec![(1, Some("b.protected.example".into()))]);
+    assert_eq!(checks(&drain(&mut g)), vec![(1, Some("b.protected.example".into()))]);
     let (step, _) = connect_and_send(&mut g, 46001, OTHER, b"\x00\x01private-protocol", now);
     assert_eq!(step, Step::Forward);
+}
+
+#[test]
+fn a_unique_current_dns_hint_warms_once_but_waits_for_the_real_name_and_check() {
+    let mut g = proof_gate();
+    let now = Instant::now();
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("a.protected.example", &[SITE])), now);
+    let syn = tcp4(MAC, 46100, SITE, 443, 1000, 0, SYN, &[]);
+    assert_eq!(g.outbound(&syn, now), Step::Forward);
+    assert_eq!(g.drain(), vec![Out::Warm {
+        group: 1, host: "a.protected.example".into(), destination: SocketAddr::from((SITE, 443)),
+    }]);
+    assert_eq!(g.outbound(&syn, now), Step::Forward);
+    // A probe to the same address on the method's own port is deduplicated.
+    let probe_syn = tcp4(MAC, 46101, SITE, 8443, 1000, 0, SYN, &[]);
+    assert_eq!(g.outbound(&probe_syn, now), Step::Forward);
+    assert!(g.drain().is_empty());
+
+    let hello = hello(Some("a.protected.example"), &[], false, 0);
+    let packet = tcp4(MAC, 46100, SITE, 443, 1001, 5001, PA, &hello);
+    assert_eq!(g.outbound(&packet, now), Step::Consumed);
+    let out = g.drain();
+    let [Out::Check { host: Some(host), host_confirmed: true, request_id, .. }] = out.as_slice() else {
+        panic!("{out:?}");
+    };
+    assert_eq!(host, "a.protected.example");
+    // The backend may have reused the warm evidence, but its own original
+    // evidence time still controls whether the held packets can leave.
+    g.verdict(1, *request_id, Verdict::AllowDirect, Some(9_950), now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
+}
+
+#[test]
+fn a_dns_hint_without_the_real_name_is_not_confirmed_and_a_different_name_does_not_reuse_it() {
+    let mut g = gate();
+    let now = Instant::now();
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("a.protected.example", &[SITE])), now);
+    connect_and_send(&mut g, 46110, SITE, &hello(None, &[], false, 0), now);
+    let out = g.drain();
+    assert!(matches!(out.as_slice(),
+        [Out::Warm { host: first, .. }, Out::Check { host: Some(second), host_confirmed: false, .. }]
+        if first == "a.protected.example" && first == second));
+    connect_and_send(&mut g, 46111, SITE, &hello(Some("b.protected.example"), &[], false, 0), now);
+    assert!(matches!(g.drain().as_slice(),
+        [Out::Check { host: Some(name), host_confirmed: true, .. }] if name == "b.protected.example"));
+    let next = now + Duration::from_secs(1);
+    assert_eq!(g.outbound(&tcp4(MAC, 46112, SITE, 443, 1000, 0, SYN, &[]), next), Step::Forward);
+    assert!(g.drain().is_empty());
+}
+
+#[test]
+fn a_confirmed_name_never_shares_pending_or_cached_results_with_a_dns_fallback() {
+    for cache_positive in [false, true] {
+        let mut g = proof_gate();
+        let now = Instant::now();
+        let host = "protected.example";
+        g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer(host, &[SITE])), now);
+        let named = hello(Some(host), &[], false, 0);
+        let (_, first) = connect_and_send(&mut g, 46180, SITE, &named, now);
+        let confirmed = request_for(&drain(&mut g), 1);
+        if cache_positive {
+            verdict(&mut g, 1, confirmed, Verdict::AllowDirect, now);
+            assert!(matches!(drain(&mut g).as_slice(), [Out::ToTunnel(packet)] if *packet == first));
+        }
+        connect_and_send(&mut g, 46181, SITE, &hello(None, &[], false, 0), now);
+        let fallback = drain(&mut g);
+        let [Out::Check { host: Some(name), host_confirmed: false, request_id, .. }] = fallback.as_slice() else {
+            panic!("{fallback:?}");
+        };
+        assert_eq!(name, host);
+        assert_ne!(*request_id, confirmed);
+        assert_eq!(g.groups[&1].pending.len(), if cache_positive { 1 } else { 2 });
+
+        let (_, same_identity) = connect_and_send(&mut g, 46182, SITE, &named, now);
+        if cache_positive {
+            assert_eq!(drain(&mut g), vec![Out::ToTunnel(same_identity)]);
+        } else {
+            assert!(drain(&mut g).is_empty());
+            verdict(&mut g, 1, confirmed, Verdict::AllowDirect, now);
+            assert_eq!(drain(&mut g), vec![Out::ToTunnel(first), Out::ToTunnel(same_identity)]);
+        }
+    }
+}
+
+#[test]
+fn warm_requires_current_unambiguous_identity_and_enforces_a_batch_limit() {
+    let now = Instant::now();
+    let mut g = gate();
+    for host in ["public.example", "protected.example"] {
+        g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer(host, &[SITE])), now);
+    }
+    for (index, dst) in [SITE, RANGE_IP, OTHER].into_iter().enumerate() {
+        let syn = tcp4(MAC, 46120 + index as u16, dst, 443, 1000, 0, SYN, &[]);
+        assert_eq!(g.outbound(&syn, now), Step::Forward);
+        assert!(g.drain().is_empty(), "shared address, bare range or unknown destination");
+    }
+
+    let mut g = gate();
+    let addresses: Vec<_> = (0..=MAX_WARMS_PER_WINDOW).map(|i| [198, 51, 100, 40 + i as u8]).collect();
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("protected.example", &addresses)), now);
+    for (i, &dst) in addresses.iter().enumerate() {
+        let syn = tcp4(MAC, 46130 + i as u16, dst, 443, 1000, 0, SYN, &[]);
+        assert_eq!(g.outbound(&syn, now), Step::Forward);
+    }
+    assert_eq!(g.drain().len(), MAX_WARMS_PER_WINDOW);
+    let expired = now + WARM_NAME_LIFETIME;
+    let syn = tcp4(MAC, 46150, addresses[0], 443, 1000, 0, SYN, &[]);
+    assert_eq!(g.outbound(&syn, expired), Step::Forward);
+    assert!(g.drain().is_empty());
+    g.invalidate();
+    assert!(g.warm_names.is_empty());
 }
 
 #[test]
@@ -670,7 +929,7 @@ fn ech_falls_back_to_the_address() {
     g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("protected.example", &[SITE])), now);
     let (step, _) = connect_and_send(&mut g, 47000, SITE, &hello(Some("public.cdn.example"), &[], true, 0), now);
     assert_eq!(step, Step::Consumed);
-    assert_eq!(checks(&g.drain()), vec![(1, Some("protected.example".into()))]);
+    assert_eq!(checks(&drain(&mut g)), vec![(1, Some("protected.example".into()))]);
     let (step, _) = connect_and_send(&mut g, 47001, OTHER, &hello(Some("public.cdn.example"), &[], true, 0), now);
     assert_eq!(step, Step::Forward);
 }
@@ -681,7 +940,7 @@ fn own_probes_pass_by_their_alpn_marker() {
     let now = Instant::now();
     let (step, _) = connect_and_send(&mut g, 48000, SITE, &hello(Some("protected.example"), &[b"http/1.1", b"ac-probe-test"], false, 0), now);
     assert_eq!(step, Step::Forward);
-    assert!(g.drain().is_empty());
+    assert!(drain(&mut g).is_empty());
     // Without the marker the same hello is held.
     let (step, _) = connect_and_send(&mut g, 48001, SITE, &hello(Some("protected.example"), &[b"http/1.1"], false, 0), now);
     assert_eq!(step, Step::Consumed);
@@ -695,11 +954,11 @@ fn quic_is_dropped_and_other_udp_passes() {
     assert_eq!(g.outbound(&udp4(MAC, 50001, [10, 0, 0, 53], 53, b"dns"), now), Step::Forward);
     // UDP to a protected range waits for the group like TCP.
     assert_eq!(g.outbound(&udp4(MAC, 50002, RANGE_IP, 3478, b"x"), now), Step::Consumed);
-    let out = g.drain();
+    let out = drain(&mut g);
     let [Out::Check { destination, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(*destination, SocketAddr::from((RANGE_IP, 3478)));
-    g.verdict(1, request_for(&out, 1), Verdict::AllowDirect, now);
-    assert_eq!(g.drain().len(), 1);
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g).len(), 1);
     assert_eq!(g.outbound(&udp4(MAC, 50002, RANGE_IP, 3478, b"y"), now), Step::Forward);
 }
 
@@ -708,12 +967,12 @@ fn a_check_that_never_answers_blocks() {
     let mut g = gate();
     let t0 = Instant::now();
     connect_and_send(&mut g, 51000, SITE, &hello(Some("protected.example"), &[], false, 0), t0);
-    let request = request_for(&g.drain(), 1);
+    let request = request_for(&drain(&mut g), 1);
     g.tick(t0 + Duration::from_millis(2900));
-    assert!(g.drain().is_empty());
+    assert!(drain(&mut g).is_empty());
     g.tick(t0 + Duration::from_secs(3));
     assert!(matches!(
-        g.drain().as_slice(),
+        drain(&mut g).as_slice(),
         [Out::TimedOut { group: 1, request_id, .. }, Out::ToHost(_)] if *request_id == request
     ));
 }
@@ -724,20 +983,20 @@ fn a_verdict_at_its_deadline_cannot_release_packets_even_before_tick() {
     let t0 = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 51010, SITE, &payload, t0);
-    let first = request_for(&g.drain(), 1);
+    let first = request_for(&drain(&mut g), 1);
     let deadline = t0 + g.cfg.check_timeout;
-    g.verdict(1, first, Verdict::AllowDirect, deadline);
+    verdict(&mut g, 1, first, Verdict::AllowDirect, deadline);
 
     let retry_at = deadline + g.cfg.reuse;
     let (_, packet) = connect_and_send(&mut g, 51011, SITE, &payload, retry_at);
-    let out = g.drain();
+    let out = drain(&mut g);
     let [Out::TimedOut { request_id: expired, .. }, Out::ToHost(_), Out::Check { request_id: retry, .. }] =
         out.as_slice() else { panic!("{out:?}") };
     assert_eq!(*expired, first);
-    g.verdict(1, first, Verdict::AllowDirect, retry_at);
-    assert!(g.drain().is_empty());
-    g.verdict(1, *retry, Verdict::AllowDirect, retry_at);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(packet)]);
+    verdict(&mut g, 1, first, Verdict::AllowDirect, retry_at);
+    assert!(drain(&mut g).is_empty());
+    verdict(&mut g, 1, *retry, Verdict::AllowDirect, retry_at);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
 }
 
 #[test]
@@ -747,9 +1006,9 @@ fn an_unfinished_hello_is_decided_by_address_after_the_timeout() {
     let rec = hello(Some("protected.example"), &[], false, 2500);
     connect_and_send(&mut g, 52000, RANGE_IP, &rec[..1000], t0);
     connect_and_send(&mut g, 52001, OTHER, &rec[..1000], t0);
-    assert!(g.drain().is_empty());
+    assert!(drain(&mut g).is_empty());
     g.tick(t0 + Duration::from_secs(3));
-    let out = g.drain();
+    let out = drain(&mut g);
     assert_eq!(checks(&out), vec![(1, None)], "the protected range is checked");
     assert_eq!(out.iter().filter(|o| matches!(o, Out::ToTunnel(_))).count(), 1, "the other one passes");
 }
@@ -759,7 +1018,7 @@ fn mid_stream_packets_are_decided_by_address() {
     let mut g = gate();
     let now = Instant::now();
     assert_eq!(g.outbound(&tcp4(MAC, 53000, RANGE_IP, 443, 9000, 1, PA, b"data"), now), Step::Consumed);
-    assert_eq!(checks(&g.drain()), vec![(1, None)]);
+    assert_eq!(checks(&drain(&mut g)), vec![(1, None)]);
     assert_eq!(g.outbound(&tcp4(MAC, 53001, OTHER, 443, 9000, 1, PA, b"data"), now), Step::Forward);
     assert_eq!(g.outbound(&tcp4(MAC, 53002, OTHER, 443, 9000, 1, ACK, &[]), now), Step::Forward);
 }
@@ -771,9 +1030,9 @@ fn fast_open_data_on_the_syn_is_held() {
     let rec = hello(Some("protected.example"), &[], false, 0);
     let syn = tcp4(MAC, 54000, SITE, 443, 7000, 0, SYN, &rec);
     assert_eq!(g.outbound(&syn, now), Step::Consumed);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::Block, now);
-    let out = g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::Block, now);
+    let out = drain(&mut g);
     let [Out::ToHost(rst)] = out.as_slice() else { panic!("{out:?}") };
     verify_checksums(rst);
     let L4::Tcp(t) = parse_ip(rst).unwrap().l4 else { panic!() };
@@ -788,11 +1047,11 @@ fn ipv6_connections_are_gated_too() {
     assert_eq!(g.outbound(&tcp6(mac, 55000, site, 443, 1, 0, SYN, &[]), now), Step::Forward);
     let data = tcp6(mac, 55000, site, 443, 2, 77, PA, &hello(Some("protected.example"), &[], false, 0));
     assert_eq!(g.outbound(&data, now), Step::Consumed);
-    let out = g.drain();
+    let out = drain(&mut g);
     let [Out::Check { destination, .. }] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(*destination, SocketAddr::new(IpAddr::V6(site), 443));
-    g.verdict(1, request_for(&out, 1), Verdict::Block, now);
-    let out = g.drain();
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::Block, now);
+    let out = drain(&mut g);
     let [Out::ToHost(rst)] = out.as_slice() else { panic!("{out:?}") };
     verify_checksums(rst);
     let p = parse_ip(rst).unwrap();
@@ -805,12 +1064,12 @@ fn groups_are_independent() {
     let now = Instant::now();
     connect_and_send(&mut g, 56000, SITE, &hello(Some("protected.example"), &[], false, 0), now);
     let (_, d2) = connect_and_send(&mut g, 56001, OTHER, &hello(Some("second.example"), &[], false, 0), now);
-    let out = g.drain();
+    let out = drain(&mut g);
     assert_eq!(checks(&out).len(), 2);
-    g.verdict(1, request_for(&out, 1), Verdict::Block, now);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-    g.verdict(2, request_for(&out, 2), Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(d2)]);
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::Block, now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    verdict(&mut g, 2, request_for(&out, 2), Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(d2)]);
 }
 
 #[test]
@@ -818,12 +1077,12 @@ fn invalidate_forces_a_fresh_check() {
     let mut g = gate();
     let t0 = Instant::now();
     connect_and_send(&mut g, 57000, SITE, &hello(Some("protected.example"), &[], false, 0), t0);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::AllowDirect, t0);
-    g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDirect, t0);
+    drain(&mut g);
     g.invalidate();
     connect_and_send(&mut g, 57001, SITE, &hello(Some("protected.example"), &[], false, 0), t0 + Duration::from_millis(100));
-    assert_eq!(checks(&g.drain()).len(), 1);
+    assert_eq!(checks(&drain(&mut g)).len(), 1);
 }
 
 #[test]
@@ -832,21 +1091,21 @@ fn only_a_current_request_for_the_specified_group_can_release_packets() {
     let now = Instant::now();
     let payload = hello(Some("protected.example"), &[], false, 0);
     connect_and_send(&mut g, 57002, SITE, &payload, now);
-    let old = request_for(&g.drain(), 1);
+    let old = request_for(&drain(&mut g), 1);
     g.invalidate();
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
     let (_, packet) = connect_and_send(&mut g, 57003, SITE, &payload, now);
-    let current = request_for(&g.drain(), 1);
+    let current = request_for(&drain(&mut g), 1);
     assert!(current > old);
 
-    g.verdict(1, old, Verdict::AllowDirect, now);
-    g.verdict(2, current, Verdict::AllowDirect, now);
-    g.verdict(1, RequestId::new(current.get() + 1).unwrap(), Verdict::Block, now);
-    assert!(g.drain().is_empty());
-    g.verdict(1, current, Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(packet)]);
-    g.verdict(1, current, Verdict::Block, now);
-    assert!(g.drain().is_empty());
+    verdict(&mut g, 1, old, Verdict::AllowDirect, now);
+    verdict(&mut g, 2, current, Verdict::AllowDirect, now);
+    verdict(&mut g, 1, RequestId::new(current.get() + 1).unwrap(), Verdict::Block, now);
+    assert!(drain(&mut g).is_empty());
+    verdict(&mut g, 1, current, Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(packet)]);
+    verdict(&mut g, 1, current, Verdict::Block, now);
+    assert!(drain(&mut g).is_empty());
 }
 
 #[test]
@@ -855,17 +1114,17 @@ fn policy_refresh_keeps_the_existing_connection_and_rechecks_the_next_one() {
     let now = Instant::now();
     let initial = hello(Some("protected.example"), &[], false, 0);
     let (_, original) = connect_and_send(&mut g, 57010, SITE, &initial, now);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::AllowDirect, now);
-    assert!(g.drain().iter().any(|o| matches!(o, Out::ToTunnel(p) if p == &original)));
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDirect, now);
+    assert!(drain(&mut g).iter().any(|o| matches!(o, Out::ToTunnel(p) if p == &original)));
     g.reconfigure(vec![], Box::new(Rules));
     let established = tcp4(MAC, 57010, SITE, 443, 1001 + initial.len() as u32, 5001, PA, b"next");
     assert_eq!(g.outbound(&established, now), Step::Forward);
-    assert!(g.drain().is_empty());
+    assert!(drain(&mut g).is_empty());
     connect_and_send(&mut g, 57011, SITE, &initial, now);
-    let request = request_for(&g.drain(), 1);
-    g.verdict(1, request, Verdict::Block, now);
-    let output = g.drain();
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::Block, now);
+    let output = drain(&mut g);
     assert!(!output.iter().any(|o| matches!(o, Out::ToTunnel(_))));
     assert!(output.iter().any(|o| matches!(o, Out::ToHost(_))));
 }
@@ -877,14 +1136,14 @@ fn eviction_never_drops_held_connections() {
     let now = Instant::now();
     let (step, _) = connect_and_send(&mut g, 58000, SITE, &hello(Some("protected.example"), &[], false, 0), now);
     assert_eq!(step, Step::Consumed);
-    let request = request_for(&g.drain(), 1);
+    let request = request_for(&drain(&mut g), 1);
     for i in 0..200u16 {
         connect_and_send(&mut g, 59000 + i, OTHER, &hello(Some("www.example.org"), &[], false, 0), now + Duration::from_millis(i as u64 + 1));
     }
     assert!(g.flow_count() <= 16);
-    assert!(g.drain().is_empty());
-    g.verdict(1, request, Verdict::AllowDirect, now);
-    assert_eq!(g.drain().len(), 1, "the held connection survived eviction");
+    assert!(drain(&mut g).is_empty());
+    verdict(&mut g, 1, request, Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g).len(), 1, "the held connection survived eviction");
 }
 
 #[test]
@@ -896,18 +1155,18 @@ fn pending_targets_and_held_packet_bytes_are_bounded() {
     for i in 0..MAX_PENDING_PER_GROUP {
         connect_and_send(&mut g, 59100 + i as u16, [198, 51, 100, i as u8 + 10], &payload, now);
     }
-    let out = g.drain();
+    let out = drain(&mut g);
     let [Out::Check { request_id, .. }, ..] = out.as_slice() else { panic!("{out:?}") };
     assert_eq!(out.len(), MAX_PENDING_PER_GROUP);
     connect_and_send(&mut g, 59200, OTHER, &payload, now);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
 
     let ack = tcp4(MAC, 59100, SITE, 443, 1001 + payload.len() as u32, 5001, ACK, &[]);
     for _ in 0..32 {
         assert_eq!(g.outbound(&ack, now), Step::Consumed);
     }
-    g.verdict(1, *request_id, Verdict::AllowDirect, now);
-    let sent: usize = g.drain().iter().map(|out| match out {
+    verdict(&mut g, 1, *request_id, Verdict::AllowDirect, now);
+    let sent: usize = drain(&mut g).iter().map(|out| match out {
         Out::ToTunnel(packet) => packet.len(),
         _ => panic!("{out:?}"),
     }).sum();
@@ -922,13 +1181,13 @@ fn a_table_full_of_pending_flows_refuses_new_connections() {
     let payload = hello(Some("protected.example"), &[], false, 0);
     let (_, a) = connect_and_send(&mut g, 59300, SITE, &payload, now);
     let (_, b) = connect_and_send(&mut g, 59301, SITE, &payload, now);
-    let id = request_for(&g.drain(), 1);
+    let id = request_for(&drain(&mut g), 1);
 
     assert_eq!(g.outbound(&tcp4(MAC, 59302, SITE, 443, 1000, 0, SYN, &[]), now), Step::Consumed);
     assert_eq!(g.flow_count(), 2);
-    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
-    g.verdict(1, id, Verdict::AllowDirect, now);
-    assert_eq!(g.drain(), vec![Out::ToTunnel(a), Out::ToTunnel(b)]);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    verdict(&mut g, 1, id, Verdict::AllowDirect, now);
+    assert_eq!(drain(&mut g), vec![Out::ToTunnel(a), Out::ToTunnel(b)]);
 }
 
 #[test]
@@ -974,5 +1233,5 @@ fn sniffers_read_names() {
     assert_eq!(http_host(b"SSH-2.0-x\r\n"), HttpHost::NotHttp);
     assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: [2001:db8::1]:80\r\n\r\n"), HttpHost::Host(Some("2001:db8::1".into())));
     assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), HttpHost::Host(None));
-    assert_eq!(parse_dns_answer(&dns_answer("a.example", &[SITE, OTHER])), Some(("a.example".into(), vec![IpAddr::V4(SITE.into()), IpAddr::V4(OTHER.into())])));
+    assert_eq!(parse_dns_answer(&dns_answer("a.example", &[SITE, OTHER])), Some(("a.example".into(), vec![(IpAddr::V4(SITE.into()), 60), (IpAddr::V4(OTHER.into()), 60)])));
 }

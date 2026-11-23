@@ -33,6 +33,27 @@ const MAX_CACHED_PER_GROUP: usize = 64;
 const MAX_REPORTED_FLOWS: usize = 4096;
 const MAX_REPORTED_GROUPS: usize = 16;
 const MAX_REPORTED_HOSTS: usize = 32;
+const EVIDENCE_AGE_MS: u64 = 1_000;
+const MAX_WARM_IDENTITIES: usize = 256;
+const MAX_WARMS_PER_WINDOW: usize = 8;
+const WARM_WINDOW: Duration = Duration::from_secs(1);
+const WARM_NAME_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Same boot-relative, sleep-inclusive clock in the gate and its controller.
+pub fn evidence_clock_ms() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    let clock = libc::CLOCK_MONOTONIC;
+    #[cfg(target_os = "linux")]
+    let clock = libc::CLOCK_BOOTTIME;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let clock = libc::CLOCK_MONOTONIC;
+    let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(clock, &mut value) } != 0 {
+        return None;
+    }
+    u64::try_from(value.tv_sec).ok()?.checked_mul(1_000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()? / 1_000_000)
+}
 
 /// Which group, if any, a name or address belongs to. Backed by the rule
 /// engine in production; the gate only asks.
@@ -96,12 +117,17 @@ pub enum Step {
 pub enum Out {
     /// A previously held packet, released into the tunnel.
     ToTunnel(Vec<u8>),
+    /// Revalidate an approval immediately before writing the first held packet.
+    SendChecked(u64),
+    /// Advisory only. No permission is granted until a regular check answers.
+    Warm { group: GroupId, host: String, destination: SocketAddr },
     /// A packet for the Mac side (a RST for a blocked connection).
     ToHost(Vec<u8>),
     /// Ask the background service to check this exact destination.
     Check {
         group: GroupId,
         host: Option<String>,
+        host_confirmed: bool,
         destination: SocketAddr,
         request_id: RequestId,
     },
@@ -109,6 +135,7 @@ pub enum Out {
     TimedOut {
         group: GroupId,
         host: Option<String>,
+        host_confirmed: bool,
         destination: SocketAddr,
         request_id: RequestId,
     },
@@ -224,9 +251,10 @@ impl BlockedFlows {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckTarget {
     host: Option<String>,
+    host_confirmed: bool,
     destination: SocketAddr,
 }
 
@@ -234,12 +262,52 @@ struct PendingCheck {
     id: RequestId,
     target: CheckTarget,
     started: Instant,
+    retried: bool,
     waiting: Vec<FlowKey>,
+}
+
+#[derive(Clone, Copy)]
+struct Evidence {
+    at_ms: u64,
+    direct: bool,
+    request_id: RequestId,
+}
+
+impl Evidence {
+    fn age(self, clock: fn() -> Option<u64>) -> Option<u64> {
+        if self.at_ms == 0 {
+            return None;
+        }
+        clock()?.checked_sub(self.at_ms)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CachedDecision {
+    evidence: Option<Evidence>,
+    at: Instant,
+}
+
+struct CheckedRelease {
+    key: FlowKey,
+    group: GroupId,
+    target: CheckTarget,
+    evidence: Evidence,
+    started: Instant,
+    retried: bool,
+}
+
+struct WarmIdentity {
+    name: String,
+    valid_until: Instant,
+    eligible_until: Option<Instant>,
+    shared: bool,
+    last_warm: Option<Instant>,
 }
 
 #[derive(Default)]
 struct GroupCheck {
-    recent: HashMap<CheckTarget, (bool, Instant)>,
+    recent: HashMap<CheckTarget, CachedDecision>,
     pending: Vec<PendingCheck>,
     failure_cutoff: u64,
 }
@@ -259,9 +327,15 @@ pub struct Gate {
     flows: HashMap<FlowKey, Flow>,
     groups: HashMap<GroupId, GroupCheck>,
     last_request: u64,
+    releases: HashMap<u64, CheckedRelease>,
+    last_release: u64,
     learned: HashMap<IpAddr, (GroupId, String, Instant)>,
+    warm_names: HashMap<IpAddr, WarmIdentity>,
+    next_warm_prune: Option<Instant>,
+    warm_sent: VecDeque<Instant>,
     out: Vec<Out>,
     blocked_flows: BlockedFlows,
+    clock: fn() -> Option<u64>,
 }
 
 impl Gate {
@@ -272,9 +346,15 @@ impl Gate {
             flows: HashMap::new(),
             groups: HashMap::new(),
             last_request: 0,
+            releases: HashMap::new(),
+            last_release: 0,
             learned: HashMap::new(),
+            warm_names: HashMap::new(),
+            next_warm_prune: None,
+            warm_sent: VecDeque::new(),
             out: Vec::new(),
             blocked_flows: BlockedFlows::default(),
+            clock: evidence_clock_ms,
         }
     }
 
@@ -292,7 +372,14 @@ impl Gate {
     /// Forget every verdict (reconnect, network change, wake: §66.6).
     pub fn invalidate(&mut self) {
         let groups = std::mem::take(&mut self.groups);
-        self.out.retain(|out| !matches!(out, Out::Check { .. }));
+        let releases = std::mem::take(&mut self.releases);
+        self.out.retain(|out| !matches!(out, Out::Check { .. } | Out::SendChecked(_) | Out::Warm { .. }));
+        self.warm_names.clear();
+        self.next_warm_prune = None;
+        self.warm_sent.clear();
+        for release in releases.into_values() {
+            self.block(release.key, None);
+        }
         for key in groups.into_values().flat_map(|group| group.pending).flat_map(|check| check.waiting) {
             self.block(key, None);
         }
@@ -332,8 +419,13 @@ impl Gate {
         let Some(p) = parse_ip(pkt) else { return };
         if let L4::Udp { sport: 53, .. } = p.l4 {
             if let Some((name, addrs)) = parse_dns_answer(p.payload) {
-                if let Some(group) = self.classifier.group_for_name(&name) {
-                    for ip in addrs {
+                let group = self.classifier.group_for_name(&name);
+                for (ip, ttl) in addrs {
+                    let lifetime = Duration::from_secs(u64::from(ttl)).min(WARM_NAME_LIFETIME);
+                    if !lifetime.is_zero() {
+                        self.observe_warm_identity(ip, &name, lifetime, group.is_some(), now);
+                    }
+                    if let Some(group) = group {
                         self.learn(ip, group, &name, now);
                     }
                 }
@@ -342,23 +434,36 @@ impl Gate {
     }
 
     /// The background service's answer to an [`Out::Check`].
-    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, verdict: Verdict, now: Instant) {
+    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, verdict: Verdict, evidence_at_ms: Option<u64>, now: Instant) {
         self.expire_group(group, now);
         let Some(checks) = self.groups.get_mut(&group) else { return };
         let Some(index) = checks.pending.iter().position(|check| check.id == request_id) else { return };
         match verdict {
             Verdict::Block => self.fail_check(group, index, now),
-            Verdict::AllowDependent if request_id.get() <= checks.failure_cutoff => {
+            Verdict::AllowDependent | Verdict::AllowDirect => {
                 let check = checks.pending.swap_remove(index);
-                self.block_waiting(group, &check);
-            }
-            Verdict::AllowDirect | Verdict::AllowDependent => {
-                let check = checks.pending.swap_remove(index);
-                if checks.recent.len() < MAX_CACHED_PER_GROUP {
-                    checks.recent.insert(check.target, (true, now));
+                // DNS hints and unnamed traffic cannot assert a flow's host.
+                let direct = matches!(verdict, Verdict::AllowDirect) && check.target.host_confirmed;
+                if !direct && request_id.get() <= checks.failure_cutoff {
+                    self.block_waiting(group, &check);
+                    return;
                 }
-                for key in check.waiting {
-                    self.release(key);
+                let proof = evidence_at_ms.map(|at_ms| Evidence { at_ms, direct, request_id });
+                match proof.and_then(|proof| proof.age(self.clock).map(|age| (proof, age))) {
+                    Some((proof, age)) if age < EVIDENCE_AGE_MS => {
+                        if checks.recent.len() < MAX_CACHED_PER_GROUP {
+                            let decision = CachedDecision { evidence: Some(proof), at: now };
+                            checks.recent.insert(check.target.clone(), decision);
+                        }
+                        for key in check.waiting {
+                            self.queue_release(CheckedRelease {
+                                key, group, target: check.target.clone(), evidence: proof,
+                                started: check.started, retried: check.retried,
+                            });
+                        }
+                    }
+                    Some(_) => self.retry_check(group, check, now),
+                    None => self.block_waiting(group, &check),
                 }
             }
         }
@@ -368,12 +473,13 @@ impl Gate {
     /// goes to the controller for a fresh decision.
     pub fn block_group(&mut self, group: GroupId) {
         let Some(checks) = self.groups.get_mut(&group) else { return };
-        checks.recent.retain(|_, (ok, _)| !*ok);
+        checks.recent.retain(|_, decision| decision.evidence.is_none());
         let pending = std::mem::take(&mut checks.pending);
-        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } if *id == group));
+        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } | Out::Warm { group: id, .. } if *id == group));
         for check in pending {
             self.block_waiting(group, &check);
         }
+        self.revoke_group_releases(group, false);
     }
 
     fn expire_group(&mut self, group: GroupId, now: Instant) {
@@ -384,6 +490,7 @@ impl Gate {
             self.out.push(Out::TimedOut {
                 group,
                 host: check.target.host.clone(),
+                host_confirmed: check.target.host_confirmed,
                 destination: check.target.destination,
                 request_id: check.id,
             });
@@ -397,19 +504,107 @@ impl Gate {
         // A dependent result may already be on the wire when a local
         // deadline fires. Independent results still speak for their own key.
         checks.failure_cutoff = self.last_request;
-        checks.recent.retain(|_, (ok, at)| !*ok && now.duration_since(*at) < self.cfg.reuse);
+        checks.recent.retain(|_, decision|
+            decision.evidence.is_none() && now.duration_since(decision.at) < self.cfg.reuse);
         self.out.retain(|out| !matches!(out, Out::Check { request_id, .. } if *request_id == failed.id));
         self.block_waiting(group, &failed);
         let checks = self.groups.get_mut(&group).expect("pending group");
         if checks.recent.len() < MAX_CACHED_PER_GROUP {
-            checks.recent.insert(failed.target, (false, now));
+            checks.recent.insert(failed.target, CachedDecision { evidence: None, at: now });
         }
+        self.revoke_group_releases(group, true);
     }
 
     fn block_waiting(&mut self, group: GroupId, check: &PendingCheck) {
         let rule = Some((group, check.target.host.as_deref()));
         for &key in &check.waiting {
             self.block(key, rule);
+        }
+    }
+
+    fn retry_check(&mut self, group: GroupId, mut check: PendingCheck, now: Instant) {
+        if check.retried || now.duration_since(check.started) >= self.cfg.check_timeout {
+            self.block_waiting(group, &check);
+            return;
+        }
+        let checks = self.groups.entry(group).or_default();
+        if let Some(pending) = checks.pending.iter_mut().find(|pending| pending.target == check.target) {
+            if pending.retried && pending.started == check.started {
+                pending.waiting.extend(check.waiting);
+            } else {
+                self.block_waiting(group, &check);
+            }
+            return;
+        }
+        let Some(id) = self.last_request.checked_add(1).and_then(RequestId::new)
+            .filter(|_| checks.pending.len() < MAX_PENDING_PER_GROUP)
+        else {
+            self.block_waiting(group, &check);
+            return;
+        };
+        self.last_request = id.get();
+        check.id = id;
+        check.retried = true;
+        self.out.push(Out::Check {
+            group, host: check.target.host.clone(), host_confirmed: check.target.host_confirmed,
+            destination: check.target.destination, request_id: id,
+        });
+        checks.pending.push(check);
+    }
+
+    fn queue_release(&mut self, release: CheckedRelease) {
+        let Some(id) = self.last_release.checked_add(1) else {
+            self.block(release.key, Some((release.group, release.target.host.as_deref())));
+            return;
+        };
+        if let Some(Flow { state: State::Holding(held), .. }) = self.flows.get_mut(&release.key) {
+            held.checking = true;
+            self.last_release = id;
+            self.releases.insert(id, release);
+            self.out.push(Out::SendChecked(id));
+        }
+    }
+
+    fn revoke_group_releases(&mut self, group: GroupId, dependent_only: bool) {
+        let revoked: Vec<_> = self.releases.iter().filter_map(|(&id, release)|
+            (release.group == group && (!dependent_only || !release.evidence.direct)).then_some(id)
+        ).collect();
+        for id in revoked {
+            if let Some(release) = self.take_release(id) {
+                self.block(release.key, Some((group, release.target.host.as_deref())));
+            }
+        }
+    }
+
+    fn take_release(&mut self, id: u64) -> Option<CheckedRelease> {
+        let release = self.releases.remove(&id);
+        if self.releases.is_empty() && self.releases.capacity() > MAX_CACHED_PER_GROUP {
+            self.releases.shrink_to_fit();
+        }
+        release
+    }
+
+    /// Commit the release only on its current token and just before the
+    /// first packet write. Failure to enqueue a packet leaves the flow blocked.
+    pub fn send_checked(&mut self, id: u64, now: Instant, send: impl FnOnce(&[Vec<u8>]) -> bool) {
+        let Some(release) = self.take_release(id) else { return };
+        let CheckedRelease { key, group, target, evidence, started, retried } = release;
+        let Some(Flow { state: State::Holding(held), .. }) = self.flows.get(&key) else { return };
+        match evidence.age(self.clock) {
+            Some(age) if age < EVIDENCE_AGE_MS => {
+                if send(&held.packets) {
+                    self.set_state(key, State::Pass);
+                    if let Some(name) = target.host.filter(|_| evidence.direct) {
+                        self.observe_warm_identity(key.dst, &name, WARM_NAME_LIFETIME, true, now);
+                    }
+                } else {
+                    self.block(key, None);
+                }
+            }
+            Some(_) => self.retry_check(group, PendingCheck {
+                id: evidence.request_id, target, started, retried, waiting: vec![key],
+            }, now),
+            None => self.block(key, Some((group, target.host.as_deref()))),
         }
     }
 
@@ -425,7 +620,7 @@ impl Gate {
             self.expire_group(group, now);
         }
         self.groups.retain(|_, checks| {
-            checks.recent.retain(|_, (_, at)| now.duration_since(*at) < self.cfg.reuse);
+            checks.recent.retain(|_, decision| now.duration_since(decision.at) < self.cfg.reuse);
             !checks.pending.is_empty() || !checks.recent.is_empty()
         });
         let stale: Vec<FlowKey> = self
@@ -470,7 +665,7 @@ impl Gate {
                 if pkt.len() <= self.cfg.max_held_bytes {
                     let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, checking: false, client_isn: None, last: None };
                     if self.insert(key, State::Holding(Box::new(held)), now) {
-                        self.wait_for_check(key, group, host, now);
+                        self.wait_for_check(key, group, host, false, now);
                     }
                 }
                 Step::Consumed
@@ -489,6 +684,9 @@ impl Gate {
                     self.reset(key, seg);
                     return Step::Consumed;
                 }
+                if p.payload.is_empty() {
+                    self.warm_known_address(key, now);
+                }
             } else if p.payload.is_empty() {
                 return Step::Forward;
             } else {
@@ -503,7 +701,7 @@ impl Gate {
                         if pkt.len() <= self.cfg.max_held_bytes {
                             let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, checking: false, client_isn: None, last: Some(seg) };
                             if self.insert(key, State::Holding(Box::new(held)), now) {
-                                self.wait_for_check(key, group, host, now);
+                                self.wait_for_check(key, group, host, false, now);
                                 return Step::Consumed;
                             }
                         }
@@ -587,19 +785,16 @@ impl Gate {
                     Target::Pass
                 } else {
                     match sni {
+                        Some(name) if !ech => self.classify_named(key.dst, name, now),
                         Some(name) => match self.classifier.group_for_name(&name) {
-                            Some(g) => Target::Group(g, Some(name)),
-                            None if ech => Target::Address,
-                            None => Target::Pass,
+                            Some(group) => Target::Group(group, name, false),
+                            None => Target::Address,
                         },
                         None => Target::Address,
                     }
                 }
             }
-            Sniff::Http(Some(name)) => match self.classifier.group_for_name(&name) {
-                Some(g) => Target::Group(g, Some(name)),
-                None => Target::Pass,
-            },
+            Sniff::Http(Some(name)) => self.classify_named(key.dst, name, now),
             Sniff::Http(None) => Target::Address,
         };
         let only_current = first;
@@ -614,11 +809,76 @@ impl Gate {
                 }
             }
             Target::Address => self.decide_by_address(key, now, only_current),
-            Target::Group(g, host) => {
-                self.wait_for_check(key, g, host, now);
+            Target::Group(group, host, confirmed) => {
+                self.wait_for_check(key, group, Some(host), confirmed, now);
                 Step::Consumed
             }
         }
+    }
+
+    fn classify_named(&mut self, ip: IpAddr, name: String, now: Instant) -> Target {
+        self.observe_warm_identity(ip, &name, WARM_NAME_LIFETIME, false, now);
+        match self.classifier.group_for_name(&name) {
+            Some(group) => Target::Group(group, name, true),
+            None => Target::Pass,
+        }
+    }
+
+    fn observe_warm_identity(&mut self, ip: IpAddr, name: &str, lifetime: Duration, eligible: bool, now: Instant) {
+        if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+            return;
+        }
+        if self.warm_names.len() >= MAX_WARM_IDENTITIES && !self.warm_names.contains_key(&ip) {
+            if self.next_warm_prune.is_none_or(|at| at <= now) {
+                self.warm_names.retain(|_, identity| identity.valid_until > now);
+                self.next_warm_prune = Some(now + WARM_WINDOW);
+            }
+            if self.warm_names.len() >= MAX_WARM_IDENTITIES {
+                return;
+            }
+        }
+        let until = now + lifetime;
+        let identity = self.warm_names.entry(ip).or_insert_with(|| WarmIdentity {
+            name: name.to_owned(), valid_until: now, eligible_until: None, shared: false, last_warm: None,
+        });
+        if identity.valid_until <= now {
+            identity.name.clear();
+            identity.name.push_str(name);
+            identity.shared = false;
+            identity.eligible_until = None;
+        } else if identity.name != name {
+            identity.shared = true;
+        }
+        identity.valid_until = identity.valid_until.max(until);
+        if eligible && !identity.shared {
+            identity.eligible_until = Some(identity.eligible_until.unwrap_or(until).max(until));
+        }
+    }
+
+    fn warm_known_address(&mut self, key: FlowKey, now: Instant) {
+        let Some(identity) = self.warm_names.get_mut(&key.dst) else { return };
+        if identity.shared || identity.eligible_until.is_none_or(|until| until <= now)
+            || identity.last_warm.is_some_and(|last| now.duration_since(last) < WARM_WINDOW)
+        {
+            return;
+        }
+        let Some(group) = self.classifier.group_for_name(&identity.name) else { return };
+        if self.groups.get(&group).is_some_and(|checks| checks.pending.iter()
+            .any(|check| check.target.destination.ip() == key.dst))
+        {
+            return;
+        }
+        while self.warm_sent.front().is_some_and(|at| now.duration_since(*at) >= WARM_WINDOW) {
+            self.warm_sent.pop_front();
+        }
+        if self.warm_sent.len() >= MAX_WARMS_PER_WINDOW {
+            return;
+        }
+        self.warm_sent.push_back(now);
+        identity.last_warm = Some(now);
+        self.out.push(Out::Warm {
+            group, host: identity.name.clone(), destination: SocketAddr::new(key.dst, key.dport),
+        });
     }
 
     /// Decide a holding connection by its destination address.
@@ -634,28 +894,36 @@ impl Gate {
                 }
             }
             Some((g, host)) => {
-                self.wait_for_check(key, g, host, now);
+                self.wait_for_check(key, g, host, false, now);
                 Step::Consumed
             }
         }
     }
 
-    fn wait_for_check(&mut self, key: FlowKey, group: GroupId, host: Option<String>, now: Instant) {
+    fn wait_for_check(&mut self, key: FlowKey, group: GroupId, host: Option<String>, host_confirmed: bool, now: Instant) {
         let target = CheckTarget {
             host,
+            host_confirmed,
             destination: SocketAddr::new(key.dst, key.dport),
         };
         self.expire_group(group, now);
         let reuse = self.cfg.reuse;
         let checks = self.groups.entry(group).or_default();
-        if let Some(&(ok, at)) = checks.recent.get(&target) {
-            if now.duration_since(at) < reuse {
-                if ok {
-                    self.release(key);
-                } else {
-                    self.block(key, Some((group, target.host.as_deref())));
+        if let Some(&decision) = checks.recent.get(&target) {
+            if now.duration_since(decision.at) < reuse {
+                match decision.evidence {
+                    Some(evidence) if evidence.age(self.clock).is_some_and(|age| age < EVIDENCE_AGE_MS) => {
+                        self.queue_release(CheckedRelease {
+                            key, group, target, evidence, started: now, retried: false,
+                        });
+                        return;
+                    }
+                    None => {
+                        self.block(key, Some((group, target.host.as_deref())));
+                        return;
+                    }
+                    Some(_) => {}
                 }
-                return;
             }
         }
         if let Some(check) = checks.pending.iter_mut().find(|check| check.target == target) {
@@ -671,6 +939,7 @@ impl Gate {
             self.out.push(Out::Check {
                 group,
                 host: target.host.clone(),
+                host_confirmed: target.host_confirmed,
                 destination: target.destination,
                 request_id: id,
             });
@@ -678,6 +947,7 @@ impl Gate {
                 id,
                 target,
                 started: now,
+                retried: false,
                 waiting: vec![key],
             });
         }
@@ -766,7 +1036,7 @@ impl Gate {
 enum Target {
     Pass,
     Address,
-    Group(GroupId, Option<String>),
+    Group(GroupId, String, bool),
 }
 
 // ---------------------------------------------------------------- packets
@@ -1142,7 +1412,7 @@ fn norm(s: &str) -> String {
 // -------------------------------------------------------------- DNS answers
 
 /// The question name and A/AAAA addresses of a DNS response.
-fn parse_dns_answer(m: &[u8]) -> Option<(String, Vec<IpAddr>)> {
+fn parse_dns_answer(m: &[u8]) -> Option<(String, Vec<(IpAddr, u32)>)> {
     if m.len() < 12 || m[2] & 0x80 == 0 {
         return None;
     }
@@ -1151,29 +1421,50 @@ fn parse_dns_answer(m: &[u8]) -> Option<(String, Vec<IpAddr>)> {
         return None;
     }
     let (name, mut p) = dns_name(m, 12)?;
+    if p + 4 > m.len() {
+        return None;
+    }
+    let question_type = be16(m, p);
+    let question_class = be16(m, p + 2);
     p += 4;
     let mut addrs = Vec::new();
+    let mut chain_ttl = if m[2] & 0x7a == 0 && m[3] & 0x0f == 0 { u32::MAX } else { 0 };
     for _ in 0..an.min(64) {
-        let (_, q) = dns_name(m, p)?;
+        let (owner, q) = dns_name(m, p)?;
         p = q;
         if p + 10 > m.len() {
             return None;
         }
         let (ty, rdlen) = (be16(m, p), be16(m, p + 8) as usize);
+        // A foreign-name answer remains a routing hint, but does not
+        // qualify for an advisory check before the flow identifies itself.
+        let ttl = if question_class == 1 && be16(m, p + 2) == 1 &&
+            (ty == question_type || ty == 5) && owner.eq_ignore_ascii_case(&name)
+        {
+            be32(m, p + 4)
+        } else {
+            0
+        };
+        if ty == 5 {
+            chain_ttl = chain_ttl.min(ttl);
+        }
         p += 10;
         if p + rdlen > m.len() {
             return None;
         }
         match (ty, rdlen) {
-            (1, 4) => addrs.push(IpAddr::V4(Ipv4Addr::new(m[p], m[p + 1], m[p + 2], m[p + 3]))),
+            (1, 4) => addrs.push((IpAddr::V4(Ipv4Addr::new(m[p], m[p + 1], m[p + 2], m[p + 3])), ttl)),
             (28, 16) => {
                 let mut a = [0u8; 16];
                 a.copy_from_slice(&m[p..p + 16]);
-                addrs.push(IpAddr::V6(Ipv6Addr::from(a)));
+                addrs.push((IpAddr::V6(Ipv6Addr::from(a)), ttl));
             }
             _ => {}
         }
         p += rdlen;
+    }
+    for (_, ttl) in &mut addrs {
+        *ttl = (*ttl).min(chain_ttl);
     }
     Some((norm(&name), addrs))
 }
