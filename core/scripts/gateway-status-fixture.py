@@ -16,7 +16,7 @@ def declaration(prefix):
     return source[start:end].removeprefix('private ')
 
 members = [
-    'enum State: Int', 'var stateLine: String', 'var showsConnected: Bool',
+    'enum State: Int', 'var ownLoginProgressText: String?', 'var stateLine: String', 'var showsConnected: Bool',
     'var certificateProtectionText: String', 'private func showGatewayRejection()',
     'private func observeRelayTrust(', 'private func confirmRelayRecovery()',
     'private func updateCiscoTrust(',

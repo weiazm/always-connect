@@ -56,12 +56,16 @@ final class ApprovalPrompt {
 
     func start() {
         guard cancellable == nil else { return }
-        cancellable = HelperClient.shared.$state
-            .combineLatest(HelperClient.shared.$gatewayTrustFailed)
-            .map { state, failed in failed ? HelperClient.State.disconnected : state }
+        let client = HelperClient.shared
+        cancellable = client.$state
+            .combineLatest(client.$detail.map(ApprovalPromptTracker.ownLoginSignal).removeDuplicates(),
+                           client.$gatewayTrustFailed)
+            .map { state, progress, failed in
+                Self.signal(state, own: !client.usesCisco, progress: progress, failed: failed)
+            }
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in self?.stateChanged(state) }
+            .sink { [weak self] in self?.stateChanged($0) }
     }
 
     /// Settings switched the card off: take it down now.
@@ -71,36 +75,43 @@ final class ApprovalPrompt {
             tracker = ApprovalPromptTracker()
             dismiss(animated: true)
         } else {
-            stateChanged(HelperClient.shared.gatewayTrustFailed ? .disconnected : HelperClient.shared.state)
+            let client = HelperClient.shared
+            stateChanged(Self.signal(client.state, own: !client.usesCisco,
+                                     progress: ApprovalPromptTracker.ownLoginSignal(client.detail),
+                                     failed: client.gatewayTrustFailed))
         }
     }
 
-    private func stateChanged(_ state: HelperClient.State) {
+    private static func signal(_ state: HelperClient.State, own: Bool, progress: ApprovalPromptTracker.Signal,
+                               failed: Bool) -> ApprovalPromptTracker.Signal {
+        if failed { return .ended }
+        switch state {
+        case .awaitingApproval: return own && progress == .configuring ? .configuring : .approval
+        case .authenticating:
+            guard own else { return .other }
+            return progress
+        case .connecting: return .establishing
+        case .connected: return .connected
+        case .disconnected: return .ended
+        case .reconnecting: return .other
+        }
+    }
+
+    private func stateChanged(_ signal: ApprovalPromptTracker.Signal) {
         ownLoginItem?.cancel()
         ownLoginItem = nil
         guard ProfileStore.loadAppSettings().isApprovalCardOn else { return }
-        switch state {
-        case .awaitingApproval:
-            apply(.approval)
-        case .authenticating where !HelperClient.shared.usesCisco:
-            let item = DispatchWorkItem { [weak self] in
-                guard !HelperClient.shared.gatewayTrustFailed, HelperClient.shared.state == .authenticating,
-                      !HelperClient.shared.usesCisco else { return }
-                self?.apply(.ownLogin)
-            }
-            ownLoginItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.ownLoginDelay, execute: item)
-        case .authenticating:
-            apply(.other)
-        case .connecting:
-            apply(.establishing)
-        case .connected:
-            apply(.connected)
-        case .disconnected:
-            apply(.ended)
-        case .reconnecting:
-            apply(.other)
+        if signal == .newAttempt { apply(.newAttempt) }
+        guard signal == .ownLogin || signal == .newAttempt else { apply(signal); return }
+        let item = DispatchWorkItem { [weak self] in
+            let client = HelperClient.shared
+            let current = ApprovalPromptTracker.ownLoginSignal(client.detail)
+            guard !client.gatewayTrustFailed, client.state == .authenticating, !client.usesCisco,
+                  current == .ownLogin || current == .newAttempt else { return }
+            self?.apply(.ownLogin)
         }
+        ownLoginItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.ownLoginDelay, execute: item)
     }
 
     private func apply(_ signal: ApprovalPromptTracker.Signal) {

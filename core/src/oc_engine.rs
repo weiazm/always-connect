@@ -405,6 +405,8 @@ fn interface_index(name: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
+// Presentation detail only. The connect hook still owns the connected state.
+const TUNNEL_NEGOTIATED: &str = "tunnel negotiation accepted";
 mod cstp_dns;
 mod delivered_dns;
 
@@ -2051,7 +2053,12 @@ impl Shared {
             self.handle_hook(c, payload);
             return;
         }
-        if stdout && c.forwarder.is_some() && c.cstp_dns.observe(line) && c.hook_fired {
+        let negotiated = stdout && c.forwarder.is_some() && c.cstp_dns.observe(line);
+        if negotiated && !c.hook_fired && !c.stop_requested && !c.recovery_suspended()
+            && matches!(c.driver.state, SessionStatus::Authenticating | SessionStatus::AwaitingApproval) {
+            self.report(c, TUNNEL_NEGOTIATED);
+        }
+        if negotiated && c.hook_fired {
             // A script-tun gate survives an internal transport reconnect.
             // Its previous checks no longer describe the new connection.
             self.egress_invalidate();
@@ -2091,6 +2098,7 @@ impl Shared {
         let pairs: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
         match event {
             "connect" => {
+                let hook_start = Instant::now();
                 self.egress_invalidate();
                 c.tunnel_dns.clear();
                 let mut tun = None;
@@ -2161,10 +2169,13 @@ impl Shared {
                 c.in_drop_episode = false;
                 c.driver.on_auth_outcome(AuthOutcome::Success);
                 let allow = c.config.allow_direct_egress_when_connected;
+                let guard_start = Instant::now();
                 self.load_pf(c, tun, gateway.into_iter().collect(), allow);
                 if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
                     c.direct_certificate_error = None;
                 }
+                network_guard::log(&format!("connect hook: preparation_ms={} guard_and_split_ms={}",
+                    guard_start.duration_since(hook_start).as_millis(), guard_start.elapsed().as_millis()));
                 self.report(c, c.pf_error.as_deref().unwrap_or("tunnel up"));
                 self.route_networks_direct(c);
             }
@@ -2225,7 +2236,8 @@ impl Shared {
             c.last_credential_wait = sent.elapsed().as_secs_f64();
         }
         Self::cancel(c, Timer::ApprovalProbe);
-        self.leave_approval_wait(c, "approval answered");
+        let detail = if c.cstp_dns.accepted().is_some() { TUNNEL_NEGOTIATED } else { "approval answered" };
+        self.leave_approval_wait(c, detail);
     }
 
     /// Back to Authenticating, so the outcome that follows is classified
@@ -2835,6 +2847,45 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(support).unwrap();
     }
+    #[test]
+    fn login_progress_distinguishes_http_reply_and_cstp_from_tunnel_readiness() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let sink = reports.clone();
+        let (engine, support) = split_engine_with_hooks("login-progress", Hooks {
+            state: Box::new(move |state, detail| sink.lock().unwrap().push((state, detail.to_owned()))),
+            terminal: Box::new(|_| {}), network_available: Box::new(|| true),
+            physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
+            system_roots: Box::new(|| None), stopped: Box::new(|| {}),
+        });
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.driver.start();
+            c.driver.on_authenticated();
+            c.driver.on_auth_outcome(AuthOutcome::NeedsApproval);
+            c.credential_sent_at = Some(Instant::now());
+            engine.shared.handle_line(&mut c, "Got HTTP response: HTTP/1.1 200 OK", true);
+            let auth = state_code(SessionStatus::Authenticating);
+            assert_eq!(*reports.lock().unwrap(), [(auth, "approval answered".to_owned())]);
+            let request = "> CONNECT /CSCOSSLC/tunnel HTTP/1.1";
+            let ok = "Got CONNECT response: HTTP/1.1 200 OK";
+            let complete = "CSTP connected. DPD 30, Keepalive 20";
+            for line in [request, "Got CONNECT response: HTTP/1.1 403 Forbidden", complete, request, ok] {
+                engine.shared.handle_line(&mut c, line, true);
+            }
+            assert_eq!(reports.lock().unwrap().len(), 1, "an incomplete negotiation cannot advance progress");
+            engine.shared.handle_line(&mut c, complete, true);
+            engine.shared.handle_line(&mut c, complete, true);
+            assert_eq!(*reports.lock().unwrap(), [(auth, "approval answered".to_owned()), (auth, TUNNEL_NEGOTIATED.to_owned())]);
+            assert!(!c.hook_fired);
+            assert_eq!(c.driver.state, SessionStatus::Authenticating);
+            c.stop_requested = true;
+            for line in [request, ok, complete] { engine.shared.handle_line(&mut c, line, true); }
+            assert_eq!(reports.lock().unwrap().len(), 2, "a stopping session cannot re-show the card");
+        }
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
     #[test]
     fn reconnect_uses_current_cstp_dns_even_if_the_script_reports_the_initial_servers() {
         let (engine, support) = split_engine("cstp-dns");

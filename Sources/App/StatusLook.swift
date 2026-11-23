@@ -63,11 +63,13 @@ struct PanelStatusHeader: View {
 
     init(client: HelperClient, subtitle: @autoclosure () -> String) {
         certificateRejected = client.gatewayTrustFailed
-        look = StatusLook.of(client.state, held: client.networkHeld, hasCredentials: client.hasCredentials,
+        let progress = client.ownLoginProgressText
+        let displayState: HelperClient.State = progress == nil ? client.state : .connecting
+        look = StatusLook.of(displayState, held: client.networkHeld, hasCredentials: client.hasCredentials,
                              onDemand: client.onDemandPaused, certificateRejected: certificateRejected,
                              pendingLogin: client.loginProtectionNotice != nil)
-        badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: certificateRejected)
-        self.subtitle = certificateRejected ? client.certificateProtectionText : subtitle()
+        badge = GlobeIcon.badge(for: displayState, held: client.networkHeld, certificateRejected: certificateRejected)
+        self.subtitle = certificateRejected ? client.certificateProtectionText : (progress ?? subtitle())
     }
 
     var body: some View {

@@ -94,7 +94,7 @@ struct ApprovalBubble: View {
     static func iconColor(_ stage: ApprovalPromptTracker.Stage) -> Color {
         switch stage {
         case .waiting: return .orange
-        case .establishing: return .blue
+        case .gatewayReply, .configuring, .establishing: return .blue
         case .connected: return .green
         }
     }
@@ -238,7 +238,7 @@ struct ApprovalCardIcon: View {
             case .waiting:
                 Image(systemName: "iphone.radiowaves.left.and.right")
                     .font(.system(size: 14, weight: .semibold))
-            case .establishing:
+            case .gatewayReply, .configuring, .establishing:
                 Image(systemName: "ellipsis")
                     .font(.system(size: 14, weight: .heavy))
             case .connected:

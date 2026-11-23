@@ -124,10 +124,20 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             || KeychainStore.exists(server: ProfileStore.loadProfile().server, username: username)
     }
 
-    /// One-line status text (UI-DESIGN.md §三), shared by the panel,
-    /// the Credentials page, and Diagnostics.
+    /// Localized details shared by the panel and the menu tooltip.
+    var ownLoginProgressText: String? {
+        guard !usesCisco, state == .authenticating || state == .awaitingApproval else { return nil }
+        switch ApprovalPromptTracker.ownLoginSignal(detail) {
+        case .gatewayReply: return "网关已回应，等待连接结果"
+        case .configuring: return "隧道协商完成，正在配置 VPN 网络"
+        default: return nil
+        }
+    }
+
+    /// One-line status shared by the panel, Credentials and Diagnostics.
     var stateLine: String {
         if gatewayTrustFailed { return StatusLook.certificateHeadline }
+        if let progress = ownLoginProgressText { return progress }
         switch state {
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }

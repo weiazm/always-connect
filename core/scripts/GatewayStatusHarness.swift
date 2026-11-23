@@ -52,6 +52,19 @@ struct GatewayStatusHarness {
         let trace = try String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8)
         let events = trace.split(separator: "\n").filter { $0.hasPrefix("GATEWAY_TRUST ") }
         check(events == ["GATEWAY_TRUST accepted", "GATEWAY_TRUST rejected", "GATEWAY_TRUST accepted"], "TLS fixture ordered trust callbacks")
+        let login = HelperClient()
+        for (state, detail, expected) in [(HelperClient.State.authenticating, "approval answered", "网关已回应，等待连接结果"),
+                                          (.awaitingApproval, "tunnel negotiation accepted", "隧道协商完成，正在配置 VPN 网络")] {
+            login.state = state
+            login.detail = detail
+            let header = PanelStatusHeader(client: login, subtitle: detail)
+            check(header.subtitle == expected && header.look.headline == "正在连接…", "panel shows the real login phase")
+            check(login.stateLine == expected && !login.showsConnected, "progress does not announce a live VPN")
+        }
+        login.gatewayTrustFailed = true
+        let rejected = PanelStatusHeader(client: login, subtitle: login.detail)
+        check(rejected.look.headline == StatusLook.certificateHeadline && rejected.subtitle == login.certificateProtectionText,
+              "certificate failure takes priority over the last progress report")
         let c = HelperClient()
         let pin = "synthetic-session"
         for event in events {
