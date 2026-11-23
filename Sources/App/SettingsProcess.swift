@@ -47,11 +47,12 @@ final class SettingsLink {
             transport?.send(["type": "show", "tab": tab ?? "", "egressRule": egressRule.map(String.init) ?? ""])
             return
         }
-        if let tab { UserDefaults.standard.set(tab, forKey: "settingsTab") }
+        if let tab { UserDefaults.standard.set(tab == "egress" ? "split" : tab, forKey: "settingsTab") }
         guard let executable = Bundle.main.executableURL else { return }
         let p = Process()
         p.executableURL = executable
         p.arguments = ["--settings"] + (egressRule.map { ["--egress-rule", String($0)] } ?? [])
+            + (tab == "egress" ? ["--focus-egress"] : [])
         guard let pair = PrivateDescriptors.pair(kind: 1) else { return }
         let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
         p.standardInput = child

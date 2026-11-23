@@ -16,10 +16,10 @@ struct EgressCountryApproval: Codable, Equatable, Identifiable {
                   sameSession: Bool) -> EgressProtection? {
         guard sameSession, current.enabled, current.methods == stored.methods,
               let rule = stored.groups.first(where: { $0.id == group && $0.enabled }),
-              let countries, Set(countries) == Set(rule.expect + [country]),
+              let countries, Set(countries).count == countries.count, Set(countries) == Set(rule.expect + [country]),
               let index = current.groups.firstIndex(of: rule) else { return nil }
         var updated = current
-        updated.groups[index].expect = Set(countries).sorted()
+        updated.groups[index].expect = countries
         return updated
     }
 }
@@ -146,6 +146,19 @@ extension EgressProtection.GroupState {
 }
 
 extension EgressProtection.Status {
+    // The menu-bar poll needs current availability only. History stays
+    // on demand in Settings and diagnostics, even on a long session.
+    static func monitoring(_ data: Data) -> Self? {
+        struct Snapshot: Decodable {
+            let running: Bool
+            let checking: [UInt32]
+            let groups: [EgressProtection.GroupState]
+        }
+        return (try? JSONDecoder().decode(Snapshot.self, from: data)).map {
+            .init(running: $0.running, checking: $0.checking, groups: $0.groups, records: [])
+        }
+    }
+
     var blockingNotices: [EgressProtection.BlockedGroupNotice] {
         groups.compactMap { group in
             guard group.blocked, let reason = group.blockReason else { return nil }
@@ -231,7 +244,8 @@ struct EgressNoticeLedger {
                 return blocked.insert(id).inserted ? .init(kind: .blocked, rule: group) : nil
             case .ok, .partial:
                 if blocked.contains(id) && recovered.insert(id).inserted { return .init(kind: .recovered, rule: group) }
-                if group.displayLevel == .partial && !blocked.contains(id) && partial.insert(id).inserted {
+                if group.displayLevel == .partial && (group.blockedCount ?? 0) > 0
+                    && !blocked.contains(id) && partial.insert(id).inserted {
                     return .init(kind: .partial, rule: group)
                 }
                 return nil

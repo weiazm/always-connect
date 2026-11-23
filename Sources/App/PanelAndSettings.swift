@@ -456,7 +456,7 @@ struct PanelView: View {
             if !manager.gatewayTrustFailed, let line = manager.egressLine {
                 Divider()
                 if manager.egressNotices.isEmpty {
-                    Button { onOpenSettings("split") } label: {
+                    Button { onOpenSettings("egress") } label: {
                         rowLabel("shield.lefthalf.filled", "出口保护", line,
                                  captionLines: manager.egressLevel == .blocked ? 2 : 1,
                                  captionColor: manager.egressLevel.color)
@@ -468,7 +468,7 @@ struct PanelView: View {
                         .foregroundStyle(.red)
                         .padding(.top, 8)
                     HStack {
-                        Button("查看规则") { onOpenSettings("split") }
+                        Button("查看规则") { onOpenSettings("egress") }
                         if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
                             Button("停用规则", role: .destructive) { askToDisableEgressGroup(notice.id) }
                         } else {

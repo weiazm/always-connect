@@ -22,6 +22,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
     private var window: NSWindow?
     @Published var egressRuleToOpen: UInt32?
     @Published var vpnConnectionsRequested = false
+    @Published var egressCardRequested = false
 
     func showVPNConnections() {
         vpnConnectionsRequested = true
@@ -58,7 +59,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
             ? arguments.firstIndex(of: "--egress-rule").flatMap { arguments.dropFirst($0 + 1).first }.flatMap(UInt32.init)
             : nil
         if let rule = egressRule ?? initialRule { egressRuleToOpen = rule }
-        if let tab {
+        let focusEgress = tab == "egress" || egressRule != nil || initialRule != nil
+            || (window == nil && arguments.contains("--focus-egress"))
+        if focusEgress {
+            egressCardRequested = true
+            UserDefaults.standard.set("split", forKey: "settingsTab")
+        } else if let tab {
             UserDefaults.standard.set(tab, forKey: "settingsTab")
         }
         NSApp.activate(ignoringOtherApps: true)

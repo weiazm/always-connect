@@ -682,6 +682,7 @@ enum DirectList {
 
 struct SplitPage: View {
     @ObservedObject private var manager = HelperClient.shared
+    @ObservedObject private var window = SettingsWindow.shared
     @State private var settings = ProfileStore.loadAppSettings()
     @State private var sites = DirectSites.sites(ProfileStore.loadAppSettings())
     @State private var certificates: [CertificateRelay.ClientIdentity] = []
@@ -691,6 +692,20 @@ struct SplitPage: View {
     @State private var localNetworks: [String] = []
 
     var body: some View {
+        ScrollViewReader { proxy in
+            splitForm
+                .onAppear { focusEgress(using: proxy) }
+                .onChange(of: window.egressCardRequested) { _ in focusEgress(using: proxy) }
+        }
+    }
+
+    private func focusEgress(using proxy: ScrollViewProxy) {
+        guard window.egressCardRequested else { return }
+        window.egressCardRequested = false
+        DispatchQueue.main.async { proxy.scrollTo("egress-protection", anchor: .top) }
+    }
+
+    private var splitForm: some View {
         Form {
             Section {
                 Toggle(isOn: Binding(
@@ -800,7 +815,7 @@ struct SplitPage: View {
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
 
-            EgressProtectionSection()
+            EgressProtectionSection().id("egress-protection")
 
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {

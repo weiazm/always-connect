@@ -2223,7 +2223,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         fetchEgressJSON { json in
             self.egressPollPending = false
             guard self.egressTimer != nil, self.egressSession == session else { return }
-            let status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
+            let status = json.flatMap { EgressProtection.Status.monitoring(Data($0.utf8)) }
             let notices = status?.blockingNotices ?? []
             let now = Date()
             if status?.checking.isEmpty == false {

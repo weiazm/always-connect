@@ -197,7 +197,7 @@ struct EgressNotificationHarness {
         var latest = local
         latest.groups.append(unchanged)
         let saved = approval.applying(["ZZ", "YY"], then: local, now: latest, sameSession: true)
-        check(saved?.groups[0].expect == ["YY", "ZZ"] && saved?.groups[1] == unchanged,
+        check(saved?.groups[0].expect == ["ZZ", "YY"] && saved?.groups[1] == unchanged,
               "successful receipt changes only this rule's allowed country")
         var altered = local
         altered.groups[0].name = "Edited after the confirmation"

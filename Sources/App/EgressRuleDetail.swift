@@ -64,6 +64,12 @@ struct EgressRuleDetail: View {
     @State private var message: String?
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
+    private var availableApprovals: [EgressCountryApproval] {
+        guard let status else { return [] }
+        return status.approvals(for: rule.id).filter { approval in
+            status.records.first { $0.group == rule.id && $0.started == approval.started }?.expected == rule.expect
+        }
+    }
 
     var body: some View {
         Form {
@@ -118,7 +124,7 @@ struct EgressRuleDetail: View {
                             }
                         }
                     }
-                    ForEach(status?.approvals(for: rule.id) ?? []) { approval in
+                    ForEach(availableApprovals) { approval in
                         Button("允许 \(egressCountryName(approval.country))") { pendingApproval = approval }
                             .disabled(approving)
                     }
