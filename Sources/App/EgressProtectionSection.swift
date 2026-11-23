@@ -42,12 +42,13 @@ struct EgressProtectionSection: View {
     @State private var confirmDropProtection = false
 
     private enum Sheet: Identifiable {
-        case add(UInt32?), details(UInt32), advanced(UInt32)
+        case add(UInt32?), details(UInt32), advanced(UInt32), unknownWeb
         var id: String {
             switch self {
             case .add(let id): return "add-\(id ?? 0)"
             case .details(let id): return "details-\(id)"
             case .advanced(let id): return "advanced-\(id)"
+            case .unknownWeb: return "unknown-web"
             }
         }
     }
@@ -107,6 +108,7 @@ struct EgressProtectionSection: View {
         .onAppear { visible = true; refresh(); openRequestedRule() }
         .onDisappear { visible = false; status = nil }
         .onChange(of: window.egressRuleToOpen) { _ in openRequestedRule() }
+        .onChange(of: window.unknownEgressRequested) { _ in openRequestedRule() }
         .onChange(of: manager.showsConnected) { _ in refresh() }
         .background {
             if visible && config.isActive {
@@ -138,6 +140,8 @@ struct EgressProtectionSection: View {
                         changeRule(id, edit: { $0 = group }, completion: done)
                     }
                 }
+            case .unknownWeb:
+                EgressUnknownWebView(config: stored, status: status, refresh: refresh)
             }
         }
         .sheet(item: $editingMethod) { method in
@@ -155,6 +159,7 @@ struct EgressProtectionSection: View {
                 defer { if opened { url.stopAccessingSecurityScopedResource() } }
                 var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url))
                 imported.enabled = false
+                imported.blockUnidentifiedWeb = nil
                 for index in imported.groups.indices { imported.groups[index].exitRangeCheck = false }
                 let offline = imported.rulesForEditing
                 change { $0 = offline }
@@ -184,6 +189,9 @@ struct EgressProtectionSection: View {
     }
 
     @ViewBuilder private var advanced: some View {
+        if config.isActive {
+            Button("认不出网站的连接") { sheet = .unknownWeb }
+        }
         ForEach(config.availableMethods) { method in
             HStack {
                 Button(method.name) { editingMethod = method }
@@ -244,7 +252,13 @@ struct EgressProtectionSection: View {
     }
 
     private func openRequestedRule() {
-        guard visible, let id = window.egressRuleToOpen else { return }
+        guard visible else { return }
+        if window.unknownEgressRequested {
+            window.unknownEgressRequested = false
+            if config.isActive && available { sheet = .unknownWeb }
+            return
+        }
+        guard let id = window.egressRuleToOpen else { return }
         window.egressRuleToOpen = nil
         if config.groups.contains(where: { $0.id == id }) { sheet = .details(id) }
     }

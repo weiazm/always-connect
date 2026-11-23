@@ -33,7 +33,7 @@ final class SettingsWindow {
     static let shared = SettingsWindow()
     private(set) var opened: [(String?, UInt32?)] = []
 
-    func show(tab: String?, egressRule: UInt32?) { opened.append((tab, egressRule)) }
+    func show(tab: String?, egressRule: UInt32? = nil) { opened.append((tab, egressRule)) }
 }
 typealias UNNotificationPresentationOptions = Set<NotificationOption>
 
@@ -220,6 +220,65 @@ struct EgressNotificationHarness {
               "legacy observations decode without authorizing trust")
         notifier.notifyGatewayCertificateFailure()
         check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
+        checkUnknownWeb()
+    }
+
+    static func checkUnknownWeb() {
+        let config = EgressProtection(enabled: true, groups: [.init(id: 1, name: "Fixture", enabled: true)])
+        check(config.blocksUnidentifiedWeb, "active old config defaults to blocking unidentified web")
+        var off = config
+        off.blockUnidentifiedWeb = false
+        check(!off.blocksUnidentifiedWeb && off.groups == config.groups,
+              "closing the switch does not change protected rules")
+        let data = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWebCount":7,"unknownWeb":[{"address":"198.51.100.17","port":443,"count":5,"allowed":false,"approvalId":"fixture-approval"},{"address":"2001:db8::8","port":8443,"count":2,"allowed":true,"approvalId":"fixture-withdraw"}]}"#.utf8)
+        let decoder = JSONDecoder()
+        var status = try! decoder.decode(EgressProtection.Status.self, from: data)
+        let monitor = EgressProtection.Status.monitoring(data)!
+        check(monitor.unknownCount == 7 && monitor.status.unknownWeb == nil,
+              "the panel reads real counts without retaining addresses or approval IDs")
+        let beforeCount = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWeb":[{"count":5}]}"#.utf8)
+        check(EgressProtection.Status.monitoring(beforeCount)?.unknownCount == nil,
+              "an older backend's missing scalar is unknown, with no fallback scan")
+        let approve = status.unknownWeb![0].change!
+        let withdraw = status.unknownWeb![1].change!
+        check(approve.endpoint.label == "198.51.100.17:443" && withdraw.endpoint.label == "[2001:db8::8]:8443",
+              "both address formats keep the single port explicit")
+        check(status.permits(approve, config: config) && !status.permits(approve, config: off)
+              && status.permits(withdraw, config: off) && !status.applied(approve),
+              "only the current blocked row can allow, and existing exceptions remain revocable")
+        let incorrect = EgressUnknownWebChange(endpoint: .init(address: approve.endpoint.address, port: 80),
+                                               allow: true, approvalId: approve.approvalId)
+        let stale = EgressUnknownWebChange(endpoint: approve.endpoint, allow: true, approvalId: "earlier-session")
+        check(!status.permits(incorrect, config: config) && !status.permits(stale, config: config)
+              && !status.permits(approve, config: .init()),
+              "a different port, session token or inactive policy cannot approve")
+        let oldRow = EgressProtection.UnknownWebRecord(address: "198.51.100.17", port: 443, count: 5,
+                                                        allowed: false, approvalId: nil)
+        let network = EgressProtection.UnknownWebRecord(address: "198.51.100.0/24", port: 443, count: 5,
+                                                         allowed: false, approvalId: "fixture")
+        check(oldRow.change == nil && network.change == nil, "old records and whole subnets offer no approval")
+        status.unknownWeb = []
+        check(!status.permits(approve, config: config) && !status.applied(withdraw), "an empty or vanished record cannot act as a receipt")
+        status.unknownWeb = [
+            .init(address: approve.endpoint.address, port: approve.endpoint.port, count: 5, allowed: true,
+                  approvalId: "fixture-new"),
+            .init(address: withdraw.endpoint.address, port: withdraw.endpoint.port, count: 2, allowed: false,
+                  approvalId: "fixture-new-withdraw"),
+        ]
+        check(status.applied(approve) && status.applied(withdraw) && !status.permits(approve, config: config),
+              "backend readback must show the actual allow or revoke state")
+        let expired = EgressProtection.Status(running: false, checking: [], groups: [], records: [], unknownWeb: status.unknownWeb)
+        check(!expired.applied(approve) && !expired.permits(withdraw, config: config),
+              "session end invalidates the event and receipt")
+
+        notifier.unknownEgressNotice(count: monitor.unknownCount!)
+        let alert = center.requests.last!
+        let category = center.categories.first { $0.identifier == alert.content.categoryIdentifier }
+        check(category?.actions.map(\.title) == ["查看"] && alert.content.userInfo.isEmpty
+              && !alert.content.body.contains(approve.endpoint.address),
+              "unknown-web notification has a review action and no endpoint or token")
+        respond(Notifier.reviewEgressAction, to: alert)
+        check(SettingsWindow.shared.opened.last?.0 == "unknown-egress", "notification opens the current blocked connections list")
     }
 
     static func checkExitRanges() {

@@ -11,6 +11,7 @@ sed 's/^import UserNotifications$/import Foundation/' "$ROOT/Sources/App/Notifie
 swiftc -parse-as-library "$WORK/Notifier.swift" \
     "$ROOT/Sources/Shared/EgressProtection.swift" "$ROOT/Sources/App/EgressPresentation.swift" \
     "$ROOT/Sources/App/EgressExitRange.swift" \
+    "$ROOT/Sources/App/EgressUnknownWeb.swift" \
     "$ROOT/core/scripts/EgressNotificationHarness.swift" \
     -o "$WORK/harness"
 "$WORK/harness"

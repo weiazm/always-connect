@@ -4,8 +4,10 @@ struct EgressProtection: Codable, Equatable {
     var enabled = false
     var groups: [Group] = []
     var methods: [Method] = []
+    var blockUnidentifiedWeb: Bool?
 
     var isActive: Bool { enabled && groups.contains(where: \.enabled) }
+    var blocksUnidentifiedWeb: Bool { blockUnidentifiedWeb ?? true }
 
     var availableMethods: [Method] {
         Method.presets.map { method($0.id) ?? $0 }
@@ -129,6 +131,15 @@ struct EgressProtection: Codable, Equatable {
         let checking: [UInt32]
         let groups: [GroupState]
         let records: [BlockRecord]
+        var unknownWeb: [UnknownWebRecord]? = nil
+    }
+
+    struct UnknownWebRecord: Decodable, Equatable {
+        let address: String
+        let port: UInt16
+        let count: UInt64
+        let allowed: Bool
+        let approvalId: String?
     }
 
     struct GroupState: Decodable, Identifiable {

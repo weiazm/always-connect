@@ -158,14 +158,16 @@ extension EgressProtection.GroupState {
 extension EgressProtection.Status {
     // The menu-bar poll needs current availability only. History stays
     // on demand in Settings and diagnostics, even on a long session.
-    static func monitoring(_ data: Data) -> Self? {
+    static func monitoring(_ data: Data) -> (status: Self, unknownCount: UInt64?)? {
         struct Snapshot: Decodable {
             let running: Bool
             let checking: [UInt32]
             let groups: [EgressProtection.GroupState]
+            let unknownWebCount: UInt64?
         }
         return (try? JSONDecoder().decode(Snapshot.self, from: data)).map {
-            .init(running: $0.running, checking: $0.checking, groups: $0.groups, records: [])
+            return (.init(running: $0.running, checking: $0.checking, groups: $0.groups, records: []),
+                    $0.running ? $0.unknownWebCount : nil)
         }
     }
 

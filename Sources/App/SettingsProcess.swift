@@ -47,12 +47,13 @@ final class SettingsLink {
             transport?.send(["type": "show", "tab": tab ?? "", "egressRule": egressRule.map(String.init) ?? ""])
             return
         }
-        if let tab { UserDefaults.standard.set(tab == "egress" ? "split" : tab, forKey: "settingsTab") }
+        if let tab { UserDefaults.standard.set(["egress", "unknown-egress"].contains(tab) ? "split" : tab, forKey: "settingsTab") }
         guard let executable = Bundle.main.executableURL else { return }
         let p = Process()
         p.executableURL = executable
         p.arguments = ["--settings"] + (egressRule.map { ["--egress-rule", String($0)] } ?? [])
             + (tab == "egress" ? ["--focus-egress"] : [])
+            + (tab == "unknown-egress" ? ["--focus-unknown-egress"] : [])
         guard let pair = PrivateDescriptors.pair(kind: 1) else { return }
         let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
         p.standardInput = child
@@ -170,6 +171,13 @@ final class SettingsLink {
                 return
             }
             client.allowEgressRange(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
+        case "changeUnknownWebException":
+            guard let change = try? JSONDecoder().decode(EgressUnknownWebChange.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.changeUnknownWebException(change) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
             return
         case "recheckEgressRule":
             guard let group = UInt32(argument) else { reply(id, "0"); return }

@@ -23,6 +23,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
     @Published var egressRuleToOpen: UInt32?
     @Published var vpnConnectionsRequested = false
     @Published var egressCardRequested = false
+    @Published var unknownEgressRequested = false
 
     func showVPNConnections() {
         vpnConnectionsRequested = true
@@ -58,8 +59,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
         let initialRule = window == nil
             ? arguments.firstIndex(of: "--egress-rule").flatMap { arguments.dropFirst($0 + 1).first }.flatMap(UInt32.init)
             : nil
-        if let rule = egressRule ?? initialRule { egressRuleToOpen = rule }
-        let focusEgress = tab == "egress" || egressRule != nil || initialRule != nil
+        let focusUnknown = tab == "unknown-egress" || (window == nil && arguments.contains("--focus-unknown-egress"))
+        if focusUnknown {
+            egressRuleToOpen = nil
+            unknownEgressRequested = true
+        } else if let rule = egressRule ?? initialRule {
+            unknownEgressRequested = false
+            egressRuleToOpen = rule
+        }
+        let focusEgress = focusUnknown || tab == "egress" || egressRule != nil || initialRule != nil
             || (window == nil && arguments.contains("--focus-egress"))
         if focusEgress {
             egressCardRequested = true

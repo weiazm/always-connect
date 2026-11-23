@@ -491,6 +491,14 @@ struct PanelView: View {
                         }
                     }.disabled(egressRechecking)
                 }
+                if let count = manager.egressUnknownWebCount, count > 0 {
+                    Button { onOpenSettings("unknown-egress") } label: {
+                        Label(EgressUnknownWebText.count(count), systemImage: "shield")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 8)
+                }
                 if let id = egressStopConfirmation {
                     Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
                     HStack {
