@@ -42,8 +42,16 @@ impl Drop for Run {
 }
 
 fn run(drop_protection: bool, egress_on: bool, gate: Option<&str>) -> Run {
-    let dir = std::env::temp_dir().join(format!("ac-egress-engine-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-    std::fs::create_dir(&dir).unwrap();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = loop {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ac-egress-start-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create egress fixture: {e}"),
+        }
+    };
     let cli = dir.join("openconnect");
     std::fs::write(
         &cli,
