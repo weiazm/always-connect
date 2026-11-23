@@ -11,7 +11,8 @@
 //! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"names":["a.example","*.a.example"],"cidrs":["203.0.113.0/24"]}]}`
 //! - gate -> controller: `{"check":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443,"requestId":1}}`
 //! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
-//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true}}`, `{"invalidate":true}`
+//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true}}`,
+//!   `{"blockGroup":1}` or `{"invalidate":true}`
 //!
 //! Without a controller every check times out and protected connections
 //! are refused: the gate fails closed.
@@ -21,7 +22,7 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, RequestId, Step};
+use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, RequestId, Step, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -43,16 +44,20 @@ struct ControllerCfg {
 }
 
 #[derive(Deserialize)]
-struct Verdict {
+struct ControlVerdict {
     group: GroupId,
     #[serde(rename = "requestId")]
     request_id: RequestId,
     ok: bool,
+    #[serde(default)]
+    direct: bool,
 }
 
 #[derive(Deserialize)]
 struct ControlMsg {
-    verdict: Option<Verdict>,
+    verdict: Option<ControlVerdict>,
+    #[serde(rename = "blockGroup")]
+    block_group: Option<GroupId>,
     invalidate: Option<bool>,
     /// A new configuration while running (same shape as the first line).
     probe_alpn: Option<String>,
@@ -322,9 +327,17 @@ fn main() {
                             if m.invalidate == Some(true) {
                                 gate.invalidate();
                             }
+                            if let Some(group) = m.block_group {
+                                gate.block_group(group);
+                            }
                             if let Some(v) = m.verdict {
                                 log(&format!("verdict group={} request={} ok={}", v.group, v.request_id, v.ok));
-                                gate.verdict(v.group, v.request_id, v.ok, Instant::now());
+                                let verdict = match (v.ok, v.direct) {
+                                    (false, _) => Verdict::Block,
+                                    (true, false) => Verdict::AllowDependent,
+                                    (true, true) => Verdict::AllowDirect,
+                                };
+                                gate.verdict(v.group, v.request_id, verdict, Instant::now());
                             }
                             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
                         }
@@ -519,6 +532,17 @@ mod tests {
     }
 
     #[test]
+    fn control_frames_distinguish_direct_evidence_from_group_dependent_results() {
+        let legacy = r#"{"verdict":{"group":7,"requestId":42,"ok":true}}"#;
+        let direct = r#"{"verdict":{"group":7,"requestId":42,"ok":true,"direct":true}}"#;
+        assert!(!serde_json::from_str::<ControlMsg>(legacy).unwrap().verdict.unwrap().direct);
+        assert!(serde_json::from_str::<ControlMsg>(direct).unwrap().verdict.unwrap().direct);
+        let blocked = serde_json::from_str::<ControlMsg>(r#"{"blockGroup":7}"#).unwrap();
+        assert_eq!(blocked.block_group, Some(7));
+        assert!(blocked.verdict.is_none());
+    }
+
+    #[test]
     fn deadline_frame_precedes_the_next_check_on_the_control_stream() {
         let (stream, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -568,7 +592,7 @@ mod tests {
         apply(&mut gate, &vpn, &tun, &mut control);
         assert!(control.is_none());
         assert_eq!(tun.0.borrow().len(), 2);
-        gate.verdict(2, RequestId::new(2).unwrap(), true, now + deadline);
+        gate.verdict(2, RequestId::new(2).unwrap(), Verdict::AllowDirect, now + deadline);
         apply(&mut gate, &vpn, &tun, &mut control);
         assert_eq!(remote.recv(&mut [0; 128]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }

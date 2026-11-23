@@ -6,8 +6,8 @@
 //! tunnel now, waits, or is dropped. Every new connection's first data packet
 //! is held until the gate knows where the connection goes (TLS SNI, HTTP Host,
 //! or the destination address). Connections to a protected group wait for an
-//! egress check of their destination. A failed check drops all held packets
-//! in the group and answers the Mac with a TCP RST.
+//! egress check of their destination. A failed check drops the packets
+//! waiting for that result and answers the Mac with a TCP RST.
 //!
 //! The module does no I/O: the caller feeds packets and verdicts and carries
 //! out the returned actions. It is pure Rust so it is tested on Linux.
@@ -20,6 +20,12 @@ use std::time::{Duration, Instant};
 /// A protected group (DESIGN.md §66.3); the caller's identifier.
 pub type GroupId = u32;
 pub type RequestId = NonZeroU64;
+
+pub enum Verdict {
+    Block,
+    AllowDirect,
+    AllowDependent,
+}
 
 const MAX_PENDING_PER_GROUP: usize = 16;
 const MAX_CACHED_PER_GROUP: usize = 64;
@@ -36,8 +42,7 @@ pub struct GateConfig {
     /// ALPN value the background service's own probes carry (§66.4). Empty
     /// disables the exemption.
     pub probe_alpn: Vec<u8>,
-    /// A positive verdict for the same target is reusable for this long.
-    /// After a failure, wait this long before submitting another check in the group.
+    /// Reuse a recent result only for the same target.
     pub reuse: Duration,
     /// A check not answered within this blocks the waiting connections.
     pub check_timeout: Duration,
@@ -166,9 +171,9 @@ struct PendingCheck {
 
 #[derive(Default)]
 struct GroupCheck {
-    passed: HashMap<CheckTarget, Instant>,
+    recent: HashMap<CheckTarget, (bool, Instant)>,
     pending: Vec<PendingCheck>,
-    blocked_at: Option<Instant>,
+    failure_cutoff: u64,
 }
 
 impl GroupCheck {
@@ -261,44 +266,68 @@ impl Gate {
     }
 
     /// The background service's answer to an [`Out::Check`].
-    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, ok: bool, now: Instant) {
+    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, verdict: Verdict, now: Instant) {
+        self.expire_group(group, now);
         let Some(checks) = self.groups.get_mut(&group) else { return };
         let Some(index) = checks.pending.iter().position(|check| check.id == request_id) else { return };
-        if let Some(expired) = checks.expired(now, self.cfg.check_timeout) {
-            self.timeout_group(group, expired, now);
-        } else if ok {
-            let check = checks.pending.swap_remove(index);
-            checks.blocked_at = None;
-            if checks.passed.len() < MAX_CACHED_PER_GROUP {
-                checks.passed.insert(check.target, now);
+        match verdict {
+            Verdict::Block => self.fail_check(group, index, now),
+            Verdict::AllowDependent if request_id.get() <= checks.failure_cutoff => {
+                for key in checks.pending.swap_remove(index).waiting {
+                    self.block(key);
+                }
             }
-            for key in check.waiting {
-                self.release(key);
+            Verdict::AllowDirect | Verdict::AllowDependent => {
+                let check = checks.pending.swap_remove(index);
+                if checks.recent.len() < MAX_CACHED_PER_GROUP {
+                    checks.recent.insert(check.target, (true, now));
+                }
+                for key in check.waiting {
+                    self.release(key);
+                }
             }
-        } else {
-            self.fail_group(group, index, now);
         }
     }
 
-    fn timeout_group(&mut self, group: GroupId, index: usize, now: Instant) {
-        let check = &self.groups[&group].pending[index];
-        self.out.push(Out::TimedOut {
-            group,
-            host: check.target.host.clone(),
-            destination: check.target.destination,
-            request_id: check.id,
-        });
-        self.fail_group(group, index, now);
+    /// The controller has suspended this group. Any subsequent new check
+    /// goes to the controller for a fresh decision.
+    pub fn block_group(&mut self, group: GroupId) {
+        let Some(checks) = self.groups.get_mut(&group) else { return };
+        checks.recent.retain(|_, (ok, _)| !*ok);
+        let pending = std::mem::take(&mut checks.pending);
+        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } if *id == group));
+        for key in pending.into_iter().flat_map(|check| check.waiting) {
+            self.block(key);
+        }
     }
 
-    fn fail_group(&mut self, group: GroupId, index: usize, now: Instant) {
+    fn expire_group(&mut self, group: GroupId, now: Instant) {
+        while let Some(index) = self.groups.get(&group)
+            .and_then(|checks| checks.expired(now, self.cfg.check_timeout))
+        {
+            let check = &self.groups[&group].pending[index];
+            self.out.push(Out::TimedOut {
+                group,
+                host: check.target.host.clone(),
+                destination: check.target.destination,
+                request_id: check.id,
+            });
+            self.fail_check(group, index, now);
+        }
+    }
+
+    fn fail_check(&mut self, group: GroupId, index: usize, now: Instant) {
         let checks = self.groups.get_mut(&group).expect("pending group");
         let failed = checks.pending.swap_remove(index);
-        let canceled = std::mem::take(&mut checks.pending);
-        checks.passed.clear();
-        checks.blocked_at = Some(now);
-        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } if *id == group));
-        for key in failed.waiting.into_iter().chain(canceled.into_iter().flat_map(|check| check.waiting)) {
+        // A dependent result may already be on the wire when a local
+        // deadline fires. Independent results still speak for their own key.
+        checks.failure_cutoff = self.last_request;
+        checks.recent.retain(|_, (ok, at)| !*ok && now.duration_since(*at) < self.cfg.reuse);
+        if checks.recent.len() < MAX_CACHED_PER_GROUP {
+            checks.recent.insert(failed.target, (false, now));
+        }
+        self.out.retain(|out| !matches!(out, Out::Check { request_id, .. } if *request_id == failed.id));
+        for key in failed.waiting {
             self.block(key);
         }
     }
@@ -309,14 +338,14 @@ impl Gate {
         let timed_out: Vec<_> = self
             .groups
             .iter()
-            .filter_map(|(&id, checks)| checks.expired(now, self.cfg.check_timeout).map(|index| (id, index)))
+            .filter_map(|(&id, checks)| checks.expired(now, self.cfg.check_timeout).is_some().then_some(id))
             .collect();
-        for (id, index) in timed_out {
-            self.timeout_group(id, index, now);
+        for group in timed_out {
+            self.expire_group(group, now);
         }
         self.groups.retain(|_, checks| {
-            checks.passed.retain(|_, at| now.duration_since(*at) < self.cfg.reuse);
-            !checks.pending.is_empty() || !checks.passed.is_empty() || checks.blocked_at.is_some()
+            checks.recent.retain(|_, (_, at)| now.duration_since(*at) < self.cfg.reuse);
+            !checks.pending.is_empty() || !checks.recent.is_empty()
         });
         let stale: Vec<FlowKey> = self
             .flows
@@ -535,20 +564,18 @@ impl Gate {
             host,
             destination: SocketAddr::new(key.dst, key.dport),
         };
-        if let Some(index) = self.groups.get(&group).and_then(|checks| checks.expired(now, self.cfg.check_timeout)) {
-            self.timeout_group(group, index, now);
-        }
+        self.expire_group(group, now);
         let reuse = self.cfg.reuse;
         let checks = self.groups.entry(group).or_default();
-        if checks.blocked_at.is_some_and(|at| now.duration_since(at) < reuse) {
-            self.block(key);
-            return;
-        }
-        // After the cooldown the controller rechecks any unresolved failed
-        // destinations together with this request's destination.
-        if checks.passed.get(&target).is_some_and(|at| now.duration_since(*at) < reuse) {
-            self.release(key);
-            return;
+        if let Some(&(ok, at)) = checks.recent.get(&target) {
+            if now.duration_since(at) < reuse {
+                if ok {
+                    self.release(key);
+                } else {
+                    self.block(key);
+                }
+                return;
+            }
         }
         if let Some(check) = checks.pending.iter_mut().find(|check| check.target == target) {
             check.waiting.push(key);
