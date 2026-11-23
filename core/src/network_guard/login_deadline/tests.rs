@@ -44,7 +44,13 @@ impl Fixture {
 D=${0%/*}
 printf '%s\n' "$*" >> "$D/calls"
 case "$*" in
-    '-E') [ ! -f "$D/reject-enable" ] || exit 1; echo 'Token : 10' >&2 ;;
+    '-E')
+        if [ -f "$D/stall-first-enable" ]; then
+            rm "$D/stall-first-enable"
+            exec /bin/sleep 20
+        fi
+        [ ! -f "$D/reject-enable" ] || exit 1
+        echo 'Token : 10' >&2 ;;
     '-a com.apple/300.AlwaysConnect -f -')
         if [ -f "$D/stall-load" ]; then exec /bin/sleep 20; fi
         if [ -f "$D/reject-next-load" ]; then rm "$D/reject-next-load"; exit 1; fi
@@ -104,12 +110,16 @@ esac
 
     fn until(&self, check: impl Fn() -> bool) {
         let limit = Instant::now() + Duration::from_secs(6);
-        while !check() {
+        loop {
+            let ready = check();
             assert!(
                 Instant::now() < limit,
                 "pfctl calls: {}",
                 self.read("calls")
             );
+            if ready {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -216,6 +226,8 @@ fn loaded_rules_with_ambiguous_old_state_never_report_confirmed() {
 #[test]
 fn rule_install_timeout_is_bounded_and_a_later_recovery_can_rearm() {
     let fixture = Fixture::new();
+    // Enabling PF can use the first attempt's entire load budget.
+    fixture.write("stall-first-enable", "");
     fixture.write("stall-load", "");
     let token = fixture.arm(CISCO_HOLDER, CUTOFF);
     assert_ne!(token, 0);
@@ -226,7 +238,15 @@ fn rule_install_timeout_is_bounded_and_a_later_recovery_can_rearm() {
     );
     assert!(!fixture.guard.is_holding());
     assert!(fixture.finish(token).is_err());
-    assert_eq!(fixture.read("calls").matches("-f -\n").count(), 3);
+    // Count attempts in the parent. The deadline can expire before a
+    // load is launched or before the child gets to log its arguments.
+    let (load_attempts, child_timed_out) = {
+        let state = fixture.guard.state.lock().unwrap();
+        (state.pf.bounded_load_attempts, state.pf.audit_child_timed_out.get())
+    };
+    assert_eq!(load_attempts, 3);
+    assert!(child_timed_out, "pfctl never reached the subprocess timeout");
+    assert_eq!(fixture.read("rules"), "");
     assert_eq!(fixture.arm(CISCO_HOLDER, Duration::from_secs(3)), 0);
     fixture.guard.release(None, reason::USER);
     fs::remove_file(fixture.dir.join("stall-load")).unwrap();

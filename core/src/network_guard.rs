@@ -159,6 +159,10 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
 struct Pfctl {
     path: Option<String>,
     token: Option<String>,
+    #[cfg(test)]
+    bounded_load_attempts: usize,
+    #[cfg(test)]
+    audit_child_timed_out: std::cell::Cell<bool>,
 }
 
 impl Pfctl {
@@ -189,9 +193,13 @@ impl Pfctl {
                 match child.try_wait() {
                     Ok(Some(status)) => break status.success(),
                     Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(3)),
-                    _ => {
+                    _status => {
                         let _ = child.kill();
                         let _ = child.wait();
+                        #[cfg(test)]
+                        if matches!(_status, Ok(None)) {
+                            self.audit_child_timed_out.set(true);
+                        }
                         break false;
                     }
                 }
@@ -265,6 +273,10 @@ impl Pfctl {
     }
 
     fn load_before(&mut self, anchor_text: &str, deadline: Instant) -> Result<(), ()> {
+        #[cfg(test)]
+        {
+            self.bounded_load_attempts += 1;
+        }
         if self.token.is_none() {
             let out = self.audit(&["-E"], deadline)?;
             self.token = Self::parse_token(&out.stderr);
@@ -329,7 +341,14 @@ pub fn shared() -> Option<Arc<Guard>> {
 
 impl Guard {
     pub fn new(settings: Settings) -> Guard {
-        let pf = Pfctl { path: settings.pfctl.clone(), token: None };
+        let pf = Pfctl {
+            path: settings.pfctl.clone(),
+            token: None,
+            #[cfg(test)]
+            bounded_load_attempts: 0,
+            #[cfg(test)]
+            audit_child_timed_out: std::cell::Cell::new(false),
+        };
         Guard {
             settings,
             state: Mutex::new(State {
