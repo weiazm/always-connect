@@ -5,20 +5,24 @@
 //! gate program; this module decides, per packet, whether it goes on into the
 //! tunnel now, waits, or is dropped. Every new connection's first data packet
 //! is held until the gate knows where the connection goes (TLS SNI, HTTP Host,
-//! or the destination address). Connections to a protected group wait for that
-//! group's egress check; everything else passes at once and is never looked at
-//! again. A failed check drops the held packets and answers the Mac with a TCP
-//! RST, so the application fails fast and no data reaches the site.
+//! or the destination address). Connections to a protected group wait for an
+//! egress check of their destination. A failed check drops all held packets
+//! in the group and answers the Mac with a TCP RST.
 //!
 //! The module does no I/O: the caller feeds packets and verdicts and carries
 //! out the returned actions. It is pure Rust so it is tested on Linux.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 /// A protected group (DESIGN.md §66.3); the caller's identifier.
 pub type GroupId = u32;
+pub type RequestId = NonZeroU64;
+
+const MAX_PENDING_PER_GROUP: usize = 16;
+const MAX_CACHED_PER_GROUP: usize = 64;
 
 /// Which group, if any, a name or address belongs to. Backed by the rule
 /// engine in production; the gate only asks.
@@ -32,7 +36,8 @@ pub struct GateConfig {
     /// ALPN value the background service's own probes carry (§66.4). Empty
     /// disables the exemption.
     pub probe_alpn: Vec<u8>,
-    /// A group verdict younger than this is reused (§66.6).
+    /// A positive verdict for the same target is reusable for this long.
+    /// After a failure, wait this long before submitting another check in the group.
     pub reuse: Duration,
     /// A check not answered within this blocks the waiting connections.
     pub check_timeout: Duration,
@@ -84,9 +89,20 @@ pub enum Out {
     ToTunnel(Vec<u8>),
     /// A packet for the Mac side (a RST for a blocked connection).
     ToHost(Vec<u8>),
-    /// Ask the background service to check this group's egress now.
-    /// `host` is the name the triggering connection asked for, if known.
-    Check { group: GroupId, host: Option<String> },
+    /// Ask the background service to check this exact destination.
+    Check {
+        group: GroupId,
+        host: Option<String>,
+        destination: SocketAddr,
+        request_id: RequestId,
+    },
+    /// Record a local deadline failure before sending another check.
+    TimedOut {
+        group: GroupId,
+        host: Option<String>,
+        destination: SocketAddr,
+        request_id: RequestId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,9 +141,8 @@ struct Held {
     stream: Vec<u8>,
     next: u32,
     since: Instant,
-    /// Set once classified as protected: waiting for this group's verdict.
-    group: Option<GroupId>,
-    host: Option<String>,
+    /// Set once classified as protected: the request holds this flow's key.
+    checking: bool,
     last: Option<ClientSeg>,
 }
 
@@ -136,10 +151,33 @@ struct Flow {
     last_seen: Instant,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct CheckTarget {
+    host: Option<String>,
+    destination: SocketAddr,
+}
+
+struct PendingCheck {
+    id: RequestId,
+    target: CheckTarget,
+    started: Instant,
+    waiting: Vec<FlowKey>,
+}
+
 #[derive(Default)]
 struct GroupCheck {
-    verdict: Option<(bool, Instant)>,
-    inflight: Option<Instant>,
+    passed: HashMap<CheckTarget, Instant>,
+    pending: Vec<PendingCheck>,
+    blocked_at: Option<Instant>,
+}
+
+impl GroupCheck {
+    fn expired(&self, now: Instant, timeout: Duration) -> Option<usize> {
+        self.pending.iter().enumerate()
+            .filter(|(_, check)| now.duration_since(check.started) >= timeout)
+            .min_by_key(|(_, check)| (check.started, check.id))
+            .map(|(index, _)| index)
+    }
 }
 
 pub struct Gate {
@@ -147,13 +185,22 @@ pub struct Gate {
     classifier: Box<dyn Classifier + Send>,
     flows: HashMap<FlowKey, Flow>,
     groups: HashMap<GroupId, GroupCheck>,
+    last_request: u64,
     learned: HashMap<IpAddr, (GroupId, String, Instant)>,
     out: Vec<Out>,
 }
 
 impl Gate {
     pub fn new(cfg: GateConfig, classifier: Box<dyn Classifier + Send>) -> Self {
-        Gate { cfg, classifier, flows: HashMap::new(), groups: HashMap::new(), learned: HashMap::new(), out: Vec::new() }
+        Gate {
+            cfg,
+            classifier,
+            flows: HashMap::new(),
+            groups: HashMap::new(),
+            last_request: 0,
+            learned: HashMap::new(),
+            out: Vec::new(),
+        }
     }
 
     /// Actions produced since the last drain, in order.
@@ -163,10 +210,9 @@ impl Gate {
 
     /// Forget every verdict (reconnect, network change, wake: §66.6).
     pub fn invalidate(&mut self) {
-        let pending: Vec<_> = self.flows.iter().filter_map(|(key, flow)|
-            matches!(&flow.state, State::Holding(held) if held.group.is_some()).then_some(*key)).collect();
-        self.groups.clear();
-        for key in pending {
+        let groups = std::mem::take(&mut self.groups);
+        self.out.retain(|out| !matches!(out, Out::Check { .. }));
+        for key in groups.into_values().flat_map(|group| group.pending).flat_map(|check| check.waiting) {
             self.block(key);
         }
     }
@@ -215,41 +261,67 @@ impl Gate {
     }
 
     /// The background service's answer to an [`Out::Check`].
-    pub fn verdict(&mut self, group: GroupId, ok: bool, now: Instant) {
-        let g = self.groups.entry(group).or_default();
-        g.verdict = Some((ok, now));
-        g.inflight = None;
-        let waiting: Vec<FlowKey> = self
-            .flows
-            .iter()
-            .filter(|(_, f)| matches!(&f.state, State::Holding(h) if h.group == Some(group)))
-            .map(|(k, _)| *k)
-            .collect();
-        for k in waiting {
-            if ok {
-                self.release(k);
-            } else {
-                self.block(k);
+    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, ok: bool, now: Instant) {
+        let Some(checks) = self.groups.get_mut(&group) else { return };
+        let Some(index) = checks.pending.iter().position(|check| check.id == request_id) else { return };
+        if let Some(expired) = checks.expired(now, self.cfg.check_timeout) {
+            self.timeout_group(group, expired, now);
+        } else if ok {
+            let check = checks.pending.swap_remove(index);
+            checks.blocked_at = None;
+            if checks.passed.len() < MAX_CACHED_PER_GROUP {
+                checks.passed.insert(check.target, now);
             }
+            for key in check.waiting {
+                self.release(key);
+            }
+        } else {
+            self.fail_group(group, index, now);
+        }
+    }
+
+    fn timeout_group(&mut self, group: GroupId, index: usize, now: Instant) {
+        let check = &self.groups[&group].pending[index];
+        self.out.push(Out::TimedOut {
+            group,
+            host: check.target.host.clone(),
+            destination: check.target.destination,
+            request_id: check.id,
+        });
+        self.fail_group(group, index, now);
+    }
+
+    fn fail_group(&mut self, group: GroupId, index: usize, now: Instant) {
+        let checks = self.groups.get_mut(&group).expect("pending group");
+        let failed = checks.pending.swap_remove(index);
+        let canceled = std::mem::take(&mut checks.pending);
+        checks.passed.clear();
+        checks.blocked_at = Some(now);
+        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } if *id == group));
+        for key in failed.waiting.into_iter().chain(canceled.into_iter().flat_map(|check| check.waiting)) {
+            self.block(key);
         }
     }
 
     /// Timers: checks that took too long, ClientHellos that never finished,
     /// idle connections.
     pub fn tick(&mut self, now: Instant) {
-        let timed_out: Vec<GroupId> = self
+        let timed_out: Vec<_> = self
             .groups
             .iter()
-            .filter(|(_, g)| g.inflight.is_some_and(|t| now.duration_since(t) >= self.cfg.check_timeout))
-            .map(|(id, _)| *id)
+            .filter_map(|(&id, checks)| checks.expired(now, self.cfg.check_timeout).map(|index| (id, index)))
             .collect();
-        for id in timed_out {
-            self.verdict(id, false, now);
+        for (id, index) in timed_out {
+            self.timeout_group(id, index, now);
         }
+        self.groups.retain(|_, checks| {
+            checks.passed.retain(|_, at| now.duration_since(*at) < self.cfg.reuse);
+            !checks.pending.is_empty() || !checks.passed.is_empty() || checks.blocked_at.is_some()
+        });
         let stale: Vec<FlowKey> = self
             .flows
             .iter()
-            .filter(|(_, f)| matches!(&f.state, State::Holding(h) if h.group.is_none() && now.duration_since(h.since) >= self.cfg.classify_timeout))
+            .filter(|(_, f)| matches!(&f.state, State::Holding(h) if !h.checking && now.duration_since(h.since) >= self.cfg.classify_timeout))
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
@@ -285,9 +357,12 @@ impl Gate {
                 Step::Forward
             }
             Some((group, host)) => {
-                let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, group: None, host: None, last: None };
-                self.insert(key, State::Holding(Box::new(held)), now);
-                self.wait_for_group(key, group, host, now);
+                if pkt.len() <= self.cfg.max_held_bytes {
+                    let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, checking: false, last: None };
+                    if self.insert(key, State::Holding(Box::new(held)), now) {
+                        self.wait_for_check(key, group, host, now);
+                    }
+                }
                 Step::Consumed
             }
         }
@@ -299,16 +374,13 @@ impl Gate {
         let syn = t.flags & SYN != 0;
         let data_start = if syn { t.seq.wrapping_add(1) } else { t.seq };
         if !self.flows.contains_key(&key) {
-            if syn && p.payload.is_empty() {
-                self.insert(key, State::Fresh { next: data_start }, now);
-                return Step::Forward;
-            }
-            if p.payload.is_empty() {
-                return Step::Forward;
-            }
             if syn {
-                // TCP Fast Open: the ClientHello rides on the SYN.
-                self.insert(key, State::Fresh { next: data_start }, now);
+                if !self.insert(key, State::Fresh { next: data_start }, now) {
+                    self.reset(key, seg);
+                    return Step::Consumed;
+                }
+            } else if p.payload.is_empty() {
+                return Step::Forward;
             } else {
                 // Mid-stream (forgotten or older than the gate): no start of
                 // stream to parse, so decide by address.
@@ -318,9 +390,14 @@ impl Gate {
                         Step::Forward
                     }
                     Some((group, host)) => {
-                        let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, group: None, host: None, last: Some(seg) };
-                        self.insert(key, State::Holding(Box::new(held)), now);
-                        self.wait_for_group(key, group, host, now);
+                        if pkt.len() <= self.cfg.max_held_bytes {
+                            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, checking: false, last: Some(seg) };
+                            if self.insert(key, State::Holding(Box::new(held)), now) {
+                                self.wait_for_check(key, group, host, now);
+                                return Step::Consumed;
+                            }
+                        }
+                        self.reset(key, seg);
                         Step::Consumed
                     }
                 };
@@ -332,9 +409,7 @@ impl Gate {
             State::Pass => Step::Forward,
             State::Blocked => {
                 if !p.payload.is_empty() || syn {
-                    if let Some(rst) = build_rst(&key, seg) {
-                        self.out.push(Out::ToHost(rst));
-                    }
+                    self.reset(key, seg);
                 }
                 Step::Consumed
             }
@@ -342,8 +417,13 @@ impl Gate {
                 if p.payload.is_empty() {
                     return Step::Forward;
                 }
+                if pkt.len() > self.cfg.max_held_bytes {
+                    f.state = State::Blocked;
+                    self.reset(key, seg);
+                    return Step::Consumed;
+                }
                 let next = *next;
-                let mut held = Held { packets: Vec::new(), bytes: 0, stream: Vec::new(), next, since: now, group: None, host: None, last: Some(seg) };
+                let mut held = Held { packets: Vec::new(), bytes: 0, stream: Vec::new(), next, since: now, checking: false, last: Some(seg) };
                 if data_start == next {
                     held.stream.extend_from_slice(p.payload);
                     held.next = next.wrapping_add(seg.len);
@@ -354,6 +434,9 @@ impl Gate {
                 self.after_hold(key, now, true)
             }
             State::Holding(h) => {
+                if h.bytes.saturating_add(pkt.len()) > self.cfg.max_held_bytes {
+                    return Step::Consumed;
+                }
                 if p.payload.is_empty() && !syn {
                     // Pure ACKs keep their place behind the held data.
                     h.packets.push(pkt.to_vec());
@@ -371,8 +454,7 @@ impl Gate {
                 h.packets.push(pkt.to_vec());
                 h.bytes += pkt.len();
                 h.last = Some(seg);
-                let waiting = h.group.is_some();
-                if waiting {
+                if h.checking {
                     Step::Consumed
                 } else {
                     self.after_hold(key, now, false)
@@ -423,7 +505,7 @@ impl Gate {
             }
             Target::Address => self.decide_by_address(key, now, only_current),
             Target::Group(g, host) => {
-                self.wait_for_group(key, g, host, now);
+                self.wait_for_check(key, g, host, now);
                 Step::Consumed
             }
         }
@@ -442,32 +524,57 @@ impl Gate {
                 }
             }
             Some((g, host)) => {
-                self.wait_for_group(key, g, host, now);
+                self.wait_for_check(key, g, host, now);
                 Step::Consumed
             }
         }
     }
 
-    fn wait_for_group(&mut self, key: FlowKey, group: GroupId, host: Option<String>, now: Instant) {
-        if let Some(Flow { state: State::Holding(h), .. }) = self.flows.get_mut(&key) {
-            h.group = Some(group);
-            h.host = host.clone();
+    fn wait_for_check(&mut self, key: FlowKey, group: GroupId, host: Option<String>, now: Instant) {
+        let target = CheckTarget {
+            host,
+            destination: SocketAddr::new(key.dst, key.dport),
+        };
+        if let Some(index) = self.groups.get(&group).and_then(|checks| checks.expired(now, self.cfg.check_timeout)) {
+            self.timeout_group(group, index, now);
         }
         let reuse = self.cfg.reuse;
-        let g = self.groups.entry(group).or_default();
-        if let Some((ok, at)) = g.verdict {
-            if now.duration_since(at) < reuse {
-                if ok {
-                    self.release(key);
-                } else {
-                    self.block(key);
-                }
-                return;
-            }
+        let checks = self.groups.entry(group).or_default();
+        if checks.blocked_at.is_some_and(|at| now.duration_since(at) < reuse) {
+            self.block(key);
+            return;
         }
-        if g.inflight.is_none() {
-            g.inflight = Some(now);
-            self.out.push(Out::Check { group, host });
+        // After the cooldown the controller rechecks any unresolved failed
+        // destinations together with this request's destination.
+        if checks.passed.get(&target).is_some_and(|at| now.duration_since(*at) < reuse) {
+            self.release(key);
+            return;
+        }
+        if let Some(check) = checks.pending.iter_mut().find(|check| check.target == target) {
+            check.waiting.push(key);
+        } else {
+            let Some(id) = self.last_request.checked_add(1).and_then(RequestId::new)
+                .filter(|_| checks.pending.len() < MAX_PENDING_PER_GROUP)
+            else {
+                self.block(key);
+                return;
+            };
+            self.last_request = id.get();
+            self.out.push(Out::Check {
+                group,
+                host: target.host.clone(),
+                destination: target.destination,
+                request_id: id,
+            });
+            checks.pending.push(PendingCheck {
+                id,
+                target,
+                started: now,
+                waiting: vec![key],
+            });
+        }
+        if let Some(Flow { state: State::Holding(held), .. }) = self.flows.get_mut(&key) {
+            held.checking = true;
         }
     }
 
@@ -484,10 +591,14 @@ impl Gate {
         let Some(f) = self.flows.get_mut(&key) else { return };
         if let State::Holding(h) = std::mem::replace(&mut f.state, State::Blocked) {
             if let (6, Some(last)) = (key.proto, h.last) {
-                if let Some(rst) = build_rst(&key, last) {
-                    self.out.push(Out::ToHost(rst));
-                }
+                self.reset(key, last);
             }
+        }
+    }
+
+    fn reset(&mut self, key: FlowKey, seg: ClientSeg) {
+        if let Some(rst) = build_rst(&key, seg) {
+            self.out.push(Out::ToHost(rst));
         }
     }
 
@@ -497,11 +608,15 @@ impl Gate {
         }
     }
 
-    fn insert(&mut self, key: FlowKey, state: State, now: Instant) {
+    fn insert(&mut self, key: FlowKey, state: State, now: Instant) -> bool {
         if self.flows.len() >= self.cfg.max_flows {
             self.evict();
+            if self.flows.len() >= self.cfg.max_flows {
+                return false;
+            }
         }
         self.flows.insert(key, Flow { state, last_seen: now });
+        true
     }
 
     /// Drop the oldest eighth of passed/blocked connections. Holding ones are
@@ -510,7 +625,7 @@ impl Gate {
         let mut idle: Vec<(Instant, FlowKey)> = self
             .flows
             .iter()
-            .filter(|(_, f)| !matches!(f.state, State::Holding(_)))
+            .filter(|(_, f)| matches!(f.state, State::Pass | State::Blocked))
             .map(|(k, f)| (f.last_seen, *k))
             .collect();
         idle.sort_by_key(|(t, _)| *t);

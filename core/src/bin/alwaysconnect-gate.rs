@@ -9,8 +9,9 @@
 //! one JSON object per line:
 //!
 //! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"names":["a.example","*.a.example"],"cidrs":["203.0.113.0/24"]}]}`
-//! - gate -> controller: `{"check":{"group":1,"host":"a.example"}}`
-//! - controller -> gate: `{"verdict":{"group":1,"ok":true}}`, `{"invalidate":true}`
+//! - gate -> controller: `{"check":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443,"requestId":1}}`
+//! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
+//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true}}`, `{"invalidate":true}`
 //!
 //! Without a controller every check times out and protected connections
 //! are refused: the gate fails closed.
@@ -20,9 +21,10 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, Step};
+use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, RequestId, Step};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +45,8 @@ struct ControllerCfg {
 #[derive(Deserialize)]
 struct Verdict {
     group: GroupId,
+    #[serde(rename = "requestId")]
+    request_id: RequestId,
     ok: bool,
 }
 
@@ -301,40 +305,38 @@ fn main() {
         if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             break;
         }
-        let now = Instant::now();
         if buffered || (fds.len() > 2 && fds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0) {
             let mut lost = false;
-            if let Some(c) = &mut control {
-                loop {
-                    match c.reader.read_until(b'\n', &mut ctl_line) {
-                        Ok(0) => {
-                            lost = true;
-                            break;
-                        }
-                        Ok(_) => match serde_json::from_slice::<ControlMsg>(&std::mem::take(&mut ctl_line)) {
-                            Ok(m) => {
-                                if let Some(v) = m.verdict {
-                                    log(&format!("verdict group={} ok={}", v.group, v.ok));
-                                    gate.verdict(v.group, v.ok, Instant::now());
-                                }
-                                if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
-                                    log("new configuration");
-                                    gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
-                                }
-                                if m.invalidate == Some(true) {
-                                    gate.invalidate();
-                                }
+            while let Some(c) = &mut control {
+                match c.reader.read_until(b'\n', &mut ctl_line) {
+                    Ok(0) => {
+                        lost = true;
+                        break;
+                    }
+                    Ok(_) => match serde_json::from_slice::<ControlMsg>(&std::mem::take(&mut ctl_line)) {
+                        Ok(m) => {
+                            if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
+                                log("new configuration");
+                                gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
                             }
-                            Err(e) => log(&format!("bad control line: {e}")),
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            lost = ctl_line.len() > 524_288;
-                            break;
+                            if m.invalidate == Some(true) {
+                                gate.invalidate();
+                            }
+                            if let Some(v) = m.verdict {
+                                log(&format!("verdict group={} request={} ok={}", v.group, v.request_id, v.ok));
+                                gate.verdict(v.group, v.request_id, v.ok, Instant::now());
+                            }
+                            apply(&mut gate, &vpn, tun.as_ref(), &mut control);
                         }
-                        Err(_) => {
-                            lost = true;
-                            break;
-                        }
+                        Err(e) => log(&format!("bad control line: {e}")),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        lost = ctl_line.len() > 524_288;
+                        break;
+                    }
+                    Err(_) => {
+                        lost = true;
+                        break;
                     }
                 }
             }
@@ -345,6 +347,7 @@ fn main() {
             }
             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
         }
+        let now = Instant::now();
         if fds[0].revents & libc::POLLIN != 0 {
             // Drain a burst from the Mac side.
             for _ in 0..64 {
@@ -399,22 +402,174 @@ fn send(vpn: &OwnedFd, pkt: &[u8]) -> std::io::Result<usize> {
     sys(unsafe { libc::send(vpn.as_raw_fd(), pkt.as_ptr().cast(), pkt.len(), 0) })
 }
 
+fn check_line(kind: &str, group: GroupId, host: Option<&str>, destination: SocketAddr, request_id: RequestId) -> String {
+    serde_json::json!({
+        (kind): {
+            "group": group,
+            "host": host,
+            "ip": destination.ip(),
+            "port": destination.port(),
+            "requestId": request_id,
+        },
+    }).to_string() + "\n"
+}
+
 fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Control>) {
+    let had_controller = control.is_some();
     for o in gate.drain() {
-        match o {
+        let (kind, group, host, destination, request_id) = match o {
             Out::ToTunnel(p) => {
                 let _ = send(vpn, &p);
+                continue;
             }
             Out::ToHost(p) => {
                 let _ = tun.write(&p);
+                continue;
             }
-            Out::Check { group, host } => {
-                log(&format!("check group={group}"));
-                if let Some(c) = control {
-                    let line = serde_json::json!({ "check": { "group": group, "host": host } }).to_string() + "\n";
-                    let _ = c.stream.write_all(line.as_bytes());
-                }
+            Out::Check { group, host, destination, request_id } => ("check", group, host, destination, request_id),
+            Out::TimedOut { group, host, destination, request_id } => ("timedOut", group, host, destination, request_id),
+        };
+        if let Some(c) = control {
+            log(&format!("{kind} group={group} request={request_id}"));
+            let line = check_line(kind, group, host.as_deref(), destination, request_id);
+            if let Err(error) = c.stream.write_all(line.as_bytes()) {
+                log(&format!("controller write failed: {error}"));
+                *control = None;
             }
         }
+    }
+    if had_controller && control.is_none() {
+        gate.invalidate();
+        for action in gate.drain() {
+            if let Out::ToHost(packet) = action {
+                let _ = tun.write(&packet);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alwaysconnect_core::egress_gate::Classifier;
+    use std::cell::RefCell;
+    use std::net::IpAddr;
+    use std::os::unix::net::UnixDatagram;
+
+    struct ExampleRoutes;
+
+    impl Classifier for ExampleRoutes {
+        fn group_for_name(&self, _: &str) -> Option<GroupId> { None }
+
+        fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId> {
+            let IpAddr::V4(ip) = ip else { return None };
+            Some(u32::from(ip.octets()[3]))
+        }
+    }
+
+    #[derive(Default)]
+    struct TestTun(RefCell<Vec<Vec<u8>>>);
+
+    impl Tun for TestTun {
+        fn fd(&self) -> RawFd { unreachable!() }
+        fn read<'a>(&self, _: &'a mut [u8]) -> std::io::Result<&'a [u8]> { unreachable!() }
+        fn write(&self, packet: &[u8]) -> std::io::Result<()> {
+            self.0.borrow_mut().push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    fn hold_packet(gate: &mut Gate, dst: u8, now: Instant) {
+        // The gate sees only synthetic midstream TCP data.
+        let mut packet = [0; 41];
+        packet[0] = 0x45;
+        packet[3] = packet.len() as u8;
+        packet[9] = 6;
+        packet[12..20].copy_from_slice(&[192, 0, 2, 10, 198, 51, 100, dst]);
+        packet[20..24].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
+        packet[32] = 0x50;
+        packet[33] = 0x18;
+        assert_eq!(gate.outbound(&packet, now), Step::Consumed);
+    }
+
+    #[test]
+    fn check_carries_the_numeric_destination_and_request_id() {
+        let destination = "[2001:db8::1]:8443".parse().unwrap();
+        let id = RequestId::new(u64::MAX).unwrap();
+        let line = check_line("check", 7, Some("a.example"), destination, id);
+        assert!(line.ends_with('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({
+                "check": {"group": 7, "host": "a.example", "ip": "2001:db8::1", "port": 8443, "requestId": u64::MAX},
+            })
+        );
+    }
+
+    #[test]
+    fn verdict_requires_a_nonzero_request_id() {
+        let line = r#"{"verdict":{"group":7,"requestId":42,"ok":true}}"#;
+        assert_eq!(serde_json::from_str::<ControlMsg>(line).unwrap().verdict.unwrap().request_id.get(), 42);
+        for invalid in [
+            r#"{"verdict":{"group":7,"requestId":0,"ok":true}}"#,
+            r#"{"verdict":{"group":7,"ok":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<ControlMsg>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn deadline_frame_precedes_the_next_check_on_the_control_stream() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut peer = BufReader::new(peer);
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream });
+        let (vpn, _remote) = UnixDatagram::pair().unwrap();
+        let vpn = vpn.into();
+        let tun = TestTun::default();
+        let cfg = GateConfig::default();
+        let deadline = cfg.check_timeout;
+        let mut gate = Gate::new(cfg, Box::new(ExampleRoutes));
+        let now = Instant::now();
+        hold_packet(&mut gate, 1, now);
+        apply(&mut gate, &vpn, &tun, &mut control);
+        gate.tick(now + deadline);
+        hold_packet(&mut gate, 2, now + deadline);
+        apply(&mut gate, &vpn, &tun, &mut control);
+
+        let frames: Vec<serde_json::Value> = (&mut peer).lines().take(3)
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames[0]["check"], frames[1]["timedOut"]);
+        assert_eq!(frames[1]["timedOut"]["ip"], "198.51.100.1");
+        assert_eq!(frames[2]["check"]["ip"], "198.51.100.2");
+        assert_ne!(frames[2]["check"]["requestId"], frames[1]["timedOut"]["requestId"]);
+        assert_eq!(tun.0.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_deadline_write_retires_the_other_pending_results() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream });
+        let (vpn, remote) = UnixDatagram::pair().unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let vpn = vpn.into();
+        let tun = TestTun::default();
+        let cfg = GateConfig::default();
+        let deadline = cfg.check_timeout;
+        let mut gate = Gate::new(cfg, Box::new(ExampleRoutes));
+        let now = Instant::now();
+        hold_packet(&mut gate, 1, now);
+        hold_packet(&mut gate, 2, now + Duration::from_secs(1));
+        apply(&mut gate, &vpn, &tun, &mut control);
+        drop(peer);
+
+        gate.tick(now + deadline);
+        apply(&mut gate, &vpn, &tun, &mut control);
+        assert!(control.is_none());
+        assert_eq!(tun.0.borrow().len(), 2);
+        gate.verdict(2, RequestId::new(2).unwrap(), true, now + deadline);
+        apply(&mut gate, &vpn, &tun, &mut control);
+        assert_eq!(remote.recv(&mut [0; 128]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 }
