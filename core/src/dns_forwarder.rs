@@ -668,6 +668,97 @@ fn strict_answer_addresses(answer: &[u8], query: &[u8]) -> Option<Vec<Ipv4Addr>>
     crate::on_demand::dns_addresses(answer,&question)?.iter().map(|ip|ip.parse().ok()).collect()
 }
 
+/// An empty OPT with EDNS version zero and all flags clear.
+/// Other additional records and EDNS options are left to the client intact.
+fn plain_dns_trailer(message: &[u8], end: usize) -> bool {
+    match message.get(10..12) {
+        Some([0, 0]) => end == message.len(),
+        Some([0, 1]) => matches!(
+            message.get(end..),
+            Some([0, 0, 41, _, _, 0, 0, 0, 0, 0, 0])
+        ),
+        _ => false,
+    }
+}
+
+/// Rewrite a validated IN A answer only when all pointers in the retained
+/// records target fixed offsets in the question or CNAME prefix. The caller
+/// returns the original bytes for other wire shapes, including signed and
+/// DNSSEC-requested replies.
+fn filtered_egress_answer(query: &[u8], answer: &[u8], excluded: &[Ipv4Addr]) -> Option<Vec<u8>> {
+    if excluded.is_empty() || query.len() < 12 || answer.len() < 12
+        || query[2] & !0x01 != 0 || query[3] != 0
+        || answer[2] & !0x05 != 0x80 || answer[3] & !0x80 != 0
+        || query[..2] != answer[..2] || query[4..10] != [0, 1, 0, 0, 0, 0]
+        || answer[4..6] != [0, 1] || answer[8..10] != [0, 0]
+    {
+        return None;
+    }
+    let question_name_end = plain_name_end(query, 12)?;
+    let question_end = question_name_end + 4;
+    if query.get(question_name_end..question_end) != Some(&[0, 1, 0, 1])
+        || !answer.get(12..question_end)?.eq_ignore_ascii_case(&query[12..question_end])
+        || !plain_dns_trailer(query, question_end)
+    {
+        return None;
+    }
+
+    let count = u16::from_be_bytes([answer[6], answer[7]]);
+    let mut at = question_end;
+    let mut name_at = 12;
+    let mut name_end = question_name_end;
+    let mut kept_address = false;
+    let mut removed = 0;
+    let mut rewritten = answer[..question_end].to_vec();
+    for _ in 0..count {
+        let head = if name_at < 0x4000
+            && answer.get(at..at + 2) == Some(&(0xc000 | name_at as u16).to_be_bytes())
+        {
+            at + 2
+        } else {
+            let owner_end = plain_name_end(answer, at)?;
+            if !answer[at..owner_end].eq_ignore_ascii_case(&answer[name_at..name_end]) {
+                return None;
+            }
+            owner_end
+        };
+        let header = answer.get(head..head + 10)?;
+        let data = head + 10;
+        let end = data + u16::from_be_bytes([header[8], header[9]]) as usize;
+        let body = answer.get(data..end)?;
+        match header[..4] {
+            [0, 5, 0, 1] if !kept_address && removed == 0 => {
+                name_at = data;
+                name_end = plain_name_end(answer, data)?;
+                if name_end != end || body == [0] {
+                    return None;
+                }
+            }
+            [0, 1, 0, 1] => {
+                let ip = Ipv4Addr::from(<[u8; 4]>::try_from(body).ok()?);
+                if excluded.contains(&ip) {
+                    removed += 1;
+                    at = end;
+                    continue;
+                }
+                kept_address = true;
+            }
+            _ => return None,
+        }
+        let ttl = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        rewritten.extend_from_slice(&answer[at..head + 4]);
+        rewritten.extend_from_slice(&ttl.min(60).to_be_bytes());
+        rewritten.extend_from_slice(&answer[head + 8..end]);
+        at = end;
+    }
+    if removed == 0 || !kept_address || !plain_dns_trailer(answer, at) {
+        return None;
+    }
+    rewritten[6..8].copy_from_slice(&(count - removed).to_be_bytes());
+    rewritten.extend_from_slice(&answer[at..]);
+    Some(rewritten)
+}
+
 fn remaining(deadline: Instant) -> Option<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     (!left.is_zero()).then_some(left)
@@ -911,6 +1002,13 @@ pub struct Observation {
     pub direct: Vec<Ipv4Addr>,
 }
 pub type AnswerHook = Box<dyn Fn(Observation) -> bool + Send + Sync>;
+
+/// Look up IPv4 candidates with a confirmed wrong exit country for this
+/// epoch and normalized query name. Candidates are sorted and deduplicated.
+/// Read the current policy and session's evidence synchronously and return
+/// an empty vector when no candidate qualifies.
+pub type EgressDnsHook = Box<dyn Fn(u64, &str, &[Ipv4Addr]) -> Vec<Ipv4Addr> + Send + Sync>;
+
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 struct Settings {
     epoch: u64,
@@ -938,6 +1036,7 @@ pub struct Inner {
     on_answer: Option<AnswerHook>,
     recent_failure: Mutex<Option<DnsFailure>>,
     preferred_server: [Mutex<Option<(u64, usize, Instant)>>; 2],
+    egress_dns: Option<EgressDnsHook>,
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -1096,6 +1195,17 @@ impl Inner {
             }
         }
 
+        // Keep the original address observation available to routing policy.
+        // The lookup runs outside the settings lock, then the epoch is
+        // checked once more before returning either version to the client.
+        let filtered = match &self.egress_dns {
+            Some(lookup) if q.qtype == TYPE_A && entry.is_none() && addresses.len() > 1 => {
+                let excluded = lookup(epoch, &trim_dots(&q.name), &addresses);
+                filtered_egress_answer(query, &answer, &excluded)
+            }
+            _ => None,
+        };
+
         // Legacy harness hook is protected against concurrent updates too.
         // Production uses on_answer, which commits under the engine's queue.
         let settings = self.settings.read().unwrap();
@@ -1108,7 +1218,7 @@ impl Inner {
             return sanitize_service_answer(&answer, entry.is_some(), rules.protected.is_some())
                 .or_else(|| empty_answer(query));
         }
-        Some(answer)
+        Some(filtered.unwrap_or(answer))
     }
 
     /// Runs `job` on a pooled worker unless MAX_INFLIGHT are queued or
@@ -1219,6 +1329,19 @@ impl Forwarder {
 
     pub fn with_answer_hook(listen: SocketAddrV4, upstream_port: u16, timeout: Duration,
         direct: Vec<String>, upstreams: Upstreams, on_direct: Option<DirectHook>, on_answer: Option<AnswerHook>) -> Self {
+        Self::with_answer_and_egress_hooks(listen, upstream_port, timeout, direct, upstreams, on_direct, on_answer, None)
+    }
+
+    pub fn with_answer_and_egress_hooks(
+        listen: SocketAddrV4,
+        upstream_port: u16,
+        timeout: Duration,
+        direct: Vec<String>,
+        upstreams: Upstreams,
+        on_direct: Option<DirectHook>,
+        on_answer: Option<AnswerHook>,
+        egress_dns: Option<EgressDnsHook>,
+    ) -> Self {
         let physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
         let tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
         Forwarder {
@@ -1230,6 +1353,7 @@ impl Forwarder {
                 on_answer,
                 recent_failure: Mutex::default(),
                 preferred_server: Default::default(),
+                egress_dns,
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
@@ -1613,6 +1737,135 @@ mod tests {
         m
     }
 
+    const WRONG_EXIT: [u8; 4] = [203, 0, 113, 5];
+    const FIRST_ALTERNATIVE: [u8; 4] = [203, 0, 113, 9];
+    const SECOND_ALTERNATIVE: [u8; 4] = [203, 0, 113, 2];
+
+    fn egress_reply(q: &[u8]) -> Vec<u8> {
+        reply(
+            q,
+            &[
+                rr(&[0xc0, 12], TYPE_A, 3600, &FIRST_ALTERNATIVE),
+                rr(&[0xc0, 12], TYPE_A, 180, &WRONG_EXIT),
+                rr(&wire(&question(q).unwrap().name), TYPE_A, 10, &SECOND_ALTERNATIVE),
+                rr(&[0xc0, 12], TYPE_A, 180, &WRONG_EXIT),
+            ],
+            &[],
+            &[],
+        )
+    }
+
+    #[test]
+    fn egress_dns_keeps_wire_order_and_caps_only_rewritten_ttls() {
+        let q = query("PrOtEcTeD.example", TYPE_A, 42);
+        let original = egress_reply(&q);
+        let filtered = filtered_egress_answer(&q, &original, &[WRONG_EXIT.into()]).unwrap();
+        assert_eq!(
+            filtered,
+            reply(
+                &q,
+                &[
+                    rr(&[0xc0, 12], TYPE_A, 60, &FIRST_ALTERNATIVE),
+                    rr(&wire("PrOtEcTeD.example"), TYPE_A, 10, &SECOND_ALTERNATIVE),
+                ],
+                &[],
+                &[],
+            ),
+        );
+        assert_eq!(filtered_egress_answer(&q, &original, &[]), None);
+        assert_eq!(filtered_egress_answer(&q, &original, &[Ipv4Addr::LOCALHOST]), None);
+        let all = [FIRST_ALTERNATIVE.into(), WRONG_EXIT.into(), SECOND_ALTERNATIVE.into()];
+        assert_eq!(filtered_egress_answer(&q, &original, &all), None);
+    }
+
+    #[test]
+    fn egress_dns_preserves_stable_cname_pointers_and_empty_edns() {
+        const OPT: [u8; 11] = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0];
+        let q = query("protected.example", TYPE_A, 42);
+        let mut edns_query = q.clone();
+        edns_query[11] = 1;
+        edns_query.extend_from_slice(&OPT);
+        let target = wire("cdn.example");
+        let target_offset = q.len() as u8 + 12;
+        let original = reply(
+            &q,
+            &[
+                rr(&[0xc0, 12], TYPE_CNAME, 240, &target),
+                rr(&[0xc0, target_offset], TYPE_A, 240, &WRONG_EXIT),
+                rr(&[0xc0, target_offset], TYPE_A, 240, &FIRST_ALTERNATIVE),
+            ],
+            &[],
+            &[OPT.to_vec()],
+        );
+        let filtered = filtered_egress_answer(&edns_query, &original, &[WRONG_EXIT.into()]).unwrap();
+        assert_eq!(
+            filtered,
+            reply(
+                &q,
+                &[
+                    rr(&[0xc0, 12], TYPE_CNAME, 60, &target),
+                    rr(&[0xc0, target_offset], TYPE_A, 60, &FIRST_ALTERNATIVE),
+                ],
+                &[],
+                &[OPT.to_vec()],
+            ),
+        );
+        assert_eq!(answer_addresses(&filtered, &edns_query), Some(vec![FIRST_ALTERNATIVE.into()]));
+    }
+
+    #[test]
+    fn egress_dns_declines_unsafe_or_unsupported_rewrites() {
+        let q = query("protected.example", TYPE_A, 42);
+        let original = egress_reply(&q);
+        let excluded = [WRONG_EXIT.into()];
+        let unchanged = |q: &[u8], a: &[u8]| {
+            assert_eq!(filtered_egress_answer(q, a, &excluded), None);
+        };
+
+        for (index, mask) in [(2, 2), (3, 0x20), (3, 0x10), (3, 1)] {
+            let mut response = original.clone();
+            response[index] |= mask; // TC, AD, CD, or RCODE
+            unchanged(&q, &response);
+        }
+        for mask in [0x20, 0x10] {
+            let mut request = q.clone();
+            request[3] |= mask;
+            unchanged(&request, &original);
+        }
+        let do_opt = [0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0];
+        let mut do_query = q.clone();
+        do_query[11] = 1;
+        do_query.extend_from_slice(&do_opt);
+        unchanged(&do_query, &original);
+        let mut do_reply = original.clone();
+        do_reply[11] = 1;
+        do_reply.extend_from_slice(&do_opt);
+        unchanged(&q, &do_reply);
+
+        for rtype in [TYPE_AAAA, 46, 250] { // AAAA, RRSIG, TSIG
+            let mut response = original.clone();
+            response[7] += 1;
+            response.extend(rr(&[0xc0, 12], rtype, 300, &[0; 16]));
+            unchanged(&q, &response);
+        }
+        unchanged(&query("other.example", TYPE_A, 42), &original);
+        unchanged(&query("protected.example", TYPE_A, 43), &original);
+        unchanged(&query("protected.example", TYPE_AAAA, 42), &original);
+        for length in 0..original.len() {
+            unchanged(&q, &original[..length]);
+        }
+
+        let first = rr(&wire("protected.example"), TYPE_A, 300, &WRONG_EXIT);
+        // The remaining A's pointer targets the owner of the removed A.
+        let second = rr(&[0xc0, q.len() as u8], TYPE_A, 300, &FIRST_ALTERNATIVE);
+        let complex = reply(&q, &[first, second], &[], &[]);
+        assert_eq!(
+            answer_addresses(&complex, &q),
+            Some(vec![WRONG_EXIT.into(), FIRST_ALTERNATIVE.into()]),
+        );
+        unchanged(&q, &complex);
+    }
+
     #[test]
     fn rule_kinds() {
         let r = SplitRules::new(&[
@@ -1789,6 +2042,139 @@ mod tests {
             if crate::child_io::creation(||TcpListener::bind(address)).is_ok() {drop(udp);return port;}
         }
         panic!("no available loopback test listener port");
+    }
+
+    #[test]
+    fn egress_dns_filters_udp_and_tcp_replies_using_current_evidence() {
+        let upstream_port = free_port();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, upstream_port)).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, upstream_port)).unwrap();
+        let upstream_udp = std::thread::spawn(move || {
+            let mut bytes = [0; 512];
+            for _ in 0..7 {
+                let (len, client) = udp.recv_from(&mut bytes).unwrap();
+                let q = &bytes[..len];
+                if q[1] == 43 {
+                    udp.send_to(&answer(q, WRONG_EXIT, true), client).unwrap();
+                    continue;
+                }
+                let response = egress_reply(q);
+                if q[1] == 42 {
+                    let mut mismatched = response.clone();
+                    mismatched[1] ^= 1;
+                    udp.send_to(&mismatched, client).unwrap();
+                }
+                udp.send_to(&response, client).unwrap();
+            }
+        });
+        let upstream_tcp = std::thread::spawn(move || {
+            let (mut stream, _) = tcp.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let q = read_framed(&mut stream).unwrap();
+            assert_eq!(q[1], 43);
+            write_framed(&mut stream, &egress_reply(&q)).unwrap();
+        });
+        let rejected = Arc::new(Mutex::new(vec![WRONG_EXIT.into()]));
+        let lookup_evidence = Arc::clone(&rejected);
+        let (observe_tx, observe_rx) = mpsc::channel();
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let upstreams = Upstreams {
+            tunnel: vec![Ipv4Addr::LOCALHOST.to_string()],
+            local: vec![Ipv4Addr::LOCALHOST.to_string()],
+            physical_if: None,
+            tunnel_if: Some(loopback_interface().into()),
+        };
+        let port = free_port();
+        let fwd = Forwarder::with_answer_and_egress_hooks(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            upstream_port,
+            Duration::from_secs(1),
+            vec!["direct.example".into()],
+            upstreams.clone(),
+            None,
+            Some(Box::new(move |observed| observe_tx.send(observed).is_ok())),
+            Some(Box::new(move |epoch, name, candidates| {
+                lookup_tx.send((epoch, name.to_string(), candidates.to_vec())).unwrap();
+                if name == "protected.example" {
+                    lookup_evidence.lock().unwrap().clone()
+                } else {
+                    Vec::new()
+                }
+            })),
+        );
+        fwd.start().unwrap();
+
+        let protected = query("Protected.example", TYPE_A, 42);
+        let udp_reply = ask(&protected, port).unwrap();
+        let alternatives = [FIRST_ALTERNATIVE, SECOND_ALTERNATIVE].map(Ipv4Addr::from);
+        assert_eq!(ipv4_answers(&udp_reply), alternatives);
+        let observation = observe_rx.try_recv().unwrap();
+        let candidates = vec![SECOND_ALTERNATIVE.into(), WRONG_EXIT.into(), FIRST_ALTERNATIVE.into()];
+        assert_eq!(observation.addresses, candidates);
+        assert_eq!(lookup_rx.try_recv().unwrap(), (observation.epoch, observation.name, candidates.clone()));
+        assert_eq!(fwd.name_for(WRONG_EXIT.into()).as_deref(), Some("protected.example"));
+
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write_framed(&mut stream, &query("protected.example", TYPE_A, 43)).unwrap();
+        assert_eq!(ipv4_answers(&read_framed(&mut stream).unwrap()), alternatives);
+        assert!(observe_rx.try_recv().is_err(), "unchanged routing observation stays deduplicated");
+        assert_eq!(lookup_rx.try_recv().unwrap().2, candidates);
+
+        let unprotected = query("unprotected.example", TYPE_A, 44);
+        assert_eq!(ask(&unprotected, port).unwrap(), egress_reply(&unprotected));
+        assert_eq!(lookup_rx.try_recv().unwrap().1, "unprotected.example");
+        let direct = query("direct.example", TYPE_A, 45);
+        assert_eq!(ask(&direct, port).unwrap(), egress_reply(&direct));
+        assert!(lookup_rx.try_recv().is_err(), "direct lookups bypass egress evidence");
+
+        *rejected.lock().unwrap() = candidates;
+        assert_eq!(ask(&protected, port).unwrap(), egress_reply(&protected));
+        rejected.lock().unwrap().clear();
+        assert_eq!(ask(&protected, port).unwrap(), egress_reply(&protected));
+
+        let disabled = Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), upstream_port,
+            Duration::from_secs(1), vec![], upstreams, None,
+        );
+        assert_eq!(disabled.inner().resolve(&protected).unwrap(), egress_reply(&protected));
+        fwd.stop();
+        upstream_udp.join().unwrap();
+        upstream_tcp.join().unwrap();
+    }
+
+    #[test]
+    fn egress_dns_drops_reply_if_epoch_changes_during_lookup() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server = socket.local_addr().unwrap().to_string();
+        let upstream = std::thread::spawn(move || {
+            let mut bytes = [0; 512];
+            let (len, client) = socket.recv_from(&mut bytes).unwrap();
+            socket.send_to(&egress_reply(&bytes[..len]), client).unwrap();
+        });
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let fwd = Forwarder::with_answer_and_egress_hooks(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53, Duration::from_secs(1), vec![],
+            Upstreams { tunnel: vec![server], local: vec![], physical_if: None, tunnel_if: Some(loopback_interface().into()) },
+            None, None,
+            Some(Box::new(move |epoch, _, _| {
+                lookup_tx.send(epoch).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+                vec![WRONG_EXIT.into()]
+            })),
+        );
+        let inner = Arc::clone(fwd.inner());
+        let pending = std::thread::spawn(move || inner.resolve(&query("protected.example", TYPE_A, 42)));
+        let initial_epoch = lookup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(initial_epoch, fwd.epoch());
+        fwd.set_rules(&["protected.example".into()]);
+        release_tx.send(()).unwrap();
+        assert!(pending.join().unwrap().is_none());
+        upstream.join().unwrap();
     }
 
     #[test]
