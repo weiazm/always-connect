@@ -126,7 +126,7 @@ enum CiscoProfiles {
         print("production CLI -> production state callback -> unchanged diagnosticsText")
         print("fake error delivered=\(got); local stop completed=\(done); full bundle leaks=\(leaks)")
         let useful = exported.contains("Cisco 引擎时间线：") && exported.contains("request-connect")
-            && exported.contains("重试 2 次") && exported.contains("认证中")
+            && exported.contains("连接重试 2 轮，等待登录确认 1 次") && exported.contains("认证中")
             && exported.contains("出口保护拦截记录") && exported.contains("2 项检测，1 项未查到")
             && exported.contains("证据级别 proxy=1，unknown=1")
         exit(got && done && useful && leaks.isEmpty && distinguishable && subsecond && bounded && historySafe ? 0 : 1)
