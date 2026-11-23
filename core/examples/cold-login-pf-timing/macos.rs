@@ -183,16 +183,51 @@ fn pf_baseline(pfctl: &str) -> Result<PfBaseline> {
         Some("Disabled") => false,
         _ => return Err("pf_status_unknown"),
     };
-    let mut references: Vec<_> = pf(pfctl, &["-s", "References"])?
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| !line.is_empty())
-        .collect();
-    references.sort_unstable();
+    let references = stable_pf_references(&pf(pfctl, &["-s", "References"])?)?;
     Ok(PfBaseline {
         enabled,
         references,
     })
+}
+
+fn stable_pf_references(output: &str) -> Result<Vec<String>> {
+    let mut stable = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [] | ["TOKENS:"] | ["PID", "Process", "Name", "TOKEN", "TIMESTAMP"]
+            | ["No", "pf_enabled", "references"] | ["No", "pf", "starter", "references", "held"] => {
+                continue;
+            }
+            _ => (),
+        }
+        let count = fields.len();
+        if count < 6
+            || fields[0].parse::<i32>().is_err()
+            || fields[count - 4].parse::<u64>().is_err()
+            || fields[count - 3].parse::<u32>().is_err()
+            || fields[count - 2] != "days"
+            || fields[count - 1].split(':').count() != 3
+            || fields[count - 1].split(':').any(|part| part.parse::<u32>().is_err())
+        {
+            return Err("pf_references_output_unrecognized");
+        }
+        stable.push(fields[..count - 3].join(" "));
+    }
+    stable.sort_unstable();
+    Ok(stable)
+}
+
+#[cfg(test)]
+#[test]
+fn pf_reference_time_does_not_change_ownership() {
+    let header = "TOKENS:\nPID   Process Name  TOKEN  TIMESTAMP\n";
+    let old = format!("{header} 88   sample app   703    0 days 00:00:01\n");
+    let newer = old.replace("00:00:01", "12:34:56");
+    assert_eq!(stable_pf_references(&old).unwrap(), vec!["88 sample app 703"]);
+    assert_eq!(stable_pf_references(&old), stable_pf_references(&newer));
+    assert_eq!(stable_pf_references("No pf_enabled references\n").unwrap(), Vec::<String>::new());
+    assert!(stable_pf_references("unknown row\n").is_err());
 }
 
 fn route_interface(target: &str) -> Result<String> {
