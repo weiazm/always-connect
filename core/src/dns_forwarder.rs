@@ -18,7 +18,7 @@
 //! client retries), which leave after 30 s without work. Idle, the
 //! forwarder is one parked thread and wakes for nothing.
 
-use crate::egress_gate::Classifier;
+use crate::egress_gate::{evidence_clock_ms, Classifier};
 use regex_lite::Regex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+mod delivered;
+pub use delivered::{DeliveredDns, DeliveredDnsKind, DeliveredDnsValue};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
@@ -360,7 +363,7 @@ fn service_reply(query: &[u8], answer: Vec<u8>, direct: bool, protected_site: bo
     if !direct && (unsigned_service_message(query)!=Some(true) || unsigned_service_message(&answer)!=Some(true)) {
         return Some(answer);
     }
-    sanitize_service_answer(&answer,direct,protected_site).or_else(|| empty_answer(query))
+    sanitize_service_answer(&answer,direct,protected_site)
 }
 
 fn sanitize_service_answer(answer: &[u8], direct: bool, strip_ech: bool) -> Option<Vec<u8>> {
@@ -1035,6 +1038,10 @@ pub type AnswerHook = Box<dyn Fn(Observation) -> bool + Send + Sync>;
 /// an empty vector when no candidate qualifies.
 pub type EgressDnsHook = Box<dyn Fn(u64, &str, &[Ipv4Addr]) -> Vec<Ipv4Addr> + Send + Sync>;
 
+/// Called under the DNS settings read lock after a successful client write.
+/// Enqueue without blocking or calling back into the forwarder or engine.
+pub type DeliveredDnsHook = Box<dyn Fn(DeliveredDns) + Send + Sync>;
+
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 struct Settings {
     epoch: u64,
@@ -1063,6 +1070,7 @@ pub struct Inner {
     recent_failure: Mutex<Option<DnsFailure>>,
     preferred_server: [Mutex<Option<(u64, usize, Instant)>>; 2],
     egress_dns: Option<EgressDnsHook>,
+    on_delivered: Option<DeliveredDnsHook>,
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -1092,6 +1100,23 @@ struct PoolState {
     workers: usize,
 }
 
+struct ResolvedAnswer {
+    bytes: Vec<u8>,
+    evidence: Option<Delivery>,
+}
+
+struct Delivery {
+    epoch: u64,
+    qtype: u16,
+    synthesized: bool,
+}
+
+impl ResolvedAnswer {
+    fn unobserved(bytes: Vec<u8>) -> Self {
+        Self { bytes, evidence: None }
+    }
+}
+
 impl Inner {
     fn remember(&self, ips: &[Ipv4Addr], name: &str) {
         if ips.is_empty() {
@@ -1115,7 +1140,7 @@ impl Inner {
     /// The answer to send back, or None when there is none to give (the
     /// client then retries or moves on to the next server).
     pub fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
-        self.resolve_in_session(query, None)
+        self.resolve_in_session(query, None).map(|answer| answer.bytes)
     }
 
     fn record_dns_failure(&self, epoch: u64, name: &str, reason: &'static str) {
@@ -1140,7 +1165,7 @@ impl Inner {
         Some(format!("最近一分钟，{} 查询失败：{}", issue.name, issue.reason))
     }
 
-    fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
+    fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<ResolvedAnswer> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
             let settings = self.settings.read().unwrap();
@@ -1148,7 +1173,7 @@ impl Inner {
             (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
         };
         let entry = rules.matches(&q.name);
-        if q.qtype == TYPE_AAAA { return empty_answer(query); }
+        if q.qtype == TYPE_AAAA { return empty_answer(query).map(ResolvedAnswer::unobserved); }
         let (servers, interface) = if entry.is_some() {
             let binding = if up.physical_if.is_some() { Some(physical_binding.as_ref()?) } else { None };
             (&up.local, binding)
@@ -1240,13 +1265,33 @@ impl Inner {
             self.direct(entry.as_deref().unwrap_or(&site_name(&q.name)), &direct);
         }
         self.remember(&addresses, &q.name);
-        if is_service(q.qtype) {
+        let bytes = if is_service(q.qtype) {
             if rules.protected.is_some() {
-                return service_reply(query, answer, entry.is_some(), rules.protects_name(&q.name));
+                service_reply(query, answer, entry.is_some(), protected)
+            } else {
+                sanitize_service_answer(&answer, entry.is_some(), false)
             }
-            return sanitize_service_answer(&answer,entry.is_some(),false).or_else(||empty_answer(query));
+        } else {
+            Some(filtered.unwrap_or(answer))
+        };
+        drop(settings);
+        let synthesized = bytes.is_none();
+        let evidence = (self.on_delivered.is_some() && session.is_some() && entry.is_none()
+            && matches!(q.qtype, TYPE_A | TYPE_AAAA | TYPE_SVCB | TYPE_HTTPS))
+            .then_some(Delivery { epoch, qtype: q.qtype, synthesized });
+        Some(ResolvedAnswer { bytes: bytes.or_else(|| empty_answer(query))?, evidence })
+    }
+
+    fn publish_delivered(&self, query: &[u8], answer: ResolvedAnswer, started_at_ms: Option<u64>, replies: &Replies) {
+        let (Some(delivery), Some(started_at_ms), Some(hook)) = (answer.evidence, started_at_ms, &self.on_delivered) else {
+            return;
+        };
+        let Some(observed_at_ms) = evidence_clock_ms().filter(|observed| *observed >= started_at_ms) else { return };
+        let Some(evidence) = delivered::extract(delivery.epoch, started_at_ms, observed_at_ms, delivery.qtype, query, &answer.bytes, delivery.synthesized) else { return };
+        let settings = self.settings.read().unwrap();
+        if settings.enabled && settings.epoch == evidence.epoch && replies.active.load(Ordering::Acquire) {
+            hook(evidence);
         }
-        Some(filtered.unwrap_or(answer))
     }
 
     /// Runs `job` on a pooled worker unless MAX_INFLIGHT are queued or
@@ -1323,10 +1368,10 @@ impl Replies {
         self.udp.lock().unwrap().take();
     }
 
-    fn send(&self, answer: &[u8], peer: std::net::SocketAddr) {
-        if let Some(socket) = self.udp.lock().unwrap().as_ref() {
-            let _ = socket.send_to(answer, peer);
-        }
+    fn send(&self, answer: &[u8], peer: std::net::SocketAddr) -> bool {
+        self.udp.lock().unwrap().as_ref().is_some_and(|socket| {
+            socket.send_to(answer, peer).is_ok_and(|written| written == answer.len())
+        })
     }
 }
 
@@ -1370,6 +1415,20 @@ impl Forwarder {
         on_answer: Option<AnswerHook>,
         egress_dns: Option<EgressDnsHook>,
     ) -> Self {
+        Self::with_dns_hooks(listen, upstream_port, timeout, direct, upstreams, on_direct, on_answer, egress_dns, None)
+    }
+
+    pub fn with_dns_hooks(
+        listen: SocketAddrV4,
+        upstream_port: u16,
+        timeout: Duration,
+        direct: Vec<String>,
+        upstreams: Upstreams,
+        on_direct: Option<DirectHook>,
+        on_answer: Option<AnswerHook>,
+        egress_dns: Option<EgressDnsHook>,
+        on_delivered: Option<DeliveredDnsHook>,
+    ) -> Self {
         let physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
         let tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
         Forwarder {
@@ -1382,6 +1441,7 @@ impl Forwarder {
                 recent_failure: Mutex::default(),
                 preferred_server: Default::default(),
                 egress_dns,
+                on_delivered,
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
@@ -1488,9 +1548,12 @@ impl Forwarder {
                     }
                     let query = buffer[..n].to_vec();
                     let reply = Arc::clone(&send_gate);
+                    let started_at_ms = inner.on_delivered.as_ref().and_then(|_| evidence_clock_ms());
                     inner.spawn(move |inner| {
                         if let Some(answer) = inner.resolve_in_session(&query, Some(&reply.active)) {
-                            reply.send(&answer, from);
+                            if reply.send(&answer.bytes, from) {
+                                inner.publish_delivered(&query, answer, started_at_ms, &reply);
+                            }
                         }
                     });
                 }
@@ -1502,11 +1565,13 @@ impl Forwarder {
                     let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = client.set_write_timeout(Some(Duration::from_secs(5)));
                     let session = Arc::clone(&send_gate);
+                    let started_at_ms = inner.on_delivered.as_ref().and_then(|_| evidence_clock_ms());
                     inner.spawn(move |inner| {
                         if let Some(query) = read_framed_until(&mut client, Instant::now()+Duration::from_secs(5)) {
                             if let Some(answer) = inner.resolve_in_session(&query, Some(&session.active)) {
-                                if session.active.load(Ordering::Acquire) {
-                                    let _ = write_framed_until(&mut client, &answer, Instant::now()+Duration::from_secs(5));
+                                if session.active.load(Ordering::Acquire)
+                                    && write_framed_until(&mut client, &answer.bytes, Instant::now()+Duration::from_secs(5)).is_some() {
+                                    inner.publish_delivered(&query, answer, started_at_ms, &session);
                                 }
                             }
                         }
@@ -1555,6 +1620,7 @@ impl Drop for Forwarder {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    mod delivered_tests;
     static GATEWAY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn loopback_interface() -> &'static str {
