@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod airports;
 mod activity;
 mod unknown_web;
+mod dns_evidence;
 use unknown_web::{UnknownCount,UnknownWeb};
 use activity::{Denied, SiteStatus};
 mod recheck;
@@ -636,6 +637,7 @@ struct ControlState {
     internal_cidrs: Vec<String>,
     source_policies: HashMap<u32, crate::egress_source::SourcePolicy>,
     warm: warm::WarmProbes,
+    dns_evidence: dns_evidence::EvidenceScope,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -723,6 +725,7 @@ impl ControlState {
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.warm.invalidate();
+        self.invalidate_delivered_dns();
         if !cfg.active() || !cfg.block_unidentified_web { self.status.unknown_web.clear(); }
         self.epoch = self.epoch.wrapping_add(1);
         self.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
@@ -742,6 +745,7 @@ impl ControlState {
 
     fn retire_checks(&mut self) {
         self.warm.invalidate();
+        self.invalidate_delivered_dns();
         let checks: Vec<_> = self.checks.values().filter(|c| c.epoch == self.epoch).map(|c|
             (c.group, c.trigger.clone(), c.generation, recheck::unconfirmed(&c.targets, "出口检查被中断"))).collect();
         for (id, host, generation, observed) in checks {
@@ -785,7 +789,7 @@ impl Controller {
         let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
-                warm: Default::default(), source_policies: source_policies(&cfg), config: cfg, status: Status::default(), peer: None, peer_id: 0,
+                dns_evidence: Default::default(), warm: Default::default(), source_policies: source_policies(&cfg), config: cfg, status: Status::default(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), internal_cidrs:Vec::new(),unknown_counts:HashMap::new(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
@@ -1019,8 +1023,15 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         let mut state = shared.state.lock().expect("controller");
         if state.peer_id != peer_id { return; }
         if let Some(up) = msg.up {
-            if !state.status.interface.is_empty() && state.status.interface != up.ifname { state.retire_checks(); }
-            state.status.interface = up.ifname;
+            if state.status.interface != up.ifname {
+                if !state.status.interface.is_empty() {
+                    state.retire_checks();
+                    state.send("{\"invalidate\":true}");
+                } else {
+                    state.invalidate_delivered_dns();
+                }
+                state.status.interface = up.ifname;
+            }
         }
         if let Some(hint) = msg.warm {
             let scope = warm::Scope { peer_id, epoch: state.epoch, interface: state.status.interface.clone() };

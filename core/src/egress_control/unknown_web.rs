@@ -116,6 +116,7 @@ impl Controller {
         let frame = state.gate_config(&self.shared.marker);
         state.epoch = state.epoch.wrapping_add(1);
         state.warm.invalidate();
+        state.invalidate_delivered_dns();
         state.send(&frame);
         state.send("{\"invalidate\":true}");
     }
@@ -157,6 +158,7 @@ impl Controller {
             row.allowed = allow;
             let config = state.gate_config(&self.shared.marker);
             state.warm.invalidate();
+            state.invalidate_delivered_dns();
             state.epoch = state.epoch.wrapping_add(1);
             state.send(&config);
             state.send("{\"invalidate\":true}");

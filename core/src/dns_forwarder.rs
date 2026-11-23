@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -1071,6 +1072,7 @@ pub struct Inner {
     preferred_server: [Mutex<Option<(u64, usize, Instant)>>; 2],
     egress_dns: Option<EgressDnsHook>,
     on_delivered: Option<DeliveredDnsHook>,
+    observe_deliveries: AtomicBool,
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
@@ -1276,7 +1278,7 @@ impl Inner {
         };
         drop(settings);
         let synthesized = bytes.is_none();
-        let evidence = (self.on_delivered.is_some() && session.is_some() && entry.is_none()
+        let evidence = (self.observe_deliveries.load(Ordering::Acquire) && session.is_some() && entry.is_none()
             && matches!(q.qtype, TYPE_A | TYPE_AAAA | TYPE_SVCB | TYPE_HTTPS))
             .then_some(Delivery { epoch, qtype: q.qtype, synthesized });
         Some(ResolvedAnswer { bytes: bytes.or_else(|| empty_answer(query))?, evidence })
@@ -1441,6 +1443,7 @@ impl Forwarder {
                 recent_failure: Mutex::default(),
                 preferred_server: Default::default(),
                 egress_dns,
+                observe_deliveries: AtomicBool::new(on_delivered.is_some()),
                 on_delivered,
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
@@ -1456,6 +1459,10 @@ impl Forwarder {
 
     pub fn inner(&self) -> &Arc<Inner> {
         &self.inner
+    }
+
+    pub(crate) fn observe_deliveries(&self, enabled: bool) {
+        self.inner.observe_deliveries.store(enabled && self.inner.on_delivered.is_some(), Ordering::Release);
     }
 
     pub fn set_rules(&self, direct: &[String]) {
@@ -1548,7 +1555,7 @@ impl Forwarder {
                     }
                     let query = buffer[..n].to_vec();
                     let reply = Arc::clone(&send_gate);
-                    let started_at_ms = inner.on_delivered.as_ref().and_then(|_| evidence_clock_ms());
+                    let started_at_ms = inner.observe_deliveries.load(Ordering::Acquire).then(evidence_clock_ms).flatten();
                     inner.spawn(move |inner| {
                         if let Some(answer) = inner.resolve_in_session(&query, Some(&reply.active)) {
                             if reply.send(&answer.bytes, from) {
@@ -1565,7 +1572,7 @@ impl Forwarder {
                     let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = client.set_write_timeout(Some(Duration::from_secs(5)));
                     let session = Arc::clone(&send_gate);
-                    let started_at_ms = inner.on_delivered.as_ref().and_then(|_| evidence_clock_ms());
+                    let started_at_ms = inner.observe_deliveries.load(Ordering::Acquire).then(evidence_clock_ms).flatten();
                     inner.spawn(move |inner| {
                         if let Some(query) = read_framed_until(&mut client, Instant::now()+Duration::from_secs(5)) {
                             if let Some(answer) = inner.resolve_in_session(&query, Some(&session.active)) {

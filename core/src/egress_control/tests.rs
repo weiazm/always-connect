@@ -581,7 +581,7 @@ fn only_current_direct_wrong_country_evidence_can_hint_dns() {
 #[test]
 fn denial_totals_are_idempotent_and_accumulate_across_gate_peers() {
     let mut state = ControlState {
-        warm:Default::default(), source_policies: HashMap::new(), config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
+        dns_evidence:Default::default(), warm:Default::default(), source_policies: HashMap::new(), config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
         checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), unknown_counts:HashMap::new(),internal_cidrs:Vec::new(), on_peer_loss: None,
     };
     let report = |n| serde_json::from_value(serde_json::json!({"group":1,"count":n,"hosts":[{"host":"a.example","count":n}],
@@ -727,4 +727,77 @@ fn dns_inferred_name_uses_dependent_evidence_and_slow_results_keep_the_original_
     let obs=target.observe(&hook,"marker","utun9");
     assert_eq!(obs.country.as_deref(),Some("ZZ"));
     assert!(!fresh_evidence(obs.evidence_at_ms.unwrap()),"response parsing must not refresh a slow probe");
+}
+
+#[test]
+fn delivered_dns_stream_scopes_withdrawals_and_fences_loss_across_epoch_updates() {
+    use crate::dns_forwarder::{DeliveredDns, DeliveredDnsKind, DeliveredDnsValue};
+    use crate::egress_gate::evidence_clock_ms;
+    let dir = std::env::temp_dir().join(format!("ac-dns-{:x}", random_u64()));
+    std::fs::create_dir(&dir).unwrap();
+    let config = cfg();
+    let routes = config.protected_routes();
+    let sock = dir.join("ctl");
+    let ctl = Controller::start(&sock, config, Arc::new(|_, _| None)).unwrap();
+    let mut reader = BufReader::new(UnixStream::connect(&sock).unwrap());
+    reader.get_ref().set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    fn frame(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    assert!(frame(&mut reader)["groups"].is_array());
+    writeln!(reader.get_mut(), "{}", serde_json::json!({"up":{"ifname":"utun7"}})).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while ctl.shared.state.lock().unwrap().status.interface != "utun7" {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    ctl.set_dns_epoch(Some(7));
+    std::thread::sleep(Duration::from_millis(3));
+    let now = evidence_clock_ms().unwrap();
+    let mut answer = DeliveredDns {
+        epoch: 7, started_at_ms: now, observed_at_ms: now, name: "ordinary.example".into(),
+        kind: DeliveredDnsKind::Ech, qtype: 65, incomplete: false, scope_known: false,
+        values: vec![DeliveredDnsValue { value: "public.example".into(), ttl: 600 }],
+    };
+    ctl.delivered_dns(&answer, "retired", &routes);
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    let first = frame(&mut reader)["dnsReset"].as_u64().unwrap();
+    let update = frame(&mut reader);
+    assert_eq!(update["dnsEvidence"]["generation"], first);
+    assert_eq!(update["dnsEvidence"]["observedAtMs"], now);
+    assert_eq!(update["dnsEvidence"]["values"][0]["ttl"], 300);
+    answer.incomplete = true;
+    answer.scope_known = true;
+    answer.values.clear();
+    answer.qtype = 64;
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    let withdrawal = frame(&mut reader);
+    assert_eq!(withdrawal["dnsEvidence"]["generation"], first);
+    assert_eq!(withdrawal["dnsEvidence"]["qtype"], 64);
+    assert_eq!(withdrawal["dnsEvidence"]["values"], serde_json::json!([]));
+
+    // The same error on a protected name could hide an outstanding address.
+    answer.name = "a.example".into();
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    let reset = frame(&mut reader)["dnsReset"].as_u64().unwrap();
+    assert!(reset > first);
+    answer.name = "ordinary.example".into();
+    answer.scope_known = false;
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    ctl.set_dns_epoch(Some(8));
+    assert!(frame(&mut reader)["dnsReset"].as_u64().unwrap() > reset);
+    answer.incomplete = false;
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    answer.epoch = 8;
+    std::thread::sleep(Duration::from_millis(3));
+    answer.started_at_ms = evidence_clock_ms().unwrap();
+    answer.observed_at_ms = answer.started_at_ms;
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    ctl.invalidate();
+    assert_eq!(frame(&mut reader), serde_json::json!({"invalidate":true}));
+    drop(reader);
+    drop(ctl);
+    std::fs::remove_dir_all(dir).unwrap();
 }

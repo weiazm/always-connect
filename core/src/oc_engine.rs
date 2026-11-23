@@ -158,6 +158,8 @@ enum Event {
     DropProtection(bool),
     AllowNetworks(Vec<String>),
     DnsAnswer(dns_forwarder::Observation, Sender<bool>),
+    DnsDelivered(delivered_dns::Record),
+    DnsCompatibilityLoss(delivered_dns::Loss),
     /// A scheduled retry: spawn again unless a manual stop landed first.
     Respawn,
     #[cfg(test)]
@@ -404,6 +406,7 @@ fn interface_index(name: &str) -> Option<u32> {
 }
 
 mod cstp_dns;
+mod delivered_dns;
 
 struct Core {
     config: Config,
@@ -641,7 +644,10 @@ impl Engine {
         let updated = cfg.group(group)?;
         let result = if range { updated.exit_ranges.clone() } else { updated.expect.clone() };
         c.config.egress = Some(cfg);
-        if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
+        if let Some(f) = &c.forwarder {
+            f.set_parsed_rules(c.split_rules());
+            if let Some(ctl) = controller.as_ref() { ctl.set_dns_epoch(Some(f.epoch())); }
+        }
         Some(result)
     }
 
@@ -990,6 +996,7 @@ impl Shared {
                     c.reset_direct_retries();
                     if let Some(f) = &c.forwarder {
                         f.set_parsed_rules(c.split_rules());
+                        self.sync_dns_scope(&c);
                     }
                     let rules = c.split_rules();
                     c.split_policy.revalidate(&rules);
@@ -1008,6 +1015,7 @@ impl Shared {
                         .then(|| Arc::new(c.config.egress.as_ref().expect("active").protected_routes()));
                     if was_active || c.protected_routes.is_some() {
                         if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
+                        self.sync_dns_scope(&c);
                         let rules = c.split_rules();
                         c.split_policy.revalidate(&rules);
                         c.reset_direct_retries();
@@ -1027,6 +1035,26 @@ impl Shared {
                     if let Some((tun, gws)) = c.last_pf.clone() {
                         let allow = c.last_allow_direct_egress;
                         self.load_pf(&mut c, Some(tun), gws, allow);
+                    }
+                }
+                Event::DnsDelivered(delivery) => {
+                    let answer = &delivery.dns;
+                    if delivery.current() && c.hook_fired && !c.stop_requested && !c.tunnel_retrying
+                        && !c.recovery_suspended() && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch))
+                    {
+                        if let (Some(interface), Some(routes), Some(ctl)) = (c.tunnel_if.as_deref(),
+                            c.protected_routes.as_deref(), self.egress.lock().expect("egress").as_ref())
+                        {
+                            ctl.delivered_dns(answer, interface, routes);
+                        }
+                    }
+                }
+                Event::DnsCompatibilityLoss(loss) => {
+                    let epoch = loss.resume();
+                    if c.forwarder.as_ref().is_some_and(|f| f.is_current(epoch)) {
+                        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+                            ctl.dns_delivery_loss(epoch);
+                        }
                     }
                 }
                 Event::DnsAnswer(answer, reply) => {
@@ -1307,9 +1335,11 @@ impl Shared {
             });
             lookup
         });
-        let forwarder = Forwarder::with_answer_and_egress_hooks(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
-            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook), egress_dns);
+        let on_delivered = Some(delivered_dns::hook(self.tx.lock().unwrap().clone()));
+        let forwarder = Forwarder::with_dns_hooks(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
+            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook), egress_dns, on_delivered);
         if c.protected_routes.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
+        forwarder.observe_deliveries(false);
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {
@@ -1443,6 +1473,17 @@ impl Shared {
         SplitSync::Complete
     }
 
+    fn sync_dns_scope(&self, c: &Core) {
+        let active = egress_active(&c.config) && c.config.egress.as_ref().is_some_and(|cfg| cfg.block_unidentified_web)
+            && c.tunnel_if.is_some() && !c.stop_requested && !c.tunnel_retrying && !c.recovery_suspended();
+        if let Some(forwarder) = &c.forwarder {
+            forwarder.observe_deliveries(active);
+        }
+        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+            ctl.set_dns_epoch(c.forwarder.as_ref().filter(|_| active).map(Forwarder::epoch));
+        }
+    }
+
     fn update_forwarder(&self, c: &Core) {
         if let Some(f) = &c.forwarder {
             let tunnel_if = c.tunnel_if.clone().filter(|_| !c.recovery_suspended());
@@ -1452,6 +1493,7 @@ impl Shared {
                 physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
                 tunnel_if,
             },index);
+            self.sync_dns_scope(c);
         }
     }
 
@@ -1460,6 +1502,7 @@ impl Shared {
             return;
         }
         c.config.drop_protection = on;
+        self.sync_dns_scope(c);
         if on {
             if let Some((tun, gws)) = c.last_pf.clone() {
                 if !c.stop_requested {
@@ -1640,6 +1683,7 @@ impl Shared {
         c.routed_networks.clear();
         c.network_routes_error=None;
         if let Some(f) = c.forwarder.take() {
+            self.sync_dns_scope(c);
             f.stop();
         }
         if !self.routes.remove_all() {
