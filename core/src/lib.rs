@@ -15,6 +15,7 @@ pub mod dns_forwarder;
 pub mod dns_routes;
 pub mod egress_control;
 pub mod egress_gate;
+pub mod egress_source;
 pub mod ffi;
 pub mod kill_switch;
 pub mod leak_probe;
