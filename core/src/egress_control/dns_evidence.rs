@@ -77,26 +77,32 @@ impl Controller {
         {
             return;
         }
-        // An unrepresentable answer may contain a protected association. Only a
-        // fully scoped error for an ordinary question can withdraw its own key.
-        let scoped_withdrawal = record.scope_known
-            && record.values.is_empty()
-            && routes.group_for_name(&record.name).is_none();
-        if (record.incomplete && !scoped_withdrawal) || record.values.len() > 16 {
-            state.suspend_dns_compatibility();
-            return;
-        }
         let Some(now) = evidence_clock_ms() else {
+            state.suspend_dns_compatibility();
             return;
         };
         let scope = &state.dns_evidence;
         if !scope
             .changed_at
-            .is_some_and(|boundary| record.started_at_ms > boundary)
+            .is_some_and(|boundary| record.observed_at_ms >= boundary)
             || record.started_at_ms > record.observed_at_ms
             || record.observed_at_ms > now
             || now.saturating_sub(record.observed_at_ms) >= MAX_AGE_MS
-            || record.started_at_ms < scope.suppressed_until
+        {
+            return;
+        }
+        let protected = routes.group_for_name(&record.name).is_some();
+        let scoped_withdrawal = record.scope_known && record.values.is_empty() && !protected;
+        if (record.incomplete && !scoped_withdrawal) || record.values.len() > 16 {
+            state.suspend_dns_compatibility();
+            return;
+        }
+        // During an evidence gap, keep subsequent protected associations.
+        // Their TTL may extend past the end of the ordinary-traffic hold.
+        if !scope
+            .changed_at
+            .is_some_and(|boundary| record.started_at_ms > boundary)
+            || (!protected && record.started_at_ms < scope.suppressed_until)
         {
             return;
         }

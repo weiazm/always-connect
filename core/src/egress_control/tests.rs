@@ -795,6 +795,14 @@ fn delivered_dns_stream_scopes_withdrawals_and_fences_loss_across_epoch_updates(
     answer.started_at_ms = evidence_clock_ms().unwrap();
     answer.observed_at_ms = answer.started_at_ms;
     ctl.delivered_dns(&answer, "utun7", &routes);
+    answer.name = "a.example".into();
+    answer.kind = DeliveredDnsKind::Ipv4;
+    answer.qtype = 1;
+    answer.values = vec![DeliveredDnsValue { value: "192.0.2.9".into(), ttl: 60 }];
+    ctl.delivered_dns(&answer, "utun7", &routes);
+    let protected = frame(&mut reader);
+    assert_eq!(protected["dnsEvidence"]["name"], "a.example");
+    assert_eq!(protected["dnsEvidence"]["values"][0]["value"], "192.0.2.9");
     ctl.invalidate();
     assert_eq!(frame(&mut reader), serde_json::json!({"invalidate":true}));
     drop(reader);
