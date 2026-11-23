@@ -146,13 +146,30 @@ impl Failures {
             .into_iter()
             .filter(|(_, method)| method.is_direct())
             .collect();
-        let alternative = direct.get(1).cloned();
+        let name_matches = |name: &str| {
+            check.host.as_ref().is_some_and(|hint| {
+                hint.trim_end_matches('.')
+                    .eq_ignore_ascii_case(name.trim_end_matches('.'))
+            })
+        };
+        let borrowed_index = if !check.host_confirmed || check.host.is_none() {
+            direct
+                .iter()
+                .position(|(name, _)| name_matches(name))
+                .or_else(|| check.host.is_none().then_some(0))
+        } else {
+            None
+        };
+        let alternative = borrowed_index.and_then(|index| {
+            direct
+                .iter()
+                .enumerate()
+                .find(|(i, _)| *i != index)
+                .map(|(_, candidate)| candidate.clone())
+        });
         for (index, (host, method)) in direct.into_iter().enumerate() {
-            let borrowed = check.host.is_none() && index == 0;
-            let named = check.host.as_ref().is_some_and(|name| {
-                name.trim_end_matches('.')
-                    .eq_ignore_ascii_case(host.trim_end_matches('.'))
-            });
+            let borrowed = borrowed_index == Some(index);
+            let named = check.host_confirmed && name_matches(&host);
             let target = Target {
                 host,
                 method,

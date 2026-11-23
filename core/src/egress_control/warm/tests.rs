@@ -40,7 +40,7 @@ fn ip(last: u8) -> IpAddr {
 
 fn check(host: Option<&str>) -> CheckMsg {
     serde_json::from_value(serde_json::json!({
-        "group": 1, "host": host, "ip": ip(1), "port": 443, "requestId": 1,
+        "group": 1, "host": host, "hostConfirmed": host.is_some(), "ip": ip(1), "port": 443, "requestId": 1,
     }))
     .unwrap()
 }

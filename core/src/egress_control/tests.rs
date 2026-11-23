@@ -214,7 +214,7 @@ fn controller_answers_a_gate() {
     reader.read_line(&mut line).unwrap();
     let first: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(first["probe_alpn"], ctl.marker());
-    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":1}}\n").unwrap();
+    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"hostConfirmed\":true,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":1}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     let v:serde_json::Value=serde_json::from_str(&line).unwrap();
@@ -230,7 +230,7 @@ fn controller_answers_a_gate() {
     config.groups[0].expect.pop();
     ctl.update(config.clone());
     for _ in 0..2 { line.clear(); reader.read_line(&mut line).unwrap(); }
-    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":2}}\n").unwrap();
+    gate.write_all(b"{\"check\":{\"group\":1,\"hostConfirmed\":true,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":2}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
@@ -255,7 +255,7 @@ fn controller_answers_a_gate() {
     assert!(line.contains("invalidate"));
     // The next flow on the same connection is released after trusting the
     // observed country. Read back the original record rather than a new one.
-    gate.write_all(b"{\"check\":{\"group\":1,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":4}}\n").unwrap();
+    gate.write_all(b"{\"check\":{\"group\":1,\"hostConfirmed\":true,\"host\":\"c.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":4}}\n").unwrap();
     line.clear();
     reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], true);
@@ -293,7 +293,7 @@ fn a_probe_started_before_rule_change_cannot_release_a_flow() {
     let mut reader = BufReader::new(gate.try_clone().unwrap());
     let mut line = String::new();
     assert!(reader.read_line(&mut line).unwrap() > 0);
-    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":5}}\n").unwrap();
+    gate.write_all(b"{\"up\":{\"ifname\":\"utun9\"}}\n{\"check\":{\"group\":1,\"hostConfirmed\":true,\"host\":\"a.example\",\"ip\":\"192.0.2.19\",\"port\":443,\"requestId\":5}}\n").unwrap();
     started.recv_timeout(Duration::from_secs(3)).unwrap();
     config.groups[0].expect = vec!["YY".into()];
     ctl.update(config);
@@ -434,7 +434,7 @@ fn late_permission_cannot_override_a_gate_timeout_and_a_new_destination_rechecks
         r
     };
     fn send(r: &mut BufReader<UnixStream>, kind: &str, ip: IpAddr, id: u64, host: &str) {
-        writeln!(r.get_mut(), "{}", serde_json::json!({kind:{"group":1,"host":host,"ip":ip,
+        writeln!(r.get_mut(), "{}", serde_json::json!({kind:{"group":1,"hostConfirmed":true,"host":host,"ip":ip,
                  "port":443,"requestId":id}})).unwrap();
     }
     fn verdict_for(r: &mut BufReader<UnixStream>, ip: IpAddr, id: u64, host: &str) -> bool {
@@ -527,7 +527,7 @@ fn explicit_recheck_and_country_approval_use_only_the_current_verified_failure()
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     writeln!(reader.get_mut(), "{}",serde_json::json!({"up":{"ifname":"utun9"}})).unwrap();
-    writeln!(reader.get_mut(),"{}",serde_json::json!({"check":{"requestId":1,"group":1,"ip":"192.0.2.9","port":443,"host":"a.example"}})).unwrap();
+    writeln!(reader.get_mut(),"{}",serde_json::json!({"check":{"requestId":1,"group":1,"hostConfirmed":true,"ip":"192.0.2.9","port":443,"host":"a.example"}})).unwrap();
     line.clear(); reader.read_line(&mut line).unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
     let (started,evidence) = {
@@ -617,4 +617,25 @@ fn approval_never_confuses_the_site_peer_with_the_reported_exit_range() {
     assert!(!approvable_source("198.51.0.0/16","198.51.100.99".parse().unwrap()));
     assert!(approvable_source("2001:db8:1::/64","2001:db8:1::a".parse().unwrap()));
     assert!(!approvable_source("2001:db8::/32","2001:db8:1::a".parse().unwrap()));
+}
+
+#[test]
+fn dns_inferred_name_uses_dependent_evidence_and_slow_results_keep_the_original_time() {
+    let cfg=cfg();
+    let mut q=target_check(1,"192.0.2.5",Some("a.example"));
+    q.host_confirmed=false;
+    let failed=Failures::default();
+    let plan=failed.plan(&cfg,&cfg.groups[0],&q);
+    assert!(plan.iter().all(|t|!t.direct_flow()));
+    assert!(plan.iter().any(|t|t.peer==Some((q.ip,443))));
+    q.host_confirmed=true;
+    let target=failed.plan(&cfg,&cfg.groups[0],&q).remove(0);
+    let hook:ProbeHook=Arc::new(|req,peer| {
+        *peer=req.connect_ip;
+        std::thread::sleep(Duration::from_millis(1050));
+        Some(b"HTTP/1.1 200 OK\r\n\r\nloc=ZZ\n".to_vec())
+    });
+    let obs=target.observe(&hook,"marker","utun9");
+    assert_eq!(obs.country.as_deref(),Some("ZZ"));
+    assert!(!fresh_evidence(obs.evidence_at_ms.unwrap()),"response parsing must not refresh a slow probe");
 }

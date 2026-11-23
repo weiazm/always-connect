@@ -462,6 +462,7 @@ fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str, in
     }
     let req = ProbeRequest { host: h, connect_ip, port, request, alpn: list, interface: interface.into(), timeout_ms };
     let mut peer = None;
+    let started_at = crate::egress_gate::evidence_clock_ms();
     let raw = hook(&req, &mut peer);
     if connect_ip.is_some() && peer.is_some() && peer != connect_ip {
         obs.error = Some("探测对端与指定地址不符".into());
@@ -474,7 +475,7 @@ fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str, in
         None => obs.error = Some("连不上或没有回答".into()),
         Some(resp) => match extract(method, &resp) {
             Ok((c, ip)) => {
-                obs.evidence_at_ms = crate::egress_gate::evidence_clock_ms();
+                obs.evidence_at_ms = started_at;
                 obs.country = Some(c);
                 obs.ip = ip;
             }
