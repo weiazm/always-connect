@@ -659,7 +659,9 @@ fn failure_reason(group: &Group, policy: Option<&crate::egress_source::SourcePol
     if obs.error.is_some() || obs.country.is_none() { return Some("unconfirmed"); }
     if !group.expect.iter().any(|c| obs.country.as_ref().is_some_and(|country| c.eq_ignore_ascii_case(country))) { return Some("country-mismatch"); }
     if !group.exit_range_check { return None; }
-    let evidence = if matches!(obs.evidence.as_deref(), Some("direct" | "member")) && obs.peer_address.is_some() {
+    // A proxy observation still connected to the flow's own destination, so the exit IP
+    // it reports is the exit used for that destination; only the site identity is borrowed.
+    let evidence = if matches!(obs.evidence.as_deref(), Some("direct" | "member" | "proxy")) && obs.peer_address.is_some() {
         obs.ip.as_deref().and_then(|v| v.parse().ok()).map_or(SourceEvidence::Unverified, SourceEvidence::Direct)
     } else { SourceEvidence::Unverified };
     match policy { Some(p) => p.evaluate(evidence).failure_reason(), None => Some("exit-ip-unavailable") }

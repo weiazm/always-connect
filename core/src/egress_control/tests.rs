@@ -612,6 +612,14 @@ fn approval_never_confuses_the_site_peer_with_the_reported_exit_range() {
     v.ip=Some("198.51.100.99".into());
     assert_eq!(failure_reason(&group,Some(&pol),&v),None);
     v.evidence=Some("proxy".into());
+    assert_eq!(failure_reason(&group,Some(&pol),&v),None, "a proxy probe to the same destination reports its exit");
+    v.ip=Some("203.0.113.8".into());
+    assert_eq!(failure_reason(&group,Some(&pol),&v),Some("exit-range-mismatch"));
+    v.peer_address=None;
+    assert_eq!(failure_reason(&group,Some(&pol),&v),Some("exit-ip-unavailable"), "no pinned destination, no exit evidence");
+    v.peer_address=Some("198.51.100.21".parse().unwrap());
+    v.ip=Some("198.51.100.99".into());
+    v.evidence=Some("third-party".into());
     assert_eq!(failure_reason(&group,Some(&pol),&v),Some("exit-ip-unavailable"));
     v.country=Some("YY".into());
     assert_eq!(failure_reason(&group,Some(&pol),&v),Some("country-mismatch"));

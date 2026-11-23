@@ -115,7 +115,9 @@ struct EgressWebsiteScope: Equatable {
             // follows the rule, so an untested subdomain cannot bypass it.
             return [.init(pattern: root, method: method), .init(pattern: "*." + root)]
         }
-        return [.init(pattern: root), .init(pattern: "*." + root, method: method, probeHost: host)]
+        // The site itself is checked with the same method: as a follow-only member it
+        // would be blocked whenever any other address of the site failed (§66.21).
+        return [.init(pattern: root, method: method), .init(pattern: "*." + root, method: method, probeHost: host)]
     }
 
     static func unique(_ scopes: [Self]) -> [Self] {
