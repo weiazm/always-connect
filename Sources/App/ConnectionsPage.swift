@@ -50,11 +50,20 @@ struct ConnectionsPage: View {
     @State private var message: String?
     @State private var updated: Date?
     @ObservedObject private var manager = HelperClient.shared
+    @ObservedObject private var settingsWindow = SettingsWindow.shared
     /// The "不走 VPN" list, read on appear and after each change here.
     @State private var sites: [DirectSite] = []
     @State private var notice: Notice?
     @State private var egressAddition: EgressAddition?
-    @State private var egressNotice: EgressNotice?
+    @State private var egressNotice: EgressAction?
+    @State private var egressPending: EgressAction?
+    @State private var egressBusy = false
+    @State private var egressVisible = false
+    @State private var egressGeneration = UUID()
+    @State private var protectedConfig = EgressProtection()
+    @State private var protectionStatus: EgressProtection.Status?
+    @State private var selected = Set<Row.ID>()
+    @State private var showEgressTip = false
     /// Totals since the previous refresh; nil until there are two samples.
     @State private var totals: (vpn: [Int], direct: [Int])?
     @State private var sortOrder: [KeyPathComparator<Row>] = []
@@ -76,16 +85,19 @@ struct ConnectionsPage: View {
 
     private struct EgressAddition: Identifiable {
         let id = UUID()
-        let site: String
-        let group: EgressProtection.Group
-        let config: EgressProtection
+        let sites: [String]
     }
 
-    private struct EgressNotice: Identifiable {
+    private struct EgressAction: Identifiable {
         let id = UUID()
-        let before: EgressProtection.Group?
-        let after: EgressProtection.Group
-        let site: String
+        let change: EgressRuleChange
+        var text: String
+        var rule: UInt32?
+        var scope: EgressWebsiteScope?
+        var method: String?
+        var source: [EgressRecentVisits.Visit] = []
+        var requiresLiveSetup = false
+        var setupSession: Date?
     }
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
@@ -111,16 +123,30 @@ struct ConnectionsPage: View {
             Text(summary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Table(shown, sortOrder: $sortOrder) {
+            if showEgressTip && filter == .vpn {
+                Text("点行尾的「保护出口」，也可以选中多行后一起加入。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !selectedEligible.isEmpty {
+                HStack {
+                    Text("已选 \(selectedEligible.count) 个网站").font(.caption)
+                    Menu("保护出口") { egressDestinations(selectedEligible) }
+                }
+            }
+            Table(shown, selection: $selected, sortOrder: $sortOrder) {
                 TableColumn("程序") { row in
                     Text(row.process).lineLimit(1).help(row.process)
                 }
                 .width(processColumnWidth)
                 TableColumn("地址") { row in
-                    Text(row.address + (row.count > 1 ? "  ×\(row.count)" : ""))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(row.address)
+                    HStack(spacing: 4) {
+                        if row.via == "vpn", let rule = protectedConfig.rule(covering: row.host) {
+                            Image(systemName: "shield.fill").foregroundStyle(.secondary)
+                                .help("受规则「\(rule.name)」保护")
+                        }
+                        Text(row.address + (row.count > 1 ? "  ×\(row.count)" : ""))
+                            .lineLimit(1).truncationMode(.middle).help(row.address)
+                    }
                 }
                 .width(min: 160, ideal: 180)
                 TableColumn("协议") { row in
@@ -145,7 +171,8 @@ struct ConnectionsPage: View {
                 // of its own cut "VPN 隧道本身" short (§44.3).
                 TableColumn("原因") { row in
                     HStack(spacing: 4) {
-                        Text(reason(row)).foregroundStyle(.secondary).lineLimit(1).help(reason(row))
+                        let label = blockedDestination(row) ? "已拦（出口不对）" : reason(row)
+                        Text(label).foregroundStyle(blockedDestination(row) ? Color.orange : Color.secondary).lineLimit(1).help(label)
                         Spacer(minLength: 0)
                         action(row)
                     }
@@ -169,16 +196,42 @@ struct ConnectionsPage: View {
             if let message {
                 Text(message).font(.caption).foregroundStyle(.orange)
             }
+            if egressBusy {
+                ProgressView("正在检查选中网站的出口…").controlSize(.small)
+            }
+            if let pending = egressPending {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(pending.text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    if pending.change.needsReconnect(connected: manager.showsConnected) {
+                        EgressReconnectPrompt(change: pending.change, cancel: { egressPending = nil }) {
+                            egressPending = nil
+                            applyEgress(pending)
+                        }
+                    } else {
+                        HStack {
+                            Button("取消") { egressPending = nil }
+                            Button("确认") { egressPending = nil; applyEgress(pending) }
+                        }
+                    }
+                }.padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            }
             if let egressNotice {
                 HStack {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("已把 \(egressNotice.site) 加入出口保护组「\(egressNotice.after.name)」。")
+                    Text(egressNotice.text)
                         .font(.caption)
                     Spacer()
-                    Button("撤销") { undoEgressAddition(egressNotice) }.buttonStyle(.borderless)
+                    if let scope = egressNotice.scope, scope.includesSubdomains {
+                        Button("只保护 \(scope.host)") { narrowEgress(egressNotice) }.buttonStyle(.borderless)
+                    }
+                    if let id = egressNotice.rule, egressNotice.change.before.groups.allSatisfy({ $0.id != id }) {
+                        Button("查看国家") { settingsWindow.show(tab: "split", egressRule: id) }.buttonStyle(.borderless)
+                    }
+                    Button("撤销") { undoEgress(egressNotice) }.buttonStyle(.borderless)
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                recommendations(egressNotice)
             }
             Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
                  + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
@@ -191,15 +244,30 @@ struct ConnectionsPage: View {
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            egressVisible = true
+            consumeVPNFilter()
             if preview == nil { sites = DirectSites.sites(ProfileStore.loadAppSettings()) }
+            refreshEgressState()
             refresh()
         }
+        .onChange(of: settingsWindow.vpnConnectionsRequested) { _ in consumeVPNFilter() }
         .onChange(of: preview) { if let sample = $0 { update(sample) } }
-        .onReceive(timer) { _ in if preview == nil { refresh() } }
-        .onDisappear { if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } } }
+        .onReceive(timer) { _ in if preview == nil && egressVisible { refresh(); refreshEgressState() } }
+        .onDisappear {
+            egressVisible = false
+            egressGeneration = UUID()
+            egressBusy = false
+            if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } }
+        }
+        .task(id: egressNotice?.id) {
+            guard let notice = egressNotice else { return }
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            if !Task.isCancelled && egressNotice?.id == notice.id { egressNotice = nil }
+        }
         .sheet(item: $egressAddition) { addition in
-            EgressGroupEditor(group: addition.group, config: addition.config, pendingSite: addition.site) { group, done in
-                saveEgressAddition(group, site: addition.site, completion: done)
+            EgressWebsiteForm(sites: addition.sites) { change, site in
+                egressNotice = .init(change: change, text: "已开始保护 \(site)")
+                refreshEgressState()
             }
         }
     }
@@ -232,101 +300,213 @@ struct ConnectionsPage: View {
     /// already covers it (it moves once the program reconnects), "移除"
     /// on a row the list sends direct. Nothing when the split is off:
     /// then Cisco and the company's list decide (§四十四).
-    @ViewBuilder
+    private var selectedEligible: [Row] {
+        shown.filter { selected.contains($0.id) && egressScope($0) != nil && protectedConfig.rule(covering: $0.host) == nil }
+    }
+
+    private func egressScope(_ row: Row) -> EgressWebsiteScope? {
+        guard row.via == "vpn", !manager.usesCisco, manager.protectsDrops, let host = row.host else { return nil }
+        return EgressWebsiteScope(host, includesSubdomains: true)
+    }
+
     private func action(_ row: Row) -> some View {
-        if manager.ownConnection, row.via != "local" {
-            if let line = DirectSites.covering(sites, host: row.host, address: row.remote) {
-                if row.via == "direct" {
-                    Menu("移除") {
-                        Button("从不走 VPN 的名单删除 \(line)") { remove(line) }
-                    }
-                    .menuStyle(.borderlessButton)
-                    .controlSize(.small)
-                    .menuIndicator(.hidden)
-                    .font(.caption)
-                    .fixedSize()
-                } else {
-                    HStack(spacing: 4) {
-                        Text("已加入").font(.caption).foregroundStyle(.secondary)
-                            .help("已在不走 VPN 的名单里")
-                        if row.via == "vpn" && ProfileStore.loadAppSettings().isDropProtectionOn {
-                            egressMenu(row).menuStyle(.borderlessButton).font(.caption)
+        let scope = egressScope(row)
+        let bypass = DirectSites.covering(sites, host: row.host, address: row.remote)
+        let directChoices = manager.ownConnection && row.via == "vpn" && bypass == nil
+            ? DirectSites.choices(host: row.host, address: row.remote) : []
+        let owner = protectedConfig.rule(covering: row.host)
+        return Group {
+            if row.via == "direct", let bypass, manager.ownConnection {
+                Menu("移除") { Button("从不走 VPN 的名单删除 \(bypass)") { remove(bypass) } }
+            } else if !directChoices.isEmpty || scope != nil {
+                Menu(scope == nil ? "加直连" : "操作") {
+                    if let scope {
+                        if let owner {
+                            let patterns = owner.patternsCovering(scope.host).sorted().joined(separator: "、")
+                            Section("当前范围：\(patterns)") {
+                                Button("移出这条规则", role: .destructive) { move(scope.host, from: owner.id, to: nil) }
+                                if protectedConfig.groups.contains(where: { $0.id != owner.id }) {
+                                    Menu("改到另一条规则") {
+                                        ForEach(protectedConfig.groups.filter { $0.id != owner.id }) { rule in
+                                            Button(rule.name) { move(scope.host, from: owner.id, to: rule.id) }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Menu("保护出口") { egressDestinations([row]) }
                         }
                     }
-                }
-            } else if row.via == "vpn" {
-                let choices = DirectSites.choices(host: row.host, address: row.remote)
-                if !choices.isEmpty {
-                    Menu("加直连") {
-                        Section(row.host == nil ? "加入不走 VPN 的名单" : "加入不走 VPN 的名单（含子域名）") {
-                            ForEach(choices, id: \.rule) { choice in
+                    if !directChoices.isEmpty && owner == nil {
+                        Section("加入不走 VPN 的名单") {
+                            ForEach(directChoices, id: \.rule) { choice in
                                 Button(choice.label) { add(choice.rule) }
                             }
                         }
-                        if row.host == nil {
-                            Text("这个程序没经过系统查域名，只能按地址加；对方换了地址就不再生效。")
-                        }
-                        if ProfileStore.loadAppSettings().isDropProtectionOn {
-                            egressMenu(row)
-                        }
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .controlSize(.small)
-                    .font(.caption)
-                    .fixedSize()
-                    .help("加入不走 VPN 的名单")
-                } else if ProfileStore.loadAppSettings().isDropProtectionOn {
-                    egressMenu(row).menuStyle(.borderlessButton).font(.caption)
                 }
-            }
-        } else if !manager.usesCisco && row.via == "vpn" && ProfileStore.loadAppSettings().isDropProtectionOn {
-            egressMenu(row).menuStyle(.borderlessButton).font(.caption)
-        }
-    }
-
-    private func egressMenu(_ row: Row) -> some View {
-        Menu("加入出口保护") {
-            let config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-            let site = row.host ?? row.remote
-            ForEach(config.groups) { group in
-                Button(group.name) { egressAddition = .init(site: site, group: group, config: config) }
-            }
-            Button("新建组") {
-                egressAddition = .init(site: site, group: EgressProtection.newGroup(in: config), config: config)
+            } else if bypass != nil && row.via == "vpn" && manager.ownConnection {
+                Text("已加入").help("已在不走 VPN 的名单里")
             }
         }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).controlSize(.small).font(.caption).fixedSize()
     }
 
-    private func saveEgressAddition(_ group: EgressProtection.Group, site: String, completion: @escaping (Bool) -> Void) {
-        var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        let before = config.groups.first { $0.id == group.id }
-        if let index = config.groups.firstIndex(where: { $0.id == group.id }) { config.groups[index] = group }
-        else { config.groups.append(group) }
-        manager.saveEgress(config) { ok in
-            if ok {
-                let notice = EgressNotice(before: before, after: group, site: site)
-                egressNotice = notice
-                DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
-                    if egressNotice?.id == notice.id { egressNotice = nil }
+    @ViewBuilder private func egressDestinations(_ rows: [Row]) -> some View {
+        let scopes = EgressWebsiteScope.unique(rows.compactMap(egressScope))
+        if !scopes.isEmpty {
+            let hosts = scopes.map(\.host)
+            Section("保护范围：\(scopes.map(\.website).joined(separator: "、")) 及子域名") {
+                ForEach(protectedConfig.rulesForEditing.groups) { rule in
+                    Button("加到：\(rule.name) · \(rule.enabled ? "只允许 " + rule.expect.map(egressCountryName).joined(separator: "、") : "已停用")") {
+                        addToEgress(hosts, rule: rule.id)
+                    }
                 }
+                Button("新建规则（按现在的出口）") { addToEgress(hosts, rule: nil) }
             }
-            completion(ok)
+            .disabled(egressBusy)
         }
     }
 
-    private func undoEgressAddition(_ notice: EgressNotice) {
-        var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let index = config.groups.firstIndex(of: notice.after) else {
-            message = "这一组已在别处修改，请在「分流」页编辑。"
+    private func addToEgress(_ hosts: [String], rule: UInt32?) {
+        guard !egressBusy else { return }
+        let scopes = EgressWebsiteScope.unique(hosts.compactMap { EgressWebsiteScope($0, includesSubdomains: true) })
+        guard !scopes.isEmpty else { return }
+        guard scopes.count <= 8 else { message = "一次最多加入 8 个网站，请减少选择。"; return }
+        let settings = ProfileStore.loadAppSettings()
+        let stored = settings.egressProtection ?? EgressProtection()
+        let direct = DirectSites.sites(settings)
+        guard scopes.allSatisfy({ !$0.conflicts(in: stored, rule: rule, direct: direct) }) else {
+            message = "保护范围与直连名单或另一条规则重叠。请先调整原规则。"
             return
         }
-        if let before = notice.before { config.groups[index] = before }
-        else { config.groups.remove(at: index) }
-        manager.saveEgress(config) { ok in
-            if ok { egressNotice = nil }
-            else { message = "撤销未生效，请到「分流」页检查后台服务。" }
+        guard manager.showsConnected, manager.protectsDrops, !manager.usesCisco else {
+            if rule == nil { egressAddition = .init(sites: scopes.map(\.host)) }
+            else { message = "请先连接 VPN（按网站分流）。" }
+            return
         }
+        message = nil
+        egressBusy = true
+        egressPending = nil
+        let request = UUID()
+        egressGeneration = request
+        let source = EgressRecentVisits.shared.visits.filter { hosts.contains($0.host) }
+        let setupSession = manager.connectedSince
+        manager.probeEgressWebsites(scopes.map(\.host), isCurrent: { egressVisible && egressGeneration == request }) { results in
+            egressBusy = false
+            guard manager.showsConnected, manager.protectsDrops, !manager.usesCisco,
+                  manager.connectedSince == setupSession else { return }
+            let eligible = verifiedMethods(results, config: stored)
+            let proposedCountry = suggestedEgressCountry(results)
+            if rule == nil && (proposedCountry == nil || results.values.contains { !$0.isComplete }) {
+                egressAddition = .init(sites: scopes.map(\.host))
+                return
+            }
+            let newID = EgressProtection.newGroup(in: stored).id
+            guard let change = EgressWebsiteScope.adding(scopes, to: stored, rule: rule, newRuleID: newID,
+                                                         methods: eligible, countries: proposedCountry.map { [$0] } ?? [],
+                                                         activateExisting: false),
+                  let target = change.after.groups.first(where: { $0.id == (rule ?? newID) }) else {
+                message = "这条规则需要至少一个能直接检查出口的网站。"
+                return
+            }
+            let website = scopes.count == 1 ? scopes[0].website : "\(scopes.count) 个网站"
+            let checked = scopes.compactMap { results[$0.host].map { "\($0.host)：\($0.caption)" } }
+            let line = rule == nil
+                ? "\(website) 及子域名 · 只允许 " + target.expect.map(egressCountryName).joined(separator: "、")
+                : "已加入「\(target.name)」：\(website) 及子域名"
+            let note = target.enabled ? checked.joined(separator: " ") : "这条规则仍处于停用状态。"
+            let scope = scopes.count == 1 ? scopes[0] : nil
+            let action = EgressAction(change: change, text: line + "。" + note, rule: target.id,
+                                      scope: scope, method: scope.flatMap { eligible[$0.host] }, source: source,
+                                      requiresLiveSetup: rule == nil, setupSession: setupSession)
+            if rule == nil || change.needsReconnect(connected: manager.showsConnected) { egressPending = action }
+            else { applyEgress(action) }
+        }
+    }
+
+    private func move(_ host: String, from source: UInt32, to target: UInt32?) {
+        let latest = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard let (change, patterns) = EgressRuleChange.move(host: host, source: source, target: target, config: latest) else { return }
+        let destination = target.flatMap { id in latest.rulesForEditing.groups.first(where: { $0.id == id }) }
+        let label = destination.map { "移到「\($0.name)」" + ($0.enabled ? "，沿用它允许的国家" : "，该规则处于停用状态") } ?? "移出出口保护"
+        egressPending = .init(change: change, text: label + "：" + patterns.sorted().joined(separator: "、"), rule: target)
+    }
+
+    private func applyEgress(_ action: EgressAction, showNotice: Bool = true) {
+        guard !action.requiresLiveSetup || (manager.showsConnected && manager.connectedSince == action.setupSession) else {
+            message = "VPN 连接已变化，请重新检查出口。"
+            return
+        }
+        egressBusy = true
+        manager.saveEgress(action.change.after, replacing: action.change.before) { ok in
+            egressBusy = false
+            if ok {
+                var saved = action
+                if action.requiresLiveSetup { saved.text = "已开始保护 " + action.text }
+                egressNotice = showNotice ? saved : nil
+                selected.removeAll()
+                refreshEgressState()
+            } else { message = "规则未保存。配置已变化或后台未接受，请刷新后重试。" }
+        }
+    }
+
+    private func undoEgress(_ notice: EgressAction) {
+        let change = notice.change.undo
+        let action = EgressAction(change: change, text: "撤销刚才的出口保护修改")
+        if change.needsReconnect(connected: manager.showsConnected) { egressPending = action }
+        else { applyEgress(action, showNotice: false) }
+    }
+
+    private func narrowEgress(_ notice: EgressAction) {
+        guard let old = notice.scope, let id = notice.rule, let scope = EgressWebsiteScope(old.host, includesSubdomains: false) else { return }
+        let oldConfig = notice.change.before
+        let existing = oldConfig.groups.contains { $0.id == id }
+        let countries = notice.change.after.groups.first { $0.id == id }?.expect ?? []
+        let methods = notice.method.map { [scope.host: $0] } ?? [:]
+        guard let replacement = EgressWebsiteScope.adding([scope], to: oldConfig, rule: existing ? id : nil, newRuleID: id,
+                                                          methods: methods, countries: countries, activateExisting: false) else { return }
+        let narrow = EgressRuleChange(before: notice.change.after, after: replacement.after)
+        let action = EgressAction(change: narrow, text: "已改为只保护 \(scope.host)", rule: id)
+        applyEgress(action)
+    }
+
+    @ViewBuilder private func recommendations(_ notice: EgressAction) -> some View {
+        if let rule = notice.rule, protectedConfig.groups.contains(where: { $0.id == rule && $0.enabled }) {
+            let related = EgressRecentVisits.shared.recommendations(for: notice.source, config: protectedConfig, direct: sites)
+            if !related.isEmpty {
+                HStack {
+                    Text("常和它一起出现").font(.caption).foregroundStyle(.secondary)
+                    ForEach(related, id: \.self) { host in
+                        Button(host) { addToEgress([host], rule: rule) }.buttonStyle(.borderless)
+                    }
+                    Button("全部加入") { addToEgress(related, rule: rule) }.buttonStyle(.borderless)
+                }.disabled(egressBusy)
+            }
+        }
+    }
+
+    private func consumeVPNFilter() {
+        guard egressVisible, settingsWindow.vpnConnectionsRequested else { return }
+        settingsWindow.vpnConnectionsRequested = false
+        filter = .vpn
+        showEgressTip = true
+    }
+
+    private func refreshEgressState() {
+        protectedConfig = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard preview == nil, manager.showsConnected, protectedConfig.isActive else { protectionStatus = nil; return }
+        manager.fetchEgressJSON { json in
+            guard egressVisible, protectedConfig.isActive, manager.showsConnected else { return }
+            protectionStatus = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
+        }
+    }
+
+    private func blockedDestination(_ row: Row) -> Bool {
+        guard row.via == "vpn", let owner = protectedConfig.rule(covering: row.host),
+              let state = protectionStatus?.groups.first(where: { $0.id == owner.id }) else { return false }
+        return state.observed.contains { $0.evidenceKind == .direct && $0.host == row.host
+            && $0.peerAddress == row.remote && $0.country != nil && $0.isOutside(owner.expect) }
     }
 
     private func add(_ rule: String) {
@@ -404,6 +584,7 @@ struct ConnectionsPage: View {
     }
 
     private func update(_ result: [ConnectionRow], speeds: Speeds? = nil) {
+        if preview == nil, egressVisible { EgressRecentVisits.shared.record(result) }
         updated = Date()
         rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
         if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {

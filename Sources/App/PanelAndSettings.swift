@@ -24,6 +24,8 @@ struct PanelView: View {
     @State private var protectionOn = ProfileStore.loadAppSettings().isDropProtectionOn
     @State private var egressDisabledWithDrop = false
     @State private var egressActionError: String?
+    @State private var egressStopConfirmation: UInt32?
+    @State private var egressRechecking = false
     @State private var showConfirmQuit = false
     /// The split switch flipped while connected: reconnect first (§26.12).
     @State private var confirmSplit: Bool?
@@ -324,7 +326,8 @@ struct PanelView: View {
 
     /// One row of the settings card: icon, name, a line under it, and
     /// whatever sits on the right.
-    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?, captionLines: Int = 1) -> some View {
+    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?, captionLines: Int = 1,
+                          captionColor: Color = .secondary) -> some View {
         HStack(spacing: 10) {
             Image(systemName: symbol)
                 .foregroundStyle(.secondary)
@@ -334,7 +337,7 @@ struct PanelView: View {
                 if let caption {
                     Text(caption)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(captionColor)
                         .lineLimit(captionLines)
                 }
             }
@@ -454,8 +457,9 @@ struct PanelView: View {
                 Divider()
                 if manager.egressNotices.isEmpty {
                     Button { onOpenSettings("split") } label: {
-                        rowLabel("shield.lefthalf.filled", "出口保护", line, captionLines: manager.egressBlocked ? 2 : 1)
-                            .foregroundStyle(manager.egressBlocked ? Color.red : Color.primary)
+                        rowLabel("shield.lefthalf.filled", "出口保护", line,
+                                 captionLines: manager.egressLevel == .blocked ? 2 : 1,
+                                 captionColor: manager.egressLevel.color)
                     }
                     .buttonStyle(.plain)
                     .padding(.vertical, 8)
@@ -464,22 +468,38 @@ struct PanelView: View {
                         .foregroundStyle(.red)
                         .padding(.top, 8)
                     HStack {
-                        Button("编辑检测方式") { onOpenSettings("split") }
+                        Button("查看规则") { onOpenSettings("split") }
                         if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
-                            Button("停用这组", role: .destructive) { disableEgressGroup(notice.id) }
+                            Button("停用规则", role: .destructive) { askToDisableEgressGroup(notice.id) }
                         } else {
-                            Menu("停用这组") {
+                            Menu("停用规则") {
                                 ForEach(manager.egressNotices) { notice in
-                                    Button(notice.name, role: .destructive) { disableEgressGroup(notice.id) }
+                                    Button(notice.name, role: .destructive) { askToDisableEgressGroup(notice.id) }
                                 }
                             }
                         }
                     }
                     .buttonStyle(.borderless)
                     .padding(.vertical, 6)
-                    if let egressActionError {
-                        Text(egressActionError).font(.caption).foregroundStyle(.red)
+                }
+                if let id = manager.egressRecheckRule {
+                    Button(egressRechecking ? "正在重新检查…" : "重新检查") {
+                        egressRechecking = true
+                        manager.recheckEgressRule(id) { ok in
+                            egressRechecking = false
+                            egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
+                        }
+                    }.disabled(egressRechecking)
+                }
+                if let id = egressStopConfirmation {
+                    Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("取消") { egressStopConfirmation = nil }
+                        Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
                     }
+                }
+                if let egressActionError {
+                    Text(egressActionError).font(.caption).foregroundStyle(.secondary)
                 }
             }
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
@@ -514,6 +534,13 @@ struct PanelView: View {
         manager.disableEgressGroup(id) { ok in
             egressActionError = ok ? nil : "这组未停用。请在分流设置重试。"
         }
+    }
+
+    private func askToDisableEgressGroup(_ id: UInt32) {
+        let config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let change = EgressRuleChange(config: config) { $0.disableGroup(id) }
+        if change.needsReconnect(connected: manager.showsConnected) { egressStopConfirmation = id }
+        else { disableEgressGroup(id) }
     }
 
     /// The engine's own words under the headline (retry count, last

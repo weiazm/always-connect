@@ -14,12 +14,19 @@ import SwiftUI
 /// In the menu-bar App, show() starts the settings process instead
 /// (§32.15); the window itself only ever lives in that process, which
 /// exits when it closes.
-final class SettingsWindow: NSObject, NSWindowDelegate {
+final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
     static let shared = SettingsWindow()
     static let size = NSSize(width: 1040, height: 640)
     static let minimumSize = NSSize(width: 900, height: 560)
 
     private var window: NSWindow?
+    @Published var egressRuleToOpen: UInt32?
+    @Published var vpnConnectionsRequested = false
+
+    func showVPNConnections() {
+        vpnConnectionsRequested = true
+        show(tab: "connections")
+    }
 
     private override init() {}
 
@@ -41,11 +48,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     /// is clicked, so a plain makeKeyAndOrderFront left the window
     /// behind whatever app was in front (user report, 2026-11-03):
     /// activate first, then bring the window up.
-    func show(tab: String? = nil) {
+    func show(tab: String? = nil, egressRule: UInt32? = nil) {
         guard AppRole.isSettings else {
-            SettingsLink.shared.show(tab: tab)
+            SettingsLink.shared.show(tab: tab, egressRule: egressRule)
             return
         }
+        let arguments = CommandLine.arguments
+        let initialRule = window == nil
+            ? arguments.firstIndex(of: "--egress-rule").flatMap { arguments.dropFirst($0 + 1).first }.flatMap(UInt32.init)
+            : nil
+        if let rule = egressRule ?? initialRule { egressRuleToOpen = rule }
         if let tab {
             UserDefaults.standard.set(tab, forKey: "settingsTab")
         }

@@ -27,129 +27,117 @@ extension EgressProtection {
 
 struct EgressProtectionSection: View {
     @ObservedObject private var manager = HelperClient.shared
-    @State private var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+    @ObservedObject private var window = SettingsWindow.shared
+    @State private var stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
     @State private var status: EgressProtection.Status?
-    @State private var confirm: Bool?
-    @State private var editing: EgressProtection.Group?
+    @State private var confirm: EgressRuleChange?
+    @State private var sheet: Sheet?
     @State private var editingMethod: EgressProtection.Method?
-    @State private var methodsOpen = false
     @State private var busy = false
+    @State private var visible = false
     @State private var message: String?
+    @State private var notice: EgressChangeNotice?
     @State private var importing = false
     @State private var exporting = false
-    private let timer = Timer.publish(every: 5, tolerance: 1, on: .main, in: .common).autoconnect()
+    @State private var confirmDropProtection = false
 
-    private var unavailable: String? {
-        if manager.usesCisco {
-            return "经 Cisco 连接时出口由公司名单决定，这里不做检测。"
+    private enum Sheet: Identifiable {
+        case add(UInt32?), details(UInt32), advanced(UInt32)
+        var id: String {
+            switch self {
+            case .add(let id): return "add-\(id ?? 0)"
+            case .details(let id): return "details-\(id)"
+            case .advanced(let id): return "advanced-\(id)"
+            }
         }
-        if !ProfileStore.loadAppSettings().isDropProtectionOn {
-            return "出口保护需要断线保护开着，否则断线时受保护网站会回落本地。"
-        }
-        return nil
     }
 
-    private var canEnableProtection: Bool {
-        var candidate = config
-        candidate.enabled = true
-        return config.enabled || candidate.permitsActivation(comparedTo: config)
-    }
+    private var config: EgressProtection { stored.rulesForEditing }
+    private var available: Bool { !manager.usesCisco && manager.protectsDrops }
 
     var body: some View {
         Section {
-            Group {
-                Toggle(isOn: Binding(get: { config.enabled }, set: { on in
-                    guard !on || canEnableProtection else { return }
-                    if manager.switchIsOn { confirm = on }
-                    else { change { $0.enabled = on } }
-                })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("出口保护")
-                        Text(summary).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                .disabled(!canEnableProtection)
-                if let on = confirm {
-                    HStack {
-                        Text("需要重新连接一次才能生效").font(.callout)
-                        Spacer()
-                        Button("稍后") { confirm = nil }
-                        Button("重新连接") {
-                            confirm = nil
-                            change { $0.enabled = on }
-                        }
-                    }
-                }
-                if config.groups.isEmpty {
-                    Text("还没有组。点「新建组」，或从「连接」页加入网站。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                ForEach(config.groups) { group in groupRow(group) }
-                if let records = status?.records, !records.isEmpty {
-                    DisclosureGroup("拦截记录") {
-                        ForEach(records.indices, id: \.self) { index in
-                            let record = records[index]
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(record.name + (record.ended == nil ? " · 有未恢复的拦截" : " · 已恢复"))
-                                ForEach(record.observed.indices, id: \.self) { observation in
-                                    Text(record.observed[observation].observationCaption)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
+            if manager.usesCisco {
+                Text("切到「按网站分流」后可用").foregroundStyle(.secondary)
+            } else if !manager.protectsDrops {
                 HStack {
-                    Button("新建组") { editing = EgressProtection.newGroup(in: config) }
+                    Text("出口保护需要断线保护").foregroundStyle(.secondary)
                     Spacer()
-                    Menu("管理配置") {
-                        Button("导入 JSON…") { importing = true }
-                        Button("导出 JSON…") { exporting = true }
-                    }.fixedSize()
-                }
-                DisclosureGroup("检测方式", isExpanded: $methodsOpen) {
-                    ForEach(config.availableMethods) { method in
-                        HStack {
-                            Button { editingMethod = method } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(method.name)
-                                    Text(method.scopeCaption).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }.buttonStyle(.plain)
-                            Spacer()
-                            if config.methods.contains(where: { $0.id == method.id }) {
-                                Button(role: .destructive) {
-                                    change { $0.methods.removeAll { $0.id == method.id } }
-                                } label: { Image(systemName: "minus.circle.fill").foregroundStyle(.red) }
-                                .buttonStyle(.borderless)
-                                .help("删除自定义方式或恢复预设")
-                            }
-                        }
-                    }
-                    Button("新增检测方式") {
-                        editingMethod = .init(id: UUID().uuidString, name: "", url: "https://{host}/",
-                                              extract: .init(kind: .json, key: "country"))
-                    }
+                    Button("打开断线保护") { confirmDropProtection = true }
                 }
             }
-            .disabled(unavailable != nil || busy)
-            if let message { Text(message).font(.caption).foregroundStyle(.orange) }
-        } footer: {
-            Text(unavailable ?? "开启后，走 VPN 的网站会改用 TCP 连接。受保护网站的新连接先等出口检查，1 秒内可共用结果。")
+            Group {
+                if config.groups.isEmpty {
+                    Text("从连接列表里点选要保护的网站").foregroundStyle(.secondary)
+                } else {
+                    Text(summary).font(.caption).foregroundStyle(.secondary)
+                    ForEach(config.groups) { group in ruleRow(group) }
+                }
+                Button { sheet = .add(nil) } label: {
+                    Label("添加要保护的网站", systemImage: "plus")
+                }
+                if let confirm {
+                    EgressReconnectPrompt(change: confirm, cancel: { self.confirm = nil }) {
+                        self.confirm = nil
+                        apply(confirm)
+                    }
+                }
+                if let notice {
+                    EgressChangeBanner(notice: notice) { undo(notice) }
+                }
+                if let message { Text(message).font(.caption).foregroundStyle(.orange) }
+                if let records = status?.records, !records.isEmpty {
+                    DisclosureGroup("最近拦截（\(records.count)）") {
+                        ForEach(records, id: \.started) { record in
+                            Button(record.host ?? record.name) { sheet = .details(record.group) }
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+                DisclosureGroup("高级") { advanced }
+            }
+            .disabled(!available || busy)
+            if config.groups.isEmpty {
+                Button("打开连接列表") { window.showVPNConnections() }
+            }
+        } header: { Text("出口保护") } footer: {
+            Text("保护的网站每次新建连接时都会确认出口。开启后，走 VPN 的网站会使用 TCP。")
                 .font(.caption).foregroundStyle(.secondary)
         }
-        .onAppear { config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection(); refresh() }
-        .onChange(of: manager.egressLine) { _ in refresh() }
+        .onAppear { visible = true; refresh(); openRequestedRule() }
+        .onDisappear { visible = false; status = nil }
+        .onChange(of: window.egressRuleToOpen) { _ in openRequestedRule() }
         .onChange(of: manager.showsConnected) { _ in refresh() }
-        .onReceive(timer) { _ in if config.isActive { refresh() } }
-        .sheet(item: $editing) { group in
-            EgressGroupEditor(group: group, config: config) { candidate, done in
-                change({ current in
-                    if let index = current.groups.firstIndex(where: { $0.id == candidate.id }) {
-                        current.groups[index] = candidate
-                    } else { current.groups.append(candidate) }
-                }, completion: done)
+        .background {
+            if visible && config.isActive {
+                Color.clear.onReceive(Timer.publish(every: 5, tolerance: 1, on: .main, in: .common).autoconnect()) { _ in refresh() }
+            }
+        }
+        .task(id: notice?.id) {
+            guard let notice else { return }
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            if !Task.isCancelled && self.notice?.id == notice.id { self.notice = nil }
+        }
+        .sheet(item: $sheet) { page in
+            switch page {
+            case .add(let rule):
+                EgressWebsiteForm(rule: rule) { change, site in
+                    notice = .init(text: "已开始保护 \(site)", change: change)
+                    refresh()
+                }
+            case .details(let id):
+                if let group = config.groups.first(where: { $0.id == id }) {
+                    EgressRuleDetail(rule: group, status: status, refresh: refresh,
+                                     addWebsite: { sheet = .add(id) }, advanced: { sheet = .advanced(id) },
+                                     edit: { edit in changeRule(id, edit: edit) },
+                                     remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
+                }
+            case .advanced(let id):
+                if let group = config.groups.first(where: { $0.id == id }) {
+                    EgressGroupEditor(group: group, config: config) { group, done in
+                        changeRule(id, edit: { $0 = group }, completion: done)
+                    }
+                }
             }
         }
         .sheet(item: $editingMethod) { method in
@@ -167,95 +155,141 @@ struct EgressProtectionSection: View {
                 defer { if opened { url.stopAccessingSecurityScopedResource() } }
                 var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url))
                 imported.enabled = false
-                change { $0 = imported }
+                let offline = imported.rulesForEditing
+                change { $0 = offline }
             } catch { message = "无法读取出口保护配置。请选择有效的 JSON 文件。" }
         }
-        .fileExporter(isPresented: $exporting, document: EgressConfigFile(config: config),
+        .fileExporter(isPresented: $exporting, document: EgressConfigFile(config: stored),
                       contentType: .json, defaultFilename: "AlwaysConnect-egress") { result in
             if case .failure = result { message = "配置未导出。请检查保存位置。" }
         }
+        .alert("打开断线保护？", isPresented: $confirmDropProtection) {
+            Button("取消", role: .cancel) {}
+            Button("打开") {
+                var settings = ProfileStore.loadAppSettings()
+                settings.dropProtection = true
+                ProfileStore.saveAppSettings(settings)
+                manager.dropProtectionChanged()
+            }
+        } message: { Text("VPN 断开时会暂时拦截网络，直到重新连接或你手动断开。") }
     }
 
     private var summary: String {
-        guard config.enabled else { return "每次连组里的网站前先查出口，国家不对就拦住。" }
-        let total = config.groups.filter(\.enabled).count
-        let blocked = status?.groups.filter(\.blocked).count ?? 0
-        if blocked != 0 { return "\(total) 组 · \(blocked) 组有拦截" }
-        let checked = status?.groups.filter { $0.state == "ok" }.count ?? 0
-        return "\(total) 组 · " + (total > 0 && checked == total ? "全部正常" : "等待检查")
+        let active = config.groups.filter(\.enabled)
+        guard !active.isEmpty else { return "出口保护已关闭" }
+        let count = Set(active.flatMap(\.websiteNames)).count
+        let state = status?.panelCaption(checkingFor: 0, expectedRules: Set(active.map(\.id))) ?? "尚未核实出口"
+        return "正在保护 \(count) 个网站 · " + state
     }
 
-    private func groupRow(_ group: EgressProtection.Group) -> some View {
-        let current = status?.groups.first { $0.id == group.id }
-        let canProbe = !config.directMembers(in: group).isEmpty
-        let needsAttention = group.enabled && !canProbe
-        let reason = current?.blocked == true ? current?.blockReason : nil
-        let description: String
-        if let caption = current?.blockCaption {
-            description = caption
-        } else if needsAttention && config.enabled {
-            description = "无法核实网站本身的出口。启用后将拦截这组新连接。"
-        } else if !canProbe {
-            description = "至少需要一个直接检查网站的成员才能开启"
-        } else {
-            description = "\(group.members.count) 个网站 · " + group.expect.map(countryName).joined(separator: "、")
-        }
-        return VStack(alignment: .leading, spacing: 6) {
+    @ViewBuilder private var advanced: some View {
+        ForEach(config.availableMethods) { method in
             HStack {
-                Button { editing = group } label: {
-                    VStack(alignment: .leading, spacing: 2) {
+                Button(method.name) { editingMethod = method }
+                Text(method.scopeCaption).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if config.methods.contains(where: { $0.id == method.id }) {
+                    Button("删除", role: .destructive) { change { $0.methods.removeAll { $0.id == method.id } } }
+                }
+            }
+        }
+        Button("新增检查方式") {
+            editingMethod = .init(id: UUID().uuidString, name: "", url: "https://{host}/",
+                                  extract: .init(kind: .json, key: "country"))
+        }
+        HStack {
+            Button("导入配置…") { importing = true }
+            Button("导出配置…") { exporting = true }
+        }
+        Button("新建高级规则") {
+            var group = EgressProtection.newGroup(in: config, name: "网站规则")
+            group.enabled = false
+            change { $0.groups.append(group) }
+        }
+    }
+
+    private func ruleRow(_ group: EgressProtection.Group) -> some View {
+        let state = status?.groups.first { $0.id == group.id }
+        let canEnable = !config.directMembers(in: group).isEmpty && !group.expect.isEmpty
+        let reason = state?.blockReason
+        let description = state?.blockCaption ?? (group.enabled && !canEnable
+            ? "无法核实网站本身的出口，连接后将拦截这条规则的新连接"
+            : group.enabled ? (state?.displayLevel == .ok ? "正常" : "尚未核实出口") : "已停用")
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Button { sheet = .details(group.id) } label: {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(group.name)
+                        if !group.expect.isEmpty {
+                            Text("只允许 " + group.expect.map(egressCountryName).joined(separator: "、"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         Text(description).font(.caption)
-                            .foregroundStyle(current?.blocked == true || !canProbe ? Color.red : Color.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+                            .foregroundStyle(reason != nil ? Color.red : (state?.displayLevel ?? .unknown).color)
+                    }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }.buttonStyle(.plain)
-                Toggle(group.name, isOn: Binding(get: { group.enabled }, set: { on in
-                    if on && canProbe { editing = group }
-                    else if !on { disableGroup(group.id) }
-                })).labelsHidden().disabled(!canProbe && !group.enabled)
-                Button(role: .destructive) { change { $0.groups.removeAll { $0.id == group.id } } } label: {
-                    Image(systemName: "minus.circle.fill").foregroundStyle(.red)
-                }.buttonStyle(.borderless).help("删除这一组")
-                }
-            if needsAttention || reason != nil {
+                Toggle("启用 \(group.name)", isOn: Binding(get: { group.enabled }, set: { on in
+                    if on && !canEnable { sheet = .details(group.id); return }
+                    changeRule(group.id) { $0.enabled = on }
+                })).labelsHidden().disabled(!canEnable && !group.enabled)
+            }
+            if group.enabled && (reason != nil || !canEnable) {
                 HStack {
-                    Button("编辑检测方式") { editing = group }
-                    Button("停用这组", role: .destructive) { disableGroup(group.id) }
-                }
-                .buttonStyle(.borderless)
+                    Button("编辑检查方式") { sheet = .advanced(group.id) }
+                    Button("停用这条规则", role: .destructive) { changeRule(group.id) { $0.enabled = false } }
+                }.buttonStyle(.borderless)
             }
         }
     }
 
-    private func disableGroup(_ id: UInt32) {
-        change { $0.disableGroup(id) }
+    private func openRequestedRule() {
+        guard visible, let id = window.egressRuleToOpen else { return }
+        window.egressRuleToOpen = nil
+        if config.groups.contains(where: { $0.id == id }) { sheet = .details(id) }
+    }
+
+    private func changeRule(_ id: UInt32, edit: (inout EgressProtection.Group) -> Void, completion: ((Bool) -> Void)? = nil) {
+        change({ config in
+            if let index = config.groups.firstIndex(where: { $0.id == id }) { edit(&config.groups[index]) }
+        }, completion: completion)
     }
 
     private func change(_ edit: (inout EgressProtection) -> Void, completion: ((Bool) -> Void)? = nil) {
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        var next = previous
-        edit(&next)
-        guard next.permitsActivation(comparedTo: previous) else {
-            message = "至少需要一个直接检查网站的成员才能开启该组。"
+        let change = EgressRuleChange(config: previous, edit: edit)
+        guard change.after.permitsActivation(comparedTo: previous) else {
+            message = "先添加一个能直接检查出口的网站。"
             completion?(false)
             return
         }
+        if change.needsReconnect(connected: manager.showsConnected) {
+            if completion != nil { sheet = nil }
+            confirm = change
+        } else { apply(change, completion: completion) }
+    }
+
+    private func apply(_ change: EgressRuleChange, completion: ((Bool) -> Void)? = nil) {
         busy = true
-        manager.saveEgress(next) { ok in
+        manager.saveEgress(change.after, replacing: change.before) { ok in
             busy = false
-            if ok { config = next; message = nil; refresh() }
-            else { message = "后台服务未接受配置。请检查配置和后台服务版本。" }
+            message = ok ? nil : "规则未保存。请重新打开设置后再试。"
+            refresh()
             completion?(ok)
         }
     }
 
+    private func undo(_ notice: EgressChangeNotice) {
+        let change = notice.change.undo
+        self.notice = nil
+        if change.needsReconnect(connected: manager.showsConnected) { confirm = change }
+        else { apply(change) }
+    }
+
     private func refresh() {
-        config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard config.isActive, manager.showsConnected else { status = nil; return }
+        stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard visible, config.isActive, manager.showsConnected else { status = nil; return }
         manager.fetchEgressJSON { json in
-            guard config.isActive, manager.showsConnected else { status = nil; return }
+            guard visible, config.isActive, manager.showsConnected else { return }
             status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
         }
     }
@@ -350,10 +384,7 @@ struct EgressGroupEditor: View {
             HStack {
                 Button("取消") { dismiss() }
                 Spacer()
-                Button("立即检测") { check(enable: false) }.disabled(probeable.isEmpty)
-                if !group.enabled {
-                    Button("检测并开启") { check(enable: true) }.disabled(directMembers.isEmpty || group.name.isEmpty)
-                }
+                Button("立即检测", action: check).disabled(probeable.isEmpty)
                 Button("保存") { commit() }.keyboardShortcut(.defaultAction).disabled(group.name.isEmpty)
             }
         }
@@ -420,39 +451,27 @@ struct EgressGroupEditor: View {
         }
     }
 
-    private func check(enable: Bool) {
-        let members = enable ? directMembers : probeable
+    private func check() {
+        let members = probeable
         guard !members.isEmpty else { return }
         busy = true
-        func next(_ index: Int, _ countries: [String], _ rows: [String]) {
+        func next(_ index: Int, _ rows: [String]) {
             guard index < members.count else {
                 busy = false
-                let actual = Array(Set(countries)).sorted()
-                note = enable ? "当前出口：" + actual.map(countryName).joined(separator: "、") : rows.joined(separator: "\n")
-                if enable {
-                    group.expect = actual
-                    group.enabled = true
-                    commit()
-                }
+                note = rows.joined(separator: "\n")
                 return
             }
             let member = members[index]
             guard let host = member.concreteHost else { busy = false; return }
             probe(host) { observations in
                 let observed = observations.first(where: { $0.method == member.method })
-                if enable && observed?.country == nil {
-                    busy = false
-                    note = "\(host) 未查到出口。请检查自建连接和检测方式。"
-                    return
-                }
                 let method = config.method(member.method)
                 let label = observed?.country.map(countryName) ?? observed?.error ?? "未查到"
                 let scope = method.map { " · " + $0.scopeCaption } ?? ""
-                next(index + 1, countries + (observed?.country.map { [$0] } ?? []),
-                     rows + ["\(host)：\(label)" + scope])
+                next(index + 1, rows + ["\(host)：\(label)" + scope])
             }
         }
-        next(0, [], [])
+        next(0, [])
     }
 }
 

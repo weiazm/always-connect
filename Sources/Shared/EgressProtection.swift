@@ -134,7 +134,40 @@ struct EgressProtection: Codable, Equatable {
         let lastCheck: Double
         let observed: [Observation]
         var reason: String? = nil
+        var level: String? = nil
+        var blockedCount: UInt64? = nil
+        var lastBlockedHost: String? = nil
+        var lastBlockedCountry: String? = nil
+        var sites: [SiteState]? = nil
         var blocked: Bool { state == "blocked" }
+    }
+
+    struct SiteState: Decodable, Identifiable {
+        let host: String
+        let state: String
+        let lastCheck: Double
+        let country: String?
+        let blockedCount: UInt64
+        var id: String { host }
+    }
+
+    struct SetupProbe: Decodable {
+        struct Result: Decodable {
+            let address: String
+            let method: String
+            let status: String
+            let country: String?
+            let error: String?
+        }
+        let host: String
+        let method: String
+        let status: String
+        let error: String?
+        let resolvedAddressCount: Int
+        let probedAddressCount: Int
+        let truncated: Bool
+        let coverageIncomplete: Bool
+        let results: [Result]
     }
 
     struct BlockRecord: Decodable {
