@@ -88,6 +88,9 @@ struct EgressUnknownWebView: View {
             Text(record.endpoint.label).font(.body.monospaced())
             Text("未知应用 · 已拦截 \(record.count) 次")
                 .font(.caption).foregroundStyle(.secondary)
+            if let explanation = record.identityExplanation {
+                Text(explanation).font(.caption).foregroundStyle(.secondary)
+            }
             if record.allowed {
                 Text("本次 VPN 会话已添加此地址和端口的例外").font(.caption).foregroundStyle(.secondary)
             }

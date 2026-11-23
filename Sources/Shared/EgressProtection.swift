@@ -136,6 +136,7 @@ struct EgressProtection: Codable, Equatable {
     }
 
     struct UnknownWebRecord: Decodable, Equatable {
+        var lastReason: String? = nil
         let address: String
         let port: UInt16
         let count: UInt64

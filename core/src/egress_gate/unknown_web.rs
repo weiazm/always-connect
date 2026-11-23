@@ -131,26 +131,43 @@ pub(super) fn is_site_name(name: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnknownWebReason {
+    /// The outer ClientHello contained the ECH extension. This also covers GREASE.
+    Ech,
+    #[default]
+    #[serde(other)]
+    Unidentified,
+}
+
+impl UnknownWebReason {
+    pub(crate) fn unspecified(&self) -> bool { *self == Self::Unidentified }
+}
+
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct UnknownWebCount {
     pub address: IpAddr,
     pub port: u16,
     pub count: u64,
+    #[serde(rename = "lastReason", skip_serializing_if = "UnknownWebReason::unspecified")]
+    pub last_reason: UnknownWebReason,
 }
 
 #[derive(Default)]
 pub(super) struct UnknownWebCounts {
-    totals: HashMap<SocketAddr, u64>,
+    totals: HashMap<SocketAddr, (u64, UnknownWebReason)>,
     changed: bool,
 }
 
 impl UnknownWebCounts {
-    pub(super) fn record(&mut self, endpoint: SocketAddr) {
+    pub(super) fn record(&mut self, endpoint: SocketAddr, reason: UnknownWebReason) {
         if self.totals.len() >= MAX_ENDPOINTS && !self.totals.contains_key(&endpoint) {
             return;
         }
-        let count = self.totals.entry(endpoint).or_default();
-        *count += 1;
+        let (count, last_reason) = self.totals.entry(endpoint).or_default();
+        *count = count.saturating_add(1);
+        *last_reason = reason;
         self.changed = true;
     }
 
@@ -158,10 +175,11 @@ impl UnknownWebCounts {
         if !std::mem::take(&mut self.changed) {
             return None;
         }
-        Some(self.totals.iter().map(|(endpoint, &count)| UnknownWebCount {
+        Some(self.totals.iter().map(|(endpoint, &(count, last_reason))| UnknownWebCount {
             address: endpoint.ip(),
             port: endpoint.port(),
             count,
+            last_reason,
         }).collect())
     }
 }
@@ -198,12 +216,12 @@ mod tests {
     fn reporting_never_reuses_a_cumulative_endpoint_slot() {
         let mut counts = UnknownWebCounts::default();
         for i in 0..=MAX_ENDPOINTS {
-            counts.record(SocketAddr::from(([93, 184, 216, i as u8], 443)));
+            counts.record(SocketAddr::from(([93, 184, 216, i as u8], 443)), UnknownWebReason::Unidentified);
         }
         assert_eq!(counts.snapshot().unwrap().len(), MAX_ENDPOINTS);
         assert!(counts.snapshot().is_none());
         let first = SocketAddr::from(([93, 184, 216, 0], 443));
-        counts.record(first);
+        counts.record(first, UnknownWebReason::Unidentified);
         let rows = counts.snapshot().unwrap();
         assert_eq!(rows.iter().find(|row| row.address == first.ip()).unwrap().count, 2);
         assert!(rows.iter().all(|row| row.address != IpAddr::from([93, 184, 216, MAX_ENDPOINTS as u8])));

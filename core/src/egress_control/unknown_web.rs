@@ -1,4 +1,5 @@
 use super::*;
+use crate::egress_gate::UnknownWebReason;
 use std::net::SocketAddr;
 
 const LIMIT: usize = 32;
@@ -8,6 +9,8 @@ pub(super) struct UnknownCount {
     address: IpAddr,
     port: u16,
     count: u64,
+    #[serde(default, rename = "lastReason")]
+    last_reason: UnknownWebReason,
 }
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
@@ -17,6 +20,8 @@ pub struct UnknownWeb {
     port: u16,
     count: u64,
     allowed: bool,
+    #[serde(skip_serializing_if = "UnknownWebReason::unspecified")]
+    last_reason: UnknownWebReason,
     approval_id: String,
 }
 
@@ -46,6 +51,7 @@ impl ControlState {
                 .find(|v| v.address == row.address && v.port == row.port)
             {
                 known.count = known.count.saturating_add(delta);
+                known.last_reason = row.last_reason;
                 continue;
             }
             if records.len() >= LIMIT {
@@ -63,6 +69,7 @@ impl ControlState {
                 port: row.port,
                 count: delta,
                 allowed: false,
+                last_reason: row.last_reason,
                 approval_id: format!("{:032x}", u128::from_be_bytes(bytes)),
             });
         }

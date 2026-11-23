@@ -631,7 +631,7 @@ fn unknown_web_exceptions_require_current_counted_endpoint_and_never_replace_a_p
     let mut line=String::new();reader.read_line(&mut line).unwrap();
     let frame=serde_json::from_str::<serde_json::Value>(&line).unwrap();
     assert_eq!(frame["blockUnidentifiedWeb"],true);
-    let announce=|count|serde_json::json!({"unknownWeb":[{"address":"198.51.100.7","port":443,"count":count},
+    let announce=|count|serde_json::json!({"unknownWeb":[{"address":"198.51.100.7","port":443,"count":count,"lastReason":"ech"},
         {"address":"203.0.113.1","port":443,"count":1}]});
     writeln!(reader.get_mut(),"{}",serde_json::json!({"up":{"ifname":"utun9"}})).unwrap();
     writeln!(reader.get_mut(),"{}",announce(2)).unwrap();
@@ -644,6 +644,8 @@ fn unknown_web_exceptions_require_current_counted_endpoint_and_never_replace_a_p
     };
     let records=status["unknownWeb"].as_array().unwrap();
     let ip="198.51.100.7".parse().unwrap();
+    assert_eq!(records[0]["lastReason"], "ech");
+    assert!(records[1].get("lastReason").is_none(), "legacy frames do not imply ECH");
     let token=records[0]["approvalId"].as_str().unwrap();
     assert!(!ctl.unknown_exception(ip,8443,true,token));
     assert!(!ctl.unknown_exception(ip,443,true,"old"));

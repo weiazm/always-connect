@@ -23,7 +23,7 @@ enum EgressUnknownWebText {
     static let turnOff = "关闭后，认不出网站的公网网页连接将不再被这项保护拦截。受保护网站仍按各自的规则检查。"
 
     static func allow(_ endpoint: EgressUnknownWebEndpoint) -> String {
-        "只为 \(endpoint.label) 跳过认不出网站的连接拦截。此地址上的受保护网站仍按原规则检查。"
+        "本次 VPN 会话内，无法识别网站名的连接都可以使用 \(endpoint.label)。多个网站可能共用这个地址。已识别的保护规则仍优先。"
     }
 
     static func revoke(_ endpoint: EgressUnknownWebEndpoint) -> String {
@@ -40,6 +40,10 @@ struct EgressUnknownWebChange: Codable, Equatable {
 }
 
 extension EgressProtection.UnknownWebRecord {
+    var identityExplanation: String? {
+        lastReason == "ech" ? "上次握手带有 ECH 扩展。浏览器也可能发送这种占位扩展，App 无法确认实际访问的网站名。" : nil
+    }
+
     var endpoint: EgressUnknownWebEndpoint { .init(address: address, port: port) }
 
     var change: EgressUnknownWebChange? {

@@ -230,12 +230,16 @@ struct EgressNotificationHarness {
         off.blockUnidentifiedWeb = false
         check(!off.blocksUnidentifiedWeb && off.groups == config.groups,
               "closing the switch does not change protected rules")
-        let data = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWebCount":7,"unknownWeb":[{"address":"198.51.100.17","port":443,"count":5,"allowed":false,"approvalId":"fixture-approval"},{"address":"2001:db8::8","port":8443,"count":2,"allowed":true,"approvalId":"fixture-withdraw"}]}"#.utf8)
+        let data = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWebCount":7,"unknownWeb":[{"address":"198.51.100.17","lastReason":"ech","port":443,"count":5,"allowed":false,"approvalId":"fixture-approval"},{"address":"2001:db8::8","port":8443,"count":2,"allowed":true,"approvalId":"fixture-withdraw"}]}"#.utf8)
         let decoder = JSONDecoder()
         var status = try! decoder.decode(EgressProtection.Status.self, from: data)
         let monitor = EgressProtection.Status.monitoring(data)!
         check(monitor.unknownWebCount == 7 && monitor.unknownWeb == nil,
               "the panel reads real counts without retaining addresses or approval IDs")
+        if let rows = try? JSONDecoder().decode(EgressProtection.Status.self, from: data).unknownWeb {
+            check(rows[0].identityExplanation?.contains("占位扩展") == true && rows[1].identityExplanation == nil,
+                  "only the latest observed ECH extension explains an unidentified connection")
+        } else { check(false, "unknown web rows decode") }
         let beforeCount = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWeb":[{"count":5}]}"#.utf8)
         check(EgressProtection.Status.monitoring(beforeCount)?.unknownWebCount == nil,
               "an older backend's missing scalar is unknown, with no fallback scan")

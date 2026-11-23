@@ -810,13 +810,13 @@ fn unidentified_public_web_denials_count_new_connections_only() {
     assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
     assert_eq!(g.outbound(&packet, now), Step::Consumed);
     drain(&mut g);
-    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 1 }]));
+    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 1, last_reason: UnknownWebReason::Unidentified }]));
     assert!(g.take_unknown_web().is_none());
     assert!(g.take_denied_group().is_none());
 
     connect_and_send(&mut g, 45111, PUBLIC, &no_sni, now);
     assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
-    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 2 }]));
+    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 2, last_reason: UnknownWebReason::Unidentified }]));
 }
 
 #[test]
@@ -843,6 +843,24 @@ fn unidentified_web_applies_to_tcp_web_ports_and_real_site_names_still_pass() {
     let records = g.take_unknown_web().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records.iter().map(|record| record.count).sum::<u64>(), 4);
+}
+
+#[test]
+fn ech_denial_reports_only_the_extension_on_the_last_blocked_web_flow() {
+    let mut gate = gate();
+    gate.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    let now = Instant::now();
+    let ech = hello(Some("front.example"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut gate, 43101, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut gate).as_slice(), [Out::ToHost(_)]));
+    let first = gate.take_unknown_web().unwrap();
+    assert_eq!((first[0].count, first[0].last_reason), (1, UnknownWebReason::Ech));
+    let ordinary = hello(Some("ordinary.example"), &[], false, 0);
+    assert_eq!(connect_and_send(&mut gate, 43102, PUBLIC, &ordinary, now).0, Step::Forward);
+    assert!(gate.take_unknown_web().is_none());
+    assert_eq!(connect_and_send(&mut gate, 43103, PUBLIC, &hello(None, &[], false, 0), now).0, Step::Consumed);
+    let last = gate.take_unknown_web().unwrap();
+    assert_eq!((last[0].count, last[0].last_reason), (2, UnknownWebReason::Unidentified));
 }
 
 #[test]

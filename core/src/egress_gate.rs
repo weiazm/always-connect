@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 mod unknown_web;
 use unknown_web::{is_site_name, UnknownWebCounts};
-pub use unknown_web::{UnknownWebCount, UnknownWebEndpoint, UnknownWebPolicy};
+pub use unknown_web::{UnknownWebCount, UnknownWebEndpoint, UnknownWebPolicy, UnknownWebReason};
 
 /// A protected group (DESIGN.md §66.3); the caller's identifier.
 pub type GroupId = u32;
@@ -197,7 +197,7 @@ struct Flow {
 
 enum BlockReason<'a> {
     Protection(GroupId, Option<&'a str>),
-    UnidentifiedWeb,
+    UnidentifiedWeb(UnknownWebReason),
     Internal,
 }
 
@@ -660,7 +660,7 @@ impl Gate {
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
-            let _ = self.decide_by_address(k, now, false);
+            let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified);
         }
         let idle = self.cfg.idle;
         self.flows.retain(|_, f| matches!(f.state, State::Holding(_)) || now.duration_since(f.last_seen) < idle);
@@ -809,7 +809,7 @@ impl Gate {
         };
         let target = match verdict {
             Sniff::Incomplete if !full => return Step::Consumed,
-            Sniff::Incomplete | Sniff::Unknown => Target::Address,
+            Sniff::Incomplete | Sniff::Unknown => Target::Address(UnknownWebReason::Unidentified),
             Sniff::Tls { sni, alpn, ech } => {
                 if !self.cfg.probe_alpn.is_empty() && alpn.contains(&self.cfg.probe_alpn) {
                     Target::Pass
@@ -818,14 +818,15 @@ impl Gate {
                         Some(name) if !ech => self.classify_named(key.dst, name, now),
                         Some(name) => match self.classifier.group_for_name(&name) {
                             Some(group) => Target::Group(group, name, false),
-                            None => Target::Address,
+                            None => Target::Address(UnknownWebReason::Ech),
                         },
-                        None => Target::Address,
+                        None if ech => Target::Address(UnknownWebReason::Ech),
+                        None => Target::Address(UnknownWebReason::Unidentified),
                     }
                 }
             }
             Sniff::Http(Some(name)) => self.classify_named(key.dst, name, now),
-            Sniff::Http(None) => Target::Address,
+            Sniff::Http(None) => Target::Address(UnknownWebReason::Unidentified),
         };
         let only_current = first;
         match target {
@@ -838,7 +839,7 @@ impl Gate {
                     Step::Consumed
                 }
             }
-            Target::Address => self.decide_by_address(key, now, only_current),
+            Target::Address(reason) => self.decide_by_address(key, now, only_current, reason),
             Target::Group(group, host, confirmed) => {
                 self.wait_for_check(key, group, Some(host), confirmed, now);
                 Step::Consumed
@@ -850,7 +851,7 @@ impl Gate {
         let group = self.classifier.group_for_name(&name);
         let identified = is_site_name(&name);
         if group.is_none() && self.cfg.unknown_web.active() && !identified {
-            return Target::Address;
+            return Target::Address(UnknownWebReason::Unidentified);
         }
         if identified {
             self.observe_warm_identity(ip, &name, WARM_NAME_LIFETIME, false, now);
@@ -919,10 +920,10 @@ impl Gate {
     }
 
     /// Decide a holding connection by its destination address.
-    fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool) -> Step {
+    fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason) -> Step {
         match self.ip_group(key.dst) {
             None if self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) => {
-                self.block(key, BlockReason::UnidentifiedWeb);
+                self.block(key, BlockReason::UnidentifiedWeb(reason));
                 Step::Consumed
             }
             None => {
@@ -1013,9 +1014,9 @@ impl Gate {
                 BlockReason::Protection(group, host) => {
                     self.blocked_flows.record(key, h.client_isn, group, host);
                 }
-                BlockReason::UnidentifiedWeb => {
+                BlockReason::UnidentifiedWeb(reason) => {
                     if self.blocked_flows.first_denial(key, h.client_isn) {
-                        self.unknown_web_counts.record(SocketAddr::new(key.dst, key.dport));
+                        self.unknown_web_counts.record(SocketAddr::new(key.dst, key.dport), reason);
                     }
                 }
                 BlockReason::Internal => {}
@@ -1084,7 +1085,7 @@ impl Gate {
 
 enum Target {
     Pass,
-    Address,
+    Address(UnknownWebReason),
     Group(GroupId, String, bool),
 }
 
