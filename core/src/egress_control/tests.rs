@@ -84,6 +84,42 @@ fn requests_are_https_only_and_name_the_site() {
 }
 
 #[test]
+fn setup_probe_reports_each_method_without_forwarding_a_redirect_or_identity() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let hook: ProbeHook = Arc::new(move |request| {
+        captured.lock().unwrap().push(request.clone());
+        let line = request.request.lines().next().unwrap();
+        let reply: &[u8] = match line {
+            "GET /cdn-cgi/trace HTTP/1.1" => b"HTTP/1.1 302 Found\r\nLocation: https://redirect.example/\r\n\r\n",
+            "HEAD / HTTP/1.1" => b"HTTP/1.1 200 OK\r\nX-Served-By: cache-iad-x1-IAD\r\n\r\n",
+            "GET /geo HTTP/1.1" => b"HTTP/1.1 200 OK\r\n\r\n{\"ip\":\"198.51.100.7\",\"geo\":{\"country\":\"YY\"}}",
+            _ => panic!("unexpected request: {line}"),
+        };
+        Some(reply.into())
+    });
+    let results = probe_methods(&cfg(), "a.example", &hook, "fixture-marker", "utun42");
+    assert_eq!(results.iter().map(|result| result.method.as_str()).collect::<Vec<_>>(),
+               [PRESET_TRACE, PRESET_CDN, "json"]);
+    assert!(results.iter().all(|result| result.host == "a.example"));
+    assert!(results[0].country.is_none() && results[0].error.is_some());
+    assert_eq!(results[1].country.as_deref(), Some("US"));
+    assert_eq!(results[2].country.as_deref(), Some("YY"));
+    assert_eq!(results[2].ip.as_deref(), Some("198.51.100.7"));
+
+    let requests = requests.lock().unwrap();
+    let mut hosts: Vec<_> = requests.iter().map(|request| request.host.as_str()).collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, ["a.example", "a.example", "echo.example"]);
+    for request in requests.iter() {
+        assert_eq!(request.alpn, ["http/1.1", "fixture-marker"]);
+        assert_eq!(request.interface, "utun42");
+        let headers: Vec<_> = request.request.lines().skip(1).filter_map(|line| line.split_once(':')).collect();
+        assert_eq!(headers.iter().map(|(name, _)| *name).collect::<Vec<_>>(), ["Host", "Accept", "Connection"]);
+    }
+}
+
+#[test]
 fn chunked_bodies_are_joined() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nloc=Z\r\n2\r\nZ\n\r\n0\r\n\r\n";
     let r = parse_response(raw).unwrap();

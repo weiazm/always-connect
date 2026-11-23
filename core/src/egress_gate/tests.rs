@@ -1,5 +1,7 @@
 use super::*;
 
+mod controller_path;
+
 // Documentation addresses only (RFC 5737 / RFC 3849) and example names.
 const MAC: [u8; 4] = [10, 0, 0, 2];
 const SITE: [u8; 4] = [198, 51, 100, 10];
