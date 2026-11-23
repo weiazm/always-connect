@@ -1,7 +1,10 @@
 //! Compatibility evidence from the final downstream wire reply. This decoder
 //! is deliberately independent of how an upstream answer is used for routing.
 
-use super::{TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_DNAME, TYPE_HTTPS, TYPE_NS, TYPE_SOA, TYPE_SVCB};
+use super::{
+    Delivery, SplitRules, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_DNAME, TYPE_HTTPS, TYPE_NS, TYPE_SOA,
+    TYPE_SVCB,
+};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 const MAX_PACKET: usize = 8192;
@@ -327,6 +330,7 @@ fn rrset_values(
     qtype: u16,
     rcode: u16,
     soa_owner: Option<&str>,
+    rules: &SplitRules,
 ) -> Option<Vec<DeliveredDnsValue>> {
     let mut owner = name;
     let mut ttl = MAX_TTL;
@@ -351,6 +355,11 @@ fn rrset_values(
         }
         if let Some(target) = alias {
             if !records.is_empty() || depth == MAX_ALIASES {
+                return None;
+            }
+            // The event is keyed by the question name. An ordinary question
+            // cannot represent protection found at a reachable alias.
+            if rules.protects_name(target) && !rules.protects_name(name) {
                 return None;
             }
             owner = target;
@@ -397,14 +406,18 @@ fn rrset_values(
 }
 
 pub(super) fn extract(
-    epoch: u64,
+    delivery: Delivery,
     started_at_ms: u64,
     observed_at_ms: u64,
-    qtype: u16,
     query: &[u8],
     answer: &[u8],
-    synthesized: bool,
 ) -> Option<DeliveredDns> {
+    let Delivery {
+        epoch,
+        qtype,
+        synthesized,
+        rules,
+    } = delivery;
     let kind = match qtype {
         TYPE_A => DeliveredDnsKind::Ipv4,
         TYPE_AAAA => DeliveredDnsKind::Ipv6,
@@ -443,7 +456,7 @@ pub(super) fn extract(
     let scoped_error = matches!(rcode, 2 | 5);
     let scope_known = fully_delivered && scoped_error && error_scope_known(&mut answer, at);
     let values = if fully_delivered && !scoped_error {
-        answer_values(&mut answer, &name, qtype, rcode, at)
+        answer_values(&mut answer, &name, qtype, rcode, at, &rules)
     } else {
         None
     };
@@ -478,6 +491,7 @@ fn answer_values(
     qtype: u16,
     rcode: u16,
     mut at: usize,
+    rules: &SplitRules,
 ) -> Option<Vec<DeliveredDnsValue>> {
     // The common single address RR has no aliases or trailing sections.
     // The question has already been matched exactly and its first label is
@@ -578,5 +592,5 @@ fn answer_values(
     if at != answer.bytes.len() || (ns && soa_owner.is_none()) {
         return None;
     }
-    rrset_values(&answers, name, qtype, rcode, soa_owner.as_deref())
+    rrset_values(&answers, name, qtype, rcode, soa_owner.as_deref(), rules)
 }

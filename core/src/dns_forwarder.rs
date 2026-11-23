@@ -1111,6 +1111,7 @@ struct Delivery {
     epoch: u64,
     qtype: u16,
     synthesized: bool,
+    rules: Arc<SplitRules>,
 }
 
 impl ResolvedAnswer {
@@ -1280,7 +1281,7 @@ impl Inner {
         let synthesized = bytes.is_none();
         let evidence = (self.observe_deliveries.load(Ordering::Acquire) && session.is_some() && entry.is_none()
             && matches!(q.qtype, TYPE_A | TYPE_AAAA | TYPE_SVCB | TYPE_HTTPS))
-            .then_some(Delivery { epoch, qtype: q.qtype, synthesized });
+            .then_some(Delivery { epoch, qtype: q.qtype, synthesized, rules });
         Some(ResolvedAnswer { bytes: bytes.or_else(|| empty_answer(query))?, evidence })
     }
 
@@ -1289,7 +1290,7 @@ impl Inner {
             return;
         };
         let Some(observed_at_ms) = evidence_clock_ms().filter(|observed| *observed >= started_at_ms) else { return };
-        let Some(evidence) = delivered::extract(delivery.epoch, started_at_ms, observed_at_ms, delivery.qtype, query, &answer.bytes, delivery.synthesized) else { return };
+        let Some(evidence) = delivered::extract(delivery, started_at_ms, observed_at_ms, query, &answer.bytes) else { return };
         let settings = self.settings.read().unwrap();
         if settings.enabled && settings.epoch == evidence.epoch && replies.active.load(Ordering::Acquire) {
             hook(evidence);

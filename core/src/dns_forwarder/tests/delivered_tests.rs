@@ -3,7 +3,18 @@ use super::*;
 const OWNER: &[u8] = &[0xc0, 12];
 
 fn observed(qtype: u16, q: &[u8], a: &[u8]) -> Option<DeliveredDns> {
-    delivered::extract(7, 101, 103, qtype, q, a, false)
+    delivered::extract(
+        Delivery {
+            epoch: 7,
+            qtype,
+            synthesized: false,
+            rules: Arc::default(),
+        },
+        101,
+        103,
+        q,
+        a,
+    )
 }
 
 fn value(value: &str, ttl: u32) -> DeliveredDnsValue {
@@ -26,6 +37,36 @@ fn ech_list(names: &[&str]) -> Vec<u8> {
     let mut list = (configs.len() as u16).to_be_bytes().to_vec();
     list.extend(configs);
     list
+}
+
+fn cname_compatibility_reply(q: &[u8]) -> Vec<u8> {
+    let (middle, terminal) = match q[1] % 3 {
+        0 => ("middle.example", "edge.example"),
+        1 => ("middle.guarded.example", "edge.example"),
+        _ => ("middle.example", "protected.example"),
+    };
+    let qtype = question(q).unwrap().qtype;
+    let data = if qtype == TYPE_A {
+        vec![192, 0, 2, 55]
+    } else {
+        svcb_data(1, ".", &param(5, &ech_list(&["outer.example"])))
+    };
+    reply(
+        q,
+        &[
+            rr(OWNER, TYPE_CNAME, 70, &wire(middle)),
+            rr(&wire(middle), TYPE_CNAME, 40, &wire(terminal)),
+            rr(&wire(terminal), qtype, 900, &data),
+            rr(
+                &wire("unrelated.example"),
+                TYPE_CNAME,
+                10,
+                &wire("other.guarded.example"),
+            ),
+        ],
+        &[],
+        &[],
+    )
 }
 
 #[test]
@@ -277,10 +318,12 @@ fn listeners_report_only_the_delivered_tunnel_rrsets() {
     let server = upstream.local_addr().unwrap().to_string();
     let responder = std::thread::spawn(move || {
         let mut buffer = [0; 512];
-        for _ in 0..8 {
+        for _ in 0..17 {
             let (size, peer) = upstream.recv_from(&mut buffer).unwrap();
             let q = &buffer[..size];
-            let mut a = if question(q).unwrap().qtype == TYPE_A {
+            let mut a = if q[1] >= 12 {
+                cname_compatibility_reply(q)
+            } else if question(q).unwrap().qtype == TYPE_A {
                 egress_reply(q)
             } else {
                 let params = if q[1] == 8 {
@@ -306,9 +349,10 @@ fn listeners_report_only_the_delivered_tunnel_rrsets() {
         }
     });
     let port = free_port();
-    let routes =
-        serde_json::from_str::<Vec<GateGroup>>(r#"[{"id":1,"names":["protected.example"]}]"#)
-            .unwrap();
+    let routes = serde_json::from_str::<Vec<GateGroup>>(
+        r#"[{"id":1,"names":["protected.example","*.guarded.example"]}]"#,
+    )
+    .unwrap();
     let direct = vec!["direct.example".into()];
     let (tx, rx) = mpsc::sync_channel(8);
     let fwd = Forwarder::with_dns_hooks(
@@ -405,6 +449,29 @@ fn listeners_report_only_the_delivered_tunnel_rrsets() {
     );
     let fallback = recv();
     assert!(fallback.incomplete && fallback.values.is_empty());
+    for (index, (qtype, expected)) in [
+        (TYPE_A, "192.0.2.55"),
+        (TYPE_HTTPS, "outer.example"),
+        (TYPE_SVCB, "outer.example"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for case in 0..3 {
+            let q = query("alias.example", qtype, 12 + index as u16 * 3 + case);
+            assert_eq!(ask(&q, port).unwrap(), cname_compatibility_reply(&q));
+            let evidence = recv();
+            assert_eq!(evidence.name, "alias.example");
+            assert_eq!(evidence.qtype, qtype);
+            if case == 0 {
+                assert!(!evidence.incomplete);
+                assert_eq!(evidence.values, [value(expected, 40)]);
+            } else {
+                assert!(evidence.incomplete && !evidence.scope_known);
+                assert!(evidence.values.is_empty());
+            }
+        }
+    }
     assert!(fwd
         .inner()
         .resolve(&query("www.example", TYPE_A, 9))
@@ -439,6 +506,7 @@ fn old_epoch_and_closed_listener_do_not_publish_evidence() {
             epoch,
             qtype: TYPE_A,
             synthesized: false,
+            rules: Arc::default(),
         }),
     };
     fwd.start().unwrap();
