@@ -273,6 +273,7 @@ fn paused_engine_does_not_reconfirm_a_stopping_childs_interface() {
             name: name.into(),
             index: interface_index(name).unwrap(),
             generation: c.generation,
+            confirmed_at: Instant::now(),
         });
         let paused = shared.reconfirm_tunnel(&mut c);
         c.tunnel_if = None;

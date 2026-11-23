@@ -1727,6 +1727,18 @@ pub extern "C" fn ac_oc_egress_probe_host(e: *const oc_engine::Engine, host: *co
     owned(serde_json::to_string(&e.egress_probe_host(&host)).unwrap_or_else(|_| "[]".into()))
 }
 #[no_mangle]
+pub extern "C" fn ac_oc_egress_probe_summary(
+    e: *const oc_engine::Engine, host: *const c_char, method: *const c_char,
+) -> *mut c_char {
+    let host = c_str(host).unwrap_or_default();
+    let method = c_str(method).unwrap_or_default();
+    let summary = unsafe { e.as_ref() }.map_or_else(
+        || crate::egress_control::setup_probe::Summary::request(&host, &method),
+        |e| e.egress_probe_summary(&host, &method),
+    );
+    owned(serde_json::to_string(&summary).unwrap_or_else(|_| "{}".into()))
+}
+#[no_mangle]
 pub extern "C" fn ac_oc_update_drop_protection(e: *const oc_engine::Engine, on: bool) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_drop_protection(on) }
 }

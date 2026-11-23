@@ -383,8 +383,16 @@ struct Child {
     alive: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
-struct TunnelLease { name: String, index: u32, generation: u64 }
+#[derive(Clone, PartialEq, Eq)]
+struct TunnelLease { name: String, index: u32, generation: u64, confirmed_at: Instant }
+
+#[derive(PartialEq, Eq)]
+struct SetupProbeTunnel {
+    lease: TunnelLease,
+    dns: Vec<String>,
+    dns_epoch: Option<u64>,
+    gate: Option<(String, u64)>,
+}
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
 const SPLIT_CAPACITY_ERROR: &str = "近一小时访问的网站过多，按网站分流暂时全部走 VPN；约一小时内自动恢复，无需重新连接";
 enum SplitSync { Complete, PendingAdditions, Blocked }
@@ -622,6 +630,50 @@ impl Engine {
         if cfg.active() && marker.is_none() { return Vec::new(); }
         let marker = marker.unwrap_or_default();
         crate::egress_control::probe_methods(&cfg, host, &hook, &marker, &iface)
+    }
+
+    pub(crate) fn egress_probe_summary(&self, host: &str, method: &str) -> crate::egress_control::setup_probe::Summary {
+        use crate::egress_control::setup_probe::Summary;
+        let mut summary = Summary::request(host, method);
+        let (method, tunnel) = {
+            let c = self.shared.core.lock().expect("engine");
+            (summary.method(c.config.egress.as_ref()), self.setup_probe_tunnel(&c))
+        };
+        let hook = self.shared.egress_probe.lock().expect("probe").clone();
+        let (Some(method), Some(tunnel), Some(hook)) = (method, tunnel, hook) else { return summary; };
+        let query = |request: &[u8], deadline| dns_forwarder::query_for_setup_probe(
+            request, &tunnel.dns, &tunnel.lease.name, tunnel.lease.index, deadline,
+        );
+        let still_current = || {
+            let c = self.shared.core.lock().expect("engine");
+            let same_method = Summary::request(host, &method.id).method(c.config.egress.as_ref()).as_ref() == Some(&method);
+            same_method && self.setup_probe_tunnel(&c).as_ref() == Some(&tunnel)
+        };
+        let marker = tunnel.gate.as_ref().map_or("", |(marker, _)| marker.as_str());
+        summary.probe(&method, &hook, marker, &tunnel.lease.name, query, still_current)
+    }
+
+    fn setup_probe_tunnel(&self, c: &Core) -> Option<SetupProbeTunnel> {
+        let lease = c.tunnel_lease.as_ref()?;
+        if c.driver.state != SessionStatus::Connected || !c.hook_fired || !c.child_alive()
+            || c.stop_requested || c.finished || c.recovery_suspended() || c.tunnel_retrying
+            || (c.config.drop_protection && c.pf_needs_load)
+            || c.tunnel_if.as_ref() != Some(&lease.name) || c.generation != lease.generation
+            || interface_index(&lease.name) != Some(lease.index)
+            || self.shared.guard.was_superseded(&self.shared.holder)
+        {
+            return None;
+        }
+        let gate = self.shared.egress.lock().expect("egress").as_ref().and_then(|ctl| ctl.setup_probe_context());
+        if c.config.egress.as_ref().is_some_and(|config| config.active()) && gate.is_none() {
+            return None;
+        }
+        Some(SetupProbeTunnel {
+            lease: lease.clone(),
+            dns: c.tunnel_dns.clone(),
+            dns_epoch: c.forwarder.as_ref().map(|forwarder| forwarder.epoch()),
+            gate,
+        })
     }
 
     pub fn update_direct_domains(&self, d: Vec<String>) {
@@ -2312,7 +2364,7 @@ impl Shared {
 
     fn remember_tunnel(&self, c: &mut Core) {
         c.tunnel_lease = c.tunnel_if.as_ref().and_then(|name| interface_index(name)
-            .map(|index| TunnelLease { name: name.clone(), index, generation: c.generation }));
+            .map(|index| TunnelLease { name: name.clone(), index, generation: c.generation, confirmed_at: Instant::now() }));
         if c.tunnel_lease.is_some() && c.last_error.as_deref()==Some(TUNNEL_RECONFIRM_ERROR) { c.last_error=None; }
     }
 

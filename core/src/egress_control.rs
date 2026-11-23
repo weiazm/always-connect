@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod airports;
 mod recheck;
+pub(crate) mod setup_probe;
 use recheck::{Failures, Target};
 
 // ------------------------------------------------------------------ config
@@ -703,6 +704,12 @@ impl Controller {
 
     pub fn marker(&self) -> String {
         self.shared.marker.clone()
+    }
+
+    pub(crate) fn setup_probe_context(&self) -> Option<(String, u64)> {
+        let state = self.shared.state.lock().expect("controller");
+        state.peer.as_ref()?;
+        Some((self.marker(), state.epoch))
     }
 
     /// Retire the previous script's reader before starting another VPN process.

@@ -206,6 +206,9 @@ final class CLIOrchestrator {
     func updateEgress(_ json: String) { ac_oc_update_egress(handle, json) }
     func egressStatus() -> String { NetworkGuard.take(ac_oc_egress_status(handle)) ?? "{}" }
     func probeEgress(_ host: String) -> String { NetworkGuard.take(ac_oc_egress_probe_host(handle, host)) ?? "[]" }
+    func probeEgressSummary(_ host: String, method: String) -> String {
+        NetworkGuard.take(ac_oc_egress_probe_summary(handle, host, method)) ?? "{}"
+    }
 
     func updateAllowNetworks(_ networks: [String]) {
         ac_oc_update_allow_networks(handle, networks.joined(separator: ","))
@@ -339,6 +342,9 @@ func ac_oc_update_egress(_ e: OpaquePointer, _ json: UnsafePointer<CChar>)
 func ac_oc_egress_status(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_egress_probe_host")
 func ac_oc_egress_probe_host(_ e: OpaquePointer, _ host: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_oc_egress_probe_summary")
+func ac_oc_egress_probe_summary(_ e: OpaquePointer, _ host: UnsafePointer<CChar>,
+                                _ method: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_egress_config_valid")
 func ac_egress_config_valid(_ json: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_oc_update_allow_networks") func ac_oc_update_allow_networks(_ e: OpaquePointer, _ n: UnsafePointer<CChar>)

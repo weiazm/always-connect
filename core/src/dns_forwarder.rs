@@ -745,6 +745,18 @@ pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&
     exchange_bound(query, servers, port, binding.as_ref(), timeout, 0).map(|(_, reply)| reply)
 }
 
+/// A setup probe queries only the active tunnel's DNS view and skips the
+/// forwarding hooks that would otherwise record the name or change routes.
+pub(crate) fn query_for_setup_probe(
+    query: &[u8], servers: &[String], interface: &str, index: u32, deadline: Instant,
+) -> Option<Vec<u8>> {
+    let binding = InterfaceBinding::pinned(interface, index)?;
+    if InterfaceBinding::new(interface).as_ref() != Some(&binding) { return None; }
+    let servers = &servers[..servers.len().min(2)];
+    let attempt = remaining(deadline)? / (servers.len().max(1) as u32 * 2);
+    exchange_until(query, servers, 53, Some(&binding), attempt, deadline).map(|(_, answer)| answer)
+}
+
 const BACKUP_DELAY: Duration = Duration::from_millis(350);
 const PREFER_BACKUP_FOR: Duration = Duration::from_secs(30);
 

@@ -142,6 +142,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
     func getEgressStatus(withReply reply: @escaping (String) -> Void)
     func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void)
+    /// Read-only address sample for a confirmed site. Empty method selects the trace method.
+    func probeEgressSummary(_ host: String, method: String, withReply reply: @escaping (String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the
     /// engine loads no pf set and a drop gives the local network back
     /// while it retries. In force at once in a running session, else

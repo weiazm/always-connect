@@ -651,6 +651,38 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
+    func probeEgressSummary(_ host: String, method: String, withReply reply: @escaping (String) -> Void) {
+        func failure(_ reason: String, status: String = "unavailable") -> String {
+            let fields: [String: Any] = [
+                "host": "", "method": "", "status": status, "error": reason,
+                "resolvedAddressCount": 0, "probedAddressCount": 0,
+                "truncated": false, "coverageIncomplete": true, "results": [],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: fields) else { return "{}" }
+            return String(decoding: data, as: UTF8.self)
+        }
+        queue.async {
+            guard host.utf8.count <= 254, !host.utf8.contains(0) else {
+                reply(failure("invalidHost", status: "invalid")); return
+            }
+            guard method.utf8.count <= 524_288, !method.utf8.contains(0) else {
+                reply(failure("invalidMethod", status: "invalid")); return
+            }
+            guard self.relay != nil, !self.userReleased, let engine = self.engine else {
+                reply(failure("tunnelUnavailable")); return
+            }
+            guard !self.probingEgress else { reply(failure("busy")); return }
+            self.probingEgress = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = engine.probeEgressSummary(host, method: method)
+                self.queue.async {
+                    self.probingEgress = false
+                    reply(self.engine === engine && !self.userReleased ? result : failure("tunnelUnavailable"))
+                }
+            }
+        }
+    }
+
     func getSplitActivity(withReply reply: @escaping ([String], Int, Bool) -> Void) {
         queue.async {
             guard let engine = self.engine else { reply([], 0, false); return }
