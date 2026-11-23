@@ -81,7 +81,8 @@ enum CiscoProfiles {
             "RAW_CANARY_7", "backup-canary.example", "SERVER_NAME_CANARY_8", "CISCO_NAME_CANARY_8",
             "RULE_TYPE_CANARY_8", "RULE_TARGET_CANARY_8.example", "STATE_DESCRIPTION_CANARY_8",
             "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8",
-            "EGRESS_GROUP_CANARY", "egress-canary.example", "198.51.100.77", "ZZ", "YY"]
+            "EGRESS_GROUP_CANARY", "egress-canary.example", "198.51.100.77", "2001:db8:9::7",
+            "EGRESS_LEVEL_CANARY", "ZZ", "YY"]
         let leaks = tokens.filter { exported.contains($0) || malformed.contains($0) }
         // Verify's two-hour sleep fixture: equal spans do not imply equal downtime.
         let start = Date(timeIntervalSince1970: 0)
@@ -127,6 +128,7 @@ enum CiscoProfiles {
         let useful = exported.contains("Cisco 引擎时间线：") && exported.contains("request-connect")
             && exported.contains("重试 2 次") && exported.contains("认证中")
             && exported.contains("出口保护拦截记录") && exported.contains("2 项检测，1 项未查到")
+            && exported.contains("证据级别 proxy=1，unknown=1")
         exit(got && done && useful && leaks.isEmpty && distinguishable && subsecond && bounded && historySafe ? 0 : 1)
     }
 }
@@ -149,9 +151,9 @@ def main():
     static func fixtureText(_ manager: HelperClient, _ profile: Profile, _ timeline: String) -> String {
         let observations = [
             EgressProtection.Observation(host: "egress-canary.example", method: "trace", country: "ZZ",
-                                         ip: "198.51.100.77", error: nil),
+                                         ip: "198.51.100.77", error: nil, evidence: "proxy", peerAddress: "2001:db8:9::7"),
             EgressProtection.Observation(host: "egress-canary.example", method: "other", country: nil,
-                                         ip: nil, error: "EGRESS_GROUP_CANARY"),
+                                         ip: nil, error: "EGRESS_GROUP_CANARY", evidence: "EGRESS_LEVEL_CANARY"),
         ]
         let block = EgressProtection.BlockRecord(started: 1, ended: 10, group: 1, name: "EGRESS_GROUP_CANARY",
                                                  host: "egress-canary.example", observed: observations, expected: ["YY"])
@@ -175,6 +177,7 @@ esac
         subprocess.run(["swiftc", "-O", "-parse-as-library",
             str(root / "Sources/Shared/PhysicalConnectivity.swift"),
             str(root / "Sources/Shared/EgressProtection.swift"),
+            str(root / "Sources/App/EgressPresentation.swift"),
             str(root / "Sources/App/CiscoEngine.swift"), str(root / "Sources/App/DropHistory.swift"),
             str(root / "Sources/App/DiagnosticsRedaction.swift"), str(exporter), str(swift),
             str(root / "core/target/release/libalwaysconnect_core.a"), "-o", str(executable)], check=True)

@@ -4,11 +4,6 @@ import Network
 import UniformTypeIdentifiers
 
 extension EgressProtection {
-    var availableMethods: [Method] {
-        Method.presets.map { preset in methods.first { $0.id == preset.id } ?? preset }
-            + methods.filter { item in !Method.presets.contains { $0.id == item.id } }
-    }
-
     static func newGroup(in config: Self, name: String = "新建组") -> Group {
         let ids = Set(config.groups.map(\.id))
         var id = UInt32.random(in: 1...UInt32.max)
@@ -54,10 +49,17 @@ struct EgressProtectionSection: View {
         return nil
     }
 
+    private var canEnableProtection: Bool {
+        var candidate = config
+        candidate.enabled = true
+        return config.enabled || candidate.permitsActivation(comparedTo: config)
+    }
+
     var body: some View {
         Section {
             Group {
                 Toggle(isOn: Binding(get: { config.enabled }, set: { on in
+                    guard !on || canEnableProtection else { return }
                     if manager.switchIsOn { confirm = on }
                     else { change { $0.enabled = on } }
                 })) {
@@ -66,6 +68,7 @@ struct EgressProtectionSection: View {
                         Text(summary).font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                .disabled(!canEnableProtection)
                 if let on = confirm {
                     HStack {
                         Text("需要重新连接一次才能生效").font(.callout)
@@ -82,6 +85,21 @@ struct EgressProtectionSection: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ForEach(config.groups) { group in groupRow(group) }
+                if let records = status?.records, !records.isEmpty {
+                    DisclosureGroup("拦截记录") {
+                        ForEach(records.indices, id: \.self) { index in
+                            let record = records[index]
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(record.name + (record.ended == nil ? " · 有未恢复的拦截" : " · 已恢复"))
+                                ForEach(record.observed.indices, id: \.self) { observation in
+                                    Text(record.observed[observation].observationCaption)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
                 HStack {
                     Button("新建组") { editing = EgressProtection.newGroup(in: config) }
                     Spacer()
@@ -93,7 +111,12 @@ struct EgressProtectionSection: View {
                 DisclosureGroup("检测方式", isExpanded: $methodsOpen) {
                     ForEach(config.availableMethods) { method in
                         HStack {
-                            Button(method.name) { editingMethod = method }.buttonStyle(.plain)
+                            Button { editingMethod = method } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(method.name)
+                                    Text(method.scopeCaption).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }.buttonStyle(.plain)
                             Spacer()
                             if config.methods.contains(where: { $0.id == method.id }) {
                                 Button(role: .destructive) {
@@ -157,43 +180,68 @@ struct EgressProtectionSection: View {
         guard config.enabled else { return "每次连组里的网站前先查出口，国家不对就拦住。" }
         let total = config.groups.filter(\.enabled).count
         let blocked = status?.groups.filter(\.blocked).count ?? 0
-        if blocked != 0 { return "\(total) 组 · \(blocked) 组已拦截" }
+        if blocked != 0 { return "\(total) 组 · \(blocked) 组有拦截" }
         let checked = status?.groups.filter { $0.state == "ok" }.count ?? 0
         return "\(total) 组 · " + (total > 0 && checked == total ? "全部正常" : "等待检查")
     }
 
     private func groupRow(_ group: EgressProtection.Group) -> some View {
         let current = status?.groups.first { $0.id == group.id }
-        let canProbe = group.members.contains { $0.method != nil && $0.concreteHost != nil }
-        return HStack {
-            Button { editing = group } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(group.name)
-                    Text(current?.blocked == true ? "出口不对，已拦截"
-                         : !canProbe ? "这一组还没有能查出口的网站"
-                         : "\(group.members.count) 个网站 · " + group.expect.map(countryName).joined(separator: "、"))
-                        .font(.caption).foregroundStyle(current?.blocked == true || !canProbe ? Color.red : Color.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }.buttonStyle(.plain)
-            Toggle(group.name, isOn: Binding(get: { group.enabled }, set: { on in
-                if on { editing = group }
-                else { change { cfg in
-                    if let index = cfg.groups.firstIndex(where: { $0.id == group.id }) {
-                        cfg.groups[index].enabled = false
+        let canProbe = !config.directMembers(in: group).isEmpty
+        let needsAttention = group.enabled && !canProbe
+        let reason = current?.blocked == true ? current?.blockReason : nil
+        let description: String
+        if let caption = current?.blockCaption {
+            description = caption
+        } else if needsAttention && config.enabled {
+            description = "无法核实网站本身的出口。启用后将拦截这组新连接。"
+        } else if !canProbe {
+            description = "至少需要一个直接检查网站的成员才能开启"
+        } else {
+            description = "\(group.members.count) 个网站 · " + group.expect.map(countryName).joined(separator: "、")
+        }
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button { editing = group } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(group.name)
+                        Text(description).font(.caption)
+                            .foregroundStyle(current?.blocked == true || !canProbe ? Color.red : Color.secondary)
                     }
-                } }
-            })).labelsHidden().disabled(!canProbe && !group.enabled)
-            Button(role: .destructive) { change { $0.groups.removeAll { $0.id == group.id } } } label: {
-                Image(systemName: "minus.circle.fill").foregroundStyle(.red)
-            }.buttonStyle(.borderless).help("删除这一组")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                Toggle(group.name, isOn: Binding(get: { group.enabled }, set: { on in
+                    if on && canProbe { editing = group }
+                    else if !on { disableGroup(group.id) }
+                })).labelsHidden().disabled(!canProbe && !group.enabled)
+                Button(role: .destructive) { change { $0.groups.removeAll { $0.id == group.id } } } label: {
+                    Image(systemName: "minus.circle.fill").foregroundStyle(.red)
+                }.buttonStyle(.borderless).help("删除这一组")
+                }
+            if needsAttention || reason != nil {
+                HStack {
+                    Button("编辑检测方式") { editing = group }
+                    Button("停用这组", role: .destructive) { disableGroup(group.id) }
+                }
+                .buttonStyle(.borderless)
+            }
         }
     }
 
+    private func disableGroup(_ id: UInt32) {
+        change { $0.disableGroup(id) }
+    }
+
     private func change(_ edit: (inout EgressProtection) -> Void, completion: ((Bool) -> Void)? = nil) {
-        var next = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        var next = previous
         edit(&next)
+        guard next.permitsActivation(comparedTo: previous) else {
+            message = "至少需要一个直接检查网站的成员才能开启该组。"
+            completion?(false)
+            return
+        }
         busy = true
         manager.saveEgress(next) { ok in
             busy = false
@@ -204,6 +252,7 @@ struct EgressProtectionSection: View {
     }
 
     private func refresh() {
+        config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
         guard config.isActive, manager.showsConnected else { status = nil; return }
         manager.fetchEgressJSON { json in
             guard config.isActive, manager.showsConnected else { status = nil; return }
@@ -241,9 +290,11 @@ struct EgressGroupEditor: View {
     @State private var note: String?
     @State private var busy = false
 
-    private var usable: [EgressProtection.Member] {
-        group.members.filter { $0.method != nil && $0.concreteHost != nil }
+    private var probeable: [EgressProtection.Member] {
+        group.members.filter { config.method($0.method) != nil && $0.concreteHost != nil }
     }
+
+    private var directMembers: [EgressProtection.Member] { config.directMembers(in: group) }
 
     var body: some View {
         Form {
@@ -273,7 +324,9 @@ struct EgressGroupEditor: View {
                     HStack {
                         Text(item.pattern)
                         Spacer()
-                        Button(config.availableMethods.first { $0.id == item.method }?.name ?? "跟随本组") {
+                        let method = config.method(item.method)
+                        Button(method?.isDirect == true ? method?.name ?? "跟随本组"
+                               : method != nil ? "跟随本组 · 第三方查询点仅供参考" : "跟随本组") {
                             newMember = false
                             member = item
                         }
@@ -289,13 +342,17 @@ struct EgressGroupEditor: View {
                     Button("添加", action: add).disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
+            if directMembers.isEmpty {
+                Text("至少需要一个直接检查网站的成员才能开启该组。")
+                    .font(.caption).foregroundStyle(.red)
+            }
             if let note { Text(note).font(.caption).foregroundStyle(.orange) }
             HStack {
                 Button("取消") { dismiss() }
                 Spacer()
-                Button("立即检测") { check(enable: false) }.disabled(usable.isEmpty)
+                Button("立即检测") { check(enable: false) }.disabled(probeable.isEmpty)
                 if !group.enabled {
-                    Button("检测并开启") { check(enable: true) }.disabled(usable.isEmpty || group.name.isEmpty)
+                    Button("检测并开启") { check(enable: true) }.disabled(directMembers.isEmpty || group.name.isEmpty)
                 }
                 Button("保存") { commit() }.keyboardShortcut(.defaultAction).disabled(group.name.isEmpty)
             }
@@ -351,8 +408,8 @@ struct EgressGroupEditor: View {
     }
 
     private func commit() {
-        guard !group.enabled || (!usable.isEmpty && !group.expect.isEmpty) else {
-            note = "已开启的组需要至少一个能查的网站和一个预期国家。"
+        guard !group.enabled || (!directMembers.isEmpty && !group.expect.isEmpty) else {
+            note = "已开启的组需要至少一个直接检查网站的成员和一个预期国家。"
             return
         }
         busy = true
@@ -364,13 +421,14 @@ struct EgressGroupEditor: View {
     }
 
     private func check(enable: Bool) {
+        let members = enable ? directMembers : probeable
+        guard !members.isEmpty else { return }
         busy = true
-        let members = usable
-        func next(_ index: Int, _ countries: [String]) {
+        func next(_ index: Int, _ countries: [String], _ rows: [String]) {
             guard index < members.count else {
                 busy = false
                 let actual = Array(Set(countries)).sorted()
-                note = "当前出口：" + actual.map(countryName).joined(separator: "、")
+                note = enable ? "当前出口：" + actual.map(countryName).joined(separator: "、") : rows.joined(separator: "\n")
                 if enable {
                     group.expect = actual
                     group.enabled = true
@@ -381,15 +439,20 @@ struct EgressGroupEditor: View {
             let member = members[index]
             guard let host = member.concreteHost else { busy = false; return }
             probe(host) { observations in
-                guard let observed = observations.first(where: { $0.method == member.method })?.country else {
+                let observed = observations.first(where: { $0.method == member.method })
+                if enable && observed?.country == nil {
                     busy = false
                     note = "\(host) 未查到出口。请检查自建连接和检测方式。"
                     return
                 }
-                next(index + 1, countries + [observed])
+                let method = config.method(member.method)
+                let label = observed?.country.map(countryName) ?? observed?.error ?? "未查到"
+                let scope = method.map { " · " + $0.scopeCaption } ?? ""
+                next(index + 1, countries + (observed?.country.map { [$0] } ?? []),
+                     rows + ["\(host)：\(label)" + scope])
             }
         }
-        next(0, [])
+        next(0, [], [])
     }
 }
 
@@ -421,13 +484,17 @@ struct EgressMemberEditor: View {
                     Picker("检测方式", selection: $member.method) {
                         ForEach(methods) { method in
                             let result = observations.first { $0.method == method.id }
-                            Text(method.name + " · " + resultLabel(result)).tag(Optional(method.id))
+                            Text(method.name + " · " + resultLabel(result) + " · " + method.scopeCaption)
+                                .tag(Optional(method.id))
                         }
                         Text("不检测，跟随本组").tag(String?.none)
                     }
                 }
                 if member.method == nil {
                     Text("同组别的网站查出问题时一起拦。").font(.caption).foregroundStyle(.secondary)
+                } else if methods.first(where: { $0.id == member.method })?.isDirect == false {
+                    Text(EgressProtection.Method.thirdPartyCaption + "。此成员跟随本组。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if !busy, observations.isEmpty, !host.isEmpty {
                     Text("连接自建 VPN 后可以探测出口。").font(.caption).foregroundStyle(.secondary)
@@ -470,10 +537,7 @@ struct EgressMemberEditor: View {
             observations = result
             busy = false
             if chooseDefault && member.method == nil {
-                member.method = methods.first { method in
-                    method.url.hasPrefix("https://{host}/")
-                        && result.contains { $0.method == method.id && $0.country != nil }
-                }?.id
+                member.method = EgressProtection.Method.preferredDirectMethod(methods, observations: result)
             }
         }
     }
@@ -489,7 +553,7 @@ private struct EgressMethodEditor: View {
         Form {
             TextField("名称", text: $method.name)
             TextField("HTTPS 地址模板", text: $method.url)
-            Text("用 {host} 代表成员网站。固定地址查到的是访问查询点的出口。")
+            Text(method.scopeCaption + "。地址中的 {host} 代表成员网站。")
                 .font(.caption).foregroundStyle(.secondary)
             Picker("请求", selection: $method.head) { Text("GET").tag(false); Text("HEAD").tag(true) }
             Picker("从哪里取值", selection: $method.extract.kind) {

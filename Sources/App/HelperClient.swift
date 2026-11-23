@@ -92,6 +92,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var pfWarning: String?
     @Published private(set) var egressLine: String?
     @Published private(set) var egressBlocked = false
+    @Published private(set) var egressNotices: [EgressProtection.BlockedGroupNotice] = []
     private var egressTimer: Timer?
     private var egressPollPending = false
     private var egressNotifications: [Double: Bool] = [:]
@@ -2035,7 +2036,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             return
         }
         let settings = ProfileStore.loadAppSettings()
-        guard !config.enabled || (!usesCisco && settings.isDropProtectionOn) else { completion(false); return }
+        guard config.permitsActivation(comparedTo: settings.egressProtection ?? EgressProtection()),
+              !config.enabled || (!usesCisco && settings.isDropProtectionOn) else { completion(false); return }
         sendEgress(config) { ok in
             if ok {
                 var latest = ProfileStore.loadAppSettings()
@@ -2071,14 +2073,25 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                   let current = status.groups.first(where: { $0.id == group && $0.blocked }) else { return }
             var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
             guard config.enabled, let index = config.groups.firstIndex(where: { $0.id == group && $0.enabled }),
-                  config.groups[index].expect == record.expected else { return }
-            let countries = Set(record.observed.compactMap(\.country))
-            guard !countries.isEmpty, record.observed.allSatisfy({ $0.country != nil }),
-                  current.observed.allSatisfy({ $0.country != nil }),
-                  countries == Set(current.observed.compactMap(\.country)) else { return }
+                  config.groups[index].expect == record.expected,
+                  let targets = record.directTargetsToTrust(current: current) else { return }
+            let members = config.directMembers(in: config.groups[index])
+            guard targets.allSatisfy({ target in
+                members.contains { $0.method == target.method && $0.matchesSite(target.host) }
+            }) else { return }
+            let countries = Set(targets.map(\.country))
             config.groups[index].expect = countries.union(record.expected).sorted()
             self.saveEgress(config) { _ in }
         }
+    }
+
+    func disableEgressGroup(_ id: UInt32, completion: @escaping (Bool) -> Void) {
+        var config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard config.disableGroup(id) else {
+            completion(false)
+            return
+        }
+        saveEgress(config, completion: completion)
     }
 
     private func updateEgressMonitoring() {
@@ -2090,6 +2103,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             egressTimer = nil
             if egressLine != nil { egressLine = nil }
             if egressBlocked { egressBlocked = false }
+            if !egressNotices.isEmpty { egressNotices = [] }
             if !enabled { egressNotifications.removeAll() }
             return
         }
@@ -2110,19 +2124,25 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             guard self.egressTimer != nil else { return }
             let status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
             let blocked = status?.groups.filter(\.blocked) ?? []
+            let notices = status?.blockingNotices ?? []
             let line: String
-            if !blocked.isEmpty { line = "出口不对，已拦截：" + blocked.map(\.name).joined(separator: "、") }
+            if let notice = notices.first { line = "\(notice.reason.caption) · \(notice.name)" }
+            else if let first = blocked.first, let caption = first.blockCaption {
+                line = caption + " · " + blocked.map(\.name).joined(separator: "、")
+            }
             else if status?.checking.isEmpty == false { line = "正在检查出口" }
             else if status?.groups.contains(where: { $0.state == "ok" }) == true { line = "已验证出口" }
             else { line = status?.running == true ? "正在等待出口检查" : "出口保护尚未就绪" }
             if self.egressLine != line { self.egressLine = line }
-            if self.egressBlocked != !blocked.isEmpty { self.egressBlocked = !blocked.isEmpty }
+            let isBlocked = !blocked.isEmpty
+            if self.egressBlocked != isBlocked { self.egressBlocked = isBlocked }
+            if self.egressNotices != notices { self.egressNotices = notices }
             guard let status else { return }
             var seen: [Double: Bool] = [:]
             for record in status.records.reversed() {
                 let ended = record.ended != nil
                 if self.egressNotifications[record.started] == nil && !ended {
-                    Notifier.shared.egressBlocked(record)
+                    Notifier.shared.egressBlocked(record, current: blocked.first { $0.id == record.group })
                 } else if self.egressNotifications[record.started] == false && ended {
                     Notifier.shared.egressRecovered(record.name)
                 }

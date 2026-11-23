@@ -21,7 +21,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private var authRequested = false
     static let heldCategory = "network-held"
     static let restoreAction = "restore-direct"
-    static let egressCategory = "egress-blocked"
+    static let egressCategory = "egress-blocked-direct"
     static let trustEgressAction = "trust-egress"
 
     private override init() { super.init() }
@@ -121,17 +121,22 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
     }
 
-    func egressBlocked(_ record: EgressProtection.BlockRecord) {
+    func egressBlocked(_ record: EgressProtection.BlockRecord, current: EgressProtection.GroupState?) {
+        let reason = current?.blockReason
         let observed = record.observed.filter { item in
-            item.country.map { !record.expected.contains($0) } ?? true
-        }.map { item in
-            "\(item.host)：\(item.country ?? "未查到")" + (item.ip.map { "（\($0)）" } ?? "")
+            item.isOutside(record.expected) || item.evidenceKind == .thirdParty
+        }.map(\.observationCaption)
+        let canTrust = current.flatMap { record.directTargetsToTrust(current: $0) } != nil
+        var lines = reason.map { [$0.caption + "。打开分流设置可编辑检测方式或停用这组。"] } ?? []
+        if current?.reason == nil, let caption = current?.blockCaption {
+            lines.append(caption + "。其他可直接检查的地址仍逐条验证。跟随本组和仅有代理观测的连接会等异常地址恢复。")
         }
-        let canTrust = !record.observed.isEmpty && record.observed.allSatisfy { $0.country != nil }
-        post(title: "出口变了，已拦住：\(record.name)",
-             body: observed.joined(separator: "、") + "。预期出口：" + record.expected.joined(separator: "、"),
+        lines.append(contentsOf: observed)
+        if !record.expected.isEmpty { lines.append("预期出口：" + record.expected.joined(separator: "、")) }
+        post(title: "新连接已拦截：\(record.name)",
+             body: lines.joined(separator: "\n"),
              category: canTrust ? Self.egressCategory : nil,
-             info: ["group": record.group, "started": record.started])
+             info: canTrust ? ["group": record.group, "started": record.started] : [:])
     }
 
     func egressRecovered(_ group: String) {
@@ -146,6 +151,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         if response.actionIdentifier == Self.restoreAction {
             DispatchQueue.main.async { HelperClient.shared.disconnect() }
         } else if response.actionIdentifier == Self.trustEgressAction,
+                  response.notification.request.content.categoryIdentifier == Self.egressCategory,
                   let group = response.notification.request.content.userInfo["group"] as? NSNumber,
                   let started = response.notification.request.content.userInfo["started"] as? NSNumber {
             DispatchQueue.main.async {

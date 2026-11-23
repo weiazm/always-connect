@@ -93,7 +93,9 @@ enum DiagnosticsExporter {
                 let end = block.ended.flatMap { $0.isFinite && $0 >= block.started
                     ? timeFormatter.string(from: Date(timeIntervalSince1970: $0)) : nil }
                 let failures = block.observed.filter { $0.country == nil }.count
-                lines.append("- \(time) → \(end ?? "尚未恢复")，\(block.observed.count) 项检测，\(failures) 项未查到")
+                let evidence = block.evidenceSummary
+                let levels = evidence.isEmpty ? "" : "，证据级别 \(evidence)"
+                lines.append("- \(time) → \(end ?? "尚未恢复")，\(block.observed.count) 项检测，\(failures) 项未查到\(levels)")
             }
         }
         return lines.joined(separator: "\n") + "\n"

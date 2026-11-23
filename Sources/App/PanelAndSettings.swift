@@ -23,6 +23,7 @@ struct PanelView: View {
     @State private var selectedServer = ProfileStore.loadProfile().server
     @State private var protectionOn = ProfileStore.loadAppSettings().isDropProtectionOn
     @State private var egressDisabledWithDrop = false
+    @State private var egressActionError: String?
     @State private var showConfirmQuit = false
     /// The split switch flipped while connected: reconnect first (§26.12).
     @State private var confirmSplit: Bool?
@@ -323,7 +324,7 @@ struct PanelView: View {
 
     /// One row of the settings card: icon, name, a line under it, and
     /// whatever sits on the right.
-    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?) -> some View {
+    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?, captionLines: Int = 1) -> some View {
         HStack(spacing: 10) {
             Image(systemName: symbol)
                 .foregroundStyle(.secondary)
@@ -334,7 +335,7 @@ struct PanelView: View {
                     Text(caption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(captionLines)
                 }
             }
         }
@@ -451,12 +452,35 @@ struct PanelView: View {
             splitRow
             if !manager.gatewayTrustFailed, let line = manager.egressLine {
                 Divider()
-                Button { onOpenSettings("split") } label: {
-                    rowLabel("shield.lefthalf.filled", "出口保护", line)
-                        .foregroundStyle(manager.egressBlocked ? Color.red : Color.primary)
+                if manager.egressNotices.isEmpty {
+                    Button { onOpenSettings("split") } label: {
+                        rowLabel("shield.lefthalf.filled", "出口保护", line, captionLines: manager.egressBlocked ? 2 : 1)
+                            .foregroundStyle(manager.egressBlocked ? Color.red : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 8)
+                } else {
+                    rowLabel("shield.lefthalf.filled", "出口保护", line, captionLines: 3)
+                        .foregroundStyle(.red)
+                        .padding(.top, 8)
+                    HStack {
+                        Button("编辑检测方式") { onOpenSettings("split") }
+                        if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
+                            Button("停用这组", role: .destructive) { disableEgressGroup(notice.id) }
+                        } else {
+                            Menu("停用这组") {
+                                ForEach(manager.egressNotices) { notice in
+                                    Button(notice.name, role: .destructive) { disableEgressGroup(notice.id) }
+                                }
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(.vertical, 6)
+                    if let egressActionError {
+                        Text(egressActionError).font(.caption).foregroundStyle(.red)
+                    }
                 }
-                .buttonStyle(.plain)
-                .padding(.vertical, 8)
             }
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
             // the local network instead of pausing it.
@@ -484,6 +508,12 @@ struct PanelView: View {
         .font(.callout)
         .padding(.horizontal, 12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
+    }
+
+    private func disableEgressGroup(_ id: UInt32) {
+        manager.disableEgressGroup(id) { ok in
+            egressActionError = ok ? nil : "这组未停用。请在分流设置重试。"
+        }
     }
 
     /// The engine's own words under the headline (retry count, last
