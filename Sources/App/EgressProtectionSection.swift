@@ -59,23 +59,26 @@ struct EgressProtectionSection: View {
     var body: some View {
         Section {
             if manager.usesCisco {
-                Text("切到「按网站分流」后可用").foregroundStyle(.secondary)
+                unavailableRow("切到「按网站分流」后才能用出口保护。")
             } else if !manager.protectsDrops {
                 HStack {
-                    Text("出口保护需要断线保护").foregroundStyle(.secondary)
-                    Spacer()
+                    unavailableRow("出口保护需要断线保护开着。")
                     Button("打开断线保护") { confirmDropProtection = true }
                 }
             }
             Group {
                 if config.groups.isEmpty {
-                    Text("从连接列表里点选要保护的网站").foregroundStyle(.secondary)
+                    emptyState
                 } else {
-                    Text(summary).font(.caption).foregroundStyle(.secondary)
+                    statusHeader
                     ForEach(config.groups) { group in ruleRow(group) }
                 }
-                Button { sheet = .add(nil) } label: {
-                    Label("添加要保护的网站", systemImage: "plus")
+                if !config.groups.isEmpty {
+                    HStack(spacing: 12) {
+                        Button { sheet = .add(nil) } label: { Label("添加网站…", systemImage: "plus") }
+                        Button("从连接列表选…") { window.showVPNConnections() }
+                        Spacer()
+                    }.buttonStyle(.borderless)
                 }
                 if let confirm {
                     EgressReconnectPrompt(change: confirm, cancel: { self.confirm = nil }) {
@@ -86,23 +89,21 @@ struct EgressProtectionSection: View {
                 if let notice {
                     EgressChangeBanner(notice: notice) { undo(notice) }
                 }
-                if let message { Text(message).font(.caption).foregroundStyle(.orange) }
+                if let message {
+                    Label(message, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                }
                 if let records = status?.records, !records.isEmpty {
-                    DisclosureGroup("最近拦截（\(records.count)）") {
-                        ForEach(records, id: \.started) { record in
-                            Button(record.host ?? record.name) { sheet = .details(record.group) }
-                                .buttonStyle(.plain)
-                        }
+                    DisclosureGroup {
+                        ForEach(records.prefix(10), id: \.started) { record in recordRow(record) }
+                    } label: {
+                        Text("最近拦截").badge(records.filter { $0.ended == nil }.count)
                     }
                 }
                 DisclosureGroup("高级") { advanced }
             }
             .disabled(!available || busy)
-            if config.groups.isEmpty {
-                Button("打开连接列表") { window.showVPNConnections() }
-            }
         } header: { Text("出口保护") } footer: {
-            Text("保护的网站每次新建连接时都会确认出口。开启后，走 VPN 的网站会使用 TCP。")
+            Text("受保护网站的每条新连接先确认出口国家再放行，约多等半秒。开着时，走 VPN 的网站不用 QUIC。")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear { visible = true; refresh(); openRequestedRule() }
@@ -180,6 +181,46 @@ struct EgressProtectionSection: View {
         } message: { Text("VPN 断开时会暂时拦截网络，直到重新连接或你手动断开。") }
     }
 
+    private func unavailableRow(_ text: String) -> some View {
+        Label(text, systemImage: "info.circle").foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var emptyState: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "shield.lefthalf.filled").font(.title2).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("还没有受保护的网站")
+                Text("选一个要保护的网站，App 会记下它现在从哪个国家出去；以后出口不对，就先拦住再问你。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 12) {
+                    Button("从连接列表选…") { window.showVPNConnections() }.buttonStyle(.borderedProminent)
+                    Button("手动输入网站…") { sheet = .add(nil) }
+                }.padding(.top, 2)
+            }
+            Spacer(minLength: 0)
+        }.padding(.vertical, 4)
+    }
+
+    private var statusHeader: some View {
+        let active = config.groups.filter(\.enabled)
+        let level = status?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown
+        let (icon, tint): (String, Color) = {
+            if active.isEmpty { return ("shield.slash", .secondary) }
+            switch level {
+            case .ok: return ("checkmark.shield.fill", .green)
+            case .partial: return ("exclamationmark.shield.fill", .orange)
+            case .blocked: return ("xmark.shield.fill", .red)
+            case .unknown: return ("shield.lefthalf.filled", .secondary)
+            }
+        }()
+        return HStack(spacing: 8) {
+            Image(systemName: icon).foregroundStyle(tint)
+            Text(summary).foregroundStyle(level == .ok || active.isEmpty ? Color.primary : tint)
+            Spacer()
+        }
+    }
+
     private var summary: String {
         let active = config.groups.filter(\.enabled)
         guard !active.isEmpty else { return "出口保护已关闭" }
@@ -190,65 +231,115 @@ struct EgressProtectionSection: View {
 
     @ViewBuilder private var advanced: some View {
         if config.isActive {
-            Button("认不出网站的连接") { sheet = .unknownWeb }
-        }
-        ForEach(config.availableMethods) { method in
             HStack {
-                Button(method.name) { editingMethod = method }
-                Text(method.scopeCaption).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if config.methods.contains(where: { $0.id == method.id }) {
-                    Button("删除", role: .destructive) { change { $0.methods.removeAll { $0.id == method.id } } }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("认不出网站的连接")
+                    Text(unknownCaption).font(.caption).foregroundStyle(.secondary)
                 }
+                Spacer()
+                Button("查看…") { sheet = .unknownWeb }
             }
         }
-        Button("新增检查方式") {
-            editingMethod = .init(id: UUID().uuidString, name: "", url: "https://{host}/",
-                                  extract: .init(kind: .json, key: "country"))
+        VStack(alignment: .leading, spacing: 6) {
+            Text("检查方式").font(.subheadline.weight(.medium))
+            ForEach(config.availableMethods) { method in
+                HStack {
+                    Text(method.name)
+                    Text(method.scopeCaption).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("编辑") { editingMethod = method }
+                    if config.methods.contains(where: { $0.id == method.id }) {
+                        Button("删除", role: .destructive) { change { $0.methods.removeAll { $0.id == method.id } } }
+                    }
+                }.buttonStyle(.borderless)
+            }
+            HStack {
+                Button("新增检查方式…") {
+                    editingMethod = .init(id: UUID().uuidString, name: "", url: "https://{host}/",
+                                          extract: .init(kind: .json, key: "country"))
+                }
+                Spacer()
+            }.buttonStyle(.borderless)
         }
         HStack {
-            Button("导入配置…") { importing = true }
-            Button("导出配置…") { exporting = true }
+            Text("规则备份")
+            Spacer()
+            Button("导入…") { importing = true }
+            Button("导出…") { exporting = true }
         }
-        Button("新建高级规则") {
-            var group = EgressProtection.newGroup(in: config, name: "网站规则")
-            group.enabled = false
-            change { $0.groups.append(group) }
+        HStack {
+            Button("手动新建空规则") {
+                var group = EgressProtection.newGroup(in: config, name: "网站规则")
+                group.enabled = false
+                change { $0.groups.append(group) }
+            }.buttonStyle(.borderless)
+            Spacer()
         }
+    }
+
+    private var unknownCaption: String {
+        guard config.blocksUnidentifiedWeb else { return "已关闭：认不出网站名的连接会直接放行" }
+        let count = status?.unknownWebCount ?? 0
+        return count > 0 ? "本次连接已拦下 \(count) 次" : "开着：认不出网站名的网页连接会先拦下"
+    }
+
+    private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
+        let date = Date(timeIntervalSince1970: record.started)
+        let cause = record.observed.lazy.compactMap(\.exitRangeFailureCaption).first
+            ?? record.observed.first(where: { $0.country != nil && $0.isOutside(record.expected) })
+                .map { "出口在\(egressCountryName($0.country ?? ""))，不在允许范围" }
+            ?? "未能核实出口"
+        return Button { sheet = .details(record.group) } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(date, format: .dateTime.hour().minute()).monospacedDigit().foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(record.host ?? record.name)
+                    Text(cause).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(record.ended == nil ? "拦截中" : "已恢复").font(.caption)
+                    .foregroundStyle(record.ended == nil ? Color.red : Color.secondary)
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain)
     }
 
     private func ruleRow(_ group: EgressProtection.Group) -> some View {
         let state = status?.groups.first { $0.id == group.id }
         let canEnable = !config.directMembers(in: group).isEmpty && !group.expect.isEmpty
-        let reason = state?.blockReason
-        let description = state?.blockCaption ?? (group.enabled && !canEnable
-            ? "无法核实网站本身的出口，连接后将拦截这条规则的新连接"
-            : group.enabled ? (state?.displayLevel == .ok ? "正常" : "尚未核实出口") : "已停用")
-        return VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Button { sheet = .details(group.id) } label: {
+        let level = state?.displayLevel ?? .unknown
+        let problem = state?.blockCaption ?? (group.enabled && !canEnable
+            ? "没有能直接检查出口的网站，连上后会拦下这条规则的新连接" : nil)
+        let allowed = group.expect.isEmpty ? "还没选允许的国家"
+            : "只允许" + group.expect.map(egressCountryName).joined(separator: "、")
+        let ranges = group.exitRangeCheck && !group.exitRanges.isEmpty
+            ? " · 出口 " + group.exitRanges.joined(separator: "、") : ""
+        let tint: Color = !group.enabled ? .secondary : problem != nil ? (level == .partial ? .orange : .red)
+            : level == .ok ? .green : .secondary
+        return HStack(alignment: .center, spacing: 10) {
+            Button { sheet = .details(group.id) } label: {
+                HStack(alignment: .top, spacing: 10) {
+                    Circle().fill(tint).frame(width: 8, height: 8).padding(.top, 6)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(group.name)
-                        if !group.expect.isEmpty {
-                            Text("只允许 " + group.expect.map(egressCountryName).joined(separator: "、"))
-                                .font(.caption).foregroundStyle(.secondary)
+                        Text(group.name).fontWeight(.medium)
+                        Text(allowed + ranges).font(.caption).foregroundStyle(.secondary)
+                        if group.enabled, let problem {
+                            Text(problem).font(.caption).foregroundStyle(tint)
+                        } else if !group.enabled {
+                            Text("已停用").font(.caption).foregroundStyle(.secondary)
                         }
-                        Text(description).font(.caption)
-                            .foregroundStyle(reason != nil ? Color.red : (state?.displayLevel ?? .unknown).color)
-                    }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                Toggle("启用 \(group.name)", isOn: Binding(get: { group.enabled }, set: { on in
-                    if on && !canEnable { sheet = .details(group.id); return }
-                    changeRule(group.id) { $0.enabled = on }
-                })).labelsHidden().disabled(!canEnable && !group.enabled)
-            }
-            if group.enabled && (reason != nil || !canEnable) {
-                HStack {
-                    Button("编辑检查方式") { sheet = .advanced(group.id) }
-                    Button("停用这条规则", role: .destructive) { changeRule(group.id) { $0.enabled = false } }
-                }.buttonStyle(.borderless)
-            }
-        }
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary).padding(.top, 4)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            Toggle("", isOn: Binding(get: { group.enabled }, set: { on in
+                if on && !canEnable { sheet = .details(group.id); return }
+                changeRule(group.id) { $0.enabled = on }
+            })).labelsHidden().toggleStyle(.switch).controlSize(.small)
+                .disabled(!canEnable && !group.enabled)
+                .help(group.enabled ? "停用这条规则" : "启用这条规则")
+        }.padding(.vertical, 2)
     }
 
     private func openRequestedRule() {
