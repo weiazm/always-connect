@@ -984,8 +984,38 @@ fn ordinary_ech_candidates_are_compatible_but_any_protected_address_association_
     assert!(matches!(out.as_slice(),
         [Out::Check { group: 1, host: Some(host), host_confirmed: false, .. }] if host == "protected.example"));
 
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("protected.example", &[PUBLIC])), now);
+    assert_eq!(g.ip_group(PUBLIC.into()).map(|(group, _)| group), Some(1));
     dns_evidence_update(&mut g, 6, "second.example", 1, 10_000, &address);
     assert_eq!(connect_and_send(&mut g, 45172, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+}
+
+#[test]
+fn a_new_dns_protection_conflict_withdraws_an_unsent_address_based_permit() {
+    let mut g = proof_gate();
+    let exception = UnknownWebEndpoint { address: PUBLIC.into(), port: 443 };
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[exception], &[]));
+    g.reset_dns_evidence(8);
+    let now = Instant::now();
+    let address = [("93.184.216.44", 60)];
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("protected.example", &[PUBLIC])), now);
+    dns_evidence_update(&mut g, 8, "protected.example", 1, 10_000, &address);
+    let ech = hello(Some("front.example"), &[], true, 0);
+    let (_, packet) = connect_and_send(&mut g, 45173, PUBLIC, &ech, now);
+    let request = request_for(&drain(&mut g), 1);
+    verdict(&mut g, 1, request, Verdict::AllowDependent, now);
+    let release = release_id(&mut g);
+    dns_evidence_update(&mut g, 8, "second.example", 1, 10_000, &address);
+    g.send_checked(release, now, |_| panic!("the earlier group permit cannot release this flow"));
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert_eq!(g.outbound(&packet, now), Step::Consumed);
+    drain(&mut g);
+
+    // Even a single fresh association cannot reconcile a different
+    // group already attached to the address.
+    dns_evidence_update(&mut g, 8, "protected.example", 1, 10_000, &[]);
+    assert_eq!(connect_and_send(&mut g, 45174, PUBLIC, &ech, now).0, Step::Consumed);
     assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
 }
 

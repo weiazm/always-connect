@@ -636,6 +636,10 @@ impl Gate {
     pub fn send_checked(&mut self, id: u64, now: Instant, send: impl FnOnce(&[Vec<u8>]) -> bool) {
         let Some(release) = self.take_release(id) else { return };
         let CheckedRelease { key, group, target, evidence, started, retried } = release;
+        if !target.host_confirmed && self.dns_address_match(key.dst, None).conflicts_with(Some(group)) {
+            self.block(key, BlockReason::Internal);
+            return;
+        }
         let Some(Flow { state: State::Holding(held), .. }) = self.flows.get(&key) else { return };
         match evidence.age(self.clock) {
             Some(age) if age < EVIDENCE_AGE_MS => {
@@ -938,29 +942,32 @@ impl Gate {
         });
     }
 
+    fn dns_address_match(&self, address: IpAddr, outer: Option<&str>) -> DnsMatch {
+        if self.dns_evidence.active() {
+            if let Some(clock) = (self.clock)() {
+                return self.dns_evidence.classify(address, outer, clock, self.classifier.as_ref());
+            }
+        }
+        DnsMatch::Unknown
+    }
+
     /// Decide a holding connection by its destination address.
     fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason, outer: Option<&str>) -> Step {
-        if let Some((group, host)) = self.ip_group(key.dst) {
+        let known = self.ip_group(key.dst);
+        let association = self.dns_address_match(key.dst, outer);
+        if association.conflicts_with(known.as_ref().map(|(group, _)| *group)) {
+            self.block(key, BlockReason::UnidentifiedWeb(reason));
+            return Step::Consumed;
+        }
+        if let Some((group, host)) = known {
             self.wait_for_check(key, group, host, false, now);
             return Step::Consumed;
         }
-        let mut ordinary = false;
-        if self.dns_evidence.active() {
-            if let Some(clock) = (self.clock)() {
-                match self.dns_evidence.classify(key.dst, outer, clock, self.classifier.as_ref()) {
-                    DnsMatch::Protected(group, host) => {
-                        self.wait_for_check(key, group, host.map(|host| host.to_string()), false, now);
-                        return Step::Consumed;
-                    }
-                    DnsMatch::ConflictingProtection => {
-                        self.block(key, BlockReason::UnidentifiedWeb(reason));
-                        return Step::Consumed;
-                    }
-                    DnsMatch::Ordinary => ordinary = true,
-                    DnsMatch::Unknown => {}
-                }
-            }
+        if let DnsMatch::Protected(group, host) = association {
+            self.wait_for_check(key, group, host.map(|host| host.to_string()), false, now);
+            return Step::Consumed;
         }
+        let ordinary = matches!(association, DnsMatch::Ordinary);
         if !ordinary && self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) {
             self.block(key, BlockReason::UnidentifiedWeb(reason));
             Step::Consumed

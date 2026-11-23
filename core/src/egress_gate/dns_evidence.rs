@@ -81,6 +81,16 @@ pub(super) enum DnsMatch {
     Unknown,
 }
 
+impl DnsMatch {
+    pub(super) fn conflicts_with(&self, group: Option<GroupId>) -> bool {
+        match self {
+            Self::ConflictingProtection => true,
+            Self::Protected(associated, _) => group.is_some_and(|known| known != *associated),
+            Self::Ordinary | Self::Unknown => false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct DnsEvidence {
     generation: Option<u64>,
