@@ -65,6 +65,14 @@ struct ConnectionsPage: View {
     @State private var protectionStatus: EgressProtection.Status?
     @State private var selected = Set<Row.ID>()
     @State private var showEgressTip = false
+    @State private var programPick: ProgramPick?
+
+    private struct ProgramPick: Identifiable {
+        let id = UUID()
+        let process: String
+        let candidates: [EgressProgramCandidate]
+        let preselected: Set<String>
+    }
     /// Totals since the previous refresh; nil until there are two samples.
     @State private var totals: (vpn: [Int], direct: [Int])?
     @State private var sortOrder: [KeyPathComparator<Row>] = []
@@ -270,6 +278,12 @@ struct ConnectionsPage: View {
             try? await Task.sleep(nanoseconds: 12_000_000_000)
             if !Task.isCancelled && egressNotice?.id == notice.id { egressNotice = nil }
         }
+        .sheet(item: $programPick) { pick in
+            EgressProgramPicker(process: pick.process, candidates: pick.candidates,
+                                rules: protectedConfig.rulesForEditing.groups, preselected: pick.preselected) { hosts, addresses, rule in
+                addProgramSelection(hosts: hosts, addresses: addresses, rule: rule)
+            }
+        }
         .sheet(item: $egressAddition) { addition in
             EgressWebsiteForm(sites: addition.sites) { change, site in
                 egressNotice = .init(change: change, text: "已开始保护 \(site)")
@@ -340,7 +354,11 @@ struct ConnectionsPage: View {
                                 }
                             }
                         } else {
-                            Menu("保护出口") { egressDestinations([row]) }
+                            Menu("保护出口") {
+                                egressDestinations([row])
+                                Divider()
+                                Button("连同「\(row.process)」用到的其他连接…") { openProgramPicker(row) }
+                            }
                         }
                     }
                     if !directChoices.isEmpty && owner == nil {
@@ -371,6 +389,38 @@ struct ConnectionsPage: View {
                 Button("新建规则（按现在的出口）") { addToEgress(hosts, rule: nil) }
             }
             .disabled(egressBusy)
+        }
+    }
+
+    private func openProgramPicker(_ row: Row) {
+        let mine = rows.filter { $0.process == row.process && $0.via == "vpn" }
+            .filter { protectedConfig.rule(covering: $0.host) == nil && DirectSites.covering(sites, host: $0.host, address: $0.remote) == nil }
+        let candidates = EgressProgramCandidate.from(process: row.process, rows: mine.map { ($0.host, $0.remote, $0.via) })
+        guard !candidates.isEmpty else { message = "「\(row.process)」没有其他可加入的连接。"; return }
+        let seed = egressScope(row).map { "w:" + $0.website } ?? "a:" + row.remote
+        programPick = .init(process: row.process, candidates: candidates,
+                            preselected: Set(candidates.map(\.id).filter { $0 == seed }))
+    }
+
+    private func addProgramSelection(hosts: [String], addresses: [String], rule: UInt32?) {
+        guard let rule, !addresses.isEmpty else {
+            if !hosts.isEmpty { addToEgress(hosts, rule: rule) }
+            return
+        }
+        let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let change = EgressRuleChange(config: stored) { config in
+            guard let index = config.groups.firstIndex(where: { $0.id == rule }) else { return }
+            for address in addresses where !config.groups[index].cidrs.contains(address + "/32") {
+                config.groups[index].cidrs.append(address + "/32")
+            }
+        }
+        egressBusy = true
+        manager.saveEgress(change.after, replacing: change.before) { ok in
+            egressBusy = false
+            guard ok else { message = "地址未加入：规则已变化或后台未接受，请重试。"; return }
+            egressNotice = EgressAction(change: change, text: "已把 \(addresses.count) 个只有地址的连接加进规则", rule: rule)
+            refreshEgressState()
+            if !hosts.isEmpty { addToEgress(hosts, rule: rule) }
         }
     }
 
