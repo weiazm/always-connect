@@ -377,6 +377,136 @@ fn a_recent_failure_resets_new_connections_at_once() {
 }
 
 #[test]
+fn denial_counts_follow_new_flows_and_include_cached_denials() {
+    let mut g = gate();
+    let now = Instant::now();
+    let first = hello(Some("Protected.Example."), &[], false, 0);
+    let next = hello(Some("protected.example"), &[], false, 0);
+    let (_, packet) = connect_and_send(&mut g, 42130, SITE, &first, now);
+    connect_and_send(&mut g, 42131, SITE, &next, now);
+    let request = request_for(&g.drain(), 1);
+    assert!(g.take_denied_group().is_none());
+    g.verdict(1, request, Verdict::Block, now);
+    assert_eq!(g.drain().len(), 2);
+    let report = g.take_denied_group().unwrap();
+    assert_eq!((report.group, report.count), (1, 2));
+    assert_eq!(report.hosts, vec![DeniedHost { host: "protected.example".into(), count: 2 }]);
+    assert_eq!(report.last_host.as_deref(), Some("protected.example"));
+    assert!(!report.hosts_truncated);
+
+    assert_eq!(g.outbound(&packet, now), Step::Consumed);
+    assert!(g.take_denied_group().is_none());
+    g.drain();
+    connect_and_send(&mut g, 42132, SITE, &next, now);
+    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    let report = g.take_denied_group().unwrap();
+    assert_eq!(report.count, 3);
+    assert_eq!(report.hosts[0].count, 3);
+}
+
+#[test]
+fn only_rule_denials_of_new_flows_enter_the_counts() {
+    let mut g = gate();
+    let now = Instant::now();
+    let payload = hello(Some("protected.example"), &[], false, 0);
+    connect_and_send(&mut g, 42140, SITE, &payload, now);
+    let revoked = request_for(&g.drain(), 1);
+    g.invalidate();
+    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    g.verdict(1, revoked, Verdict::Block, now);
+    assert!(g.take_denied_group().is_none());
+
+    let midstream = tcp4(MAC, 42141, RANGE_IP, 443, 9000, 0, PA, b"midstream");
+    assert_eq!(g.outbound(&midstream, now), Step::Consumed);
+    let old_flow = request_for(&g.drain(), 1);
+    g.verdict(1, old_flow, Verdict::Block, now);
+    assert!(g.take_denied_group().is_none());
+
+    assert_eq!(g.outbound(&udp4(MAC, 42142, RANGE_IP, 443, b"quic"), now), Step::Consumed);
+    assert!(g.take_denied_group().is_none());
+    g.drain();
+    let udp = udp4(MAC, 42143, RANGE_IP, 3478, b"test");
+    assert_eq!(g.outbound(&udp, now), Step::Consumed);
+    let datagram_flow = request_for(&g.drain(), 1);
+    assert_eq!(g.outbound(&udp, now), Step::Consumed);
+    g.verdict(1, datagram_flow, Verdict::Block, now);
+    let report = g.take_denied_group().unwrap();
+    assert_eq!(report.count, 1);
+    assert!(report.hosts.is_empty());
+    assert!(report.last_host.is_none());
+    assert_eq!(g.outbound(&udp, now), Step::Consumed);
+    assert!(g.take_denied_group().is_none());
+}
+
+#[test]
+fn actual_deadline_denials_are_counted_without_recounting_retransmissions_after_eviction() {
+    let cfg = GateConfig { max_flows: 1, ..GateConfig::default() };
+    let mut g = Gate::new(cfg, Box::new(Rules));
+    let now = Instant::now();
+    let payload = hello(Some("protected.example"), &[], false, 0);
+    connect_and_send(&mut g, 42150, SITE, &payload, now);
+    let request = request_for(&g.drain(), 1);
+    let deadline = now + g.cfg.check_timeout;
+    g.tick(deadline);
+    assert!(matches!(
+        g.drain().as_slice(),
+        [Out::TimedOut { request_id, .. }, Out::ToHost(_)] if *request_id == request
+    ));
+    assert_eq!(g.take_denied_group().unwrap().count, 1);
+    connect_and_send(&mut g, 42151, OTHER, &hello(Some("www.example.org"), &[], false, 0), deadline);
+    g.drain();
+    connect_and_send(&mut g, 42150, SITE, &payload, deadline);
+    assert!(matches!(g.drain().as_slice(), [Out::ToHost(_)]));
+    assert!(g.take_denied_group().is_none());
+}
+
+#[test]
+fn cumulative_denial_counts_keep_the_first_hosts_and_have_fixed_limits() {
+    let mut g = gate();
+    let mut flow = FlowKey {
+        proto: 6, src: MAC.into(), sport: 50000, dst: SITE.into(), dport: 443,
+    };
+    for index in 0..=MAX_REPORTED_HOSTS {
+        let host = format!("n{index}.example");
+        flow.sport += 1;
+        g.blocked_flows.record(flow, Some(1), 1, Some(&host));
+    }
+    let report = g.take_denied_group().unwrap();
+    assert_eq!(report.count, MAX_REPORTED_HOSTS as u64 + 1);
+    assert_eq!(report.hosts.len(), MAX_REPORTED_HOSTS);
+    assert!(report.hosts_truncated);
+    assert!(report.last_host.is_none());
+    flow.sport += 1;
+    g.blocked_flows.record(flow, Some(1), 1, Some("n0.example"));
+    let later = g.take_denied_group().unwrap();
+    assert_eq!(later.count, MAX_REPORTED_HOSTS as u64 + 2);
+    assert_eq!(later.hosts.first().unwrap().count, 2);
+    assert_eq!(later.last_host.as_deref(), Some("n0.example"));
+    flow.sport += 1;
+    g.blocked_flows.record(flow, Some(1), 1, Some("例.example"));
+    let unnamed = g.take_denied_group().unwrap();
+    assert_eq!(unnamed.count, MAX_REPORTED_HOSTS as u64 + 3);
+    assert_eq!(unnamed.hosts.len(), MAX_REPORTED_HOSTS);
+    assert!(unnamed.last_host.is_none());
+
+    for group in 2..=MAX_REPORTED_GROUPS as u32 + 1 {
+        flow.sport += 1;
+        g.blocked_flows.record(flow, Some(1), group, None);
+    }
+    assert_eq!(g.blocked_flows.groups.len(), MAX_REPORTED_GROUPS);
+    assert!(!g.blocked_flows.groups.contains_key(&(MAX_REPORTED_GROUPS as u32 + 1)));
+    let count = g.blocked_flows.groups[&1].count;
+    for index in 0..(MAX_REPORTED_FLOWS as u32) {
+        g.blocked_flows.record(flow, Some(100 + index), 1, None);
+    }
+    assert_eq!(g.blocked_flows.seen.len(), MAX_REPORTED_FLOWS);
+    let capped = g.blocked_flows.groups[&1].count;
+    assert!(capped > count);
+    g.blocked_flows.record(flow, Some(u32::MAX), 1, None);
+    assert_eq!(g.blocked_flows.groups[&1].count, capped);
+}
+
+#[test]
 fn earlier_dependent_results_cannot_release_packets_across_a_failure() {
     for local_deadline in [false, true] {
         let mut g = gate();

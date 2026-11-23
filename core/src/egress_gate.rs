@@ -12,7 +12,8 @@
 //! The module does no I/O: the caller feeds packets and verdicts and carries
 //! out the returned actions. It is pure Rust so it is tested on Linux.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
@@ -29,6 +30,9 @@ pub enum Verdict {
 
 const MAX_PENDING_PER_GROUP: usize = 16;
 const MAX_CACHED_PER_GROUP: usize = 64;
+const MAX_REPORTED_FLOWS: usize = 4096;
+const MAX_REPORTED_GROUPS: usize = 16;
+const MAX_REPORTED_HOSTS: usize = 32;
 
 /// Which group, if any, a name or address belongs to. Backed by the rule
 /// engine in production; the gate only asks.
@@ -148,12 +152,76 @@ struct Held {
     since: Instant,
     /// Set once classified as protected: the request holds this flow's key.
     checking: bool,
+    /// A TCP flow first seen without its SYN cannot be counted as new.
+    client_isn: Option<u32>,
     last: Option<ClientSeg>,
 }
 
 struct Flow {
     state: State,
     last_seen: Instant,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeniedGroup {
+    pub group: GroupId,
+    pub count: u64,
+    pub hosts: Vec<DeniedHost>,
+    pub hosts_truncated: bool,
+    pub last_host: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DeniedHost {
+    pub host: String,
+    pub count: u64,
+}
+
+#[derive(Default)]
+struct BlockedFlows {
+    seen: HashSet<u64>,
+    groups: HashMap<GroupId, DeniedGroup>,
+    dirty: VecDeque<GroupId>,
+}
+
+impl BlockedFlows {
+    fn record(&mut self, flow: FlowKey, client_isn: Option<u32>, group: GroupId, host: Option<&str>) {
+        if self.seen.len() >= MAX_REPORTED_FLOWS || (flow.proto == 6 && client_isn.is_none()) {
+            return;
+        }
+        // Keep a bounded fingerprint even if the packet table evicts the
+        // flow. A collision can only lower this best-effort count.
+        let flow_id = self.seen.hasher().hash_one((flow, client_isn));
+        if !self.seen.insert(flow_id) {
+            return;
+        }
+        if self.groups.len() == MAX_REPORTED_GROUPS && !self.groups.contains_key(&group) {
+            return;
+        }
+        let stats = self.groups.entry(group).or_insert_with(|| DeniedGroup { group, ..Default::default() });
+        stats.count += 1;
+        let mut reported_host = None;
+        // DNS names on the wire use ASCII (including IDNA A-labels). Keep
+        // optional reports ASCII too so a short write cannot split UTF-8.
+        if let Some(host) = host.filter(|host| host.len() <= 253 && host.is_ascii()) {
+            if let Some(entry) = stats.hosts.iter_mut().find(|entry| entry.host == host) {
+                entry.count += 1;
+                reported_host = Some(host);
+            } else if stats.hosts.len() < MAX_REPORTED_HOSTS {
+                stats.hosts.push(DeniedHost { host: host.to_owned(), count: 1 });
+                reported_host = Some(host);
+            } else {
+                stats.hosts_truncated = true;
+            }
+        }
+        if stats.last_host.as_deref() != reported_host {
+            stats.last_host = reported_host.map(str::to_owned);
+        }
+        if !self.dirty.contains(&group) {
+            self.dirty.push_back(group);
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -193,6 +261,7 @@ pub struct Gate {
     last_request: u64,
     learned: HashMap<IpAddr, (GroupId, String, Instant)>,
     out: Vec<Out>,
+    blocked_flows: BlockedFlows,
 }
 
 impl Gate {
@@ -205,6 +274,7 @@ impl Gate {
             last_request: 0,
             learned: HashMap::new(),
             out: Vec::new(),
+            blocked_flows: BlockedFlows::default(),
         }
     }
 
@@ -213,12 +283,18 @@ impl Gate {
         std::mem::take(&mut self.out)
     }
 
+    /// A changed group's cumulative counts for this gate's control peer.
+    pub fn take_denied_group(&mut self) -> Option<&DeniedGroup> {
+        let id = self.blocked_flows.dirty.pop_front()?;
+        self.blocked_flows.groups.get(&id)
+    }
+
     /// Forget every verdict (reconnect, network change, wake: §66.6).
     pub fn invalidate(&mut self) {
         let groups = std::mem::take(&mut self.groups);
         self.out.retain(|out| !matches!(out, Out::Check { .. }));
         for key in groups.into_values().flat_map(|group| group.pending).flat_map(|check| check.waiting) {
-            self.block(key);
+            self.block(key, None);
         }
     }
 
@@ -273,9 +349,8 @@ impl Gate {
         match verdict {
             Verdict::Block => self.fail_check(group, index, now),
             Verdict::AllowDependent if request_id.get() <= checks.failure_cutoff => {
-                for key in checks.pending.swap_remove(index).waiting {
-                    self.block(key);
-                }
+                let check = checks.pending.swap_remove(index);
+                self.block_waiting(group, &check);
             }
             Verdict::AllowDirect | Verdict::AllowDependent => {
                 let check = checks.pending.swap_remove(index);
@@ -296,8 +371,8 @@ impl Gate {
         checks.recent.retain(|_, (ok, _)| !*ok);
         let pending = std::mem::take(&mut checks.pending);
         self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } if *id == group));
-        for key in pending.into_iter().flat_map(|check| check.waiting) {
-            self.block(key);
+        for check in pending {
+            self.block_waiting(group, &check);
         }
     }
 
@@ -323,12 +398,18 @@ impl Gate {
         // deadline fires. Independent results still speak for their own key.
         checks.failure_cutoff = self.last_request;
         checks.recent.retain(|_, (ok, at)| !*ok && now.duration_since(*at) < self.cfg.reuse);
+        self.out.retain(|out| !matches!(out, Out::Check { request_id, .. } if *request_id == failed.id));
+        self.block_waiting(group, &failed);
+        let checks = self.groups.get_mut(&group).expect("pending group");
         if checks.recent.len() < MAX_CACHED_PER_GROUP {
             checks.recent.insert(failed.target, (false, now));
         }
-        self.out.retain(|out| !matches!(out, Out::Check { request_id, .. } if *request_id == failed.id));
-        for key in failed.waiting {
-            self.block(key);
+    }
+
+    fn block_waiting(&mut self, group: GroupId, check: &PendingCheck) {
+        let rule = Some((group, check.target.host.as_deref()));
+        for &key in &check.waiting {
+            self.block(key, rule);
         }
     }
 
@@ -387,7 +468,7 @@ impl Gate {
             }
             Some((group, host)) => {
                 if pkt.len() <= self.cfg.max_held_bytes {
-                    let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, checking: false, last: None };
+                    let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, checking: false, client_isn: None, last: None };
                     if self.insert(key, State::Holding(Box::new(held)), now) {
                         self.wait_for_check(key, group, host, now);
                     }
@@ -420,7 +501,7 @@ impl Gate {
                     }
                     Some((group, host)) => {
                         if pkt.len() <= self.cfg.max_held_bytes {
-                            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, checking: false, last: Some(seg) };
+                            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, checking: false, client_isn: None, last: Some(seg) };
                             if self.insert(key, State::Holding(Box::new(held)), now) {
                                 self.wait_for_check(key, group, host, now);
                                 return Step::Consumed;
@@ -452,7 +533,7 @@ impl Gate {
                     return Step::Consumed;
                 }
                 let next = *next;
-                let mut held = Held { packets: Vec::new(), bytes: 0, stream: Vec::new(), next, since: now, checking: false, last: Some(seg) };
+                let mut held = Held { packets: Vec::new(), bytes: 0, stream: Vec::new(), next, since: now, checking: false, client_isn: Some(next.wrapping_sub(1)), last: Some(seg) };
                 if data_start == next {
                     held.stream.extend_from_slice(p.payload);
                     held.next = next.wrapping_add(seg.len);
@@ -572,7 +653,7 @@ impl Gate {
                 if ok {
                     self.release(key);
                 } else {
-                    self.block(key);
+                    self.block(key, Some((group, target.host.as_deref())));
                 }
                 return;
             }
@@ -583,7 +664,7 @@ impl Gate {
             let Some(id) = self.last_request.checked_add(1).and_then(RequestId::new)
                 .filter(|_| checks.pending.len() < MAX_PENDING_PER_GROUP)
             else {
-                self.block(key);
+                self.block(key, None);
                 return;
             };
             self.last_request = id.get();
@@ -614,9 +695,12 @@ impl Gate {
         }
     }
 
-    fn block(&mut self, key: FlowKey) {
+    fn block(&mut self, key: FlowKey, rule: Option<(GroupId, Option<&str>)>) {
         let Some(f) = self.flows.get_mut(&key) else { return };
         if let State::Holding(h) = std::mem::replace(&mut f.state, State::Blocked) {
+            if let Some((group, host)) = rule {
+                self.blocked_flows.record(key, h.client_isn, group, host);
+            }
             if let (6, Some(last)) = (key.proto, h.last) {
                 self.reset(key, last);
             }

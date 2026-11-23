@@ -11,6 +11,8 @@
 //! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"names":["a.example","*.a.example"],"cidrs":["203.0.113.0/24"]}]}`
 //! - gate -> controller: `{"check":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443,"requestId":1}}`
 //! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
+//! - gate -> controller statistics: `{"denied":[{"group":1,"count":2,"hosts":[{"host":"a.example","count":2}],"hostsTruncated":false,"lastHost":"a.example"}]}`
+//!   Cumulative for this peer and sent only after a real denial.
 //! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true}}`,
 //!   `{"blockGroup":1}` or `{"invalidate":true}`
 //!
@@ -22,7 +24,7 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::{Gate, GateConfig, GroupId, Out, RequestId, Step, Verdict};
+use alwaysconnect_core::egress_gate::{DeniedGroup, Gate, GateConfig, GroupId, Out, RequestId, Step, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -242,6 +244,35 @@ fn open_tun() -> std::io::Result<(Box<dyn Tun>, String)> {
 struct Control {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    partial_report: bool,
+}
+
+impl Control {
+    fn separated_frame(&self, mut frame: String) -> String {
+        if self.partial_report {
+            frame.insert(0, '\n');
+        }
+        frame
+    }
+
+    fn write_required(&mut self, frame: String) -> std::io::Result<()> {
+        let frame = self.separated_frame(frame);
+        self.stream.write_all(frame.as_bytes())?;
+        self.partial_report = false;
+        Ok(())
+    }
+
+    fn report_denied(&mut self, denied: &DeniedGroup) {
+        let line = serde_json::json!({ "denied": [denied] }).to_string() + "\n";
+        let frame = self.separated_frame(line);
+        if let Ok(written) = self.stream.write(frame.as_bytes()) {
+            if written > 0 {
+                // Incomplete optional frames are discarded by the line
+                // reader. Terminate the fragment before any subsequent frame.
+                self.partial_report = frame.as_bytes()[written - 1] != b'\n';
+            }
+        }
+    }
 }
 
 fn connect_control() -> Option<(Control, ControllerCfg)> {
@@ -254,7 +285,7 @@ fn connect_control() -> Option<(Control, ControllerCfg)> {
     let cfg: ControllerCfg = serde_json::from_str(&first).map_err(|e| log(&format!("bad config: {e}"))).ok()?;
     stream.set_read_timeout(None).ok()?;
     stream.set_nonblocking(true).ok()?;
-    Some((Control { stream, reader }, cfg))
+    Some((Control { stream, reader, partial_report: false }, cfg))
 }
 
 fn main() {
@@ -398,6 +429,9 @@ fn main() {
         if now.duration_since(last_tick) >= Duration::from_millis(250) {
             gate.tick(now);
             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
+            if let (Some(control), Some(denied)) = (&mut control, gate.take_denied_group()) {
+                control.report_denied(denied);
+            }
             last_tick = now;
         }
     }
@@ -445,7 +479,7 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
         if let Some(c) = control {
             log(&format!("{kind} group={group} request={request_id}"));
             let line = check_line(kind, group, host.as_deref(), destination, request_id);
-            if let Err(error) = c.stream.write_all(line.as_bytes()) {
+            if let Err(error) = c.write_required(line) {
                 log(&format!("controller write failed: {error}"));
                 *control = None;
             }
@@ -543,11 +577,33 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_denial_frame_is_separated_before_later_policy_frames() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut control = Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: true };
+        control.stream.write_all(b"{\"denied\":[").unwrap();
+        control.report_denied(&DeniedGroup { group: 7, count: 2, ..Default::default() });
+        assert!(!control.partial_report);
+        let check = check_line("check", 7, None, "192.0.2.1:443".parse().unwrap(), RequestId::new(42).unwrap());
+        control.write_required(check).unwrap();
+
+        let mut lines = BufReader::new(peer).lines();
+        let partial = lines.next().unwrap().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&partial).is_err());
+        let denied: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(denied, serde_json::json!({
+            "denied":[{"group":7,"count":2,"hosts":[],"hostsTruncated":false,"lastHost":null}],
+        }));
+        let required: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(required["check"]["requestId"], 42);
+    }
+
+    #[test]
     fn deadline_frame_precedes_the_next_check_on_the_control_stream() {
         let (stream, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut peer = BufReader::new(peer);
-        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream });
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: false });
         let (vpn, _remote) = UnixDatagram::pair().unwrap();
         let vpn = vpn.into();
         let tun = TestTun::default();
@@ -574,7 +630,7 @@ mod tests {
     #[test]
     fn a_failed_deadline_write_retires_the_other_pending_results() {
         let (stream, peer) = UnixStream::pair().unwrap();
-        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream });
+        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_report: false });
         let (vpn, remote) = UnixDatagram::pair().unwrap();
         remote.set_nonblocking(true).unwrap();
         let vpn = vpn.into();
