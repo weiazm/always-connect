@@ -41,7 +41,7 @@ if [ "$IDENTITY" != - ] && ! security find-identity -p codesigning | grep -q "\"
     echo "scripts/dev-signing-identity.sh; RELEASE_SIGN_IDENTITY=- packages ad-hoc." >&2
     exit 1
 fi
-SIGN_IDENTITY=$IDENTITY "$ROOT/scripts/build-local.sh"
+SIGN_IDENTITY=$IDENTITY "$ROOT/scripts/build-local.sh" --release
 APP="$ROOT/.local-build/AlwaysConnect.app"
 GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
 test -x "$APP/Contents/Resources/openconnect/bin/openconnect"
@@ -64,15 +64,25 @@ if [ "$IDENTITY" != - ]; then
     }
     codesign --verify --strict -R="certificate leaf = H\"$LEAF\"" "$GATE"
 fi
-# Nothing in the shipped files may name the builder (DESIGN.md §36.5):
-# no home directory or user name in any string of any file.
-LEAK=$(find "$APP" -type f -print0 | xargs -0 strings -a 2>/dev/null \
-    | grep -F -e "$HOME" -e "/Users/$(id -un)" | sort -u | head -5 || true)
-if [ -n "$LEAK" ]; then
-    echo "the App contains the builder's paths; not packaging:" >&2
-    echo "$LEAK" >&2
-    exit 1
-fi
+# Scan raw bytes because macOS strings can miss Mach-O debug-map paths.
+# Report only the bundled filename so a blocked release cannot log the path.
+python3 - "$APP" "$ROOT" <<'PY'
+import os
+from pathlib import Path
+import pwd
+import sys
+
+app = Path(sys.argv[1])
+builder = pwd.getpwuid(os.getuid())
+paths = (sys.argv[2], str(Path.home()), builder.pw_dir, f"/Users/{builder.pw_name}",
+         os.environ.get("RUNNER_TEMP", ""), "/Users/runner/work")
+markers = {os.fsencode(path.rstrip("/") + "/") for path in paths if path.startswith("/") and path != "/"}
+for bundled in app.rglob("*"):
+    if bundled.is_file():
+        contents = bundled.read_bytes()
+        if any(marker in contents for marker in markers):
+            sys.exit(f"Build-machine path found in {bundled.relative_to(app)}; not packaging")
+PY
 BUILT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
 [ "$BUILT" = "$PLIST_VERSION" ] || { echo "built App reports $BUILT, expected $PLIST_VERSION" >&2; exit 1; }
 ARCH=$(uname -m)
@@ -87,7 +97,10 @@ SRC_DIR="$ROOT/.local-build/third-party-sources-$PLIST_VERSION"
 SRC_TAR="$ROOT/.local-build/AlwaysConnect-$PLIST_VERSION-third-party-sources.tar.gz"
 rm -rf "$SRC_DIR" "$SRC_TAR"
 if "$ROOT/scripts/fetch-third-party-sources.sh" "$SRC_DIR" "$APP/Contents/Resources/openconnect/SOURCES"; then
-    tar -czf "$SRC_TAR" -C "$(dirname "$SRC_DIR")" "$(basename "$SRC_DIR")"
+    # Do not record the builder account or its macOS file metadata.
+    /usr/bin/tar --uid 0 --gid 0 --uname root --gname wheel --no-mac-metadata \
+        --no-xattrs --no-acls --no-fflags \
+        -czf "$SRC_TAR" -C "$(dirname "$SRC_DIR")" "$(basename "$SRC_DIR")"
     rm -rf "$SRC_DIR"
     echo "packaged $SRC_TAR"
 else

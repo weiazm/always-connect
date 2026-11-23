@@ -18,6 +18,7 @@
 # Usage: scripts/build-local.sh            build everything
 #        scripts/build-local.sh --tests    build, then run the CI-equivalent
 #                                          Helper / vpnc-script / harness checks
+#        scripts/build-local.sh --release  remove debug symbols before signing
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -112,6 +113,12 @@ fi
 GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
 mkdir -p "$(dirname "$GATE")"
 install -m 755 "$ROOT/core/target/release/alwaysconnect-gate" "$GATE"
+if [ "${1:-}" = "--release" ]; then
+    # The Mach-O debug map can keep absolute paths to Rust object files
+    # even after rustc remaps the paths in panic messages (DESIGN.md §36.6).
+    /usr/bin/strip -S "$APP/Contents/MacOS/AlwaysConnect" \
+        "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper" "$GATE"
+fi
 codesign --force --sign "$IDENTITY" --timestamp=none "$GATE"
 codesign --verify --strict "$GATE"
 codesign --force --options runtime --sign "$IDENTITY" \
