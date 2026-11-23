@@ -116,7 +116,13 @@ fn contains(network: IpAddr, length: u8, address: IpAddr) -> bool {
 }
 
 pub(super) fn is_site_name(name: &str) -> bool {
-    name.len() <= 253 && name.parse::<IpAddr>().is_err() && name.split('.').all(|label| {
+    if name.len() > 253
+        || (name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && name.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.'))
+    {
+        return false;
+    }
+    name.split('.').all(|label| {
         let bytes = label.as_bytes();
         bytes.len() <= 63
             && bytes.first().is_some_and(u8::is_ascii_alphanumeric)

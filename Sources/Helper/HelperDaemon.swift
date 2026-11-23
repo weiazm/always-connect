@@ -678,6 +678,15 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         queue.async { reply(self.engine?.egressStatus() ?? "{}") }
     }
 
+    func setUnknownWebException(_ address: String, port: Int, allow: Bool, approvalId: String,
+                                withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard self.dropProtection, self.egress.isActive, !self.userReleased, [80,443,8443].contains(port),
+                  let engine = self.engine else { reply(false); return }
+            reply(engine.setUnknownWebException(address, port: UInt16(port), allow: allow, approvalId: approvalId))
+        }
+    }
+
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void) {
         queue.async {
             guard self.dropProtection, self.egress.isActive, let engine = self.engine else { reply(false); return }

@@ -1704,6 +1704,14 @@ fn install_egress_probe(e: *const oc_engine::Engine,
 }
 
 #[no_mangle]
+pub extern "C" fn ac_oc_unknown_web_exception(e: *const oc_engine::Engine, address: *const c_char, port: u16,
+                                              allow: bool, approval_id: *const c_char) -> bool {
+    let (Some(engine), Some(ip), Some(id)) = (unsafe {e.as_ref()}, c_str(address).and_then(|s|s.parse().ok()), c_str(approval_id))
+        else {return false};
+    engine.unknown_web_exception(ip, port, allow, &id)
+}
+
+#[no_mangle]
 pub extern "C" fn ac_oc_recheck_egress(e: *const oc_engine::Engine, group: u32) -> bool {
     unsafe { e.as_ref() }.is_some_and(|engine| engine.recheck_egress(group))
 }

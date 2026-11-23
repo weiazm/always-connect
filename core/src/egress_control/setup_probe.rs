@@ -68,7 +68,7 @@ impl SetupReceipt {
     }
 
     pub(crate) fn approves(&self, old: &EgressConfig, new: &EgressConfig, id: u32) -> bool {
-        if !new.valid() || !new.active() || old.methods != new.methods {
+        if !new.valid() || !new.active() || old.methods != new.methods || old.block_unidentified_web != new.block_unidentified_web {
             return false;
         }
         let old_other: Vec<_> = old.groups.iter().filter(|g|g.id!=id).collect();

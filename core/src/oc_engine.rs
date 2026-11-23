@@ -622,6 +622,15 @@ impl Engine {
         job.is_some_and(|run| run())
     }
 
+    pub fn unknown_web_exception(&self, address: std::net::IpAddr, port: u16, allow: bool, approval_id: &str) -> bool {
+        let c = self.shared.core.lock().expect("engine");
+        if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none() {
+            return false;
+        }
+        self.shared.egress.lock().expect("egress").as_ref().is_some_and(|ctl|
+            ctl.unknown_exception(address, port, allow, approval_id))
+    }
+
     pub fn approve_egress(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
                                 value: &str, range: bool, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
         let mut c = self.shared.core.lock().ok()?;
@@ -2084,6 +2093,10 @@ impl Shared {
                         }
                     }
                     gateway = Some(peer);
+                }
+                if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
+                    let includes = pairs.iter().find(|(k, _)| *k == "intweb").map_or("",|(_,v)| *v);
+                    ctl.session_internal_routes(includes);
                 }
                 c.hook_fired = true;
                 if let Some(servers) = c.cstp_dns.accepted() {

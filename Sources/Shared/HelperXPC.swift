@@ -145,6 +145,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
                           withReply reply: @escaping (Bool, [String]) -> Void)
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void)
+    func setUnknownWebException(_ address: String, port: Int, allow: Bool, approvalId: String,
+                                withReply reply: @escaping (Bool) -> Void)
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             withReply reply: @escaping (Bool, [String]) -> Void)
     func getEgressStatus(withReply reply: @escaping (String) -> Void)

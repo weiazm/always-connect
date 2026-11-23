@@ -15,6 +15,7 @@ fn custom_json() -> ProbeMethod {
 
 fn cfg() -> EgressConfig {
     EgressConfig {
+        block_unidentified_web:true,
         enabled: true,
         methods: vec![custom_json()],
         groups: vec![
@@ -581,7 +582,7 @@ fn only_current_direct_wrong_country_evidence_can_hint_dns() {
 fn denial_totals_are_idempotent_and_accumulate_across_gate_peers() {
     let mut state = ControlState {
         warm:Default::default(), source_policies: HashMap::new(), config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
-        checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
+        checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), unknown_counts:HashMap::new(),internal_cidrs:Vec::new(), on_peer_loss: None,
     };
     let report = |n| serde_json::from_value(serde_json::json!({"group":1,"count":n,"hosts":[{"host":"a.example","count":n}],
         "lastHost":"a.example","hostsTruncated":false})).unwrap();
@@ -617,6 +618,92 @@ fn approval_never_confuses_the_site_peer_with_the_reported_exit_range() {
     assert!(!approvable_source("198.51.0.0/16","198.51.100.99".parse().unwrap()));
     assert!(approvable_source("2001:db8:1::/64","2001:db8:1::a".parse().unwrap()));
     assert!(!approvable_source("2001:db8::/32","2001:db8:1::a".parse().unwrap()));
+}
+
+#[test]
+fn unknown_web_exceptions_require_current_counted_endpoint_and_never_replace_a_protected_rule() {
+    let dir = std::env::temp_dir().join(format!("ac-unknown-control-{:x}", random_u64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("ctl");
+    let ctl = Controller::start(&socket,cfg(),Arc::new(|_,_|None)).unwrap();
+    let mut reader = BufReader::new(UnixStream::connect(&socket).unwrap());
+    reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut line=String::new();reader.read_line(&mut line).unwrap();
+    let frame=serde_json::from_str::<serde_json::Value>(&line).unwrap();
+    assert_eq!(frame["blockUnidentifiedWeb"],true);
+    let announce=|count|serde_json::json!({"unknownWeb":[{"address":"198.51.100.7","port":443,"count":count},
+        {"address":"203.0.113.1","port":443,"count":1}]});
+    writeln!(reader.get_mut(),"{}",serde_json::json!({"up":{"ifname":"utun9"}})).unwrap();
+    writeln!(reader.get_mut(),"{}",announce(2)).unwrap();
+    writeln!(reader.get_mut(),"{}",announce(2)).unwrap();
+    let deadline=std::time::Instant::now()+Duration::from_secs(2);
+    let status=loop {
+        let s:serde_json::Value=serde_json::from_str(&ctl.status_json()).unwrap();
+        if s["unknownWebCount"]==3 {break s}
+        assert!(std::time::Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));
+    };
+    let records=status["unknownWeb"].as_array().unwrap();
+    let ip="198.51.100.7".parse().unwrap();
+    let token=records[0]["approvalId"].as_str().unwrap();
+    assert!(!ctl.unknown_exception(ip,8443,true,token));
+    assert!(!ctl.unknown_exception(ip,443,true,"old"));
+    assert!(!ctl.unknown_exception("203.0.113.1".parse().unwrap(),443,true,records[1]["approvalId"].as_str().unwrap()));
+    assert!(ctl.unknown_exception(ip,443,true,token));
+    line.clear();reader.read_line(&mut line).unwrap();
+    let frame:serde_json::Value=serde_json::from_str(&line).unwrap();
+    assert_eq!(frame["unknownWebExceptions"],serde_json::json!([{"address":ip,"port":443}]));
+    line.clear();reader.read_line(&mut line).unwrap();assert!(line.contains("invalidate"));
+    assert!(ctl.unknown_exception(ip,443,false,token));
+    line.clear();reader.read_line(&mut line).unwrap();
+    let frame:serde_json::Value=serde_json::from_str(&line).unwrap();
+    assert_eq!(frame["unknownWebExceptions"],serde_json::json!([]));
+    line.clear();reader.read_line(&mut line).unwrap();
+    ctl.session_internal_routes("0.0.0.0/0,198.51.0.0/16,198.51.100.0/24,2001:db8:1::/64");
+    line.clear();reader.read_line(&mut line).unwrap();
+    let frame:serde_json::Value=serde_json::from_str(&line).unwrap();
+    assert_eq!(frame["unknownWebInternalCidrs"],serde_json::json!(["198.51.100.0/24","2001:db8:1::/64"]));
+    drop(reader);drop(ctl);std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn range_confirmation_is_bound_to_the_live_exit_ip_and_cannot_expand_country_trust() {
+    let dir = std::env::temp_dir().join(format!("ac-source-trust-{:x}", random_u64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg=cfg();
+    cfg.groups[0].exit_range_check=true;
+    cfg.groups[0].exit_ranges=vec!["198.51.100.1/32".into()];
+    let ctl=Controller::start(&dir.join("ctl"),cfg.clone(),Arc::new(|_,_|None)).unwrap();
+    let request=target_check(1,"192.0.2.5",Some("a.example"));
+    let (hold,_other)=UnixStream::pair().unwrap();
+    let observe=|exit:&str| {
+        let mut state=ctl.shared.state.lock().unwrap();
+        let group=cfg.groups[0].clone();
+        let failed=state.failures.entry(group.id).or_default();
+        let generation=failed.generation;
+        let target=failed.plan(&cfg,&group,&request).remove(0);
+        let obs=Observation{host:"a.example".into(),method:PRESET_TRACE.into(),country:Some("ZZ".into()),
+            evidence:Some("direct".into()),peer_address:Some(request.ip),ip:Some(exit.into()),..Default::default()};
+        assert!(!state.record(&group,Some("a.example"),generation,vec![(target,obs)]));
+        let current=state.status.groups[0].observed[0].clone();
+        assert_eq!(current.failure_reason.as_deref(),Some("exit-range-mismatch"));
+        (state.status.records[0].started,current)
+    };
+    {
+        let mut state=ctl.shared.state.lock().unwrap();
+        state.peer=Some(hold);state.status.interface="utun9".into();
+    }
+    let (started,old)=observe("203.0.113.5");
+    let (same,current)=observe("203.0.113.6");
+    assert_eq!(started,same);
+    assert_ne!(old.approval_id,current.approval_id);
+    assert!(ctl.approve(&cfg,1,started,"203.0.113.0/24",true,&old).is_none());
+    assert!(ctl.approve(&cfg,1,started,"203.0.0.0/16",true,&current).is_none());
+    assert!(ctl.approve(&cfg,1,started,"192.0.2.5/32",true,&current).is_none());
+    let updated=ctl.approve(&cfg,1,started,"203.0.113.6/32",true,&current).unwrap();
+    assert_eq!(updated.groups[0].exit_ranges,["198.51.100.1/32","203.0.113.6/32"]);
+    assert_eq!(updated.groups[0].expect,cfg.groups[0].expect);
+    assert!(ctl.approve(&updated,1,started,"203.0.113.0/24",true,&current).is_none());
+    drop(ctl);std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

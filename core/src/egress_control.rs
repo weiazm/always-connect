@@ -21,6 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod airports;
 mod activity;
+mod unknown_web;
+use unknown_web::{UnknownCount,UnknownWeb};
 use activity::{Denied, SiteStatus};
 mod recheck;
 mod warm;
@@ -29,14 +31,19 @@ use recheck::{Failures, Target};
 
 // ------------------------------------------------------------------ config
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EgressConfig {
+    pub block_unidentified_web: bool,
     pub enabled: bool,
     pub groups: Vec<Group>,
     /// User-defined methods; the presets ([`preset_methods`]) are always
     /// available under their own ids.
     pub methods: Vec<ProbeMethod>,
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self { Self { enabled:false, groups:Vec::new(), methods:Vec::new(), block_unidentified_web:true } }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -567,6 +574,8 @@ pub const MAX_RECORDS: usize = 10;
 #[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    pub unknown_web_count: u64,
+    pub unknown_web: Vec<UnknownWeb>,
     pub running: bool,
     pub checking: Vec<u32>,
     pub interface: String,
@@ -623,6 +632,8 @@ struct ControlState {
     checks: HashMap<(u64, u64), ActiveCheck>,
     failures: HashMap<u32, Failures>,
     peer_counts: HashMap<u32, Denied>,
+    unknown_counts: HashMap<std::net::SocketAddr,u64>,
+    internal_cidrs: Vec<String>,
     source_policies: HashMap<u32, crate::egress_source::SourcePolicy>,
     warm: warm::WarmProbes,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
@@ -712,6 +723,7 @@ impl ControlState {
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.warm.invalidate();
+        if !cfg.active() || !cfg.block_unidentified_web { self.status.unknown_web.clear(); }
         self.epoch = self.epoch.wrapping_add(1);
         self.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
         self.source_policies = source_policies(&cfg);
@@ -724,7 +736,7 @@ impl ControlState {
             failed.invalidate_dns();
             true
         });
-        self.send(&config_line(&self.config, marker));
+        self.send(&self.gate_config(marker));
         self.send("{\"invalidate\":true}");
     }
 
@@ -746,6 +758,8 @@ impl ControlState {
             let _ = peer.shutdown(std::net::Shutdown::Both);
         }
         self.peer_counts.clear();
+        self.unknown_counts.clear();
+        self.internal_cidrs.clear();
         self.status.interface.clear();
         self.peer_id = self.peer_id.wrapping_add(1);
         self.retire_checks();
@@ -772,7 +786,7 @@ impl Controller {
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
                 warm: Default::default(), source_policies: source_policies(&cfg), config: cfg, status: Status::default(), peer: None, peer_id: 0,
-                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
+                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), internal_cidrs:Vec::new(),unknown_counts:HashMap::new(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
         });
@@ -895,6 +909,11 @@ impl Controller {
     pub fn invalidate(&self) {
         let mut state = self.shared.state.lock().expect("controller");
         state.retire_checks();
+        if !state.internal_cidrs.is_empty() {
+            state.internal_cidrs.clear();
+            let frame = state.gate_config(&self.shared.marker);
+            state.send(&frame);
+        }
         state.send("{\"invalidate\":true}");
     }
 }
@@ -915,10 +934,6 @@ fn random_u64() -> u64 {
         let _ = f.read_exact(&mut b);
     }
     u64::from_ne_bytes(b) ^ now().to_bits()
-}
-
-fn config_line(cfg: &EgressConfig, marker: &str) -> String {
-    serde_json::json!({ "probe_alpn": marker, "groups": cfg.gate_groups() }).to_string()
 }
 
 fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
@@ -953,7 +968,7 @@ fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
         state.disconnect();
         state.peer = Some(writer);
         let peer_id = state.peer_id;
-        let line = config_line(&state.config, &shared.marker);
+        let line = state.gate_config(&shared.marker);
         state.send(&line);
         let shared = shared.clone();
         if std::thread::Builder::new().name("egress-gate".into())
@@ -966,6 +981,8 @@ fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
 
 #[derive(Deserialize)]
 struct GateMsg {
+    #[serde(rename="unknownWeb")]
+    unknown_web: Option<Vec<UnknownCount>>,
     warm: Option<warm::WarmMsg>,
     check: Option<CheckMsg>,
     #[serde(rename = "timedOut")]
@@ -1014,6 +1031,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
                 warm.start(config, scope, generation, hint, &shared.hook, &shared.marker);
             }
         }
+        if let Some(reports) = msg.unknown_web {state.note_unknown(reports);}
         if let Some(reports) = msg.denied { state.denied_counts(reports); }
         let timed_out = msg.timed_out.is_some();
         if let Some(check) = msg.timed_out.or(msg.check) {

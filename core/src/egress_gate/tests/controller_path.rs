@@ -100,6 +100,7 @@ enum ProbeResult {
 fn controller_and_gate_admit_reject_and_recover_ipv6_flows() {
     let directory = TestDirectory::new();
     let config = EgressConfig {
+        block_unidentified_web:true,
         enabled: true,
         methods: vec![],
         groups: vec![
