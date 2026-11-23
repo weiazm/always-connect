@@ -141,6 +141,7 @@ struct EgressNotificationHarness {
     }
 
     static func main() {
+        checkExitRanges()
         var ledger = EgressNoticeLedger()
         let partial = group("partial")
         let unknown = group("unknown")
@@ -219,5 +220,91 @@ struct EgressNotificationHarness {
               "legacy observations decode without authorizing trust")
         notifier.notifyGatewayCertificateFailure()
         check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
+    }
+
+    static func checkExitRanges() {
+        let decoder = JSONDecoder()
+        let old = Data(#"{"enabled":true,"groups":[{"id":7,"name":"Fixture","enabled":true,"members":[{"pattern":"site.example","method":"trace"}],"cidrs":["203.0.113.0/24"],"expect":["ZZ"]}],"methods":[]}"#.utf8)
+        let model = try! decoder.decode(EgressProtection.self, from: old)
+        let rule = model.groups[0]
+        check(!rule.exitRangeCheck && rule.exitRanges.isEmpty, "legacy rules do not enable prefix checks")
+        let summary = Data(#"{"host":"site.example","method":"trace","status":"ok","resolvedAddressCount":3,"probedAddressCount":3,"truncated":false,"coverageIncomplete":false,"proofId":"fixture-proof","results":[{"address":"203.0.113.1","method":"trace","status":"ok","country":"ZZ","exitIP":"198.51.100.17"},{"address":"203.0.113.2","method":"trace","status":"ok","country":"YY","exitIP":"192.0.2.8"},{"address":"203.0.113.3","method":"trace","status":"ok","country":"ZZ"}]}"#.utf8)
+        let probe = try! decoder.decode(EgressProtection.SetupProbe.self, from: summary)
+        let offers = EgressExitRangeOffer.from([probe.host: probe], countries: rule.expect, config: model)
+        guard let offer = offers.first, let ip = offer.suggestions.addresses.first else { exit(1) }
+        check(offer.suggestions.addresses.count == 1 && ip.single == "198.51.100.17/32" && ip.subnet == "198.51.100.0/24",
+              "suggestions use only real exitIP from an allowed country, never the destination field")
+        var unattested = probe
+        unattested.proofId = nil
+        var reference = model
+        reference.methods = [.init(id: "trace", name: "Reference", url: "https://query.example/",
+                                   extract: .init(kind: .kv, key: "loc"))]
+        check(EgressExitRangeOffer.from([probe.host: unattested], countries: rule.expect, config: model).isEmpty
+              && EgressExitRangeOffer.from([probe.host: probe], countries: rule.expect, config: reference).isEmpty,
+              "old and third-party responses cannot start exit range approval")
+        let ipv6 = EgressExitAddress("2001:db8:7::8")!
+        check(ipv6.single == "2001:db8:7::8/128" && ipv6.subnet == "2001:db8:7::/64"
+              && EgressExitRangeSuggestions(addresses: [ipv6]).recommended == [ipv6.single],
+              "IPv6 defaults to exact /128, with explicit /64 available")
+        let choice = EgressExitRangeSelection(proof: offer.proof, ranges: [ip.single])
+        let wider = EgressExitRangeSelection(proof: offer.proof, ranges: ["198.51.0.0/16"])
+        check(!wider.verified(in: offers) && !choice.verified(in: []), "missing or wider choices cannot be confirmed")
+        guard let setup = EgressExitRangeSetup(proposed: model, previous: model, group: rule.id,
+                                              selection: choice, offers: offers) else { exit(1) }
+        check(!model.groups[0].exitRangeCheck && setup.proposed.groups[0].exitRanges == [ip.single]
+              && setup.proposed.groups[0].cidrs == rule.cidrs && setup.proposed.groups[0].expect == rule.expect,
+              "a draft changes neither the old preferences nor destination ranges or countries")
+        var changed = model
+        changed.groups[0].name = "Concurrent edit"
+        check(setup.applying(accepted: nil, now: model, sameSession: true) == nil
+              && setup.applying(accepted: false, now: model, sameSession: true) == nil
+              && setup.applying(accepted: true, now: setup.proposed, sameSession: true) == nil
+              && setup.applying(accepted: true, now: model, sameSession: false) == nil
+              && setup.applying(accepted: true, now: changed, sameSession: true) == nil,
+              "timeout, expired or used proof, changed session and competing edits preserve preferences")
+        guard let enabled = setup.applying(accepted: true, now: model, sameSession: true) else { exit(1) }
+        let current = enabled.groups[0]
+        let miss = EgressProtection.Observation(host: "site.example", method: "trace", country: "ZZ",
+            ip: "192.0.2.70", error: nil, evidence: "direct", peerAddress: "203.0.113.1",
+            failureReason: "exit-range-mismatch", approvalId: "fixture-approval")
+        let record = EgressProtection.BlockRecord(started: 5, ended: nil, group: rule.id, name: rule.name,
+                                                 host: "older.example", observed: [], expected: ["YY"])
+        func snapshot(_ observation: EgressProtection.Observation, reason: String? = nil) -> EgressProtection.Status {
+            .init(running: true, checking: [], groups: [.init(id: rule.id, name: "Fixture", state: "blocked", lastCheck: 6,
+                  observed: [observation], reason: reason, level: "partial", blockedCount: 1)], records: [record])
+        }
+        let status = snapshot(miss)
+        guard let incident = status.exitChanges(for: current).first else { exit(1) }
+        let approval = incident.approval(for: incident.exit.subnet)
+        let roundTrip = try! decoder.decode(EgressExitRangeApproval.self, from: JSONEncoder().encode(approval))
+        check(status.permits(approval, in: enabled)
+              && roundTrip.observation.approvalId == "fixture-approval"
+              && !status.permits(incident.approval(for: "192.0.0.0/8"), in: enabled)
+              && status.approvals(for: rule.id).isEmpty
+              && status.panelCaption(checkingFor: 0).contains("出口换到了未允许的网段"),
+              "current range evidence retains its approval ID and is independent of the first record and country approval")
+        var borrowed = miss
+        borrowed.evidence = "proxy"
+        var stale = miss
+        stale.peerAddress = "203.0.113.2"
+        var unavailable = miss
+        unavailable.failureReason = "exit-ip-unavailable"
+        var changedApprovalID = miss
+        changedApprovalID.approvalId = "changed-approval"
+        var withoutApprovalID = miss
+        withoutApprovalID.approvalId = nil
+        check(!snapshot(borrowed).permits(approval, in: enabled)
+              && !snapshot(stale).permits(approval, in: enabled)
+              && !snapshot(changedApprovalID).permits(approval, in: enabled)
+              && snapshot(withoutApprovalID).exitChanges(for: current).isEmpty
+              && !snapshot(miss, reason: "failed-target-overflow").permits(approval, in: enabled)
+              && snapshot(unavailable).exitChanges(for: current).isEmpty
+              && snapshot(unavailable).panelCaption(checkingFor: 0).contains("未能核实出口 IP"),
+              "borrowed, changed, locked and missing-IP evidence cannot authorize a range")
+        let accepted = [ip.single, incident.exit.subnet]
+        check(approval.applying(accepted, then: enabled, now: enabled, sameSession: true)?.groups[0].exitRanges == accepted
+              && approval.applying([], then: enabled, now: enabled, sameSession: true) == nil
+              && approval.applying(accepted, then: enabled, now: model, sameSession: true) == nil,
+              "only the exact successful receipt updates the rule's exit ranges")
     }
 }

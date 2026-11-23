@@ -2163,6 +2163,69 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
+    func confirmExitRangeSetup(_ setup: EgressExitRangeSetup, completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            guard let data = try? JSONEncoder().encode(setup) else { completion(false); return }
+            SettingsLink.shared.send("confirmExitRangeSetup", String(decoding: data, as: UTF8.self)) { completion($0 == "1") }
+            return
+        }
+        let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard showsConnected, !usesCisco, protectsDrops, !egressSavePending, stored == setup.previous,
+              let before = try? JSONEncoder().encode(setup.previous.forService()),
+              let after = try? JSONEncoder().encode(setup.proposed.forService()) else { completion(false); return }
+        let session = egressSession
+        egressSavePending = true
+        egressRPC({ proxy, done in
+            proxy.confirmEgressRangeSetup(String(decoding: after, as: UTF8.self),
+                                          previous: String(decoding: before, as: UTF8.self),
+                                          group: setup.group, proof: setup.proof, withReply: done)
+        }) { accepted in
+            self.egressSavePending = false
+            var settings = ProfileStore.loadAppSettings()
+            guard settings.isDropProtectionOn, !self.usesCisco,
+                  let updated = setup.applying(accepted: accepted, now: settings.egressProtection ?? EgressProtection(),
+                                               sameSession: self.egressSession == session) else { completion(false); return }
+            settings.egressProtection = updated
+            ProfileStore.saveAppSettings(settings, updatingEgress: true)
+            self.updateEgressMonitoring()
+            completion(true)
+        }
+    }
+
+    func allowEgressRange(_ approval: EgressExitRangeApproval, completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            guard let data = try? JSONEncoder().encode(approval) else { completion(false); return }
+            SettingsLink.shared.send("allowEgressRange", String(decoding: data, as: UTF8.self)) { completion($0 == "1") }
+            return
+        }
+        fetchEgressJSON { json in
+            guard let json, self.showsConnected, !self.egressSavePending,
+                  let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
+                  let evidence = try? JSONEncoder().encode(approval.observation) else { completion(false); return }
+            let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+            guard status.permits(approval, in: stored) else { completion(false); return }
+            let session = self.egressSession
+            self.egressSavePending = true
+            self.egressRPC({ proxy, done in
+                proxy.allowEgressRange(approval.cidr, group: approval.group, started: approval.started,
+                                       evidence: String(decoding: evidence, as: UTF8.self)) { ok, ranges in
+                    done(ok ? ranges : [])
+                }
+            }) { (ranges: [String]?) in
+                self.egressSavePending = false
+                var fresh = ProfileStore.loadAppSettings()
+                guard fresh.isDropProtectionOn, let config = fresh.egressProtection,
+                      let updated = approval.applying(ranges, then: stored, now: config,
+                                                     sameSession: self.egressSession == session)
+                else { completion(false); return }
+                fresh.egressProtection = updated
+                ProfileStore.saveAppSettings(fresh, updatingEgress: true)
+                self.refreshEgress()
+                completion(true)
+            }
+        }
+    }
+
     func recheckEgressRule(_ id: UInt32, completion: @escaping (Bool) -> Void) {
         if AppRole.isSettings {
             SettingsLink.shared.send("recheckEgressRule", String(id)) { completion($0 == "1") }

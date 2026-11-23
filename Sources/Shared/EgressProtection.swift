@@ -45,6 +45,8 @@ struct EgressProtection: Codable, Equatable {
         var members: [Member] = []
         var cidrs: [String] = []
         var expect: [String] = []
+        var exitRangeCheck = false
+        var exitRanges: [String] = []
     }
 
     struct Member: Codable, Equatable, Identifiable {
@@ -117,6 +119,8 @@ struct EgressProtection: Codable, Equatable {
         let error: String?
         var evidence: String? = nil
         var peerAddress: String? = nil
+        var failureReason: String? = nil
+        var approvalId: String? = nil
         var id: String { method }
     }
 
@@ -158,6 +162,7 @@ struct EgressProtection: Codable, Equatable {
             let status: String
             let country: String?
             let error: String?
+            var exitIP: String? = nil
         }
         let host: String
         let method: String
@@ -168,6 +173,7 @@ struct EgressProtection: Codable, Equatable {
         let truncated: Bool
         let coverageIncomplete: Bool
         let results: [Result]
+        var proofId: String? = nil
     }
 
     struct BlockRecord: Decodable {
@@ -178,5 +184,19 @@ struct EgressProtection: Codable, Equatable {
         let host: String?
         let observed: [Observation]
         let expected: [String]
+    }
+}
+
+extension EgressProtection.Group {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UInt32.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        enabled = try values.decode(Bool.self, forKey: .enabled)
+        members = try values.decode([EgressProtection.Member].self, forKey: .members)
+        cidrs = try values.decode([String].self, forKey: .cidrs)
+        expect = try values.decode([String].self, forKey: .expect)
+        exitRangeCheck = try values.decodeIfPresent(Bool.self, forKey: .exitRangeCheck) ?? false
+        exitRanges = try values.decodeIfPresent([String].self, forKey: .exitRanges) ?? []
     }
 }

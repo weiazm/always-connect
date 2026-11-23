@@ -91,6 +91,14 @@ extension EgressProtection {
 }
 
 extension EgressProtection.Observation {
+    var exitRangeFailureCaption: String? {
+        switch failureReason {
+        case "exit-range-mismatch": return "出口换到了未允许的网段，已拦截相关新连接"
+        case "exit-ip-unavailable": return "未能核实出口 IP，已拦截相关新连接"
+        default: return nil
+        }
+    }
+
     var evidenceKind: EgressProtection.Evidence {
         evidence.flatMap(EgressProtection.Evidence.init(rawValue:)) ?? .unknown
     }
@@ -102,7 +110,8 @@ extension EgressProtection.Observation {
 
     var observationCaption: String {
         let address = peerAddress.map { "（目的地址 \($0)）" } ?? ""
-        return "\(host)\(address)：\(countryAndAddress) · \(evidenceKind.caption)"
+        let cause = exitRangeFailureCaption.map { " · \($0)" } ?? ""
+        return "\(host)\(address)：\(countryAndAddress) · \(evidenceKind.caption)" + cause
     }
 
     func isOutside(_ expected: [String]) -> Bool {
@@ -132,6 +141,7 @@ extension EgressProtection.GroupState {
 
     var blockCaption: String? {
         if let reason = blockReason { return reason.caption }
+        if blocked, let reason = observed.lazy.compactMap(\.exitRangeFailureCaption).first { return reason }
         switch displayLevel {
         case .ok: return nil
         case .partial:
@@ -189,7 +199,9 @@ extension EgressProtection.Status {
         case .blocked:
             return groups.first { $0.displayLevel == .blocked }?.blockCaption ?? "有网站暂时打不开"
         case .partial:
-            return blockedCount > 0 ? "本次已拦下 \(blockedCount) 次连接" : "部分地址已拦截"
+            return groups.lazy.filter { $0.blocked && (expectedRules?.contains($0.id) ?? true) }
+                .flatMap(\.observed).compactMap(\.exitRangeFailureCaption).first
+                ?? (blockedCount > 0 ? "本次已拦下 \(blockedCount) 次连接" : "部分地址已拦截")
         case .ok: return "正常"
         case .unknown:
             if running && !checking.isEmpty && checkingFor >= 1 { return "正在核对出口" }

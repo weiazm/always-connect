@@ -34,6 +34,7 @@ struct EgressChangeBanner: View {
 struct EgressReconnectPrompt: View {
     let change: EgressRuleChange
     let cancel: () -> Void
+    var canConfirm = true
     let confirm: () -> Void
     var body: some View {
         HStack {
@@ -41,7 +42,7 @@ struct EgressReconnectPrompt: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
             Button("取消", action: cancel)
-            Button(change.confirmationTitle, action: confirm)
+            Button(change.confirmationTitle, action: confirm).disabled(!canConfirm)
         }
     }
 }
@@ -96,6 +97,7 @@ struct EgressRuleDetail: View {
                     }
                 }
             }
+            EgressExitRangeDetail(rule: rule, status: status, refresh: refresh, edit: edit)
             Section("网站") {
                 ForEach(rule.members) { member in
                     HStack {
@@ -149,7 +151,8 @@ struct EgressRuleDetail: View {
             Button("取消", role: .cancel) {}
             Button("允许 " + egressCountryName(approval.country)) { allow(approval) }
         } message: { approval in
-            Text("已确认 \(approval.observation.host) 的服务器 \(approval.observation.peerAddress ?? "") 从 \(egressCountryName(approval.country)) 出去。允许后，这条规则也会接受来自该国家或地区的出口。")
+            Text("已确认 \(approval.observation.host) 的服务器 \(approval.observation.peerAddress ?? "") 从 \(egressCountryName(approval.country)) 出去。允许后，这条规则也会核对该国家的连接。"
+                 + (rule.exitRangeCheck ? "出口仍须符合已允许的网段。" : ""))
         }
     }
 

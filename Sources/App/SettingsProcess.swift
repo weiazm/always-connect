@@ -157,6 +157,20 @@ final class SettingsLink {
             }
             client.allowEgressCountry(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
             return
+        case "confirmExitRangeSetup":
+            guard let setup = try? JSONDecoder().decode(EgressExitRangeSetup.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.confirmExitRangeSetup(setup) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
+        case "allowEgressRange":
+            guard let approval = try? JSONDecoder().decode(EgressExitRangeApproval.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.allowEgressRange(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
         case "recheckEgressRule":
             guard let group = UInt32(argument) else { reply(id, "0"); return }
             client.recheckEgressRule(group) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }

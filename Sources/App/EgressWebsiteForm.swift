@@ -11,6 +11,8 @@ struct EgressWebsiteForm: View {
     @State private var method: String?
     @State private var selectedSites: Set<String>
     @State private var countries: [String] = []
+    @State private var rangeSelection: EgressExitRangeSelection?
+    @State private var rangeProofRejected = false
     @State private var probes: [String: EgressProtection.SetupProbe] = [:]
     @State private var probing = false
     @State private var request = UUID()
@@ -39,6 +41,13 @@ struct EgressWebsiteForm: View {
         .init(hosts: scopes.map(\.host), method: method, online: online, connectedSince: manager.connectedSince, retry: retry)
     }
     private var hasVerifiedSite: Bool { probes.values.contains { $0.verifiedMethod != nil } }
+    private var rangeOffers: [EgressExitRangeOffer] {
+        guard online, rule == nil else { return [] }
+        return EgressExitRangeOffer.from(probes, countries: countries, config: config)
+    }
+    private var canConfirmRanges: Bool {
+        rangeSelection == nil || (!rangeProofRejected && rangeSelection?.verified(in: rangeOffers) == true)
+    }
     private var conflictingScope: Bool {
         let direct = DirectSites.sites(ProfileStore.loadAppSettings())
         return scopes.contains { $0.conflicts(in: config, rule: rule, direct: direct) }
@@ -100,6 +109,12 @@ struct EgressWebsiteForm: View {
                     }
                     if rule == nil && hasVerifiedSite {
                         EgressCountrySelection(countries: $countries)
+                        EgressExitRangePicker(offers: rangeOffers, selection: $rangeSelection)
+                        if rangeSelection != nil && !canConfirmRanges {
+                            Text("这些网段需重新检查后才能确认。").font(.caption).foregroundStyle(.orange)
+                            Button("重新检查") { retry += 1 }
+                            Button("仅核对国家") { rangeSelection = nil }
+                        }
                     }
                 }
             }
@@ -144,6 +159,7 @@ struct EgressWebsiteForm: View {
                     Button("取消") { self.confirm = nil }
                     Button(confirm.confirmationTitle) { self.confirm = nil; apply(confirm) }
                         .keyboardShortcut(.defaultAction)
+                        .disabled(!canConfirmRanges)
                 } else {
                     Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                     Spacer()
@@ -152,7 +168,7 @@ struct EgressWebsiteForm: View {
                         if proposal.needsReconnect(connected: manager.showsConnected) { confirm = proposal }
                         else { apply(proposal) }
                     }
-                    .keyboardShortcut(.defaultAction).disabled(proposal == nil)
+                    .keyboardShortcut(.defaultAction).disabled(proposal == nil || !canConfirmRanges)
                 }
             }
         }
@@ -175,6 +191,8 @@ struct EgressWebsiteForm: View {
         request = current
         probes = [:]
         countries = []
+        rangeSelection = nil
+        rangeProofRejected = false
         confirm = nil
         probing = false
         guard query.online, !query.hosts.isEmpty, query.hosts.count <= 8 else { return }
@@ -189,20 +207,36 @@ struct EgressWebsiteForm: View {
     }
 
     private func apply(_ change: EgressRuleChange) {
-        guard online, proposal?.after == change.after else {
+        guard online, proposal?.after == change.after, canConfirmRanges else {
             error = "网站或规则已修改，请重新检查出口。"
             return
         }
         let website = scopes.count == 1 ? scopes[0].website : "\(scopes.count) 个网站"
         saving = true
-        manager.saveEgress(change.after, replacing: change.before) { ok in
+        func completed(_ ok: Bool, result: EgressRuleChange) {
             saving = false
             if ok {
-                saved(change, website)
+                saved(result, website)
                 dismiss()
             } else {
                 error = "规则未保存。请检查后台服务，或重新打开表单。"
             }
+        }
+        if let rangeSelection {
+            guard let setup = EgressExitRangeSetup(proposed: change.after, previous: change.before,
+                                                  group: newRuleID, selection: rangeSelection, offers: rangeOffers) else {
+                saving = false
+                return
+            }
+            manager.confirmExitRangeSetup(setup) { ok in
+                completed(ok, result: .init(before: change.before, after: setup.proposed))
+                if !ok {
+                    rangeProofRejected = true
+                    error = "未能确认出口范围。原设置已保留，请重新检查。"
+                }
+            }
+        } else {
+            manager.saveEgress(change.after, replacing: change.before) { completed($0, result: change) }
         }
     }
 }

@@ -57,6 +57,7 @@ struct ConnectionsPage: View {
     @State private var egressAddition: EgressAddition?
     @State private var egressNotice: EgressAction?
     @State private var egressPending: EgressAction?
+    @State private var egressRangeSelection: EgressExitRangeSelection?
     @State private var egressBusy = false
     @State private var egressVisible = false
     @State private var egressGeneration = UUID()
@@ -90,7 +91,7 @@ struct ConnectionsPage: View {
 
     private struct EgressAction: Identifiable {
         let id = UUID()
-        let change: EgressRuleChange
+        var change: EgressRuleChange
         var text: String
         var rule: UInt32?
         var scope: EgressWebsiteScope?
@@ -98,6 +99,7 @@ struct ConnectionsPage: View {
         var source: [EgressRecentVisits.Visit] = []
         var requiresLiveSetup = false
         var setupSession: Date?
+        var rangeOffers: [EgressExitRangeOffer] = []
     }
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
@@ -202,15 +204,19 @@ struct ConnectionsPage: View {
             if let pending = egressPending {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(pending.text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    EgressExitRangePicker(offers: pending.rangeOffers, selection: $egressRangeSelection)
+                    let canConfirm = egressRangeSelection == nil || egressRangeSelection?.verified(in: pending.rangeOffers) == true
                     if pending.change.needsReconnect(connected: manager.showsConnected) {
-                        EgressReconnectPrompt(change: pending.change, cancel: { egressPending = nil }) {
+                        EgressReconnectPrompt(change: pending.change, cancel: {
+                            egressPending = nil; egressRangeSelection = nil
+                        }, canConfirm: canConfirm) {
                             egressPending = nil
                             applyEgress(pending)
                         }
                     } else {
                         HStack {
-                            Button("取消") { egressPending = nil }
-                            Button("确认") { egressPending = nil; applyEgress(pending) }
+                            Button("取消") { egressPending = nil; egressRangeSelection = nil }
+                            Button("确认") { egressPending = nil; applyEgress(pending) }.disabled(!canConfirm)
                         }
                     }
                 }.padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
@@ -388,6 +394,7 @@ struct ConnectionsPage: View {
         message = nil
         egressBusy = true
         egressPending = nil
+        egressRangeSelection = nil
         let request = UUID()
         egressGeneration = request
         let source = EgressRecentVisits.shared.visits.filter { hosts.contains($0.host) }
@@ -417,9 +424,10 @@ struct ConnectionsPage: View {
                 : "已加入「\(target.name)」：\(website) 及子域名"
             let note = target.enabled ? checked.joined(separator: " ") : "这条规则仍处于停用状态。"
             let scope = scopes.count == 1 ? scopes[0] : nil
+            let offers = rule == nil ? EgressExitRangeOffer.from(results, countries: target.expect, config: stored) : []
             let action = EgressAction(change: change, text: line + "。" + note, rule: target.id,
                                       scope: scope, method: scope.flatMap { eligible[$0.host] }, source: source,
-                                      requiresLiveSetup: rule == nil, setupSession: setupSession)
+                                      requiresLiveSetup: rule == nil, setupSession: setupSession, rangeOffers: offers)
             if rule == nil || change.needsReconnect(connected: manager.showsConnected) { egressPending = action }
             else { applyEgress(action) }
         }
@@ -430,6 +438,7 @@ struct ConnectionsPage: View {
         guard let (change, patterns) = EgressRuleChange.move(host: host, source: source, target: target, config: latest) else { return }
         let destination = target.flatMap { id in latest.rulesForEditing.groups.first(where: { $0.id == id }) }
         let label = destination.map { "移到「\($0.name)」" + ($0.enabled ? "，沿用它允许的国家" : "，该规则处于停用状态") } ?? "移出出口保护"
+        egressRangeSelection = nil
         egressPending = .init(change: change, text: label + "：" + patterns.sorted().joined(separator: "、"), rule: target)
     }
 
@@ -439,21 +448,38 @@ struct ConnectionsPage: View {
             return
         }
         egressBusy = true
-        manager.saveEgress(action.change.after, replacing: action.change.before) { ok in
+        let selection = egressRangeSelection
+        egressRangeSelection = nil
+        func completed(_ ok: Bool, result: EgressRuleChange) {
             egressBusy = false
             if ok {
                 var saved = action
+                saved.change = result
+                saved.rangeOffers = []
                 if action.requiresLiveSetup { saved.text = "已开始保护 " + action.text }
                 egressNotice = showNotice ? saved : nil
                 selected.removeAll()
                 refreshEgressState()
             } else { message = "规则未保存。配置已变化或后台未接受，请刷新后重试。" }
         }
+        if action.requiresLiveSetup, let selection {
+            guard let id = action.rule,
+                  let setup = EgressExitRangeSetup(proposed: action.change.after, previous: action.change.before,
+                                                  group: id, selection: selection, offers: action.rangeOffers)
+            else { egressBusy = false; message = "请重新检查出口网段。"; return }
+            manager.confirmExitRangeSetup(setup) { ok in
+                completed(ok, result: .init(before: action.change.before, after: setup.proposed))
+                if !ok { message = "未能确认出口范围。原设置已保留，请重新选择网站并检查出口。" }
+            }
+        } else {
+            manager.saveEgress(action.change.after, replacing: action.change.before) { completed($0, result: action.change) }
+        }
     }
 
     private func undoEgress(_ notice: EgressAction) {
         let change = notice.change.undo
         let action = EgressAction(change: change, text: "撤销刚才的出口保护修改")
+        egressRangeSelection = nil
         if change.needsReconnect(connected: manager.showsConnected) { egressPending = action }
         else { applyEgress(action, showNotice: false) }
     }
@@ -466,7 +492,13 @@ struct ConnectionsPage: View {
         let methods = notice.method.map { [scope.host: $0] } ?? [:]
         guard let replacement = EgressWebsiteScope.adding([scope], to: oldConfig, rule: existing ? id : nil, newRuleID: id,
                                                           methods: methods, countries: countries, activateExisting: false) else { return }
-        let narrow = EgressRuleChange(before: notice.change.after, after: replacement.after)
+        var updated = replacement.after
+        if let existing = notice.change.after.groups.first(where: { $0.id == id }),
+           let index = updated.groups.firstIndex(where: { $0.id == id }) {
+            updated.groups[index].exitRangeCheck = existing.exitRangeCheck
+            updated.groups[index].exitRanges = existing.exitRanges
+        }
+        let narrow = EgressRuleChange(before: notice.change.after, after: updated)
         let action = EgressAction(change: narrow, text: "已改为只保护 \(scope.host)", rule: id)
         applyEgress(action)
     }

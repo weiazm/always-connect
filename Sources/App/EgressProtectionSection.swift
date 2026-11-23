@@ -155,6 +155,7 @@ struct EgressProtectionSection: View {
                 defer { if opened { url.stopAccessingSecurityScopedResource() } }
                 var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url))
                 imported.enabled = false
+                for index in imported.groups.indices { imported.groups[index].exitRangeCheck = false }
                 let offline = imported.rulesForEditing
                 change { $0 = offline }
             } catch { message = "无法读取出口保护配置。请选择有效的 JSON 文件。" }
