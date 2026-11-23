@@ -16,6 +16,8 @@
 //!   Cumulative for this peer and sent only after a real denial.
 //! - gate -> controller, unidentified Web denials: `{"unknownWeb":[{"address":"192.0.2.1","port":443,"count":1}]}`
 //! - configuration may include `blockUnidentifiedWeb`, `unknownWebExceptions` and `unknownWebInternalCidrs`
+//! - controller -> gate, trusted DNS: `{"dnsReset":4}`, then
+//!   `{"dnsEvidence":{"generation":4,"name":"a.example","kind":"ipv4","qtype":1,"observedAtMs":1234,"values":[{"value":"192.0.2.1","ttl":60}]}}`
 //! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true,"evidenceAtMs":1234}}`,
 //!   `{"blockGroup":1}` or `{"invalidate":true}`
 //!
@@ -27,7 +29,7 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::{DeniedGroup, Gate, GateConfig, GroupId, Out, RequestId, Step, UnknownWebEndpoint, UnknownWebPolicy, Verdict};
+use alwaysconnect_core::egress_gate::{DeniedGroup, DnsEvidenceUpdate, Gate, GateConfig, GroupId, Out, RequestId, Step, UnknownWebEndpoint, UnknownWebPolicy, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -88,6 +90,10 @@ struct ControlMsg {
     #[serde(rename = "blockGroup")]
     block_group: Option<GroupId>,
     invalidate: Option<bool>,
+    #[serde(rename = "dnsReset")]
+    dns_reset: Option<u64>,
+    #[serde(rename = "dnsEvidence")]
+    dns_evidence: Option<DnsEvidenceUpdate>,
     /// A new configuration while running (same shape as the first line).
     probe_alpn: Option<String>,
     groups: Option<Vec<GateGroup>>,
@@ -396,6 +402,12 @@ fn main() {
                             if m.invalidate == Some(true) {
                                 gate.invalidate();
                             }
+                            if let Some(generation) = m.dns_reset {
+                                gate.reset_dns_evidence(generation);
+                            }
+                            if let Some(evidence) = m.dns_evidence {
+                                gate.update_dns_evidence(evidence);
+                            }
                             if let Some(group) = m.block_group {
                                 gate.block_group(group);
                             }
@@ -668,6 +680,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({
             "warm": {"group":1,"host":"a.example","ip":"192.0.2.1","port":443},
         }));
+    }
+
+    #[test]
+    fn dns_control_frames_require_the_authoritative_generation_and_exact_qtype() {
+        let reset = serde_json::from_str::<ControlMsg>(r#"{"dnsReset":6}"#).unwrap();
+        assert_eq!(reset.dns_reset, Some(6));
+        assert!(reset.dns_evidence.is_none());
+        let update = r#"{"dnsEvidence":{"generation":6,"name":"a.example","kind":"ech","qtype":65,"observedAtMs":1234,"values":[]}}"#;
+        let frame = serde_json::from_str::<ControlMsg>(update).unwrap().dns_evidence.unwrap();
+        assert_eq!((frame.generation, frame.qtype, frame.observed_at_ms), (6, 65, 1234));
+        assert!(frame.values.is_empty());
+        let missing = update.replace(r#""qtype":65,"#, "");
+        assert!(serde_json::from_str::<ControlMsg>(&missing).is_err());
     }
 
     #[test]

@@ -903,6 +903,122 @@ fn unknown_web_policy_preserves_existing_flows_and_retires_exceptions_with_the_c
     assert_eq!(connect_and_send(&mut g, 45153, exception_ip, &no_sni, now).0, Step::Consumed);
 }
 
+fn dns_evidence_update(gate: &mut Gate, generation: u64, name: &str, qtype: u16, observed_at_ms: u64, values: &[(&str, u32)]) {
+    let kind = match qtype {
+        1 => DnsEvidenceKind::Ipv4,
+        28 => DnsEvidenceKind::Ipv6,
+        64 | 65 => DnsEvidenceKind::Ech,
+        _ => panic!("unexpected fixture qtype"),
+    };
+    gate.update_dns_evidence(DnsEvidenceUpdate {
+        generation, name: name.into(), kind, qtype, observed_at_ms,
+        values: values.iter().map(|&(value, ttl)| DnsEvidenceValue { value: value.into(), ttl }).collect(),
+    });
+}
+
+#[test]
+fn only_current_forwarder_evidence_relaxes_ech_ambiguity() {
+    let mut g = proof_gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    let now = Instant::now();
+    let outer = "ordinary.example";
+    let ech = hello(Some(outer), &[], true, 0);
+    let address = [("93.184.216.44", 60)];
+    // The gate may inspect packets for protective routing, but an observed
+    // ordinary DNS packet is not the controller's final forwarded RRset.
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer(outer, &[PUBLIC])), now);
+    dns_evidence_update(&mut g, 3, outer, 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45160, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    g.take_unknown_web();
+
+    g.reset_dns_evidence(4);
+    dns_evidence_update(&mut g, 3, outer, 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45161, PUBLIC, &ech, now).0, Step::Consumed);
+    drain(&mut g);
+    g.take_unknown_web();
+    dns_evidence_update(&mut g, 4, "Ordinary.Example.", 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45162, PUBLIC, &ech, now).0, Step::Forward);
+    assert!(drain(&mut g).is_empty());
+    assert!(g.take_unknown_web().is_none());
+
+    // An address association alone cannot identify a truly unnamed flow.
+    let unnamed = hello(None, &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45163, PUBLIC, &unnamed, now).0, Step::Consumed);
+    drain(&mut g);
+    let unassociated = hello(Some("unassociated.example"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45166, PUBLIC, &unassociated, now).0, Step::Consumed);
+    drain(&mut g);
+    g.reconfigure(vec![], Box::new(Rules));
+    g.reset_dns_evidence(4);
+    dns_evidence_update(&mut g, 4, outer, 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45164, PUBLIC, &ech, now).0, Step::Consumed);
+    drain(&mut g);
+    g.reset_dns_evidence(5);
+    dns_evidence_update(&mut g, 5, outer, 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45165, PUBLIC, &ech, now).0, Step::Forward);
+}
+
+#[test]
+fn ordinary_ech_candidates_are_compatible_but_any_protected_address_association_takes_priority() {
+    let mut g = proof_gate();
+    let exception = UnknownWebEndpoint { address: PUBLIC.into(), port: 443 };
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    g.reset_dns_evidence(6);
+    let now = Instant::now();
+    let address = [("93.184.216.44", 60)];
+    let outer = "front.example";
+    for (host, qtype) in [("ordinary-a.example", 64), ("ordinary-b.example", 65)] {
+        dns_evidence_update(&mut g, 6, host, 1, 10_000, &address);
+        dns_evidence_update(&mut g, 6, host, qtype, 10_000, &[(outer, 60)]);
+    }
+    let ech = hello(Some(outer), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45170, PUBLIC, &ech, now).0, Step::Forward);
+    assert!(drain(&mut g).is_empty());
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[exception], &[]));
+    // Even a protected association with no matching public_name at this
+    // destination takes precedence over any suggestion of an ordinary site.
+    dns_evidence_update(&mut g, 6, "protected.example", 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45171, PUBLIC, &ech, now).0, Step::Consumed);
+    let out = drain(&mut g);
+    assert!(matches!(out.as_slice(),
+        [Out::Check { group: 1, host: Some(host), host_confirmed: false, .. }] if host == "protected.example"));
+
+    dns_evidence_update(&mut g, 6, "second.example", 1, 10_000, &address);
+    assert_eq!(connect_and_send(&mut g, 45172, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+}
+
+#[test]
+fn ech_rrsets_replace_independently_and_expire_from_observation_time() {
+    let mut g = proof_gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    g.reset_dns_evidence(7);
+    let now = Instant::now();
+    let host = "ordinary.example";
+    let outer = "front.example";
+    let ech = hello(Some(outer), &[], true, 0);
+    // The answers were already 500 ms old before the gate received them.
+    dns_evidence_update(&mut g, 7, host, 1, 9_500, &[("93.184.216.44", 60)]);
+    dns_evidence_update(&mut g, 7, host, 28, 9_500, &[("2600:abcd::44", 60)]);
+    dns_evidence_update(&mut g, 7, host, 64, 9_500, &[(outer, 60)]);
+    dns_evidence_update(&mut g, 7, host, 65, 9_500, &[(outer, 1)]);
+    dns_evidence_update(&mut g, 7, host, 64, 10_000, &[]);
+    dns_evidence_update(&mut g, 7, host, 28, 10_000, &[]);
+    assert_eq!(connect_and_send(&mut g, 45175, PUBLIC, &ech, now).0, Step::Forward);
+    PROOF_CLOCK.set(Some(10_500));
+    dns_evidence_update(&mut g, 7, host, 64, 9_900, &[(outer, 60)]);
+    assert_eq!(connect_and_send(&mut g, 45176, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    dns_evidence_update(&mut g, 7, host, 65, 10_501, &[(outer, 60)]);
+    assert_eq!(connect_and_send(&mut g, 45177, PUBLIC, &ech, now).0, Step::Consumed);
+    drain(&mut g);
+    dns_evidence_update(&mut g, 7, host, 65, 10_500, &[(outer, 60)]);
+    dns_evidence_update(&mut g, 7, host, 1, 10_500, &[]);
+    assert_eq!(connect_and_send(&mut g, 45178, PUBLIC, &ech, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+}
+
 #[test]
 fn tunnel_dns_answers_teach_protected_addresses() {
     let mut g = gate();

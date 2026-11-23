@@ -18,7 +18,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
+mod dns_evidence;
 mod unknown_web;
+use dns_evidence::{DnsEvidence, DnsMatch};
+pub use dns_evidence::{DnsEvidenceKind, DnsEvidenceUpdate, DnsEvidenceValue};
 use unknown_web::{is_site_name, UnknownWebCounts};
 pub use unknown_web::{UnknownWebCount, UnknownWebEndpoint, UnknownWebPolicy, UnknownWebReason};
 
@@ -352,6 +355,7 @@ pub struct Gate {
     out: Vec<Out>,
     blocked_flows: BlockedFlows,
     unknown_web_counts: UnknownWebCounts,
+    dns_evidence: DnsEvidence,
     clock: fn() -> Option<u64>,
 }
 
@@ -372,6 +376,7 @@ impl Gate {
             out: Vec::new(),
             blocked_flows: BlockedFlows::default(),
             unknown_web_counts: UnknownWebCounts::default(),
+            dns_evidence: DnsEvidence::default(),
             clock: evidence_clock_ms,
         }
     }
@@ -395,6 +400,17 @@ impl Gate {
         self.cfg.unknown_web = policy;
     }
 
+    pub fn reset_dns_evidence(&mut self, generation: u64) {
+        self.dns_evidence.enable(generation);
+    }
+
+    /// Only the private controller calls this with the final forwarded RRset.
+    pub fn update_dns_evidence(&mut self, update: DnsEvidenceUpdate) {
+        if let Some(now) = (self.clock)() {
+            self.dns_evidence.update(update, now);
+        }
+    }
+
     pub fn controller_lost(&mut self) {
         self.cfg.unknown_web.revoke_exemptions();
         self.invalidate();
@@ -408,6 +424,7 @@ impl Gate {
         self.warm_names.clear();
         self.next_warm_prune = None;
         self.warm_sent.clear();
+        self.dns_evidence.clear();
         for release in releases.into_values() {
             self.block(release.key, BlockReason::Internal);
         }
@@ -641,6 +658,7 @@ impl Gate {
     /// Timers: checks that took too long, ClientHellos that never finished,
     /// idle connections.
     pub fn tick(&mut self, now: Instant) {
+        self.dns_evidence.sweep(self.clock);
         let timed_out: Vec<_> = self
             .groups
             .iter()
@@ -660,7 +678,7 @@ impl Gate {
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
-            let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified);
+            let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified, None);
         }
         let idle = self.cfg.idle;
         self.flows.retain(|_, f| matches!(f.state, State::Holding(_)) || now.duration_since(f.last_seen) < idle);
@@ -818,7 +836,7 @@ impl Gate {
                         Some(name) if !ech => self.classify_named(key.dst, name, now),
                         Some(name) => match self.classifier.group_for_name(&name) {
                             Some(group) => Target::Group(group, name, false),
-                            None => Target::Address(UnknownWebReason::Ech),
+                            None => Target::EchAddress(name),
                         },
                         None if ech => Target::Address(UnknownWebReason::Ech),
                         None => Target::Address(UnknownWebReason::Unidentified),
@@ -839,7 +857,8 @@ impl Gate {
                     Step::Consumed
                 }
             }
-            Target::Address(reason) => self.decide_by_address(key, now, only_current, reason),
+            Target::Address(reason) => self.decide_by_address(key, now, only_current, reason, None),
+            Target::EchAddress(name) => self.decide_by_address(key, now, only_current, UnknownWebReason::Ech, Some(&name)),
             Target::Group(group, host, confirmed) => {
                 self.wait_for_check(key, group, Some(host), confirmed, now);
                 Step::Consumed
@@ -920,25 +939,37 @@ impl Gate {
     }
 
     /// Decide a holding connection by its destination address.
-    fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason) -> Step {
-        match self.ip_group(key.dst) {
-            None if self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) => {
-                self.block(key, BlockReason::UnidentifiedWeb(reason));
-                Step::Consumed
-            }
-            None => {
-                if only_current {
-                    self.set_state(key, State::Pass);
-                    Step::Forward
-                } else {
-                    self.release(key);
-                    Step::Consumed
+    fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason, outer: Option<&str>) -> Step {
+        if let Some((group, host)) = self.ip_group(key.dst) {
+            self.wait_for_check(key, group, host, false, now);
+            return Step::Consumed;
+        }
+        let mut ordinary = false;
+        if self.dns_evidence.active() {
+            if let Some(clock) = (self.clock)() {
+                match self.dns_evidence.classify(key.dst, outer, clock, self.classifier.as_ref()) {
+                    DnsMatch::Protected(group, host) => {
+                        self.wait_for_check(key, group, host.map(|host| host.to_string()), false, now);
+                        return Step::Consumed;
+                    }
+                    DnsMatch::ConflictingProtection => {
+                        self.block(key, BlockReason::UnidentifiedWeb(reason));
+                        return Step::Consumed;
+                    }
+                    DnsMatch::Ordinary => ordinary = true,
+                    DnsMatch::Unknown => {}
                 }
             }
-            Some((g, host)) => {
-                self.wait_for_check(key, g, host, false, now);
-                Step::Consumed
-            }
+        }
+        if !ordinary && self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) {
+            self.block(key, BlockReason::UnidentifiedWeb(reason));
+            Step::Consumed
+        } else if only_current {
+            self.set_state(key, State::Pass);
+            Step::Forward
+        } else {
+            self.release(key);
+            Step::Consumed
         }
     }
 
@@ -1086,6 +1117,7 @@ impl Gate {
 enum Target {
     Pass,
     Address(UnknownWebReason),
+    EchAddress(String),
     Group(GroupId, String, bool),
 }
 
