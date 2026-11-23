@@ -18,6 +18,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
+mod unknown_web;
+use unknown_web::{is_site_name, UnknownWebCounts};
+pub use unknown_web::{UnknownWebCount, UnknownWebEndpoint, UnknownWebPolicy};
+
 /// A protected group (DESIGN.md §66.3); the caller's identifier.
 pub type GroupId = u32;
 pub type RequestId = NonZeroU64;
@@ -85,6 +89,7 @@ pub struct GateConfig {
     pub idle: Duration,
     /// Drop all UDP 443 (QUIC) into the tunnel (§66.5).
     pub block_quic: bool,
+    pub unknown_web: UnknownWebPolicy,
 }
 
 impl Default for GateConfig {
@@ -99,6 +104,7 @@ impl Default for GateConfig {
             max_learned: 4096,
             idle: Duration::from_secs(15 * 60),
             block_quic: true,
+            unknown_web: UnknownWebPolicy::default(),
         }
     }
 }
@@ -189,6 +195,12 @@ struct Flow {
     last_seen: Instant,
 }
 
+enum BlockReason<'a> {
+    Protection(GroupId, Option<&'a str>),
+    UnidentifiedWeb,
+    Internal,
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeniedGroup {
@@ -213,14 +225,18 @@ struct BlockedFlows {
 }
 
 impl BlockedFlows {
-    fn record(&mut self, flow: FlowKey, client_isn: Option<u32>, group: GroupId, host: Option<&str>) {
+    fn first_denial(&mut self, flow: FlowKey, client_isn: Option<u32>) -> bool {
         if self.seen.len() >= MAX_REPORTED_FLOWS || (flow.proto == 6 && client_isn.is_none()) {
-            return;
+            return false;
         }
         // Keep a bounded fingerprint even if the packet table evicts the
         // flow. A collision can only lower this best-effort count.
         let flow_id = self.seen.hasher().hash_one((flow, client_isn));
-        if !self.seen.insert(flow_id) {
+        self.seen.insert(flow_id)
+    }
+
+    fn record(&mut self, flow: FlowKey, client_isn: Option<u32>, group: GroupId, host: Option<&str>) {
+        if !self.first_denial(flow, client_isn) {
             return;
         }
         if self.groups.len() == MAX_REPORTED_GROUPS && !self.groups.contains_key(&group) {
@@ -335,6 +351,7 @@ pub struct Gate {
     warm_sent: VecDeque<Instant>,
     out: Vec<Out>,
     blocked_flows: BlockedFlows,
+    unknown_web_counts: UnknownWebCounts,
     clock: fn() -> Option<u64>,
 }
 
@@ -354,6 +371,7 @@ impl Gate {
             warm_sent: VecDeque::new(),
             out: Vec::new(),
             blocked_flows: BlockedFlows::default(),
+            unknown_web_counts: UnknownWebCounts::default(),
             clock: evidence_clock_ms,
         }
     }
@@ -369,6 +387,19 @@ impl Gate {
         self.blocked_flows.groups.get(&id)
     }
 
+    pub fn take_unknown_web(&mut self) -> Option<Vec<UnknownWebCount>> {
+        self.unknown_web_counts.snapshot()
+    }
+
+    pub fn set_unknown_web(&mut self, policy: UnknownWebPolicy) {
+        self.cfg.unknown_web = policy;
+    }
+
+    pub fn controller_lost(&mut self) {
+        self.cfg.unknown_web.revoke_exemptions();
+        self.invalidate();
+    }
+
     /// Forget every verdict (reconnect, network change, wake: §66.6).
     pub fn invalidate(&mut self) {
         let groups = std::mem::take(&mut self.groups);
@@ -378,10 +409,10 @@ impl Gate {
         self.next_warm_prune = None;
         self.warm_sent.clear();
         for release in releases.into_values() {
-            self.block(release.key, None);
+            self.block(release.key, BlockReason::Internal);
         }
         for key in groups.into_values().flat_map(|group| group.pending).flat_map(|check| check.waiting) {
-            self.block(key, None);
+            self.block(key, BlockReason::Internal);
         }
     }
 
@@ -516,9 +547,8 @@ impl Gate {
     }
 
     fn block_waiting(&mut self, group: GroupId, check: &PendingCheck) {
-        let rule = Some((group, check.target.host.as_deref()));
         for &key in &check.waiting {
-            self.block(key, rule);
+            self.block(key, BlockReason::Protection(group, check.target.host.as_deref()));
         }
     }
 
@@ -554,7 +584,7 @@ impl Gate {
 
     fn queue_release(&mut self, release: CheckedRelease) {
         let Some(id) = self.last_release.checked_add(1) else {
-            self.block(release.key, Some((release.group, release.target.host.as_deref())));
+            self.block(release.key, BlockReason::Protection(release.group, release.target.host.as_deref()));
             return;
         };
         if let Some(Flow { state: State::Holding(held), .. }) = self.flows.get_mut(&release.key) {
@@ -571,7 +601,7 @@ impl Gate {
         ).collect();
         for id in revoked {
             if let Some(release) = self.take_release(id) {
-                self.block(release.key, Some((group, release.target.host.as_deref())));
+                self.block(release.key, BlockReason::Protection(group, release.target.host.as_deref()));
             }
         }
     }
@@ -598,13 +628,13 @@ impl Gate {
                         self.observe_warm_identity(key.dst, &name, WARM_NAME_LIFETIME, true, now);
                     }
                 } else {
-                    self.block(key, None);
+                    self.block(key, BlockReason::Internal);
                 }
             }
             Some(_) => self.retry_check(group, PendingCheck {
                 id: evidence.request_id, target, started, retried, waiting: vec![key],
             }, now),
-            None => self.block(key, Some((group, target.host.as_deref()))),
+            None => self.block(key, BlockReason::Protection(group, target.host.as_deref())),
         }
     }
 
@@ -817,9 +847,16 @@ impl Gate {
     }
 
     fn classify_named(&mut self, ip: IpAddr, name: String, now: Instant) -> Target {
-        self.observe_warm_identity(ip, &name, WARM_NAME_LIFETIME, false, now);
-        match self.classifier.group_for_name(&name) {
-            Some(group) => Target::Group(group, name, true),
+        let group = self.classifier.group_for_name(&name);
+        let identified = is_site_name(&name);
+        if group.is_none() && self.cfg.unknown_web.active() && !identified {
+            return Target::Address;
+        }
+        if identified {
+            self.observe_warm_identity(ip, &name, WARM_NAME_LIFETIME, false, now);
+        }
+        match group {
+            Some(group) => Target::Group(group, name, identified),
             None => Target::Pass,
         }
     }
@@ -884,6 +921,10 @@ impl Gate {
     /// Decide a holding connection by its destination address.
     fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool) -> Step {
         match self.ip_group(key.dst) {
+            None if self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) => {
+                self.block(key, BlockReason::UnidentifiedWeb);
+                Step::Consumed
+            }
             None => {
                 if only_current {
                     self.set_state(key, State::Pass);
@@ -919,7 +960,7 @@ impl Gate {
                         return;
                     }
                     None => {
-                        self.block(key, Some((group, target.host.as_deref())));
+                        self.block(key, BlockReason::Protection(group, target.host.as_deref()));
                         return;
                     }
                     Some(_) => {}
@@ -932,7 +973,7 @@ impl Gate {
             let Some(id) = self.last_request.checked_add(1).and_then(RequestId::new)
                 .filter(|_| checks.pending.len() < MAX_PENDING_PER_GROUP)
             else {
-                self.block(key, None);
+                self.block(key, BlockReason::Internal);
                 return;
             };
             self.last_request = id.get();
@@ -965,11 +1006,19 @@ impl Gate {
         }
     }
 
-    fn block(&mut self, key: FlowKey, rule: Option<(GroupId, Option<&str>)>) {
+    fn block(&mut self, key: FlowKey, reason: BlockReason<'_>) {
         let Some(f) = self.flows.get_mut(&key) else { return };
         if let State::Holding(h) = std::mem::replace(&mut f.state, State::Blocked) {
-            if let Some((group, host)) = rule {
-                self.blocked_flows.record(key, h.client_isn, group, host);
+            match reason {
+                BlockReason::Protection(group, host) => {
+                    self.blocked_flows.record(key, h.client_isn, group, host);
+                }
+                BlockReason::UnidentifiedWeb => {
+                    if self.blocked_flows.first_denial(key, h.client_isn) {
+                        self.unknown_web_counts.record(SocketAddr::new(key.dst, key.dport));
+                    }
+                }
+                BlockReason::Internal => {}
             }
             if let (6, Some(last)) = (key.proto, h.last) {
                 self.reset(key, last);

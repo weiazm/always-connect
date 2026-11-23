@@ -7,6 +7,8 @@ const MAC: [u8; 4] = [10, 0, 0, 2];
 const SITE: [u8; 4] = [198, 51, 100, 10];
 const RANGE_IP: [u8; 4] = [203, 0, 113, 7];
 const OTHER: [u8; 4] = [192, 0, 2, 50];
+// Public address shapes for classifier-only fixtures; no packets are sent.
+const PUBLIC: [u8; 4] = [93, 184, 216, 44];
 
 struct Rules;
 impl Classifier for Rules {
@@ -796,6 +798,91 @@ fn an_explicit_range_checks_unidentified_tls_and_http_before_releasing_data() {
         verdict(&mut g, 1, *request_id, Verdict::Block, now);
         assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
     }
+}
+
+#[test]
+fn unidentified_public_web_denials_count_new_connections_only() {
+    let mut g = gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    let now = Instant::now();
+    let no_sni = hello(None, &[], false, 0);
+    let (_, packet) = connect_and_send(&mut g, 45110, PUBLIC, &no_sni, now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert_eq!(g.outbound(&packet, now), Step::Consumed);
+    drain(&mut g);
+    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 1 }]));
+    assert!(g.take_unknown_web().is_none());
+    assert!(g.take_denied_group().is_none());
+
+    connect_and_send(&mut g, 45111, PUBLIC, &no_sni, now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert_eq!(g.take_unknown_web(), Some(vec![UnknownWebCount { address: PUBLIC.into(), port: 443, count: 2 }]));
+}
+
+#[test]
+fn unidentified_web_applies_to_tcp_web_ports_and_real_site_names_still_pass() {
+    let mut g = gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    let now = Instant::now();
+    let outer_ech = hello(Some("public.example"), &[], true, 0);
+    let cases = [
+        (443, outer_ech.as_slice(), Step::Consumed),
+        (443, &b"opaque"[..], Step::Consumed),
+        (80, b"GET / HTTP/1.0\r\n\r\n", Step::Consumed),
+        (8443, b"GET / HTTP/1.1\r\nHost: 93.184.216.44\r\n\r\n", Step::Consumed),
+        (80, b"GET / HTTP/1.0\r\nHost: public.example\r\n\r\n", Step::Forward),
+        (22, b"opaque", Step::Forward),
+    ];
+    for (i, (port, payload, expected)) in cases.into_iter().enumerate() {
+        let (actual, _) = connect_to_port(&mut g, 45120 + i as u16, PUBLIC, port, payload, now);
+        assert_eq!(actual, expected);
+        drain(&mut g);
+    }
+    assert_eq!(g.outbound(&udp4(MAC, 45130, PUBLIC, 8443, b"other protocol"), now), Step::Forward);
+    assert_eq!(g.outbound(&udp4(MAC, 45131, PUBLIC, 443, b"QUIC"), now), Step::Consumed);
+    let records = g.take_unknown_web().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records.iter().map(|record| record.count).sum::<u64>(), 4);
+}
+
+#[test]
+fn exact_unknown_web_exceptions_never_replace_checks_for_protected_destinations() {
+    let now = Instant::now();
+    let mut g = gate();
+    let endpoint = UnknownWebEndpoint { address: PUBLIC.into(), port: 443 };
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[endpoint], &[]));
+    let no_sni = hello(None, &[], false, 0);
+    assert_eq!(connect_and_send(&mut g, 45140, PUBLIC, &no_sni, now).0, Step::Forward);
+    assert_eq!(connect_to_port(&mut g, 45141, PUBLIC, 8443, &no_sni, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+
+    g.inbound(&udp4([10, 0, 0, 53], 53, MAC, 5353, &dns_answer("protected.example", &[PUBLIC])), now);
+    assert_eq!(connect_and_send(&mut g, 45142, PUBLIC, &no_sni, now).0, Step::Consumed);
+    let out = drain(&mut g);
+    assert!(matches!(out.as_slice(), [Out::Check { host: Some(host), host_confirmed: false, .. }] if host == "protected.example"));
+    verdict(&mut g, 1, request_for(&out, 1), Verdict::Block, now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    assert_eq!(g.take_unknown_web().unwrap().len(), 1);
+}
+
+#[test]
+fn unknown_web_policy_preserves_existing_flows_and_retires_exceptions_with_the_controller() {
+    let now = Instant::now();
+    let mut g = gate();
+    let no_sni = hello(None, &[], false, 0);
+    let (_, established) = connect_and_send(&mut g, 45150, PUBLIC, &no_sni, now);
+    let exception_ip = [93, 184, 216, 45];
+    let endpoint = UnknownWebEndpoint { address: exception_ip.into(), port: 443 };
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[endpoint], &[]));
+    assert_eq!(g.outbound(&established, now), Step::Forward);
+    let midstream = tcp4(MAC, 45154, PUBLIC, 443, 9000, 0, PA, b"already established");
+    assert_eq!(g.outbound(&midstream, now), Step::Forward);
+    assert_eq!(connect_and_send(&mut g, 45151, PUBLIC, &no_sni, now).0, Step::Consumed);
+    assert_eq!(connect_and_send(&mut g, 45152, exception_ip, &no_sni, now).0, Step::Forward);
+
+    g.controller_lost();
+    assert_eq!(g.outbound(&established, now), Step::Forward);
+    assert_eq!(connect_and_send(&mut g, 45153, exception_ip, &no_sni, now).0, Step::Consumed);
 }
 
 #[test]

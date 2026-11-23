@@ -14,6 +14,8 @@
 //! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
 //! - gate -> controller statistics: `{"denied":[{"group":1,"count":2,"hosts":[{"host":"a.example","count":2}],"hostsTruncated":false,"lastHost":"a.example"}]}`
 //!   Cumulative for this peer and sent only after a real denial.
+//! - gate -> controller, unidentified Web denials: `{"unknownWeb":[{"address":"192.0.2.1","port":443,"count":1}]}`
+//! - configuration may include `blockUnidentifiedWeb`, `unknownWebExceptions` and `unknownWebInternalCidrs`
 //! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true,"evidenceAtMs":1234}}`,
 //!   `{"blockGroup":1}` or `{"invalidate":true}`
 //!
@@ -25,7 +27,7 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::{DeniedGroup, Gate, GateConfig, GroupId, Out, RequestId, Step, Verdict};
+use alwaysconnect_core::egress_gate::{DeniedGroup, Gate, GateConfig, GroupId, Out, RequestId, Step, UnknownWebEndpoint, UnknownWebPolicy, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -44,6 +46,28 @@ extern "C" fn on_signal(_: libc::c_int) {
 struct ControllerCfg {
     probe_alpn: String,
     groups: Vec<GateGroup>,
+    #[serde(flatten)]
+    unknown_web: UnknownWebCfg,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnknownWebCfg {
+    block_unidentified_web: Option<bool>,
+    #[serde(default)]
+    unknown_web_exceptions: Vec<UnknownWebEndpoint>,
+    #[serde(default)]
+    unknown_web_internal_cidrs: Vec<String>,
+}
+
+impl UnknownWebCfg {
+    fn policy(&self, groups: &[GateGroup]) -> UnknownWebPolicy {
+        UnknownWebPolicy::new(
+            !groups.is_empty() && self.block_unidentified_web.unwrap_or(true),
+            &self.unknown_web_exceptions,
+            &self.unknown_web_internal_cidrs,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,6 +91,8 @@ struct ControlMsg {
     /// A new configuration while running (same shape as the first line).
     probe_alpn: Option<String>,
     groups: Option<Vec<GateGroup>>,
+    #[serde(flatten)]
+    unknown_web: UnknownWebCfg,
 }
 
 fn log(msg: &str) {
@@ -324,7 +350,11 @@ fn main() {
     };
     let mut control = Some(controller);
     let groups = ProtectedRoutes::new(&cfg.groups);
-    let gcfg = GateConfig { probe_alpn: cfg.probe_alpn.into_bytes(), ..GateConfig::default() };
+    let gcfg = GateConfig {
+        probe_alpn: cfg.probe_alpn.into_bytes(),
+        unknown_web: cfg.unknown_web.policy(&cfg.groups),
+        ..GateConfig::default()
+    };
     let mut gate = Gate::new(gcfg, Box::new(groups));
     log(&format!("up on {ifname}"));
     if let Some(c) = &mut control {
@@ -360,6 +390,7 @@ fn main() {
                         Ok(m) => {
                             if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
                                 log("new configuration");
+                                gate.set_unknown_web(m.unknown_web.policy(&groups));
                                 gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
                             }
                             if m.invalidate == Some(true) {
@@ -392,7 +423,7 @@ fn main() {
             }
             if lost {
                 log("controller gone: protected connections will be refused (fail closed)");
-                gate.invalidate();
+                gate.controller_lost();
                 control = None;
             }
             // Apply only after buffered invalidations and group blocks have
@@ -437,8 +468,13 @@ fn main() {
         if now.duration_since(last_tick) >= Duration::from_millis(250) {
             gate.tick(now);
             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
-            if let (Some(control), Some(denied)) = (&mut control, gate.take_denied_group()) {
-                control.report_denied(denied);
+            if let Some(control) = &mut control {
+                if let Some(denied) = gate.take_denied_group() {
+                    control.report_denied(denied);
+                }
+                if let Some(unknown) = gate.take_unknown_web() {
+                    control.write_optional(serde_json::json!({ "unknownWeb": unknown }).to_string() + "\n");
+                }
             }
             last_tick = now;
         }
@@ -532,7 +568,7 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
         }
     }
     if had_controller && control.is_none() {
-        gate.invalidate();
+        gate.controller_lost();
         for action in gate.drain() {
             if let Out::ToHost(packet) = action {
                 let _ = tun.write(&packet);
@@ -632,6 +668,43 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({
             "warm": {"group":1,"host":"a.example","ip":"192.0.2.1","port":443},
         }));
+    }
+
+    #[test]
+    fn unidentified_web_defaults_on_only_for_active_groups_and_accepts_exact_wire_entries() {
+        let cases = [
+            (r#"{"probe_alpn":"","groups":[]}"#, Step::Forward),
+            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}]}"#, Step::Consumed),
+            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"blockUnidentifiedWeb":false}"#, Step::Forward),
+            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"unknownWebExceptions":[{"address":"93.184.216.44","port":443}]}"#, Step::Forward),
+            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"unknownWebInternalCidrs":["93.184.216.0/24"]}"#, Step::Forward),
+        ];
+        for (config, expected) in cases {
+            let cfg: ControllerCfg = serde_json::from_str(config).unwrap();
+            let routes = Box::new(ProtectedRoutes::new(&cfg.groups));
+            let settings = GateConfig { unknown_web: cfg.unknown_web.policy(&cfg.groups), ..GateConfig::default() };
+            let mut gate = Gate::new(settings, routes);
+            let mut packet = [0; 41];
+            packet[0] = 0x45;
+            packet[3] = 40;
+            packet[9] = 6;
+            packet[12..20].copy_from_slice(&[192, 0, 2, 10, 93, 184, 216, 44]);
+            packet[20..24].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
+            packet[32] = 0x50;
+            packet[33] = 0x02;
+            let now = Instant::now();
+            assert_eq!(gate.outbound(&packet[..40], now), Step::Forward);
+            packet[3] = 41;
+            packet[27] = 1;
+            packet[33] = 0x18;
+            assert_eq!(gate.outbound(&packet, now), expected, "{config}");
+            if expected == Step::Consumed {
+                let counts = gate.take_unknown_web().unwrap();
+                assert_eq!(serde_json::json!({"unknownWeb": counts}), serde_json::json!({
+                    "unknownWeb":[{"address":"93.184.216.44","port":443,"count":1}],
+                }));
+            }
+        }
     }
 
     #[test]
