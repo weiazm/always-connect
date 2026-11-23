@@ -609,6 +609,30 @@ impl Engine {
     pub fn update_egress(&self, cfg: crate::egress_control::EgressConfig) {
         self.send(Event::Egress(cfg));
     }
+    pub fn recheck_egress(&self, group: u32) -> bool {
+        {
+            let c = self.shared.core.lock().expect("engine");
+            if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none() {
+                return false;
+            }
+        }
+        let job = self.shared.egress.lock().expect("egress").as_ref().and_then(|ctl| ctl.recheck_job(group));
+        job.is_some_and(|run| run())
+    }
+
+    pub fn allow_egress_country(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
+                                country: &str, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
+        let mut c = self.shared.core.lock().ok()?;
+        if c.stop_requested || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none()
+            || c.recovery_suspended() || c.config.egress.as_ref() != Some(expected) { return None; }
+        let controller = self.shared.egress.lock().ok()?;
+        let cfg = controller.as_ref()?.allow_country(expected, group, started, country, evidence)?;
+        let result = cfg.group(group)?.expect.clone();
+        c.config.egress = Some(cfg);
+        if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
+        Some(result)
+    }
+
     /// JSON status for the App; `{"running":false}` when not in use.
     pub fn egress_status(&self) -> String {
         let ctl = self.shared.egress.lock().expect("egress");
@@ -1235,8 +1259,25 @@ impl Shared {
             // re-add a bypass after its rule or session was removed.
             rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
         });
-        let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
-            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
+        let egress_dns = c.protected_routes.as_ref().map(|_| {
+            let weak = Arc::downgrade(self);
+            let lookup: dns_forwarder::EgressDnsHook = Box::new(move |epoch, name, candidates| {
+                let Some(engine) = weak.upgrade() else { return Vec::new() };
+                // This optional hint must never wait for the engine, which can be joining DNS workers.
+                let Ok(c) = engine.core.try_lock() else { return Vec::new() };
+                if c.stop_requested || c.tunnel_retrying || c.recovery_suspended()
+                    || c.forwarder.as_ref().is_none_or(|f| f.epoch() != epoch) { return Vec::new(); }
+                let Some(interface) = c.tunnel_if.as_deref() else { return Vec::new() };
+                let Some(group) = c.protected_routes.as_ref().and_then(|routes|
+                    crate::egress_gate::Classifier::group_for_name(routes.as_ref(), name)) else { return Vec::new() };
+                let Ok(controller) = engine.egress.try_lock() else { return Vec::new() };
+                controller.as_ref().map_or_else(Vec::new, |controller|
+                    controller.wrong_dns_addresses(group, name, candidates, interface))
+            });
+            lookup
+        });
+        let forwarder = Forwarder::with_answer_and_egress_hooks(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
+            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook), egress_dns);
         if c.protected_routes.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),

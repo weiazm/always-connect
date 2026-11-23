@@ -89,6 +89,7 @@ struct FailedTarget {
     target: Target,
     observation: Observation,
     generation: u64,
+    dns_current: bool,
 }
 
 #[derive(Default)]
@@ -207,6 +208,7 @@ impl Failures {
                 target,
                 observation: obs.clone(),
                 generation: next,
+                dns_current: true,
             };
             if let Some(old) = self.targets.iter_mut().find(|f| f.target == entry.target) {
                 *old = entry;
@@ -229,6 +231,26 @@ impl Failures {
                 .any(|old| results.iter().any(|(t, _)| t == &old.target));
         }
         current && self.targets.is_empty()
+    }
+
+    pub fn pending_targets(&self) -> Vec<Target> {
+        self.targets.iter().map(|f| f.target.clone()).collect()
+    }
+
+    pub fn invalidate_dns(&mut self) {
+        for entry in &mut self.targets { entry.dns_current = false; }
+    }
+
+    pub fn wrong_ipv4(&self, group: &Group, name: &str, candidates: &[std::net::Ipv4Addr]) -> Vec<std::net::Ipv4Addr> {
+        self.targets.iter().filter_map(|f| {
+            let obs = &f.observation;
+            let country = obs.country.as_deref()?;
+            if !f.dns_current || !f.target.direct_flow() || obs.evidence.as_deref() != Some("direct")
+                || !obs.host.trim_end_matches('.').eq_ignore_ascii_case(name) || obs.error.is_some()
+                || group.expect.is_empty() || group.expect.iter().any(|v| v.eq_ignore_ascii_case(country)) { return None; }
+            let IpAddr::V4(ip) = obs.peer_address? else { return None };
+            (f.target.peer.map(|p| p.0) == Some(IpAddr::V4(ip)) && candidates.contains(&ip)).then_some(ip)
+        }).collect()
     }
 
     pub fn observed_failures(&self) -> Vec<Observation> {

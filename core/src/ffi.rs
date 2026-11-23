@@ -1704,6 +1704,24 @@ fn install_egress_probe(e: *const oc_engine::Engine,
 }
 
 #[no_mangle]
+pub extern "C" fn ac_oc_recheck_egress(e: *const oc_engine::Engine, group: u32) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|engine| engine.recheck_egress(group))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_allow_egress_country(e: *const oc_engine::Engine, expected: *const c_char,
+    group: u32, started: f64, country: *const c_char, evidence: *const c_char) -> *mut c_char {
+    let apply = || {
+        let engine = unsafe { e.as_ref() }?;
+        let cfg = serde_json::from_str(&c_str(expected)?).ok()?;
+        let observed = serde_json::from_str(&c_str(evidence)?).ok()?;
+        let result = engine.allow_egress_country(&cfg, group, started, &c_str(country)?, &observed)?;
+        serde_json::to_string(&result).ok()
+    };
+    apply().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_oc_update_egress(e: *const oc_engine::Engine, json: *const c_char) {
     let (Some(e), Some(json)) = (unsafe { e.as_ref() }, c_str(json)) else { return };
     if let Ok(cfg) = serde_json::from_str(&json) { e.update_egress(cfg); }

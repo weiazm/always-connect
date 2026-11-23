@@ -204,6 +204,15 @@ final class CLIOrchestrator {
     func updateDropProtection(_ on: Bool) { ac_oc_update_drop_protection(handle, on) }
 
     func updateEgress(_ json: String) { ac_oc_update_egress(handle, json) }
+    func recheckEgressFailures(_ group: UInt32) -> Bool { ac_oc_recheck_egress(handle, group) }
+
+    func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
+                            expected: EgressProtection) -> [String]? {
+        guard let cfg = try? JSONEncoder().encode(expected),
+              let json = NetworkGuard.take(ac_oc_allow_egress_country(handle, String(decoding: cfg, as: UTF8.self),
+                                                                      group, started, country, evidence)) else { return nil }
+        return try? JSONDecoder().decode([String].self, from: Data(json.utf8))
+    }
     func egressStatus() -> String { NetworkGuard.take(ac_oc_egress_status(handle)) ?? "{}" }
     func probeEgress(_ host: String) -> String { NetworkGuard.take(ac_oc_egress_probe_host(handle, host)) ?? "[]" }
     func probeEgressSummary(_ host: String, method: String) -> String {
@@ -336,6 +345,11 @@ func ac_oc_new(_ config: UnsafePointer<CChar>, _ hooks: UnsafePointer<AcEngineHo
 @_silgen_name("ac_oc_set_egress_probe_with_peer")
 func ac_oc_set_egress_probe_with_peer(_ e: OpaquePointer, _ ctx: UnsafeMutableRawPointer?,
     _ probe: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeMutablePointer<Int>?, UnsafeMutablePointer<UInt8>?, Int) -> UnsafeMutablePointer<UInt8>?)
+@_silgen_name("ac_oc_recheck_egress")
+private func ac_oc_recheck_egress(_ e: OpaquePointer, _ group: UInt32) -> Bool
+@_silgen_name("ac_oc_allow_egress_country")
+private func ac_oc_allow_egress_country(_ e: OpaquePointer, _ cfg: UnsafePointer<CChar>, _ group: UInt32, _ started: Double,
+                                        _ country: UnsafePointer<CChar>, _ evidence: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_update_egress")
 func ac_oc_update_egress(_ e: OpaquePointer, _ json: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_egress_status")

@@ -465,3 +465,131 @@ fn late_permission_cannot_override_a_gate_timeout_and_a_new_destination_rechecks
     drop(ctl);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_resolved_member_failure_is_rechecked_on_its_observed_peer_without_becoming_direct_evidence() {
+    let mut cfg = cfg();
+    cfg.groups[0].members.truncate(1);
+    let check = target_check(1, "192.0.2.80", Some("follow.example"));
+    let group = &cfg.groups[0];
+    let mut failed = Failures::default();
+    let first = failed.plan(&cfg, group, &check);
+    let a: IpAddr = "192.0.2.10".parse().unwrap();
+    let b: IpAddr = "192.0.2.20".parse().unwrap();
+    let healthy_a = Arc::new(AtomicBool::new(false));
+    let healthy = healthy_a.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sequence = calls.clone();
+    let hook: ProbeHook = Arc::new(move |r, peer| {
+        let ip = r.connect_ip.unwrap_or_else(|| if sequence.fetch_add(1, Ordering::SeqCst) == 0 { a } else { b });
+        *peer = Some(ip);
+        let country = if ip == a && !healthy.load(Ordering::SeqCst) { "YY" } else { "ZZ" };
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={country}\n").into_bytes())
+    });
+    let run = |targets: Vec<Target>| targets.into_iter().map(|t| {
+        let observation = t.observe(&hook, "marker", "utun9");
+        (t, observation)
+    }).collect::<Vec<_>>();
+    assert!(!failed.evaluate(group, 0, &run(first)));
+    let next = failed.plan(&cfg, group, &check);
+    assert!(next.iter().any(|t| t.peer == Some((a,443)) && !t.direct_flow()));
+    assert!(!failed.evaluate(group, failed.generation, &run(next)));
+    let obs = failed.observed_failures();
+    assert_eq!(obs.len(), 1);
+    assert_eq!(obs[0].evidence.as_deref(), Some("member"));
+    assert_eq!(obs[0].peer_address, Some(a));
+    healthy_a.store(true, Ordering::SeqCst);
+    let next = failed.plan(&cfg, group, &check);
+    assert!(failed.evaluate(group, failed.generation, &run(next)));
+}
+
+#[test]
+fn explicit_recheck_and_country_approval_use_only_the_current_verified_failure() {
+    let dir = std::env::temp_dir().join(format!("ac-recheck-{:x}", random_u64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = cfg();
+    cfg.groups[0].members.truncate(1);
+    let ok = Arc::new(AtomicBool::new(false));
+    let valid = ok.clone();
+    let hook: ProbeHook = Arc::new(move |request, actual| {
+        *actual = request.connect_ip;
+        let value = if valid.load(Ordering::SeqCst) {"ZZ"} else {"YY"};
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={value}\n").into_bytes())
+    });
+    let socket = dir.join("ctl");
+    let ctl = Controller::start(&socket,cfg.clone(),hook).unwrap();
+    let mut reader = BufReader::new(UnixStream::connect(&socket).unwrap());
+    reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    writeln!(reader.get_mut(), "{}",serde_json::json!({"up":{"ifname":"utun9"}})).unwrap();
+    writeln!(reader.get_mut(),"{}",serde_json::json!({"check":{"requestId":1,"group":1,"ip":"192.0.2.9","port":443,"host":"a.example"}})).unwrap();
+    line.clear(); reader.read_line(&mut line).unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["verdict"]["ok"], false);
+    let (started,evidence) = {
+        let state = ctl.shared.state.lock().unwrap();
+        let incident = &state.status.records[0];
+        (incident.started, incident.observed[0].clone())
+    };
+    let mut forged = evidence.clone(); forged.peer_address = Some("192.0.2.99".parse().unwrap());
+    assert!(ctl.allow_country(&cfg,1,started,"YY",&forged).is_none());
+    assert!(ctl.allow_country(&cfg,1,started,"XX",&evidence).is_none());
+    assert!(ctl.allow_country(&cfg,1,started-1.0,"YY",&evidence).is_none());
+    forged = evidence.clone(); forged.evidence = Some("proxy".into());
+    assert!(ctl.allow_country(&cfg,1,started,"YY",&forged).is_none());
+    let updated = ctl.allow_country(&cfg,1,started,"YY",&evidence).unwrap();
+    assert_eq!(updated.groups[0].expect, ["ZZ","YY"]);
+    assert!(ctl.allow_country(&cfg,1,started,"YY",&evidence).is_none(), "outdated settings cannot be overwritten");
+    let run = ctl.recheck_job(1).unwrap();
+    assert!(ctl.recheck_job(1).is_none(), "coalesce duplicate explicit rechecks");
+    assert!(run());
+    assert!(ctl.recheck_job(1).is_none());
+    assert!(ctl.allow_country(&updated,1,started,"YY",&evidence).is_none(), "closed incident cannot authorize a country");
+    drop(reader); drop(ctl); std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn only_current_direct_wrong_country_evidence_can_hint_dns() {
+    let cfg = cfg();
+    let group = &cfg.groups[0];
+    let a: std::net::Ipv4Addr = "192.0.2.10".parse().unwrap();
+    let b: std::net::Ipv4Addr = "192.0.2.11".parse().unwrap();
+    let mut failed = Failures::default();
+    let check = target_check(1, &a.to_string(), Some("a.example"));
+    let t = failed.plan(&cfg, group, &check)[0].clone();
+    let hook: ProbeHook = Arc::new(|_, _| None);
+    let mut o = t.observe(&hook, "marker","utun9");
+    o.error = None;
+    o.country = Some("YY".into());
+    assert!(!failed.evaluate(group,0,&[(t.clone(),o.clone())]));
+    assert_eq!(failed.wrong_ipv4(group,"a.example",&[a,b]),[a]);
+    assert!(failed.wrong_ipv4(group,"other.example",&[a,b]).is_empty());
+    failed.invalidate_dns();
+    assert!(failed.wrong_ipv4(group,"a.example",&[a,b]).is_empty());
+    o.country = None;
+    o.error = Some("timeout".into());
+    assert!(!failed.evaluate(group,failed.generation,&[(t,o)]));
+    assert!(failed.wrong_ipv4(group,"a.example",&[a,b]).is_empty());
+    assert!(!failed.pending_targets().is_empty(), "gate still rechecks an unconfirmed target");
+}
+
+#[test]
+fn denial_totals_are_idempotent_and_accumulate_across_gate_peers() {
+    let mut state = ControlState {
+        config: cfg(), status: Status::default(), peer: None, peer_id: 1, epoch: 1,
+        checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
+    };
+    let report = |n| serde_json::from_value(serde_json::json!({"group":1,"count":n,"hosts":[{"host":"a.example","count":n}],
+        "lastHost":"a.example","hostsTruncated":false})).unwrap();
+    state.denied_counts(vec![report(4)]);
+    state.denied_counts(vec![report(4)]);
+    state.denied_counts(vec![report(2)]);
+    assert_eq!(state.status.groups[0].blocked_count,4);
+    state.disconnect();
+    state.denied_counts(vec![report(3)]);
+    let j=serde_json::to_value(&state.status.groups[0]).unwrap();
+    assert_eq!(j["blockedCount"],7);
+    assert_eq!(j["sites"][0]["blockedCount"],7);
+    assert_eq!(j["lastBlockedHost"],"a.example");
+    assert!(j["lastBlockedCountry"].is_null());
+}

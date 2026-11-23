@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod airports;
+mod activity;
+use activity::{Denied, SiteStatus};
 mod recheck;
 pub(crate) mod setup_probe;
 use recheck::{Failures, Target};
@@ -291,7 +293,7 @@ pub struct ProbeRequest {
 /// Raw response bytes, or None (connect/TLS/timeout failure).
 pub type ProbeHook = Arc<dyn Fn(&ProbeRequest, &mut Option<IpAddr>) -> Option<Vec<u8>> + Send + Sync>;
 
-#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -521,6 +523,11 @@ pub fn decide(group: &Group, obs: &[Observation]) -> bool {
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupStatus {
+    pub level: String,
+    pub blocked_count: u64,
+    pub last_blocked_host: Option<String>,
+    pub last_blocked_country: Option<String>,
+    pub sites: Vec<SiteStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub id: u32,
@@ -603,6 +610,7 @@ struct ControlState {
     // Retired workers count towards the bound until they exit.
     checks: HashMap<(u64, u64), ActiveCheck>,
     failures: HashMap<u32, Failures>,
+    peer_counts: HashMap<u32, Denied>,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -643,9 +651,31 @@ impl ControlState {
         self.status.apply(group, host, observations, !blocked, now());
         if let Some(st) = self.status.groups.iter_mut().find(|s| s.id == group.id) {
             st.reason = reason.map(str::to_owned);
-            if !unresolved.is_empty() { st.observed = unresolved; }
+            let last = st.last_check;
+            let latest = std::mem::take(&mut st.observed);
+            st.observe_sites(group, &latest, last);
+            st.observe_sites(group, &unresolved, last);
+            st.observed = if unresolved.is_empty() { latest } else { unresolved };
+            st.level = st.level().into();
         }
         ok
+    }
+
+    fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
+        let line = config_line(&cfg, marker);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
+        let previous = std::mem::replace(&mut self.config, cfg);
+        let ControlState { failures, config, .. } = self;
+        failures.retain(|id, failed| {
+            let Some(group) = config.group(*id).filter(|g| config.active() && g.enabled) else { return false };
+            failed.reset_if_edited(&previous, config, group);
+            failed.update(config, group);
+            failed.invalidate_dns();
+            true
+        });
+        self.send(&line);
+        self.send("{\"invalidate\":true}");
     }
 
     fn retire_checks(&mut self) {
@@ -657,12 +687,14 @@ impl ControlState {
             }
         }
         self.epoch = self.epoch.wrapping_add(1);
+        for failed in self.failures.values_mut() { failed.invalidate_dns(); }
     }
 
     fn disconnect(&mut self) {
         if let Some(peer) = self.peer.take() {
             let _ = peer.shutdown(std::net::Shutdown::Both);
         }
+        self.peer_counts.clear();
         self.status.interface.clear();
         self.peer_id = self.peer_id.wrapping_add(1);
         self.retire_checks();
@@ -689,7 +721,7 @@ impl Controller {
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
                 config: cfg, status: Status::default(), peer: None, peer_id: 0,
-                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), on_peer_loss: None,
+                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
         });
@@ -723,6 +755,14 @@ impl Controller {
         self.shared.state.lock().expect("controller").peer.is_some()
     }
 
+    pub(crate) fn wrong_dns_addresses(&self, group: u32, name: &str, candidates: &[std::net::Ipv4Addr],
+                                      interface: &str) -> Vec<std::net::Ipv4Addr> {
+        let Ok(state) = self.shared.state.try_lock() else { return Vec::new() };
+        if state.peer.is_none() || state.status.interface != interface || !state.config.active() { return Vec::new(); }
+        let Some(g) = state.config.group(group).filter(|g| g.enabled) else { return Vec::new() };
+        state.failures.get(&group).map_or_else(Vec::new, |f| f.wrong_ipv4(g, name, candidates))
+    }
+
     pub fn status_json(&self) -> String {
         let state = self.shared.state.lock().expect("controller");
         let mut status = state.status.clone();
@@ -737,6 +777,7 @@ impl Controller {
             }
         }
         status.checking = state.checks.values().filter(|c| c.epoch == state.epoch).map(|c| c.group).collect();
+        for st in &mut status.groups { st.level = st.level().into(); }
         status.checking.sort_unstable();
         status.checking.dedup();
         serde_json::to_string(&status).unwrap_or_else(|_| "{}".into())
@@ -745,19 +786,44 @@ impl Controller {
     /// Send the new rules. A probe started before this configuration can no longer release packets.
     pub fn update(&self, cfg: EgressConfig) {
         let mut state = self.shared.state.lock().expect("controller");
-        let line = config_line(&cfg, &self.shared.marker);
-        state.epoch = state.epoch.wrapping_add(1);
-        state.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
-        let previous = std::mem::replace(&mut state.config, cfg);
-        let ControlState { failures, config, .. } = &mut *state;
-        failures.retain(|id, failed| {
-            let Some(group) = config.group(*id).filter(|g| config.active() && g.enabled) else { return false };
-            failed.reset_if_edited(&previous, config, group);
-            failed.update(config, group);
-            true
-        });
-        state.send(&line);
-        state.send("{\"invalidate\":true}");
+        state.replace_config(cfg, &self.shared.marker);
+    }
+
+    pub fn recheck_job(&self, id: u32) -> Option<impl FnOnce() -> bool + Send + 'static> {
+        let mut state = self.shared.state.lock().ok()?;
+        let group = state.config.group(id).filter(|g| g.enabled && state.config.active())?.clone();
+        let failed = state.failures.get(&id)?;
+        let targets = failed.pending_targets();
+        let generation = failed.generation;
+        let key = (0, u64::from(id)); // gate peer ids start at one
+        if failed.overflowed() || targets.is_empty() || state.status.interface.is_empty() || state.peer.is_none()
+            || state.checks.contains_key(&key) || state.checks.len() >= MAX_GROUPS
+            || targets.len() + state.checks.values().map(|c| c.targets.len()).sum::<usize>() > MAX_GROUPS * MAX_PROBES_PER_GROUP { return None; }
+        let epoch = state.epoch;
+        let iface = state.status.interface.clone();
+        state.checks.insert(key, ActiveCheck { group: id, epoch, generation, trigger: None, targets: targets.clone() });
+        let shared = self.shared.clone();
+        Some(move || run_check(&shared, group, None, targets, iface, key))
+    }
+
+    pub fn allow_country(&self, expected: &EgressConfig, group_id: u32, started: f64, country: &str,
+                         evidence: &Observation) -> Option<EgressConfig> {
+        if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) || !started.is_finite()
+            || evidence.evidence.as_deref() != Some("direct") || evidence.peer_address.is_none()
+            || evidence.error.is_some() || evidence.country.as_deref() != Some(country) { return None; }
+        let matches = |o: &Observation| o.evidence == evidence.evidence && o.peer_address == evidence.peer_address
+            && o.method == evidence.method && o.host.eq_ignore_ascii_case(&evidence.host)
+            && o.country == evidence.country && o.error.is_none();
+        let mut state = self.shared.state.lock().ok()?;
+        let record = state.status.records.iter().find(|r| r.group == group_id && r.started == started && r.ended.is_none())?;
+        let failed = state.failures.get(&group_id)?;
+        if &state.config != expected || state.peer.is_none() || state.status.interface.is_empty() || failed.overflowed()
+            || !record.observed.iter().any(&matches) || !failed.observed_failures().iter().any(matches) { return None; }
+        let mut config = state.config.clone();
+        let group = config.groups.iter_mut().find(|g| g.enabled && g.id == group_id)?;
+        if !group.expect.iter().any(|v| v.eq_ignore_ascii_case(country)) { group.expect.push(country.to_owned()); }
+        state.replace_config(config.clone(), &self.shared.marker);
+        Some(config)
     }
 
     pub fn invalidate(&self) {
@@ -837,6 +903,7 @@ struct GateMsg {
     check: Option<CheckMsg>,
     #[serde(rename = "timedOut")]
     timed_out: Option<CheckMsg>,
+    denied: Option<Vec<Denied>>,
     up: Option<UpMsg>,
 }
 #[derive(Deserialize)]
@@ -866,6 +933,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         if let Some(up) = msg.up {
             state.status.interface = up.ifname;
         }
+        if let Some(reports) = msg.denied { state.denied_counts(reports); }
         let timed_out = msg.timed_out.is_some();
         if let Some(check) = msg.timed_out.or(msg.check) {
             let id = check.request_id.get();
@@ -913,7 +981,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
 }
 
 fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<Target>,
-             iface: String, key: (u64, u64)) {
+             iface: String, key: (u64, u64)) -> bool {
     let results = std::thread::scope(|scope| {
         let workers: Vec<_> = targets.iter().map(|target| {
             let worker = std::thread::Builder::new().spawn_scoped(scope, || target.observe(&shared.hook, &shared.marker, &iface));
@@ -927,11 +995,12 @@ fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<T
         }).collect()
     });
     let mut state = shared.state.lock().expect("controller");
-    let Some(active) = state.checks.remove(&key) else { return };
-    if active.epoch != state.epoch || state.peer_id != key.0 { return; }
+    let Some(active) = state.checks.remove(&key) else { return false };
+    if active.epoch != state.epoch || (key.0 != 0 && state.peer_id != key.0) { return false; }
     let direct = !targets.is_empty() && targets.iter().all(Target::direct_flow);
     let ok = state.record(&group, host.as_deref(), active.generation, results);
-    state.send(&verdict(group.id, key.1, ok, direct));
+    if key.0 != 0 { state.send(&verdict(group.id, key.1, ok, direct)); }
+    true
 }
 
 #[cfg(test)]

@@ -637,6 +637,31 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         queue.async { reply(self.engine?.egressStatus() ?? "{}") }
     }
 
+    func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard self.dropProtection, self.egress.isActive, let engine = self.engine else { reply(false); return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let finished = engine.recheckEgressFailures(group)
+                self.queue.async { reply(finished && self.engine === engine) }
+            }
+        }
+    }
+
+    func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
+                            withReply reply: @escaping (Bool, [String]) -> Void) {
+        queue.async {
+            guard self.dropProtection, self.egress.isActive,
+                  let index = self.egress.groups.firstIndex(where: { $0.id == group && $0.enabled }),
+                  let countries = self.engine?.allowEgressCountry(country, group: group, started: started,
+                                                                  evidence: evidence, expected: self.egress) else {
+                reply(false, [])
+                return
+            }
+            self.egress.groups[index].expect = countries
+            reply(true, countries)
+        }
+    }
+
     func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void) {
         queue.async {
             guard self.relay != nil, !self.probingEgress, let engine = self.engine else { reply("[]"); return }
