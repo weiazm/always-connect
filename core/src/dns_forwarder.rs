@@ -337,6 +337,32 @@ pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
     sanitize_service_answer(answer, direct, false)
 }
 
+// Only DNS data that can be rewritten without changing an authentication proof is eligible.
+fn unsigned_service_message(message: &[u8]) -> Option<bool> {
+    if message.len()<12 || message[2]&0x7a!=0 || message[3]&0x7f!=0 { return Some(false); }
+    let count = |i| usize::from(u16::from_be_bytes([message[i], message[i+1]]));
+    if count(4)!=1 { return Some(false); }
+    let mut at=read_name(message,12)?.1.checked_add(4)?;
+    for _ in 0..count(6)+count(8)+count(10) {
+        let (_,end)=read_name(message,at)?;
+        let header=message.get(end..end+10)?;
+        let kind=u16::from_be_bytes([header[0],header[1]]);
+        let size=usize::from(u16::from_be_bytes([header[8],header[9]]));
+        if matches!(kind,24|25|43|46|47|48|50|51|59|60|249|250)
+            || (kind==41 && (header[6]&0x80!=0 || size!=0)) { return Some(false); }
+        at=end.checked_add(10+size)?;
+        if at>message.len() { return None; }
+    }
+    Some(at==message.len())
+}
+
+fn service_reply(query: &[u8], answer: Vec<u8>, direct: bool, protected_site: bool) -> Option<Vec<u8>> {
+    if !direct && (unsigned_service_message(query)!=Some(true) || unsigned_service_message(&answer)!=Some(true)) {
+        return Some(answer);
+    }
+    sanitize_service_answer(&answer,direct,protected_site).or_else(|| empty_answer(query))
+}
+
 fn sanitize_service_answer(answer: &[u8], direct: bool, strip_ech: bool) -> Option<Vec<u8>> {
     if answer.len() < 12 {
         return None;
@@ -1215,8 +1241,10 @@ impl Inner {
         }
         self.remember(&addresses, &q.name);
         if is_service(q.qtype) {
-            return sanitize_service_answer(&answer, entry.is_some(), rules.protected.is_some())
-                .or_else(|| empty_answer(query));
+            if rules.protected.is_some() {
+                return service_reply(query, answer, entry.is_some(), rules.protects_name(&q.name));
+            }
+            return sanitize_service_answer(&answer,entry.is_some(),false).or_else(||empty_answer(query));
         }
         Some(filtered.unwrap_or(answer))
     }
@@ -1922,6 +1950,24 @@ mod tests {
             let stripped = sanitize_service_answer(&answer, false, true).unwrap();
             assert_eq!(records(&stripped)[0].3, "prio=1 target= 0:\0\u{1} 1:\u{2}h2");
         }
+    }
+
+    #[test]
+    fn ech_rewrite_is_scoped_to_unsigned_protected_names() {
+        let mut q=query("secure.example",TYPE_HTTPS,7);
+        let rrdata=svcb_data(1,"",&param(5,b"fixture-ech"));
+        let record=rr(&[0xc0,12],TYPE_HTTPS,60,&rrdata);
+        let response=reply(&q,std::slice::from_ref(&record),&[],&[]);
+        assert_eq!(service_reply(&q,response.clone(),false,false),Some(response.clone()));
+        assert_ne!(service_reply(&q,response.clone(),false,true),Some(response.clone()));
+        let signed=reply(&q,std::slice::from_ref(&record),&[],&[rr(&[0xc0,12],46,60,b"signature")]);
+        assert_eq!(service_reply(&q,signed.clone(),false,true),Some(signed));
+        let mut authenticated=response.clone();
+        authenticated[3]|=0x20;
+        assert_eq!(service_reply(&q,authenticated.clone(),false,true),Some(authenticated));
+        q[11]=1;
+        q.extend(rr(&[0],41,0x8000,&[]));
+        assert_eq!(service_reply(&q,response.clone(),false,true),Some(response));
     }
 
     #[test]

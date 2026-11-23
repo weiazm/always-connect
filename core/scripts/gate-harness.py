@@ -160,7 +160,10 @@ def cmd_controller(a):
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
             if "check" in msg:
                 c = msg["check"]
                 threading.Thread(target=check, args=(c["group"], c.get("host"), c["ip"], c["requestId"]), daemon=True).start()
