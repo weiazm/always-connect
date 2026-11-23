@@ -218,6 +218,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var activeParameters: [String]?
     /// Set by prepareRelay, used by the next connect (DESIGN.md §二十三).
     private var relay: RelaySettings?
+    private let relayHandover = RelayHandover()
+    private var relayCredentials: (group: String, username: String, password: String)?
     /// Names that go out the local network (DESIGN.md §26.5), from the App.
     private var directDomains: [String] = []
     /// The App's direct networks (its list and the local network), kept
@@ -303,6 +305,17 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         NetworkGuard.shared.ownerAttached()
     }
 
+    /// Read-only test seam, never exported over XPC.
+    func harnessAuthenticationExposed() -> Bool {
+        precondition(TestSeam.isActive)
+        return queue.sync { engine?.authenticationExposed ?? true }
+    }
+
+    func harnessEngineHolder() -> String? {
+        precondition(TestSeam.isActive)
+        return queue.sync { engine?.holder }
+    }
+
     /// Session harness only: an App attaching or vanishing, no XPC.
     func harnessOwner(attached: Bool, appPath: String? = nil) {
         queue.sync {
@@ -342,6 +355,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         withReply reply: @escaping (Bool) -> Void
     ) {
         queue.async {
+            _ = self.relayHandover.command(["op": "reset"])
+            self.relayCredentials = nil
             // A new relay (the App restarted it: new pin, maybe a new
             // gateway address) must restart the engine too.
             let parameters = [server, group, username, password,
@@ -355,21 +370,154 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
+    func connectRelayed(server: String, group: String, username: String, password: String,
+                        context: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard context.utf8.count <= 131072,
+                  let data = context.data(using: .utf8),
+                  let value = try? JSONDecoder().decode(RelayConnectionContext.self, from: data),
+                  UUID(uuidString: value.session) != nil,
+                  let relay = self.relay,
+                  RelayHandover.target(server) == value.target, relay.serverPin == value.pin,
+                  let (decision, _) = self.relayHandover.command([
+                    "op": "register", "session": value.session, "target": value.target,
+                    "pin": relay.serverPin, "allowed": value.allowed]), decision.ok else { reply(false); return }
+            Self.log("relay session=\(value.session) attempt=0 stage=register")
+            self.relayCredentials = (group, username, password)
+            let parameters = [server, group, username, password, relay.gatewayIp, relay.serverPin]
+            self.startEngine(server: server, group: group, username: username,
+                             password: password, parameters: parameters, reply: reply)
+        }
+    }
+
+    func beginRelayHandover(_ event: String, withReply reply: @escaping (String) -> Void) {
+        queue.async {
+            guard event.utf8.count <= 131072,
+                  let data = event.data(using: .utf8),
+                  var request = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let current = self.engine, self.stoppingEngine == nil,
+                  let parameters = self.activeParameters, parameters.count == 6,
+                  request["pin"] as? String == parameters[5],
+                  request["source"] as? String == RelayHandover.target(parameters[0]) else { reply(""); return }
+            request["op"] = "begin"
+            request["replay_unsafe"] = (request["replay_unsafe"] as? Bool ?? true) || current.authenticationExposed
+            guard let (decision, result) = self.relayHandover.command(request) else { reply(""); return }
+            // A stale event must not stop a newer intent. Policy failures for
+            // the current intent still freeze retries without restoring direct.
+            guard decision.code != "stale_context" else { reply(result); return }
+            if let session = request["session"] as? String {
+                Self.log("relay session=\(session) attempt=\(decision.attempt) stage=handover code=\(decision.code)")
+            }
+            self.startBarrier.cancel()
+            if self.dropProtection, NetworkGuard.shared.isHolding {
+                NetworkGuard.shared.supersedeOwnHolders()
+            }
+            self.engine = nil
+            self.activeParameters = nil
+            self.stoppingEngine = current
+            self.lastStateCode = decision.ok ? 1 : 0
+            self.lastDetail = decision.ok ? "正在切换 VPN 节点" : "当前认证流程发生节点跳转，无法安全继续"
+            if !decision.ok {
+                self.relayCredentials = nil
+                if self.dropProtection, let error = NetworkGuard.shared.failOwnHandover() { self.lastDetail = error }
+            } else if let session = request["session"] as? String {
+                self.relayHandover.watchDeadline(session: session, queue: self.queue) { [weak self] in
+                    self?.cancelRelayHandover(session: session, reason: "redirect_deadline") {}
+                }
+            }
+            self.push(state: self.lastStateCode, detail: self.lastDetail)
+            current.stop { [weak self, weak current] in
+                guard let self, let current else { reply(""); return }
+                self.queue.async {
+                    if self.stoppingEngine === current { self.stoppingEngine = nil }
+                    guard decision.ok, let ticket = decision.ticket else { reply(result); return }
+                    let stopped = self.relayHandover.command(["op": "engine_stopped", "ticket": ticket])
+                    if stopped?.0.ok != true, let session = request["session"] as? String {
+                        self.cancelRelayHandover(session: session, reason: "redirect_deadline") {}
+                    }
+                    reply(stopped?.1 ?? "")
+                }
+            }
+            // No timer is allowed to claim successful process termination.
+        }
+    }
+
+    func commitRelayHandover(ticket: String, server: String, serverPin: String, listenerClosed: Bool,
+                             withReply reply: @escaping (Bool, Int) -> Void) {
+        queue.async {
+            guard self.engine == nil, self.stoppingEngine == nil,
+                  let relay = self.relay, relay.serverPin == serverPin, let credentials = self.relayCredentials,
+                  let (decision, _) = self.relayHandover.command([
+                    "op": "commit", "ticket": ticket, "target": server,
+                    "pin": relay.serverPin, "listener_closed": listenerClosed]), decision.ok else { reply(false, 0); return }
+            Self.log("relay attempt=\(decision.attempt) stage=commit")
+            let parameters = [server, credentials.group, credentials.username, credentials.password,
+                              relay.gatewayIp, relay.serverPin]
+            self.startEngineNow(server: server, group: credentials.group, username: credentials.username,
+                                password: credentials.password, parameters: parameters) { accepted in
+                if !accepted {
+                    self.relayCredentials = nil
+                    self.relay = nil
+                    _ = self.relayHandover.command(["op": "reset"])
+                    self.lastStateCode = 0
+                    self.lastDetail = self.dropProtection ? (NetworkGuard.shared.failOwnHandover() ?? "新 VPN 引擎启动失败，连接已停止") : "新 VPN 引擎启动失败，连接已停止"
+                    self.push(state: self.lastStateCode, detail: self.lastDetail)
+                }
+                reply(accepted, Int(decision.attempt))
+            }
+        }
+    }
+
+    func cancelRelayHandover(session: String, reason: String, withReply reply: @escaping () -> Void) {
+        queue.async {
+            if let (decision, _) = self.relayHandover.command(["op": "cancel", "session": session]), decision.ok {
+                self.startBarrier.cancel()
+                if let current = self.engine {
+                    if self.dropProtection, NetworkGuard.shared.isHolding {
+                        NetworkGuard.shared.supersedeOwnHolders()
+                    }
+                    self.engine = nil
+                    self.activeParameters = nil
+                    self.stoppingEngine = current
+                    current.stop { [weak self, weak current] in
+                        guard let self, let current else { return }
+                        self.queue.async {
+                            if self.stoppingEngine === current { self.stoppingEngine = nil }
+                        }
+                    }
+                }
+                self.relayCredentials = nil
+                self.relay = nil
+                self.lastStateCode = 0
+                switch reason {
+                case "gateway_certificate": self.lastDetail = "无法验证 VPN 网关证书，连接已停止"
+                case "identity_expired": self.lastDetail = "客户端证书已过期，连接已停止"
+                case "identity_unavailable": self.lastDetail = "客户端证书身份不可用，连接已停止"
+                case "relay_unavailable", "relay_rejected": self.lastDetail = "本机安全转接未就绪，连接已停止"
+                case "redirect_deadline": self.lastDetail = "VPN 连接准备或节点切换超时，连接已停止"
+                default: self.lastDetail = "VPN 连接已停止"
+                }
+                if self.dropProtection, let error = NetworkGuard.shared.failOwnHandover() { self.lastDetail = error }
+                self.push(state: self.lastStateCode, detail: self.lastDetail)
+            }
+            reply()
+        }
+    }
+
     /// On `queue`. Different parameters while an engine runs (the
     /// Credentials page's test connection) replace it, as before.
     /// An engine still winding down (a replacement waits for it), and
     /// the start that waits: a later connect or a disconnect bumps the
     /// generation, so a superseded start never runs.
     private var stoppingEngine: CLIOrchestrator?
-    private var startGeneration = 0
+    private let startBarrier = EngineStartBarrier()
 
     private func startEngine(
         server: String, group: String, username: String, password: String,
         parameters: [String], reply: @escaping (Bool) -> Void
     ) {
-        startGeneration += 1
+        let ticket = startBarrier.begin()
         userReleased = false
-        let generation = startGeneration
         // Replacing a running engine (new server, new relay): stop it
         // the whole way first — routes back, its own pf hold released —
         // then start the new one (§25.7). Starting at once left the old
@@ -390,22 +538,32 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             NetworkGuard.shared.supersedeOwnHolders()
         }
         if let stopping = stoppingEngine {
-            var started = false
             let begin: () -> Void = { [weak self] in
                 guard let self else { return }
                 self.queue.async {
-                    guard !started else { return }
-                    started = true
                     if self.stoppingEngine === stopping { self.stoppingEngine = nil }
-                    guard generation == self.startGeneration else { reply(false); return }
-                    self.startEngineNow(server: server, group: group, username: username,
-                                        password: password, parameters: parameters, reply: reply)
+                    switch ticket.complete(stopped: true) {
+                    case .start:
+                        self.startEngineNow(server: server, group: group, username: username,
+                                            password: password, parameters: parameters, reply: reply)
+                    case .cancelled: reply(false)
+                    case .ignore, .timedOut: break
+                    }
                 }
             }
             stopping.stop(keepSession: sameLogin, completion: begin)
-            // Fallback only: the old engine's own restore must not land
-            // on top of the new session's routes (§30.3).
-            queue.asyncAfter(deadline: .now() + 20) { begin() }
+            // A deadline is failure, never evidence of process/route cleanup.
+            queue.asyncAfter(deadline: .now() + 20) {
+                switch ticket.complete(stopped: false) {
+                case .timedOut:
+                    self.lastStateCode = 0
+                    self.lastDetail = "旧 VPN 连接尚未完成清理，请稍后重试"
+                    self.push(state: self.lastStateCode, detail: self.lastDetail)
+                    reply(false)
+                case .cancelled: reply(false)
+                case .ignore, .start: break
+                }
+            }
             return
         }
         startEngineNow(server: server, group: group, username: username,
@@ -475,6 +633,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 // instead of releasing the kill switch (§25.1, F1).
                 self.engine = nil
                 self.activeParameters = nil
+                self.relayCredentials = nil
+                let protectionError = self.relay != nil && self.dropProtection && reason != .stoppedManual
+                    ? NetworkGuard.shared.failOwnHandover() : nil
+                _ = self.relayHandover.command(["op": "reset"])
                 switch reason {
                 case .stoppedManual: self.lastReasonCode = 1
                 case .authFailure: self.lastReasonCode = 2
@@ -485,7 +647,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 self.lastRetryCount = retries
                 // Terminal state is already reflected by the last pushed
                 // state + detail; the App maps authFailure to its error row.
-                if reason == .authFailure || reason == .approvalDeclined, let error {
+                if let protectionError {
+                    self.lastDetail = protectionError
+                    self.push(state: self.lastStateCode, detail: protectionError)
+                } else if reason == .authFailure || reason == .approvalDeclined, let error {
                     self.push(state: self.lastStateCode, detail: error)
                 }
             }
@@ -518,7 +683,9 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// On `queue`. pf first — the network is direct the moment this
     /// returns — then the parts that take their time.
     private func releaseEverythingLocked(reason: String) {
-        startGeneration += 1 // a replacement waiting to start never does
+        _ = relayHandover.command(["op": "reset"])
+        relayCredentials = nil
+        startBarrier.cancel() // a replacement waiting to start never does
         if reason == NetworkGuard.Reason.user { userReleased = true }
         NetworkGuard.shared.release(holder: nil, reason: reason)
         // The Cisco kill switch, always: an own-connection engine

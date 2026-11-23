@@ -22,12 +22,17 @@ pub mod oc_engine;
 pub mod offline;
 pub mod pf;
 pub mod relay;
+pub mod relay_http;
+pub mod relay_switch;
 pub mod relay_log;
+pub mod relay_handshake;
+pub mod relay_diagnostics;
 pub mod route_watch;
 pub mod rules;
 pub mod session;
 pub mod split_policy;
 pub mod state_machine;
+pub mod start_barrier;
 pub mod traffic;
 pub mod update_check;
 

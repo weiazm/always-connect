@@ -25,12 +25,13 @@
 //! tunnel, ours included (§23.6).
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -42,6 +43,38 @@ pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 pub enum FramingError {
     Invalid,
     Oversized,
+    Redirect,
+    Cancelled,
+}
+
+/// Authentication and cancellation belong to the logical relay, not a TLS
+/// socket: openconnect may open several sockets during one login.
+#[derive(Default)]
+pub struct RelaySession {
+    sensitive: AtomicBool,
+    cancelled: AtomicBool,
+    handshakes: Mutex<crate::relay_handshake::Budget>,
+}
+
+impl RelaySession {
+    pub fn cancel(&self) { self.cancelled.store(true, Ordering::SeqCst); }
+    pub fn active(&self) -> bool { !self.cancelled.load(Ordering::SeqCst) }
+    pub fn finish_handshake(&self, pair: u32, outcome: u32) {
+        self.handshakes.lock().unwrap().finish(pair, outcome, Instant::now());
+    }
+    pub fn admit(&self, pair: u32) -> crate::relay_handshake::Admission {
+        if !self.active() { return crate::relay_handshake::Admission { allowed: false, retry_after_ms: 0, notify: false }; }
+        self.handshakes.lock().unwrap().admit(pair, Instant::now())
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct RedirectEvent {
+    pub status: u16,
+    pub location: String,
+    /// Conservatively true for any credential header, query, body or
+    /// non-idempotent/unknown method. No secret is retained here.
+    pub replay_unsafe: bool,
 }
 
 const HEADER_LIMIT: usize = 131072;
@@ -159,6 +192,8 @@ pub fn edit_header(header: &[u8], mut edit: impl FnMut(&str, &str) -> Option<Str
 pub struct HttpRequests {
     header: Vec<u8>,
     body_remaining: usize,
+    session: Arc<RelaySession>,
+    methods: VecDeque<(bool, bool)>,
 }
 
 impl HttpRequests {
@@ -186,6 +221,12 @@ impl HttpRequests {
             let mut head = whole[..boundary].to_vec();
             let text = String::from_utf8_lossy(&head).into_owned();
             let lines: Vec<&str> = text.split("\r\n").collect();
+            let mut request = lines.first().copied().unwrap_or("").split_whitespace();
+            let method = request.next().unwrap_or("");
+            let path = request.next().unwrap_or("");
+            if !matches!(method, "GET" | "HEAD") || path != "/" {
+                self.session.sensitive.store(true, Ordering::SeqCst);
+            }
             if lines.first().is_some_and(|l| l.starts_with("CONNECT ")) {
                 connect = true;
                 head = edit_header(&head, |name, value| {
@@ -201,18 +242,27 @@ impl HttpRequests {
             }
             for line in lines.iter().skip(1) {
                 let Some((name, value)) = line.split_once(':') else { continue };
-                let name = name.to_ascii_lowercase();
+                let name = name.trim().to_ascii_lowercase();
+                if !matches!(name.as_str(), "host" | "user-agent" | "accept" | "accept-encoding" | "connection" | "content-length") {
+                    self.session.sensitive.store(true, Ordering::SeqCst);
+                }
+                if matches!(name.as_str(), "cookie" | "authorization" | "proxy-authorization") {
+                    self.session.sensitive.store(true, Ordering::SeqCst);
+                }
                 if name == "content-length" {
                     let count: usize = value.trim_matches(|c| c == ' ' || c == '\t').parse().map_err(|_| FramingError::Invalid)?;
                     if count > 1_048_576 {
                         return Err(FramingError::Invalid);
                     }
                     self.body_remaining = count;
+                    if count > 0 { self.session.sensitive.store(true, Ordering::SeqCst); }
                 }
                 if name == "transfer-encoding" {
                     return Err(FramingError::Invalid);
                 }
             }
+            if self.methods.len() >= 64 { return Err(FramingError::Oversized); }
+            self.methods.push_back((method == "HEAD", method == "CONNECT"));
             out.push(&head);
             // What came after the header: the body or the next request.
             let tail = whole[boundary..].to_vec();
@@ -231,23 +281,10 @@ pub fn attribute(name: &str, tag: &str, text: &str) -> Option<String> {
     rest.find('"').map(|end| rest[..end].to_string())
 }
 
-pub fn element(tag: &str, text: &str) -> Option<String> {
-    let open = text.find(&format!("<{tag}"))? + tag.len() + 1;
-    let rest = &text[open..];
-    let gt = rest.find('>')?;
-    let close = rest.find(&format!("</{tag}>"))?;
-    if gt >= close {
-        return None;
-    }
-    let value = rest[gt + 1..close].trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 /// The login's shape, for the relay log: which kind of request went to
 /// the gateway (POST, whether it carried the password), how long the
-/// gateway took to answer, its status and the auth form's id and
-/// message. The answer to the password arrives only after the phone
-/// approval, so the wait is visible without administrator rights.
+/// gateway took to answer, its numeric status and fixed auth-form categories.
+/// Gateway-provided messages and arbitrary identifiers are never copied.
 pub struct AuthTrace {
     pair: u32,
     log: Option<Log>,
@@ -293,7 +330,8 @@ impl AuthTrace {
         }
         if self.answer.is_none() {
             let status = if text.starts_with("HTTP/") {
-                text.split("\r\n").next().and_then(|l| l.split(' ').filter(|s| !s.is_empty()).nth(1)).unwrap_or("?").to_string()
+                text.split("\r\n").next().and_then(|l| l.split(' ').filter(|s| !s.is_empty()).nth(1))
+                    .filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or("?").to_string()
             } else {
                 "?".to_string()
             };
@@ -322,12 +360,11 @@ impl AuthTrace {
         self.logged = true;
         let mut form = String::new();
         if let Some(id) = attribute("id", "auth", &body) {
-            form += &format!(" auth={id}");
+            let category = match id.as_str() { "main" => "main", "success" => "success", _ => "other" };
+            form += &format!(" auth={category}");
         }
-        if let Some(message) = element("message", &body).or_else(|| element("error", &body)) {
-            let short: String = message.chars().take(60).collect();
-            form += &format!(" message=\"{short}\"");
-        }
+        if body.contains("<message") { form += " message=present"; }
+        if body.contains("<error") { form += " error=present"; }
         let password = if self.password { " (password)" } else { "" };
         self.write(format!("pair {} login: {}{} answered after {}s: {}{}", self.pair, self.request, password, wait, status, form));
     }
@@ -531,6 +568,8 @@ pub struct Stream {
     interface: Option<String>,
     log: Option<Log>,
     requests: HttpRequests,
+    responses: crate::relay_http::Responses,
+    session: Arc<RelaySession>,
     auth: AuthTrace,
     connect_requested: bool,
     response_header: Vec<u8>,
@@ -546,13 +585,16 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(pair: u32, gateway: Ipv4Addr, log: Option<Log>) -> Self {
+        let session = Arc::new(RelaySession::default());
         Stream {
             pair,
             gateway,
             interface: None,
             auth: AuthTrace::new(pair, log.clone()),
             log,
-            requests: HttpRequests::default(),
+            requests: HttpRequests { header: Vec::new(), body_remaining: 0, session: Arc::clone(&session), methods: VecDeque::new() },
+            responses: crate::relay_http::Responses::default(),
+            session,
             connect_requested: false,
             response_header: Vec::new(),
             cstp_since: None,
@@ -580,6 +622,35 @@ impl Stream {
             .or_else(|| interface.filter(|i| !i.is_empty()).map(str::to_string));
     }
 
+    pub fn finish_handshake(&self, outcome: u32) {
+        self.session.handshakes.lock().unwrap().finish(self.pair, outcome, Instant::now());
+    }
+    pub fn active(&self) -> bool { self.session.active() }
+    pub fn interface(&self) -> Option<&str> { self.interface.as_deref() }
+
+    pub fn set_context(&mut self, session: String, attempt: u32) {
+        if let Some(log) = self.log.clone() {
+            let log: Log = Arc::new(move |line| log(&format!("session={session} attempt={attempt} {line}")));
+            self.auth.log = Some(log.clone());
+            self.log = Some(log);
+        }
+    }
+
+    pub fn set_session(&mut self, session: Arc<RelaySession>) {
+        self.requests.session = Arc::clone(&session);
+        self.session = session;
+    }
+
+    pub fn take_redirect(&mut self) -> Option<RedirectEvent> {
+        let (status, location) = self.responses.take_redirect()?;
+        Some(RedirectEvent { status, location,
+            replay_unsafe: self.session.sensitive.load(Ordering::SeqCst) })
+    }
+
+    pub fn set_target(&mut self, host: &str, port: u16) {
+        self.responses.set_target(host, port);
+    }
+
     pub fn in_tunnel(&self) -> bool {
         self.cstp_since.is_some()
     }
@@ -589,7 +660,8 @@ impl Stream {
         let side = if from_client { 0 } else { 1 };
         let mut out = std::mem::take(&mut self.out[side]);
         out.clear();
-        let result = self.frame(data, from_client, &mut out);
+        let result = if self.session.active() { self.frame(data, from_client, &mut out) }
+            else { Err(FramingError::Cancelled) };
         if result.is_ok() && self.in_tunnel() {
             let counter = if from_client { &mut self.up } else { &mut self.down };
             counter.0 += out.len() as u64;
@@ -607,18 +679,24 @@ impl Stream {
         self.auth.observe(data, from_client);
         if from_client {
             let connect = self.requests.pass(data, out)?;
+            while let Some((head, is_connect)) = self.requests.methods.pop_front() {
+                // CONNECT may only start after earlier authentication replies
+                // are complete; never mistake an earlier 200 for a tunnel.
+                if is_connect && self.responses.has_pending_request() { return Err(FramingError::Invalid); }
+                self.responses.enqueue_request(head)?;
+            }
             self.connect_requested = connect || self.connect_requested;
             return Ok(());
         }
         if !self.connect_requested {
-            out.push(data);
-            return Ok(());
+            return self.responses.feed(data, out);
         }
         self.response_header.extend_from_slice(data);
-        if self.response_header.len() > HEADER_LIMIT {
+        let boundary = find(&self.response_header, b"\r\n\r\n").map(|i| i + 4);
+        if boundary.unwrap_or(self.response_header.len()) > HEADER_LIMIT {
             return Err(FramingError::Oversized);
         }
-        let Some(boundary) = find(&self.response_header, b"\r\n\r\n").map(|i| i + 4) else { return Ok(()) };
+        let Some(boundary) = boundary else { return Ok(()) };
         let whole = std::mem::take(&mut self.response_header);
         let mut header = whole[..boundary].to_vec();
         let status_line = String::from_utf8_lossy(&header).split("\r\n").next().unwrap_or("").to_string();
@@ -627,16 +705,18 @@ impl Stream {
             self.cstp_since = Some(Instant::now());
             header = self.open_datagrams(&header);
         }
-        self.connect_requested = false;
-        out.push(&header);
+        let interim = status_line.split_whitespace().nth(1)
+            .and_then(|s| s.parse::<u16>().ok()).is_some_and(|s| (100..200).contains(&s));
+        self.connect_requested = interim;
         let tail = &whole[boundary..];
         if ok {
+            out.push(&header);
             self.server_frames.feed(tail, out)
+        } else if interim {
+            self.responses.feed(&header, out)?;
+            self.frame(tail, false, out)
         } else {
-            if !tail.is_empty() {
-                out.push(tail);
-            }
-            Ok(())
+            self.responses.feed(&whole, out)
         }
     }
 
@@ -763,12 +843,27 @@ mod tests {
     }
 
     #[test]
+    fn login_trace_never_copies_gateway_text_or_unknown_status_tokens() {
+        for status in ["200", "STATUS_CANARY_123"] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let target = seen.clone();
+            let mut trace = AuthTrace::new(1, Some(Arc::new(move |line| target.lock().unwrap().push(line.into()))));
+            trace.observe(b"POST / HTTP/1.1\r\n\r\n<password>PASS_CANARY_123</password>", true);
+            let response = format!("HTTP/1.1 {status} OK\r\nContent-Type: text/xml\r\n\r\n<config-auth><auth id=\"ID_CANARY_123\"><message>MSG_CANARY_123</message><error>ERR_CANARY_123</error></auth></config-auth>");
+            trace.observe(response.as_bytes(), false);
+            let text = seen.lock().unwrap().join("\n");
+            for canary in ["PASS_CANARY_123", "ID_CANARY_123", "MSG_CANARY_123", "ERR_CANARY_123", "STATUS_CANARY_123"] {
+                assert!(!text.contains(canary), "{text}");
+            }
+            assert!(text.contains("auth=other message=present error=present"), "{text}");
+        }
+    }
+
+    #[test]
     fn login_trace() {
         let form = "HTTP/1.1 200 OK\r\n\r\n<config-auth><auth id=\"main\"><message>Login failed.</message>\
                     <input type=\"password\" name=\"password\"/></auth></config-auth>";
         assert_eq!(attribute("id", "auth", form).as_deref(), Some("main"));
-        assert_eq!(element("message", form).as_deref(), Some("Login failed."));
-        assert_eq!(element("error", form), None);
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l = Arc::clone(&lines);
         let mut t = AuthTrace::new(3, Some(Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()))));
@@ -823,4 +918,86 @@ mod tests {
         let summary = s.close();
         assert!(summary.contains("udp up 1 pkts/13 B, down 1 pkts/17 B"), "{summary}");
     }
+    #[test]
+    fn connect_redirect_is_also_guarded_after_interim() {
+        let mut s = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        s.set_target("vpn-a.example", 6443);
+        s.feed(b"CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\n\r\n", true).unwrap();
+        let response = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n";
+        assert_eq!(s.feed(response, false), Err(FramingError::Redirect));
+        assert!(!s.in_tunnel());
+        assert!(!String::from_utf8_lossy(&s.out[1].to_vecs().concat()).contains("Location"));
+    }
+
+    #[test]
+    fn cancelled_session_never_admits_after_a_late_ready_callback() {
+        let session = Arc::new(RelaySession::default());
+        assert!(session.admit(1).allowed);
+        let mut stream = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        stream.set_session(Arc::clone(&session));
+        session.cancel(); stream.finish_handshake(0);
+        assert!(!stream.active()); assert!(!session.admit(2).allowed);
+    }
+
+    #[test]
+    fn connect_cannot_overtake_an_authentication_response() {
+        let get = b"GET / HTTP/1.1\r\n\r\n";
+        let connect = b"CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\n\r\n";
+        let mut pending = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        pending.feed(get, true).unwrap();
+        assert_eq!(pending.feed(connect, true), Err(FramingError::Invalid));
+        let mut body = Stream::new(2, Ipv4Addr::LOCALHOST, None);
+        body.feed(get, true).unwrap();
+        body.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbo", false).unwrap();
+        assert_eq!(body.feed(connect, true), Err(FramingError::Invalid));
+        let mut ready = Stream::new(3, Ipv4Addr::LOCALHOST, None);
+        ready.feed(get, true).unwrap();
+        ready.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", false).unwrap();
+        assert!(ready.feed(connect, true).is_ok());
+    }
+
+    #[test]
+    fn authentication_boundary_survives_a_new_tls_pair() {
+        for request in [
+            "POST /auth HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+            "GET / HTTP/1.1\r\nCookie: webvpn=secret\r\n\r\n",
+            "GET / HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n",
+            "GET /login?token=secret HTTP/1.1\r\n\r\n",
+            "GET /auth/opaque-value HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nX-Unknown-Authentication: opaque\r\n\r\n",
+            "GET / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+        ] {
+            let session = Arc::new(RelaySession::default());
+            let mut first = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+            first.set_session(Arc::clone(&session));
+            for part in request.as_bytes().chunks(3) { first.feed(part, true).unwrap(); }
+            drop(first);
+            let mut next = Stream::new(2, Ipv4Addr::LOCALHOST, None);
+            next.set_target("vpn-a.example", 6443);
+            next.set_session(Arc::clone(&session));
+            assert_eq!(next.feed(b"HTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n", false), Err(FramingError::Redirect));
+            let event = next.take_redirect().unwrap();
+            assert!(event.replay_unsafe);
+            assert_eq!(event.status, 302);
+            assert!(next.take_redirect().is_none(), "a redirect event is consumed once");
+        }
+    }
+
+    #[test]
+    fn fresh_session_is_not_contaminated_and_cancel_stops_buffered_work() {
+        let mut s = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        s.set_target("vpn-a.example", 6443);
+        s.feed(b"GET / HTTP/1.1\r\n\r\n", true).unwrap();
+        assert_eq!(s.feed(b"HTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n", false), Err(FramingError::Redirect));
+        assert!(!s.take_redirect().unwrap().replay_unsafe);
+        let session = Arc::new(RelaySession::default());
+        s.set_session(Arc::clone(&session));
+        s.feed(b"GET / HTTP/1.1\r\nHost:", true).unwrap();
+        session.cancel();
+        assert_eq!(s.feed(b" x\r\n\r\n", true), Err(FramingError::Cancelled));
+        assert!(s.out[0].is_empty());
+        assert_eq!(s.feed(b"response", false), Err(FramingError::Cancelled));
+        assert!(s.out[1].is_empty());
+    }
+
 }

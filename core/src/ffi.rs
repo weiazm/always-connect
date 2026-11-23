@@ -487,8 +487,8 @@ mod tests {
         let app = c("com.example.app");
         let dom = c("a.video.example");
         let ip = c("1.2.3.4");
-        let mut buf = vec![0i8; 64];
-        let reason = |buf: &[i8]| unsafe {
+        let mut buf = vec![0 as c_char; 64];
+        let reason = |buf: &[c_char]| unsafe {
             CStr::from_ptr(buf.as_ptr()).to_str().unwrap().to_owned()
         };
         // No rule yet: secure default.
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(reason(&buf), "app-conflict->vpn");
         // Short buffer truncates the reason but keeps the direction
         // and the NUL terminator.
-        let mut small = vec![0i8; 4];
+        let mut small = vec![0 as c_char; 4];
         assert_eq!(
             ac_engine_resolve_detail(
                 e,
@@ -897,7 +897,7 @@ pub extern "C" fn ac_dns_name_for(f: *const Forwarder, ip: *const c_char) -> *mu
 
 // MARK: - Certificate relay (DESIGN.md §32.7)
 
-use crate::relay::{self, Stream};
+use crate::relay::{self, RelaySession, Stream};
 
 /// One relay log line (the App writes relay.log).
 pub type AcRelayLog = extern "C" fn(line: *const c_char);
@@ -942,7 +942,49 @@ pub extern "C" fn ac_relay_stream_feed(s: *mut Stream, from_client: bool, data: 
         Ok(n) => n as c_int,
         Err(relay::FramingError::Invalid) => -1,
         Err(relay::FramingError::Oversized) => -2,
+        Err(relay::FramingError::Redirect) => -3,
+        Err(relay::FramingError::Cancelled) => -4,
     }
+}
+
+/// One logical relay login. Streams retain the shared state independently of
+/// the opaque handle, so closing the listener cannot invalidate live streams.
+#[no_mangle]
+pub extern "C" fn ac_relay_session_new() -> *mut std::sync::Arc<RelaySession> {
+    Box::into_raw(Box::new(std::sync::Arc::new(RelaySession::default())))
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_cancel(p: *const std::sync::Arc<RelaySession>) {
+    if let Some(p) = unsafe { p.as_ref() } { p.cancel(); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_active(p: *const std::sync::Arc<RelaySession>) -> bool {
+    (unsafe { p.as_ref() }).is_some_and(|p| p.active())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_free(p: *mut std::sync::Arc<RelaySession>) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_session(s: *mut Stream, p: *const std::sync::Arc<RelaySession>) {
+    if let (Some(s), Some(p)) = (unsafe { s.as_mut() }, unsafe { p.as_ref() }) {
+        s.set_session(std::sync::Arc::clone(p));
+    }
+}
+/// Private structured event, consumed exactly once. Never log its raw JSON:
+/// Location can contain authentication material. Caller frees via ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_take_redirect(s: *mut Stream) -> *mut c_char {
+    let Some(s) = (unsafe { s.as_mut() }) else { return std::ptr::null_mut() };
+    s.take_redirect().and_then(|e| serde_json::to_string(&e).ok())
+        .map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Bind the response guard to the actual upstream TLS authority.
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_target(s: *mut Stream, host: *const c_char, port: u16) {
+    let Some(s) = (unsafe { s.as_mut() }) else { return };
+    if let Some(host) = c_str(host) { s.set_target(&host, port); }
 }
 
 /// Chunk `index` of the last feed in that direction; its length, with
@@ -1417,6 +1459,11 @@ pub extern "C" fn ac_guard_supersede_own_holders() {
     if let Some(g) = guard() {
         g.supersede_own_holders();
     }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_fail_own_handover() -> *mut c_char {
+    guard().and_then(|g| g.fail_own_handover()).map(owned).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -1908,4 +1955,104 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
 #[no_mangle]
 pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {
     crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_new_with_budget(milliseconds: u32) -> *mut crate::relay_switch::Handover {
+    Box::into_raw(Box::new(crate::relay_switch::Handover::with_budget(milliseconds)))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_new() -> *mut crate::relay_switch::Handover {
+    Box::into_raw(Box::new(crate::relay_switch::Handover::default()))
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_free(p: *mut crate::relay_switch::Handover) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_command(p: *mut crate::relay_switch::Handover, request: *const c_char) -> *mut c_char {
+    let Some(p) = (unsafe { p.as_mut() }) else { return std::ptr::null_mut() };
+    let Some(command) = c_str(request).filter(|s| s.len() <= 131072)
+        .and_then(|s| serde_json::from_str::<crate::relay_switch::Command>(&s).ok()) else { return std::ptr::null_mut() };
+    serde_json::to_string(&p.command(command)).ok().map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_authentication_exposed(e: *const oc_engine::Engine) -> bool {
+    (unsafe { e.as_ref() }).is_none_or(|e| e.authentication_exposed())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_context(s: *mut Stream, session: *const c_char, attempt: u32) {
+    let (Some(s), Some(session)) = (unsafe { s.as_mut() }, c_str(session)) else { return };
+    if session.len() == 36 && session.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        s.set_context(session, attempt);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_new() -> *mut std::sync::Arc<crate::start_barrier::Owner> {
+    Box::into_raw(Box::new(std::sync::Arc::new(crate::start_barrier::Owner::default())))
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_free(p: *mut std::sync::Arc<crate::start_barrier::Owner>) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_cancel(p: *const std::sync::Arc<crate::start_barrier::Owner>) {
+    if let Some(p) = unsafe { p.as_ref() } { p.cancel(); }
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_begin(p: *const std::sync::Arc<crate::start_barrier::Owner>) -> *mut crate::start_barrier::Ticket {
+    (unsafe { p.as_ref() }).map(|p| Box::into_raw(Box::new(p.begin()))).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_start_ticket_complete(p: *mut crate::start_barrier::Ticket, stopped: bool) -> u32 {
+    (unsafe { p.as_mut() }).map(|p| p.complete(stopped) as u32).unwrap_or(0)
+}
+#[no_mangle]
+pub extern "C" fn ac_start_ticket_free(p: *mut crate::start_barrier::Ticket) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_relay_session_admit(p: *const std::sync::Arc<RelaySession>, pair: u32) -> *mut c_char {
+    let Some(p) = (unsafe { p.as_ref() }) else { return std::ptr::null_mut() };
+    serde_json::to_string(&p.admit(pair)).ok().map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_finish(p: *const std::sync::Arc<RelaySession>, pair: u32, outcome: u32) {
+    if let Some(p) = unsafe { p.as_ref() } { p.finish_handshake(pair, outcome); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_finish_handshake(s: *const Stream, outcome: u32) {
+    if let Some(s) = unsafe { s.as_ref() } { s.finish_handshake(outcome); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_active(s: *const Stream) -> bool {
+    (unsafe { s.as_ref() }).is_some_and(|s| s.active())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_interface(s: *const Stream) -> *mut c_char {
+    (unsafe { s.as_ref() }).and_then(|s| s.interface()).map(|s| cstring(s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_diagnostic_write(event: *const c_char) {
+    if let Some(event) = c_str(event) { crate::relay_diagnostics::write(&event); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_diagnostics_json() -> *mut c_char {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let result = (|| -> Option<String> {
+        let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+            .open(crate::relay_log::path()?).ok()?;
+        let size = file.metadata().ok()?.len();
+        if size > 1_000_000 { file.seek(SeekFrom::End(-1_000_000)).ok()?; }
+        let mut bytes = Vec::new(); file.take(1_000_000).read_to_end(&mut bytes).ok()?;
+        Some(crate::relay_diagnostics::project(&String::from_utf8_lossy(&bytes)))
+    })().unwrap_or_else(|| "[]".into());
+    cstring(&result).into_raw()
 }

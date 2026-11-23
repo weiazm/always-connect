@@ -58,10 +58,11 @@ ssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Relay Test CA" \
 ssl x509 -in ca.pem -outform DER -out ca.der
 issue() { # name usage
     ssl req -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout "$1.key" -out "$1.csr"
-    printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=%s\n' "$2" > "$1.ext"
+    printf 'subjectAltName=%s\nextendedKeyUsage=%s\n' "${3:-DNS:localhost,IP:127.0.0.1}" "$2" > "$1.ext"
     ssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile "$1.ext" -out "$1.pem"
 }
 issue gateway serverAuth
+issue badgateway serverAuth DNS:wrong.example
 issue company clientAuth
 issue stranger clientAuth
 for who in company stranger; do
@@ -72,6 +73,17 @@ done
 "$HELPER" relay-client-cert --support-dir "$W/support" > relay-client.pem
 cp "$W/support/relay/client.key" relay-client.key
 [ -s relay-client.pem ] && [ -s relay-client.key ] || { echo "FAIL relay client identity"; exit 1; }
+
+# Real listener cancellation, then a new listener on the same loopback port.
+# Test identities only; this never initiates an upstream connection.
+ALWAYSCONNECT_TEST_REBIND=1 "$W/RelayHarness" relay company.p12 test ca.der 4467 4464 relay-client.pem > "$W/rebind.out" 2>&1
+REBIND_STATUS=$?
+if [ "$REBIND_STATUS" = 77 ]; then echo "SKIP relay: memory-only import requires macOS 15"; exit 0; fi
+if [ "$REBIND_STATUS" = 0 ]; then
+    pass "old listener cancellation completes before same-port replacement"
+else
+    fail "same-port relay replacement"; cat "$W/rebind.out"
+fi
 
 start_relay() { # listen upstream [identity.p12 [renewal.p12]] -> sets RELAY_IP RELAY_PIN
     "$W/RelayHarness" relay "${3:-company.p12}" test ca.der "$1" "$2" relay-client.pem ${4:+"$4"} \
@@ -100,6 +112,16 @@ grep -q "client certificate expired: switched" "$W/relay.log" &&
 # Control: a certificate that has not expired is kept.
 start_relay 4467 4468 stranger.p12
 python3 -I "$ROOT/core/scripts/relay-framing-check.py" presents 4467 4468 "$D" stranger || FAILS=$((FAILS + 1))
+
+# Native TLS failure stages: no HTTP or authentication is reached. Separate
+# relays keep the deterministic trust cancellation isolated from other cases.
+start_relay 4469 4470
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" invalid-certificate 4469 4470 "$D" || FAILS=$((FAILS + 1))
+grep -q '^FATAL gateway_certificate' "$W/relay-4469.out" &&
+    pass "hostname rejection reports a terminal certificate issue" || fail "missing terminal certificate issue"
+start_relay 4471 4472
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" tls-close 4471 4472 "$D" || FAILS=$((FAILS + 1))
+grep -q '^FATAL' "$W/relay-4471.out" && fail "TLS close guessed to be a certificate failure"
 
 # 4
 python3 -I "$ROOT/core/scripts/mock-anyconnect.py" 4464 gateway.pem gateway.key ca.pem \
@@ -138,6 +160,10 @@ printf 'testpass\n' | "$HELPER" run-once --server https://127.0.0.1:4464 --user 
     --max-attempts 1 --no-routes --cookie-store "$W/direct.json" --support-dir "$W/direct" > "$W/direct.out" 2>&1
 grep -q "credential password" "$W/direct.out" && ! grep -q mockcookie123 "$W/direct.json" 2>/dev/null &&
     pass "without the relay the gateway refuses openconnect" || fail "direct login unexpectedly worked"
+
+# Production App handover methods are extracted unchanged. Only the initial
+# pre-authentication CLI is a controlled GET; destination auth uses OpenConnect.
+python3 -I "$ROOT/core/scripts/relay-handover-test.py" "$D" || FAILS=$((FAILS + 1))
 
 echo "relay FAILS=$FAILS"
 [ "$FAILS" = 0 ]

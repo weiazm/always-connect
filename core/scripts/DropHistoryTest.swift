@@ -48,7 +48,7 @@ struct DropHistoryTest {
               && r3b.summary == "断了 5 分钟，重新登录 4 次后停止重试：账号或密码被拒绝", "rejected: \(r3b.summary)")
         check(r3b.panelSummary == "断了 5 分钟，重新登录 4 次，没恢复", "panel: \(r3b.panelSummary)")
         check(r3!.applyingTerminal(3).failureReason == "重试次数用完", "attempts exhausted")
-        check(r3!.applyingTerminal(5).failureReason == "手机上的登录确认没有通过" && r3!.applyingTerminal(5).outcome == .failed,
+        check(r3!.applyingTerminal(5).failureReason == "本次认证未通过" && r3!.applyingTerminal(5).outcome == .failed,
               "phone confirmation failed (§43)")
         check(r3!.applyingTerminal(1).outcome == .stoppedByUser, "terminal manual stop = the user's")
 
@@ -121,7 +121,7 @@ struct DropHistoryTest {
         check(history.count == 2 && history.last!.sleepDropCount == 4 && history.last!.retries == 2
               && history.last!.approvals == 1 && history.last!.durationSeconds == 64,
               "drop within the wake grace folds in with its re-logins and approval")
-        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共重新登录 2 次，都已恢复；其中 1 次等你在手机上批准",
+        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共重新登录 2 次，都已恢复；其中 1 次等待认证响应",
               "sleep summary with re-logins: \(history.last!.summary)")
         drop(15_200, 15_201)
         check(history.count == 3 && history.last!.sleepSince == nil, "after the grace: an ordinary record")
