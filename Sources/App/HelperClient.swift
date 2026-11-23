@@ -151,11 +151,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         case .connected: return "已连接 · \(ProfileStore.loadProfile().server)"
         case .reconnecting:
             if detail == "等待网络恢复" { return detail }
-            let retries = dropRetryCount > 0 ? "（第 \(dropRetryCount) 次）" : ""
+            let progress = dropRetryCount > 0 ? "连接重试 \(dropRetryCount) 轮" : "正在重连"
             if !protectsDrops {
-                return "已断开，正在重连（断线保护已关，流量走本地网络）" + retries
+                return "断线保护已关，流量走本地网络 · " + progress
             }
-            return "已断开，网络已拦截，正在重连" + retries
+            return "网络已拦截 · " + progress
         }
     }
 

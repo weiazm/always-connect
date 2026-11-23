@@ -21,11 +21,11 @@ struct DropRecord: Codable, Equatable, Identifiable {
     /// When the episode ended (the name predates failed episodes).
     var recoveredAt: Date
     var outcome: Outcome?
-    /// Re-logins started during the episode (Cisco engine / Helper
+    /// Connection attempts started during the episode (Cisco engine / Helper
     /// openconnect engine episodeRetries). 0 = the session came back
     /// by itself; nil = old record.
     var retries: Int?
-    /// Times the episode waited for approval on the phone.
+    /// Times the App entered its approval-wait state during the episode.
     var approvals: Int?
     /// "cisco" or "own".
     var engine: String?
@@ -113,31 +113,31 @@ extension DropRecord {
         }
     }
 
-    /// One sentence: how long it was down, how many re-logins, how it
+    /// One sentence: how long it was down, how many connection attempts, how it
     /// ended and why.
     var summary: String {
         if isSleepRecord { return sleepSummary }
         let down = "断了 \(Self.durationText(durationSeconds))"
-        let relogins: String? = retries.flatMap { $0 > 0 ? "重新登录 \($0) 次" : nil }
+        let attempts: String? = retries.flatMap { $0 > 0 ? "连接重试 \($0) 轮" : nil }
         var text: String
         switch resolvedOutcome {
         case .recovered:
             if let retries {
-                text = retries == 0 ? "\(down)，连接自己续上了（没有重新登录）"
-                    : "\(down)，重新登录 \(retries) 次后恢复"
+                text = retries == 0 ? "\(down)，连接自己续上了"
+                    : "\(down)，连接重试 \(retries) 轮后恢复"
             } else {
                 text = "\(down)后恢复（旧记录，没有重试详情）"
             }
         case .failed:
-            text = "\(down)，\(relogins.map { $0 + "后" } ?? "")停止重试"
+            text = "\(down)，\(attempts.map { $0 + "后" } ?? "")停止重试"
             if let failureReason { text += "：\(failureReason)" }
         case .stoppedByUser:
-            text = "\(down)，\(relogins.map { $0 + "时" } ?? "重连中")你断开了 VPN"
+            text = "\(down)，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 VPN"
         case .quit:
-            text = "\(down)，\(relogins.map { $0 + "时" } ?? "重连中")退出了 App"
+            text = "\(down)，\(attempts.map { $0 + "时" } ?? "重连中")退出了 App"
         }
         if let approvals, approvals > 0 {
-            text += "；其中 \(approvals) 次等你在手机上批准"
+            text += "，等待登录确认 \(approvals) 次"
         }
         return text
     }
@@ -147,28 +147,30 @@ extension DropRecord {
     private var sleepSummary: String {
         let n = sleepDropCount
         let down = Self.durationText(durationSeconds)
-        let relogins: String? = retries.flatMap { $0 > 0 ? "重新登录 \($0) 次" : nil }
+        let attempts: String? = retries.flatMap { $0 > 0 ? "连接重试 \($0) 轮" : nil }
         var text = n > 1 ? "电脑睡眠时断了 \(n) 次，合计 \(down)" : "电脑睡眠时断了 \(down)"
         switch resolvedOutcome {
         case .recovered:
-            if let relogins {
-                text += n > 1 ? "，共\(relogins)，都已恢复" : "，\(relogins)后恢复"
+            if let attempts {
+                text += n > 1 ? "，共\(attempts)，都已恢复" : "，\(attempts)后恢复"
+            } else if retries == 0 {
+                text += n > 1 ? "，每次都自己续上了" : "，连接自己续上了"
             } else {
-                text += n > 1 ? "，每次都自己续上了（没有重新登录）" : "，连接自己续上了（没有重新登录）"
+                text += "，已恢复（旧记录，没有重试详情）"
             }
         case .failed:
-            text += n > 1 ? "，\(relogins.map { "共" + $0 + "，" } ?? "")最后一次停止重试"
-                : "，\(relogins.map { $0 + "后" } ?? "")停止重试"
+            text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次停止重试"
+                : "，\(attempts.map { $0 + "后" } ?? "")停止重试"
             if let failureReason { text += "：\(failureReason)" }
         case .stoppedByUser:
-            text += n > 1 ? "，\(relogins.map { "共" + $0 + "，" } ?? "")最后一次重连中你断开了 VPN"
-                : "，\(relogins.map { $0 + "时" } ?? "重连中")你断开了 VPN"
+            text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次重连中你断开了 VPN"
+                : "，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 VPN"
         case .quit:
-            text += n > 1 ? "，\(relogins.map { "共" + $0 + "，" } ?? "")最后一次重连中退出了 App"
-                : "，\(relogins.map { $0 + "时" } ?? "重连中")退出了 App"
+            text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次重连中退出了 App"
+                : "，\(attempts.map { $0 + "时" } ?? "重连中")退出了 App"
         }
         if let approvals, approvals > 0 {
-            text += "；其中 \(approvals) 次等你在手机上批准"
+            text += "，等待登录确认 \(approvals) 次"
         }
         return text
     }
@@ -179,21 +181,21 @@ extension DropRecord {
             let n = sleepDropCount
             let down = Self.durationText(durationSeconds)
             let head = n > 1 ? "睡眠中断了 \(n) 次（合计 \(down)）" : "睡眠中断了 \(down)"
-            let relogins = retries.flatMap { $0 > 0 ? "，重新登录 \($0) 次" : nil } ?? ""
+            let attempts = retries.flatMap { $0 > 0 ? "，连接重试 \($0) 轮" : nil } ?? ""
             switch resolvedOutcome {
-            case .recovered: return n > 1 ? "\(head)\(relogins)，都已恢复" : "\(head)\(relogins)后恢复"
-            case .failed: return "\(head)\(relogins)，没恢复"
-            case .stoppedByUser: return "\(head)\(relogins)，你断开了"
-            case .quit: return "\(head)\(relogins)，退出了 App"
+            case .recovered: return n > 1 ? "\(head)\(attempts)，都已恢复" : "\(head)\(attempts)后恢复"
+            case .failed: return "\(head)\(attempts)，没恢复"
+            case .stoppedByUser: return "\(head)\(attempts)，你断开了"
+            case .quit: return "\(head)\(attempts)，退出了 App"
             }
         }
         let down = Self.durationText(durationSeconds)
-        let relogins = retries.flatMap { $0 > 0 ? "，重新登录 \($0) 次" : nil } ?? ""
+        let attempts = retries.flatMap { $0 > 0 ? "，连接重试 \($0) 轮" : nil } ?? ""
         switch resolvedOutcome {
-        case .recovered: return "断了 \(down)\(relogins)后恢复"
-        case .failed: return "断了 \(down)\(relogins)，没恢复"
-        case .stoppedByUser: return "断了 \(down)\(relogins)，你断开了"
-        case .quit: return "断了 \(down)\(relogins)，退出了 App"
+        case .recovered: return "断了 \(down)\(attempts)后恢复"
+        case .failed: return "断了 \(down)\(attempts)，没恢复"
+        case .stoppedByUser: return "断了 \(down)\(attempts)，你断开了"
+        case .quit: return "断了 \(down)\(attempts)，退出了 App"
         }
     }
 

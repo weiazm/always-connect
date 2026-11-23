@@ -79,7 +79,7 @@ enum DiagnosticsExporter {
                 DiagnosticsRedaction.classify(.isSleepRecord, String(drop.isSleepRecord)),
                 DiagnosticsRedaction.classify(.sleepDropCount, String(drop.sleepDropCount)),
             ].filter { !$0.isEmpty }.joined(separator: "，")
-            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，重试 \(retries) 次，等待批准 \(approvals) 次；原因：\(reason)")
+            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，连接重试 \(retries) 轮，等待登录确认 \(approvals) 次；原因：\(reason)")
             if !metadata.isEmpty { lines[lines.count - 1] += "；\(metadata)" }
         }
         lines.append("")

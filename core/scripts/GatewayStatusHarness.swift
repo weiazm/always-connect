@@ -52,6 +52,12 @@ struct GatewayStatusHarness {
         let trace = try String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8)
         let events = trace.split(separator: "\n").filter { $0.hasPrefix("GATEWAY_TRUST ") }
         check(events == ["GATEWAY_TRUST accepted", "GATEWAY_TRUST rejected", "GATEWAY_TRUST accepted"], "TLS fixture ordered trust callbacks")
+        let retrying = HelperClient()
+        retrying.state = .reconnecting
+        retrying.dropRetryCount = 29
+        check(retrying.stateLine == "网络已拦截 · 连接重试 29 轮", "reconnection count identifies transport attempts")
+        retrying.detail = "等待网络恢复"
+        check(retrying.stateLine == "等待网络恢复", "offline waiting does not imply another retry")
         let login = HelperClient()
         for (state, detail, expected) in [(HelperClient.State.authenticating, "approval answered", "网关已回应，等待连接结果"),
                                           (.awaitingApproval, "tunnel negotiation accepted", "隧道协商完成，正在配置 VPN 网络")] {
