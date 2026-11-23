@@ -234,10 +234,10 @@ struct EgressNotificationHarness {
         let decoder = JSONDecoder()
         var status = try! decoder.decode(EgressProtection.Status.self, from: data)
         let monitor = EgressProtection.Status.monitoring(data)!
-        check(monitor.unknownCount == 7 && monitor.status.unknownWeb == nil,
+        check(monitor.unknownWebCount == 7 && monitor.unknownWeb == nil,
               "the panel reads real counts without retaining addresses or approval IDs")
         let beforeCount = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWeb":[{"count":5}]}"#.utf8)
-        check(EgressProtection.Status.monitoring(beforeCount)?.unknownCount == nil,
+        check(EgressProtection.Status.monitoring(beforeCount)?.unknownWebCount == nil,
               "an older backend's missing scalar is unknown, with no fallback scan")
         let approve = status.unknownWeb![0].change!
         let withdraw = status.unknownWeb![1].change!
@@ -271,7 +271,7 @@ struct EgressNotificationHarness {
         check(!expired.applied(approve) && !expired.permits(withdraw, config: config),
               "session end invalidates the event and receipt")
 
-        notifier.unknownEgressNotice(count: monitor.unknownCount!)
+        notifier.unknownEgressNotice(count: monitor.unknownWebCount!)
         let alert = center.requests.last!
         let category = center.categories.first { $0.identifier == alert.content.categoryIdentifier }
         check(category?.actions.map(\.title) == ["查看"] && alert.content.userInfo.isEmpty

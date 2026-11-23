@@ -132,6 +132,7 @@ struct EgressProtection: Codable, Equatable {
         let groups: [GroupState]
         let records: [BlockRecord]
         var unknownWeb: [UnknownWebRecord]? = nil
+        var unknownWebCount: UInt64? = nil
     }
 
     struct UnknownWebRecord: Decodable, Equatable {
