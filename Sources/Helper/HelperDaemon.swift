@@ -641,6 +641,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         let modeChanged = config.isActive != egress.isActive
         egress = config
         egressConfigured = true
+        if relay != nil && modeChanged {
+            // Only switching the gate on or off changes how OpenConnect is started.
+            HelperSession.log("egress: protection turned \(config.isActive ? "on" : "off"); reconnecting with the same login")
+        }
         if relay != nil && !(modeChanged && restartForEgressChange()) { engine?.updateEgress(json) }
     }
 
