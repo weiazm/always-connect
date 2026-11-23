@@ -48,7 +48,7 @@ struct EgressUnknownWebView: View {
                             if on { saveBlocking(true) }
                             else { pending = .turnOff }
                         }))
-                    Text("出口保护开启时，会拦截发往公网网页端口、无法判断网站的连接。可在这里查看原因和处理这次 VPN 会话中的例外。")
+                    Text("按浏览器查过的网址认，不保证认出所有程序。仍认不出网站时，会拦截发往公网网页端口的连接。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("本次连接的拦截记录") {
