@@ -35,7 +35,7 @@ struct EgressRuleDetail: View {
         self.remove = remove
         self.saveSites = saveSites
         _originalSites = State(initialValue: rule.sites)
-        _input = State(initialValue: EgressRuleInput.clashText(rule.sites))
+        _input = State(initialValue: rule.sites.joined(separator: "\n"))
     }
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
@@ -83,6 +83,9 @@ struct EgressRuleDetail: View {
                     EgressRuleIssues(issues: issues)
                 } header: {
                     Text("要保护的网站或网段")
+                } footer: {
+                    Text("直接在框里增删改，点「完成」保存。网址、*.example.com、粘贴的 Clash 规则行会统一成上面这种写法。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -150,7 +153,7 @@ struct EgressRuleDetail: View {
     }
 
     private func finish() {
-        if input == EgressRuleInput.clashText(originalSites) {
+        if input == originalSites.joined(separator: "\n") {
             dismiss()
             return
         }
@@ -159,7 +162,7 @@ struct EgressRuleDetail: View {
         guard let sites = parsed.replacementSites else {
             if !issues.isEmpty {
                 saveError = "第 \(issues[0].id) 行有问题，请修正后保存。"
-            } else if parsed.lines.isEmpty {
+            } else if parsed.sites.isEmpty {
                 saveError = "请至少保留一条规则。"
             } else {
                 saveError = "每个保护最多 \(EgressRuleInput.siteLimit) 条规则。"

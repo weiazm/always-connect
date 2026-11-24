@@ -1,53 +1,126 @@
 import Darwin
 import Foundation
 
-/// One line of the "不走 VPN" list (DESIGN.md §26.13). The user types
-/// any of:
+@_silgen_name("ac_list_rule_valid")
+private func ac_list_rule_valid(_ rule: UnsafePointer<CChar>) -> Bool
+
+/// One rule line, the same for the split list ("不走 VPN 的名单",
+/// DESIGN.md §26.13) and exit protection (§66.30: one parser, one
+/// syntax). The syntax is v2fly/domain-list-community's, the source of
+/// the site lists themselves (and what v2ray and Xray read):
 ///   example.com          the site and all its subdomains
-///   geosite:github       a ready-made site list (v2fly domain-list-
-///   geosite:google@cn    community, as v2ray uses), optionally
-///                        only its rules with that attribute
+///                        ("domain:example.com" is the same)
+///   full:www.example.com that name only
+///   keyword:example      any name containing it
+///   regexp:^a\d+\.example\.com$  any name matching it
+///   geosite:github       a ready-made site list, optionally
+///   geosite:google@cn    only its rules with that attribute
 ///   geoip:cn             any name whose address is in China mainland
 ///   192.168.0.0/16       a network (also a single address)
 /// Names and site lists are expanded here into the background service's
-/// rule kinds; networks go to the drop-protection allowlist (and, in
-/// split mode, direct routes), so they also work under Cisco.
+/// rule kinds. In the split list, networks go to the drop-protection
+/// allowlist (and, in split mode, direct routes), so they also work under
+/// Cisco; exit protection checks them as addresses.
 enum ListRule: Equatable {
     case domain(String)
+    case full(String)
+    case keyword(String)
+    case regexp(String)
     case geosite(String, attribute: String?)
     case geoip(String)
     case network(String)
 
     static func parse(_ input: String) -> ListRule? {
-        let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A pasted Clash/Surge line is only an input: it is stored and shown
+        // in this syntax (user, 2026-11-24: "保存时做格式归一化，转成 v2fly 格式").
+        if let converted = fromRuleLine(s) { s = converted }
         let lower = s.lowercased()
-        if lower.hasPrefix("geosite:") {
-            let parts = lower.dropFirst("geosite:".count).split(separator: "@", maxSplits: 1)
-            guard let name = parts.first.map(String.init), GeoData.hasList(name) else { return nil }
-            return .geosite(name, attribute: parts.count == 2 ? String(parts[1]) : nil)
+        func value(_ prefix: String) -> String? {
+            lower.hasPrefix(prefix) ? String(s.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) : nil
         }
-        if lower.hasPrefix("geoip:") {
-            let code = String(lower.dropFirst("geoip:".count))
-            return GeoData.geoipCountries.contains(code) ? .geoip(code) : nil
+        let rule: ListRule
+        if let name = value("geosite:") {
+            let parts = name.lowercased().split(separator: "@", maxSplits: 1).map(String.init)
+            guard let list = parts.first, GeoData.hasList(list) else { return nil }
+            let attribute = parts.count == 2 ? parts[1] : nil
+            if let attribute, GeoData.geosite(list, attribute: attribute).isEmpty { return nil }
+            rule = .geosite(list, attribute: attribute)
+        } else if let code = value("geoip:") {
+            guard GeoData.geoipCountries.contains(code.lowercased()) else { return nil }
+            rule = .geoip(code.lowercased())
+        } else if let name = value("full:") {
+            guard let name = domainName(name) else { return nil }
+            rule = .full(name)
+        } else if let word = value("keyword:") {
+            guard !word.isEmpty else { return nil }
+            rule = .keyword(word.lowercased())
+        } else if let pattern = value("regexp:") {
+            guard !pattern.isEmpty else { return nil }
+            rule = .regexp(pattern)
+        } else if let name = value("domain:") {
+            guard let name = domainName(name) else { return nil }
+            rule = .domain(name)
+        } else if isValidCIDR(s) {
+            rule = .network(s)
+        } else if isValidIPv4Address(s) {
+            rule = .network(s + "/32")
+        } else if let name = domainName(s) {
+            rule = .domain(name)
+        } else {
+            return nil
         }
-        if isValidCIDR(s) { return .network(s) }
-        if isValidIPv4Address(s) { return .network(s + "/32") }
-        if let domain = DirectSites.clean(s) { return .domain(domain) }
-        return nil
+        // The background service's own check (core egress_control::valid_rule):
+        // a regexp it cannot compile is refused here, not silently dropped there.
+        return ac_list_rule_valid(rule.text) ? rule : nil
+    }
+
+    /// A typed name cleaned of scheme, path and port; never an address:
+    /// "192.0.2.0/33" must not become the domain "192.0.2.0".
+    private static func domainName(_ input: String) -> String? {
+        guard let name = DirectSites.clean(input), !isValidIPv4Address(name) else { return nil }
+        return name
+    }
+
+    /// "DOMAIN-SUFFIX,example.com[,policy]" and the like, in this syntax;
+    /// nil when the line is not one. The policy field is dropped.
+    private static func fromRuleLine(_ line: String) -> String? {
+        guard !line.lowercased().hasPrefix("regexp:"), line.contains(",") else { return nil }
+        let fields = line.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard fields.count >= 2, !fields[1].isEmpty else { return nil }
+        let value = fields[1]
+        switch fields[0].uppercased() {
+        case "DOMAIN-SUFFIX": return "domain:" + value
+        case "DOMAIN": return "full:" + value
+        case "DOMAIN-KEYWORD": return "keyword:" + value
+        case "DOMAIN-REGEX": return "regexp:" + value
+        case "GEOSITE": return "geosite:" + value
+        case "GEOIP": return "geoip:" + value
+        case "IP-CIDR": return value
+        default: return nil
+        }
     }
 
     /// Why `input` is not a rule, in the user's words; nil when it is.
     static func problem(_ input: String) -> String? {
         let lower = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lower.isEmpty, parse(input) == nil else { return nil }
-        if lower.hasPrefix("geosite:") { return "没有叫这个名字的网站清单" }
+        if lower.hasPrefix("geosite:") {
+            return lower.contains("@") ? "这个清单里没有带这个标记的条目" : "没有叫这个名字的网站清单"
+        }
         if lower.hasPrefix("geoip:") { return "目前只支持 geoip:cn" }
-        return "认不出来：可以写网址、geosite:清单名、geoip 或网段"
+        if lower.hasPrefix("regexp:") { return "正则表达式写得不对" }
+        return "认不出来：可以写网址、full:、keyword:、regexp:、geosite:清单名、geoip 或网段"
     }
 
+    /// The stored and shown form.
     var text: String {
         switch self {
         case .domain(let d): return d
+        case .full(let d): return "full:" + d
+        case .keyword(let k): return "keyword:" + k
+        case .regexp(let r): return "regexp:" + r
         case .geosite(let name, let attribute): return "geosite:" + name + (attribute.map { "@" + $0 } ?? "")
         case .geoip(let code): return "geoip:" + code
         case .network(let cidr): return cidr
@@ -58,19 +131,25 @@ enum ListRule: Equatable {
     var kind: String {
         switch self {
         case .domain: return "网站（含子域名）"
+        case .full: return "只这一个域名"
+        case .keyword: return "域名里含这个词"
+        case .regexp: return "域名符合这个正则"
         case .geosite(let name, _):
             return "网站清单 · \(GeoData.ruleCount(name)) 条规则"
-        case .geoip: return "国家 IP · 解析到这些地址的网站直连"
-        case .network: return "网段 · 断线时也照常可用"
+        case .geoip: return "国家 IP · 解析到这些地址的网站"
+        case .network: return "网段"
         }
     }
 
     var isNetwork: Bool { if case .network = self { return true } else { return false } }
 
-    /// The background service's rule kinds (DNSForwarder's SplitRules).
+    /// The background service's rule kinds (DNSForwarder's SplitRules,
+    /// the exit gate's ProtectedSites). A network is [] here: the split
+    /// list routes it, exit protection sends it as "ipcidr:".
     var expanded: [String] {
         switch self {
         case .domain(let d): return [d]
+        case .full, .keyword, .regexp: return [text]
         case .geosite(let name, let attribute): return GeoData.geosite(name, attribute: attribute)
         case .geoip(let code): return GeoData.geoip(code).map { "ipcidr:" + $0 }
         case .network: return []
@@ -83,8 +162,11 @@ func isValidIPv4Address(_ value: String) -> Bool {
     return inet_pton(AF_INET, value, &a) == 1
 }
 
-/// The bundled data (scripts/make-geo-data.py): Resources/geosite.txt
-/// and geoip-cn.txt. Read once, on first use.
+/// The site lists and geoip:cn. geosite.txt is the downloaded one
+/// (GeoUpdater, DESIGN.md §66.30) when there is one, else the bundled
+/// one (scripts/make-geo-data.py); geoip-cn.txt is bundled. Read on first
+/// use and again whenever the downloaded file changes (the settings
+/// process and the menu-bar App each notice the other's update).
 enum GeoData {
     static let geoipCountries: Set<String> = ["cn"]
 
@@ -95,20 +177,58 @@ enum GeoData {
     /// whole file parsed and cached cost the App ~20 MB).
     private static var mapped: Data?
     private static var index: [String: Range<Int>]?
+    /// Which file was read: its path and modification time.
+    private static var loaded: (path: String, modified: timespec)?
+
+    /// Where updates go; uninstall removes the folder with the rest (§31).
+    static var updateDirectory: URL {
+        if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEO_DIR"] {
+            return URL(fileURLWithPath: dir)  // the harness never touches the user's copy
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AlwaysConnect/GeoData")
+    }
 
     private static func url(_ name: String) -> URL? {
         if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEODATA"] {
             return URL(fileURLWithPath: dir).appendingPathComponent(name)
         }
+        if name == "geosite.txt" {
+            let updated = updateDirectory.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: updated.path) { return updated }
+        }
+        return bundled(name)
+    }
+
+    static func bundled(_ name: String) -> URL? {
         let base = (name as NSString).deletingPathExtension
         return Bundle.main.url(forResource: base, withExtension: "txt")
             ?? Bundle.main.url(forResource: base, withExtension: "txt", subdirectory: "GeoData")
     }
 
+    private static func modified(_ path: String) -> timespec? {
+        var info = stat()
+        return stat(path, &info) == 0 ? info.st_mtimespec : nil
+    }
+
     private static func loadIndex() -> (Data, [String: Range<Int>]) {
         lock.lock(); defer { lock.unlock() }
-        if let mapped, let index { return (mapped, index) }
-        let data = url("geosite.txt").flatMap { try? Data(contentsOf: $0, options: .alwaysMapped) } ?? Data()
+        let file = url("geosite.txt")
+        let stamp = file.flatMap { modified($0.path) }
+        if let mapped, let index, let loaded, loaded.path == file?.path,
+           loaded.modified.tv_sec == stamp?.tv_sec, loaded.modified.tv_nsec == stamp?.tv_nsec {
+            return (mapped, index)
+        }
+        let data = file.flatMap { try? Data(contentsOf: $0, options: .alwaysMapped) } ?? Data()
+        let found = Self.listRanges(in: data)
+        mapped = data
+        index = found
+        loaded = file.flatMap { file in stamp.map { (file.path, $0) } }
+        return (data, found)
+    }
+
+    /// Where each "[name]" list's lines sit in the text.
+    static func listRanges(in data: Data) -> [String: Range<Int>] {
         var found: [String: Range<Int>] = [:]
         var current: String?
         var bodyStart = 0
@@ -127,9 +247,7 @@ enum GeoData {
             }
         }
         if let current { found[current] = bodyStart..<max(bodyStart, data.count) }
-        mapped = data
-        index = found
-        return (data, found)
+        return found
     }
 
     static func hasList(_ name: String) -> Bool { loadIndex().1[name] != nil }

@@ -127,6 +127,10 @@ final class SettingsLink {
         case "approvalCard": ApprovalPrompt.shared.settingsChanged()
         case "quit": AppQuit.request()  // the uninstaller, from Settings (not from this block, §37)
         case "installUpdate": UpdateChecker.shared.installAvailable()  // §35.4
+        case "updateSiteLists":  // §66.30: the menu-bar App downloads and re-sends
+            GeoUpdater.shared.check { [weak self] error in self?.reply(id, error == nil ? "1" : "0") }
+            return
+        case "siteListsChanged": client.siteListsChanged()
         case "pushDirectDomains":
             client.pushDirectDomains { [weak self] ok in self?.reply(id, ok.map { $0 ? "1" : "0" }) }
             return

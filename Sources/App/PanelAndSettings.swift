@@ -729,6 +729,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         // restart and corrects availability.
         manager.refreshStatus()
         UpdateChecker.shared.checkIfDue()
+        GeoUpdater.shared.checkIfDue()
         let view = PanelView(
             manager: manager,
             profile: ProfileStore.loadProfile(),

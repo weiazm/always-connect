@@ -33,6 +33,7 @@ pub mod session;
 pub mod split_policy;
 pub mod state_machine;
 pub mod traffic;
+pub mod geosite;
 pub mod update_check;
 
 #[cfg(feature = "openconnect")]

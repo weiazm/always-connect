@@ -170,12 +170,9 @@ struct EgressProtectionPage: View {
 
     private var moreMenu: some View {
         Menu {
-            Button("拷贝为 Clash 规则") {
-                let rules = config.groups.flatMap { group in
-                    group.sites.map { EgressRuleInput.clash($0, group: group.name) }
-                }.joined(separator: "\n")
+            Button("拷贝全部规则") {
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(rules, forType: .string)
+                NSPasteboard.general.setString(EgressRuleInput.text(of: config), forType: .string)
             }
             .disabled(!config.groups.contains { !$0.sites.isEmpty })
             Button("导入备份…") { importing = true }
@@ -258,7 +255,7 @@ struct EgressProtectionPage: View {
                             Text(group.name).fontWeight(.medium).lineLimit(1)
                             Text("\(group.sites.count) 条规则 · 查不到出口时：\(group.unverified.label)")
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                .help(group.sites.map { EgressRuleInput.clash($0) }.joined(separator: "\n"))
+                                .help(group.sites.joined(separator: "\n"))
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
                             } else if unverified > 0 {

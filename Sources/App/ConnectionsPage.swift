@@ -250,7 +250,7 @@ struct ConnectionsPage: View {
                 guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config:
                         ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) else { done(false); return }
                 let added = change.after.groups.first { group in !change.before.groups.contains { $0.id == group.id } }
-                let action = EgressAction(change: change, text: "已加入 \(input.lines.count) 条出口保护规则", rule: added?.id)
+                let action = EgressAction(change: change, text: "已加入 \(input.sites.count) 条出口保护规则", rule: added?.id)
                 done(true)
                 if change.needsReconnect(connected: manager.showsConnected) { egressPending = action } else { applyEgress(action) }
             }
@@ -304,7 +304,7 @@ struct ConnectionsPage: View {
                         } else {
                             Button("新建出口保护…") { egressAddition = .init(site: site) }
                             // Or add it to a rule there already is (user, 2026-11-24).
-                            let choices = Self.egressChoices(host: row.host, address: row.remote)
+                            let choices = DirectSites.choices(host: row.host, address: row.remote)
                             if !choices.isEmpty {
                                 ForEach(protectedConfig.groups) { rule in
                                     Menu("加入「\(rule.name)」") {
@@ -331,27 +331,18 @@ struct ConnectionsPage: View {
         .menuStyle(.borderlessButton).menuIndicator(.hidden).controlSize(.small).font(.caption).fixedSize()
     }
 
-    /// The 分流 menu's scopes, as exit-protection lines: the last one
-    /// ("只这一个") is that name alone (DOMAIN), not its subdomains.
-    static func egressChoices(host: String?, address: String) -> [DirectSites.Choice] {
-        let choices = DirectSites.choices(host: host, address: address)
-        return choices.map { choice in
-            choice.label.hasSuffix("只这一个") ? .init(rule: "full:" + choice.rule, label: choice.label) : choice
-        }
-    }
-
     private func addToRule(_ id: UInt32, line: String) {
         let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
         guard let rule = stored.groups.first(where: { $0.id == id }) else { return }
         guard !rule.sites.contains(line) else {
-            message = "「\(rule.name)」里已经有 \(EgressRuleInput.clash(line)) 了。"
+            message = "「\(rule.name)」里已经有 \(line) 了。"
             return
         }
         let change = EgressRuleChange(config: stored) { config in
             guard let index = config.groups.firstIndex(where: { $0.id == id }) else { return }
             config.groups[index].sites.append(line)
         }
-        let action = EgressAction(change: change, text: "已把 \(EgressRuleInput.clash(line)) 加入「\(rule.name)」", rule: id)
+        let action = EgressAction(change: change, text: "已把 \(line) 加入「\(rule.name)」", rule: id)
         if change.needsReconnect(connected: manager.showsConnected) { egressPending = action } else { applyEgress(action) }
     }
 

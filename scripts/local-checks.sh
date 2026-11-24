@@ -94,6 +94,7 @@ python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sa
 # 4d5 approval card: when it shows, updates, finishes, hides (§29)
 "$REPO/scripts/approval-prompt-test.sh" > /tmp/ac-approval-prompt.log 2>&1 && pass approval-prompt || { fail approval-prompt; grep FAIL /tmp/ac-approval-prompt.log || true; }
 "$REPO/scripts/list-rules-test.sh" > /tmp/ac-list-rules.log 2>&1 && pass list-rules || { fail list-rules; grep FAIL /tmp/ac-list-rules.log || true; }
+"$REPO/scripts/geo-update-test.sh" > /tmp/ac-geo-update.log 2>&1 && pass geo-update || { fail geo-update; grep FAIL /tmp/ac-geo-update.log || true; }
 "$REPO/scripts/neighbors-test.sh" > /tmp/ac-neighbors.log 2>&1 && pass neighbors || { fail neighbors; grep FAIL /tmp/ac-neighbors.log || true; }
 "$REPO/scripts/connections-test.sh" > /tmp/ac-connections.log 2>&1 && pass connections || { fail connections; grep FAIL /tmp/ac-connections.log || true; }
 "$REPO/scripts/connections-ui-test.sh" && pass connections-ui || fail connections-ui

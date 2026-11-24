@@ -1730,7 +1730,7 @@ pub extern "C" fn ac_egress_config_valid(json: *const c_char) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn ac_egress_rule_valid(rule: *const c_char) -> bool {
+pub extern "C" fn ac_list_rule_valid(rule: *const c_char) -> bool {
     c_str(rule).is_some_and(|rule| crate::egress_control::valid_rule(&rule, false))
 }
 
@@ -2072,4 +2072,20 @@ pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engin
 #[no_mangle]
 pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
     unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
+}
+
+/// A downloaded `dlc.dat` as the bundled site-list text (DESIGN.md
+/// §66.30); null when the file is damaged or not a full catalogue.
+#[no_mangle]
+pub extern "C" fn ac_geosite_from_dlc(data: *const u8, len: usize) -> *mut c_char {
+    if data.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the App passes a buffer it owns for the length it states.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    crate::geosite::from_dlc(bytes)
+        .ok()
+        .and_then(|text| CString::new(text).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }

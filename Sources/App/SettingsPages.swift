@@ -804,6 +804,8 @@ struct SplitPage: View {
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
 
+            SiteListsSection()
+
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {
                     LocalLanStatus()
@@ -826,6 +828,8 @@ struct SplitPage: View {
     /// shows no region or streaming examples. geoip:cn still parses.
     static let examples: [(rule: String, meaning: String)] = [
         ("example.com", "这个网站和它所有子域名"),
+        ("full:www.example.com", "只这一个域名"),
+        ("keyword:example", "域名里含这个词"),
         ("10.0.0.5", "单个地址"),
         ("192.168.50.0/24", "一个网段"),
         ("geosite:apple", "苹果相关域名（系统更新、App Store 等）"),
@@ -841,7 +845,8 @@ struct SplitPage: View {
     private func icon(_ site: DirectSite) -> String {
         guard site.domains.count == 1, let rule = ListRule.parse(site.domains[0]) else { return "globe" }
         switch rule {
-        case .domain: return "globe"
+        case .domain, .full: return "globe"
+        case .keyword, .regexp: return "text.magnifyingglass"
         case .geosite: return "list.bullet.rectangle"
         case .geoip: return "flag"
         case .network: return "point.3.connected.trianglepath.dotted"
@@ -947,6 +952,57 @@ struct SplitPage: View {
 
 }
 
+/// The site lists' version and updates (DESIGN.md §66.30), shared by the
+/// split list and exit protection.
+struct SiteListsSection: View {
+    @ObservedObject private var updater = GeoUpdater.shared
+    @State private var autoUpdate = ProfileStore.loadAppSettings().isSiteListsAutoUpdateOn
+    @State private var result: String?
+
+    var body: some View {
+        Section {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("现用 \(updater.versionText)")
+                    if let error = updater.lastError {
+                        Text("上次更新没成功：\(error)").font(.caption).foregroundStyle(.orange)
+                    } else if let result {
+                        Text(result).font(.caption).foregroundStyle(.secondary)
+                    } else if let when = updater.lastSuccess {
+                        Text("上次检查 \(when.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if updater.checking { ProgressView().controlSize(.small) }
+                Button("立即更新") {
+                    let before = updater.version
+                    result = nil
+                    updater.check { error in
+                        result = error ?? (updater.version == before ? "已经是最新" : "已更新，规则已重新生效")
+                    }
+                }
+                .disabled(updater.checking)
+            }
+            Toggle("每天自动更新", isOn: $autoUpdate)
+                .onChange(of: autoUpdate) { on in
+                    var settings = ProfileStore.loadAppSettings()
+                    settings.siteListsAutoUpdate = on
+                    ProfileStore.saveAppSettings(settings)
+                }
+            if updater.version != nil {
+                Button("改回 App 自带的清单") { updater.useBundled() }
+                    .buttonStyle(.borderless).font(.caption)
+            }
+        } header: {
+            Text("网站清单（geosite）")
+        } footer: {
+            Footnote("分流名单和出口保护里的 geosite: 都按这份清单展开。开着自动更新时，App 每天看一次 v2fly/domain-list-community 有没有新版，校验通过才换上，换上后规则马上按新清单生效。")
+        }
+        .onAppear { updater.reload() }
+    }
+}
+
 /// The hover card on the split page: the rules in one column, what they
 /// mean in the other (§26.16, §26.18).
 struct RuleExamples: View {
@@ -961,7 +1017,7 @@ struct RuleExamples: View {
                     }
                 }
             }
-            Text("geosite 后面填清单名，来自开源的 v2fly/domain-list-community（App 自带 2026-11-05 版）。\n点这个问号打开全部清单名：github.com/v2fly/domain-list-community")
+            Text("geosite 后面填清单名，来自开源的 v2fly/domain-list-community（现用 \(GeoUpdater.shared.versionText)）。出口保护用同一种写法。\n点这个问号打开全部清单名：github.com/v2fly/domain-list-community")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

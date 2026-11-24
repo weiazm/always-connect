@@ -293,7 +293,11 @@ struct AppSettings: Codable, Equatable {
     var onDemandEnabled: Bool?
     var onDemandRules: [OnDemandRule]?
     var egressProtection: EgressProtection?
+    /// Keep the site lists (geosite:) current from their publisher
+    /// (DESIGN.md §66.30). Nil = on.
+    var siteListsAutoUpdate: Bool?
 
+    var isSiteListsAutoUpdateOn: Bool { siteListsAutoUpdate ?? true }
     var isDropProtectionOn: Bool { dropProtection ?? true }
     var isApprovalCardOn: Bool { approvalCard ?? true }
     var usesOwnConnection: Bool { connectionMode == "own" }

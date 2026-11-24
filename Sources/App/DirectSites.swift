@@ -78,7 +78,8 @@ extension DirectSites {
             }
             for (i, level) in levels.reversed().enumerated() {
                 let last = i == levels.count - 1
-                out.append(Choice(rule: level, label: level + (last ? "  只这一个" : "  和它的子域名")))
+                // The same rules for both lists (§66.30): "只这一个" is that name alone.
+                out.append(Choice(rule: last ? "full:" + level : level, label: level + (last ? "  只这一个" : "  和它的子域名")))
             }
         }
         if isValidIPv4Address(address) {
@@ -96,6 +97,8 @@ extension DirectSites {
             switch ListRule.parse(line) {
             case .domain(let d)?:
                 if let name, name == d || name.hasSuffix("." + d) { return line }
+            case .full(let d)?:
+                if name == d { return line }
             case .network(let cidr)?:
                 if contains(cidr, address) { return line }
             default: break

@@ -395,6 +395,11 @@ jobs:
       - name: Split list rules (domains, geosite, geoip, networks; bundled data)
         # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
         run: scripts/list-rules-test.sh
+      - name: Site-list updates (synthetic releases on a local feed)
+        # Sources/App/GeoUpdater.swift (DESIGN.md §66.30): hash, catalogue and
+        # lists-in-use checks, no download for an unchanged release. The real
+        # GitHub release download is Mac proof.
+        run: scripts/geo-update-test.sh
       - name: On-demand policy and connection orchestration
         run: scripts/on-demand-test.sh
       - name: Egress notification actions and recovery (mock settings and delivery)

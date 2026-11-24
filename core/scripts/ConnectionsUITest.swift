@@ -91,9 +91,9 @@ struct ConnectionsUITest {
         }
 
         let defaultViewport = scroll.contentView.bounds.size
-        let scopes = ConnectionsPage.egressChoices(host: "a.edge.example.com", address: "192.0.2.9").map(\.rule)
+        let scopes = DirectSites.choices(host: "a.edge.example.com", address: "192.0.2.9").map(\.rule)
         check(scopes == ["example.com", "edge.example.com", "full:a.edge.example.com", "192.0.2.9/32"],
-              "adding a row to an existing protection offers the site, its subdomains, the name alone and the address")
+              "both lists offer the site, its subdomains, the name alone and the address")
         check(table.rect(ofColumn: 5).maxX <= scroll.documentVisibleRect.maxX,
               "all columns fit at the default window size")
         for size in [SettingsWindow.size, SettingsWindow.minimumSize] {
@@ -139,35 +139,37 @@ struct ConnectionsUITest {
         check(!initial.rulesForEditing.groups[0].enabled
               && (try! JSONDecoder().decode(EgressProtection.self, from: bytes)).groups[0].enabled,
               "old disabled master switch remains disabled and viewing doesn't mutate stored bytes")
+        // One parser for both lists (§66.30): the split list's syntax, no Clash lines.
         let input = EgressRuleInput("""
+        example.org
+        full:exact.test
+        keyword:fixture
+        domain:example.org
         DOMAIN-SUFFIX,example.org,Office
-        DOMAIN,exact.test,Office
-        DOMAIN-KEYWORD,fixture,Office
-        IP-CIDR,192.0.2.0/24,Network,no-resolve
-        GEOIP,CN,Network,no-resolve
-        GEOSITE,test
-        IP-CIDR,198.51.100.2
-        PROCESS-NAME,Example,Office
-        IP-CIDR,192.0.2.0/33
-        IP-CIDR6,2001:db8::/32
+        PROCESS-NAME,example
+        regexp:(
+        geosite:nosuchlist
         """.replacingOccurrences(of: "\n", with: "\r\n"))
-        check(input.lines.count == 7 && input.groupCount == 3
-              && input.issues.map(\.id) == [8, 9, 10] && input.issues[0].message == "不支持 PROCESS-NAME",
-              "mixed Clash rows retain actual CRLF line numbers and group names")
-        for line in input.lines {
-            let copy = EgressRuleInput.clash(line.site, group: line.group)
-            check(EgressRuleInput(copy).lines == [line], "Clash rule round trips")
+        check(input.sites == ["example.org", "full:exact.test", "keyword:fixture"]
+              && input.issues.map(\.id) == [6, 7, 8] && input.issues[1].message == "正则表达式写得不对"
+              && input.issues[2].message == "没有叫这个名字的网站清单",
+              "rule lines parse like the split list, pasted Clash lines normalize, CRLF line numbers and reasons")
+        check(EgressRuleInput(input.sites.joined(separator: "\n")).sites == input.sites
+              && EgressRuleInput("regexp:^node[0-9]{1,3}[.]example$").sites == ["regexp:^node[0-9]{1,3}[.]example$"],
+              "stored rules read back unchanged")
+        func add(_ text: String, _ countries: [String], _ policy: EgressProtection.Unverified,
+                 to config: EgressProtection) -> EgressRuleChange? {
+            EgressRuleChange.adding(EgressRuleInput(text), countries: countries, unverified: policy, config: config)
         }
-        let regex = EgressRuleInput("regexp:^node[0-9]{1,3}[.]example$")
-        check(regex.lines.count == 1
-              && EgressRuleInput(EgressRuleInput.clash(regex.lines[0].site, group: "Fixture, regex")).lines.first?.group == "Fixture, regex"
-              && EgressRuleInput("regexp:(").lines.isEmpty, "a compiled regex and quoted group round trip")
-        guard let added = EgressRuleChange.adding(input, countries: ["ZZ"], unverified: .block, config: initial) else {
-            fail("create grouped rules")
+        guard let first = add(input.sites.joined(separator: "\n"), ["ZZ"], .block, to: initial),
+              let second = add("192.0.2.0/24\ngeoip:cn", ["ZZ"], .block, to: first.after),
+              let third = add("geosite:test\n198.51.100.2", ["ZZ"], .block, to: second.after) else {
+            fail("create rules")
         }
+        let added = EgressRuleChange(before: initial, after: third.after)
         check(added.after.enabled && !added.after.groups[0].enabled && added.after.groups.count == 4
-              && added.after.groups[1].name == "Office" && added.after.groups[1].expect == ["ZZ"]
-              && added.after.groups[1].unverified == .block, "new groups arm with the selected policy")
+              && added.after.groups[1].name == "example.org" && added.after.groups[1].expect == ["ZZ"]
+              && added.after.groups[1].unverified == .block, "a new rule arms with the selected policy")
         check(added.needsReconnect(connected: true) && !added.needsReconnect(connected: false)
               && added.undo.after == initial, "first rule requires a live reconnect and undo restores the original snapshot")
         check(EgressRuleChange.adding(EgressRuleInput(""), countries: ["ZZ"], unverified: .allow, config: initial) == nil
@@ -184,21 +186,20 @@ struct ConnectionsUITest {
         check(added.after.groups.allSatisfy { $0.matches == nil }
               && added.after.forBackgroundService.groups[2].matches?.contains(where: { $0.hasPrefix("ipcidr:") }) == true,
               "expansion stays out of the settings model")
-        let append = EgressRuleInput("DOMAIN,additional.test,Office")
-        let merged = EgressRuleChange.adding(append, countries: ["YY"], unverified: .allow, config: added.after)?.after
-        check(merged?.groups.count == 4 && merged?.groups[1].sites.last == "full:additional.test"
-              && merged?.groups[1].expect == ["ZZ"] && merged?.groups[1].unverified == .block,
-              "an existing policy group keeps its own countries and policy")
+        let copied = EgressRuleInput.text(of: added.after)
+        check(copied.hasPrefix("# Retained\nretained.example.com\n\n# example.org\nexample.org\n")
+              && EgressRuleInput(copied).issues.isEmpty,
+              "copied rules are one block per protection and read back without errors")
+        // The detail's whole-list edit (§66.29) in the shared syntax (§66.30).
         let old = Data(#"{"enabled":true,"groups":[{"id":7,"name":"Fixture","enabled":true,"expect":["ZZ"],"members":[{"pattern":"*.legacy.example"},{"pattern":"archive.example"}]}]}"#.utf8)
         let legacy = try! JSONDecoder().decode(EgressProtection.self, from: old)
         let original = legacy.groups[0].sites
-        check(EgressRuleInput.clashText(original) == "DOMAIN-SUFFIX,legacy.example\nDOMAIN-SUFFIX,archive.example",
+        check(original.joined(separator: "\n") == "legacy.example\narchive.example",
               "opening an older rule prefills the original entries in order")
-
         let changed = EgressRuleInput("""
         DOMAIN,EXACT.EXAMPLE.,Ignored group
         192.0.2.4
-        DOMAIN-SUFFIX,legacy.example
+        domain:legacy.example
         full:exact.example
         """)
         let expected = ["full:exact.example", "192.0.2.4/32", "legacy.example"]
@@ -211,10 +212,9 @@ struct ConnectionsUITest {
               "completion deletes omitted entries, normalizes edits and preserves all other settings")
         let update = EgressConfigUpdate(config: replacement.after, previous: replacement.before)
         let reopened = try! JSONDecoder().decode(EgressConfigUpdate.self, from: JSONEncoder().encode(update)).config
-        check(EgressRuleInput(EgressRuleInput.clashText(reopened.groups[0].sites)).replacementSites == expected,
+        check(EgressRuleInput(reopened.groups[0].sites.joined(separator: "\n")).replacementSites == expected,
               "reopening shows the saved normalized list")
-
-        let invalid = EgressRuleInput("DOMAIN,valid.example\nPROCESS-NAME,Fixture\nIP-CIDR,192.0.2.0/33")
+        let invalid = EgressRuleInput("full:valid.example\nPROCESS-NAME,Fixture\n192.0.2.0/33")
         let tooMany = EgressRuleInput((0...EgressRuleInput.siteLimit).map { "example-\($0).test" }.joined(separator: "\n"))
         check(invalid.issues.map(\.id) == [2, 3] && invalid.replacementSites == nil
               && EgressRuleInput("# comment only").replacementSites == nil && tooMany.replacementSites == nil,
@@ -223,10 +223,10 @@ struct ConnectionsUITest {
               "a stale editor cannot overwrite a rule already changed elsewhere")
         let mixed = ["legacy.example", "full:exact.example", "keyword:fixture", "regexp:^node[0-9]{1,3}[.]example$",
                      "geosite:test", "geoip:cn", "192.0.2.0/24"]
-        check(EgressRuleInput(EgressRuleInput.clashText(mixed)).replacementSites == mixed,
+        check(EgressRuleInput(mixed.joined(separator: "\n")).replacementSites == mixed,
               "all existing rule types retain their meaning when reopened")
         print("PASS exit rule detail normalizes a complete edit and rejects an invalid or stale draft")
-        print("PASS Clash rules parse, group, expand and round trip")
+        print("PASS rule lines parse, expand and copy like the split list")
     }
 
     @MainActor private static func renderEgress(to output: String) {

@@ -89,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // here and on panel open, after the launch's own work settled.
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             UpdateChecker.shared.checkIfDue()
+            GeoUpdater.shared.checkIfDue()  // §66.30, the same rhythm
         }
         // Auto-connect on launch when credentials are stored — after
         // updating a background service older than this App (one

@@ -200,7 +200,7 @@ remove "$R/Library/Logs/AlwaysConnect"
 if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
     L="$USER_HOME/Library"
     remove "$L/Logs/AlwaysConnect"
-    remove "$L/Application Support/AlwaysConnect"
+    remove "$L/Application Support/AlwaysConnect"  # incl. downloaded site lists (§66.30)
     remove "$L/Caches/$BUNDLE_ID"
     remove "$L/HTTPStorages/$BUNDLE_ID"
     remove "$L/HTTPStorages/$BUNDLE_ID.binarycookies"

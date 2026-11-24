@@ -2045,6 +2045,24 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
     }
 
+    /// New site lists are in place (GeoUpdater, §66.30): the split list
+    /// and exit protection are expanded again and sent, when they name one.
+    func siteListsChanged() {
+        if AppRole.isSettings {
+            SettingsLink.shared.send("siteListsChanged") { _ in }
+            return
+        }
+        let settings = ProfileStore.loadAppSettings()
+        let usesLists = { (lines: [String]) in lines.contains { $0.lowercased().hasPrefix("geosite:") } }
+        if settings.splitOn, usesLists(DirectSites.sites(settings).flatMap(\.domains)) {
+            pushDirectDomains()
+        }
+        if let egress = settings.egressProtection, egress.isActive, !usesCisco, settings.isDropProtectionOn,
+           usesLists(egress.groups.filter(\.enabled).flatMap(\.sites)) {
+            sendEgress(egress) { _ in }
+        }
+    }
+
     func saveEgress(_ config: EgressProtection, replacing previous: EgressProtection? = nil,
                     completion: @escaping (Bool) -> Void) {
         if AppRole.isSettings {

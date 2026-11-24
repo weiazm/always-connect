@@ -6,7 +6,7 @@ struct EgressRuleText: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("每行一条，支持 Clash 写法或分流名单写法。")
+            Text("每行一条，和分流名单同一种写法：example.com、full:、keyword:、regexp:、geosite:、geoip:cn、网段。粘贴的 Clash 规则行会自动转换。")
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $input)
                 .font(.system(.callout, design: .monospaced))
@@ -143,7 +143,7 @@ struct EgressSiteSheet: View {
          save: @escaping (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void) {
         self.preview = preview
         self.save = save
-        _input = State(initialValue: EgressRuleInput.clashText(sites))
+        _input = State(initialValue: sites.joined(separator: "\n"))
         _countries = State(initialValue: countries)
     }
 
@@ -156,18 +156,14 @@ struct EgressSiteSheet: View {
                 Section("要保护的网站或网段") {
                     EgressRuleText(input: $input)
                     if !input.isEmpty {
-                        Text("识别 \(parsed.lines.count) 条（分成 \(parsed.groupCount) 条保护） · 不支持或无效 \(parsed.issues.count) 条")
+                        Text("识别 \(parsed.sites.count) 条 · 无效 \(parsed.issues.count) 条")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     EgressRuleIssues(issues: parsed.issues)
-                    if parsed.lines.contains(where: { $0.group != nil }) {
-                        Text("有策略组名的规则按组名归入保护，同名保护沿用原来的出口设置。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
                     EgressRecentSites(preview: preview) { site in
-                        guard !parsed.lines.contains(where: { $0.site == site && $0.group == nil }) else { return }
+                        guard !parsed.sites.contains(site) else { return }
                         if !input.isEmpty && input.last?.isNewline != true { input += "\n" }
-                        input += EgressRuleInput.clash(site)
+                        input += site
                     }
                 }
                 Section("允许的出口") {
@@ -196,7 +192,7 @@ struct EgressSiteSheet: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(parsed.lines.isEmpty || countries.isEmpty || saving)
+                .disabled(parsed.sites.isEmpty || countries.isEmpty || saving)
             }
             .padding(16)
         }

@@ -30,7 +30,7 @@ setup() {
     S="$R/Library/Application Support/AlwaysConnect"
     mkdir -p "$R/Library/LaunchDaemons" "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin" \
         "$S/relay" "$R/Library/Logs/AlwaysConnect" \
-        "$H/Library/Logs/AlwaysConnect" "$H/Library/Application Support/AlwaysConnect" \
+        "$H/Library/Logs/AlwaysConnect" "$H/Library/Application Support/AlwaysConnect/GeoData" \
         "$H/Library/Caches/com.alwaysconnect.app" "$H/Library/Preferences" "$H/Desktop" \
         "$H/Library/Saved Application State/com.alwaysconnect.app.savedState" \
         "$R/opt/cisco/secureclient/bin" "$R/Applications/Cisco"
@@ -44,6 +44,7 @@ setup() {
         "$R/Library/Logs/AlwaysConnect/helper.log" \
         "$H/Library/Logs/AlwaysConnect/relay.log" "$H/Library/Logs/AlwaysConnect/update.log" \
         "$H/Library/Application Support/AlwaysConnect/alwaysconnect-vpnc.sh" \
+        "$H/Library/Application Support/AlwaysConnect/GeoData/geosite.txt" \
         "$H/Library/Preferences/com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.render.plist" \
