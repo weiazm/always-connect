@@ -824,7 +824,7 @@ fn unidentified_web_applies_to_tcp_web_ports_and_real_site_names_still_pass() {
     let mut g = gate();
     g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
     let now = Instant::now();
-    let outer_ech = hello(Some("public.example"), &[], true, 0);
+    let outer_ech = hello(Some("cloudflare-ech.com"), &[], true, 0);
     let cases = [
         (443, outer_ech.as_slice(), Step::Consumed),
         (443, &b"opaque"[..], Step::Consumed),
@@ -850,7 +850,7 @@ fn ech_denial_reports_only_the_extension_on_the_last_blocked_web_flow() {
     let mut gate = gate();
     gate.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
     let now = Instant::now();
-    let ech = hello(Some("front.example"), &[], true, 0);
+    let ech = hello(Some("cloudflare-ech.com"), &[], true, 0);
     assert_eq!(connect_and_send(&mut gate, 43101, PUBLIC, &ech, now).0, Step::Consumed);
     assert!(matches!(drain(&mut gate).as_slice(), [Out::ToHost(_)]));
     let first = gate.take_unknown_web().unwrap();
@@ -921,7 +921,8 @@ fn only_current_forwarder_evidence_relaxes_ech_ambiguity() {
     let mut g = proof_gate();
     g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
     let now = Instant::now();
-    let outer = "ordinary.example";
+    // A cover name: only current forwarder evidence can vouch for it.
+    let outer = "cloudflare-ech.com";
     let ech = hello(Some(outer), &[], true, 0);
     let address = [("93.184.216.44", 60)];
     // The gate may inspect packets for protective routing, but an observed
@@ -937,7 +938,7 @@ fn only_current_forwarder_evidence_relaxes_ech_ambiguity() {
     assert_eq!(connect_and_send(&mut g, 45161, PUBLIC, &ech, now).0, Step::Consumed);
     drain(&mut g);
     g.take_unknown_web();
-    dns_evidence_update(&mut g, 4, "Ordinary.Example.", 1, 10_000, &address);
+    dns_evidence_update(&mut g, 4, "Cloudflare-ECH.com.", 1, 10_000, &address);
     assert_eq!(connect_and_send(&mut g, 45162, PUBLIC, &ech, now).0, Step::Forward);
     assert!(drain(&mut g).is_empty());
     assert!(g.take_unknown_web().is_none());
@@ -946,8 +947,9 @@ fn only_current_forwarder_evidence_relaxes_ech_ambiguity() {
     let unnamed = hello(None, &[], true, 0);
     assert_eq!(connect_and_send(&mut g, 45163, PUBLIC, &unnamed, now).0, Step::Consumed);
     drain(&mut g);
+    // A plain visible name is the real site (GREASE) and passes (§66.23).
     let unassociated = hello(Some("unassociated.example"), &[], true, 0);
-    assert_eq!(connect_and_send(&mut g, 45166, PUBLIC, &unassociated, now).0, Step::Consumed);
+    assert_eq!(connect_and_send(&mut g, 45166, PUBLIC, &unassociated, now).0, Step::Forward);
     drain(&mut g);
     g.reconfigure(vec![], Box::new(Rules));
     g.reset_dns_evidence(4);
@@ -1026,7 +1028,7 @@ fn ech_rrsets_replace_independently_and_expire_from_observation_time() {
     g.reset_dns_evidence(7);
     let now = Instant::now();
     let host = "ordinary.example";
-    let outer = "front.example";
+    let outer = "cloudflare-ech.com";
     let ech = hello(Some(outer), &[], true, 0);
     // The answers were already 500 ms old before the gate received them.
     dns_evidence_update(&mut g, 7, host, 1, 9_500, &[("93.184.216.44", 60)]);
@@ -1485,4 +1487,32 @@ fn sniffers_read_names() {
     assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: [2001:db8::1]:80\r\n\r\n"), HttpHost::Host(Some("2001:db8::1".into())));
     assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), HttpHost::Host(None));
     assert_eq!(parse_dns_answer(&dns_answer("a.example", &[SITE, OTHER])), Some(("a.example".into(), vec![(IpAddr::V4(SITE.into()), 60), (IpAddr::V4(OTHER.into()), 60)])));
+}
+
+#[test]
+fn grease_with_a_plain_name_passes_but_cover_and_published_public_names_wait_for_evidence() {
+    let mut g = proof_gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    g.reset_dns_evidence(9);
+    let now = Instant::now();
+    // Chromium's GREASE: the real name outside, no DNS seen by the forwarder.
+    let grease = hello(Some("chat.ordinary.example"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45180, PUBLIC, &grease, now).0, Step::Forward);
+    assert!(drain(&mut g).is_empty());
+    assert!(g.take_unknown_web().is_none());
+    // A built-in cover name hides the site.
+    let cover = hello(Some("cloudflare-ech.com"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45181, PUBLIC, &cover, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    // So does a public name a live HTTPS answer published for another site.
+    dns_evidence_update(&mut g, 9, "elsewhere.example", 65, 10_000, &[("front.example", 60)]);
+    let published = hello(Some("front.example"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45182, PUBLIC, &published, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::ToHost(_)]));
+    // A protected name is still checked, never passed by its visibility.
+    let protected = hello(Some("a.protected.example"), &[], true, 0);
+    assert_eq!(connect_and_send(&mut g, 45183, PUBLIC, &protected, now).0, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 1, .. }]));
+    // An ECH hello without any outer name stays unidentified.
+    assert_eq!(connect_and_send(&mut g, 45184, PUBLIC, &hello(None, &[], true, 0), now).0, Step::Consumed);
 }

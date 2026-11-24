@@ -250,6 +250,14 @@ impl DnsEvidence {
         });
     }
 
+    /// Whether a live HTTPS/SVCB answer published `outer` as an ECH public
+    /// name: then a ClientHello showing it hides its real site.
+    pub(super) fn is_public_name(&self, outer: &str, now: u64) -> bool {
+        self.names.values().any(|name| {
+            name.ech.iter().any(|set| set.values.iter().any(|link| link.at_ms > now && link.value == outer))
+        })
+    }
+
     pub(super) fn classify(&self, address: IpAddr, outer: Option<&str>, now: u64, classifier: &dyn Classifier) -> DnsMatch {
         let Some(entry) = self.addresses.get(&address) else { return DnsMatch::Unknown };
         let mut group = None;

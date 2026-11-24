@@ -46,6 +46,9 @@ const MAX_WARMS_PER_WINDOW: usize = 8;
 const WARM_WINDOW: Duration = Duration::from_secs(1);
 const WARM_NAME_LIFETIME: Duration = Duration::from_secs(60);
 
+/// Outer names that real ECH deployments use to hide the site.
+const ECH_COVER_NAMES: &[&str] = &["cloudflare-ech.com"];
+
 /// Same boot-relative, sleep-inclusive clock in the gate and its controller.
 pub fn evidence_clock_ms() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -951,6 +954,25 @@ impl Gate {
         DnsMatch::Unknown
     }
 
+    /// A ClientHello with the ECH extension shows either the real site
+    /// (GREASE, what Chromium sends when the site has no ECH) or a cover name
+    /// (real ECH). Without matching DNS evidence, a plain site name that is
+    /// neither a known cover name nor a public name from a live HTTPS/SVCB
+    /// answer is taken as the real site: blocking every such connection
+    /// stopped ordinary apps that resolve names their own way (maintainer,
+    /// 2026-11-24, DESIGN §66.23). Protected names never reach this point.
+    fn visible_ordinary_name(&self, outer: &str) -> bool {
+        let name = norm(outer);
+        if !is_site_name(&name) || ECH_COVER_NAMES.contains(&name.as_str()) {
+            return false;
+        }
+        if self.classifier.group_for_name(&name).is_some() {
+            return false;
+        }
+        !(self.dns_evidence.active()
+            && (self.clock)().is_none_or(|now| self.dns_evidence.is_public_name(&name, now)))
+    }
+
     /// Decide a holding connection by its destination address.
     fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason, outer: Option<&str>) -> Step {
         let known = self.ip_group(key.dst);
@@ -967,7 +989,9 @@ impl Gate {
             self.wait_for_check(key, group, host.map(|host| host.to_string()), false, now);
             return Step::Consumed;
         }
-        let ordinary = matches!(association, DnsMatch::Ordinary);
+        let ordinary = matches!(association, DnsMatch::Ordinary)
+            || (reason == UnknownWebReason::Ech && matches!(association, DnsMatch::Unknown)
+                && outer.is_some_and(|name| self.visible_ordinary_name(name)));
         if !ordinary && self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) {
             self.block(key, BlockReason::UnidentifiedWeb(reason));
             Step::Consumed

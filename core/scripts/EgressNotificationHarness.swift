@@ -237,7 +237,7 @@ struct EgressNotificationHarness {
         check(monitor.unknownWebCount == 7 && monitor.unknownWeb == nil,
               "the panel reads real counts without retaining addresses or approval IDs")
         if let rows = try? JSONDecoder().decode(EgressProtection.Status.self, from: data).unknownWeb {
-            check(rows[0].identityExplanation?.contains("占位扩展") == true && rows[1].identityExplanation == nil,
+            check(rows[0].identityExplanation?.contains("加密掩护名") == true && rows[1].identityExplanation == nil,
                   "only the latest observed ECH extension explains an unidentified connection")
         } else { check(false, "unknown web rows decode") }
         let beforeCount = Data(#"{"running":true,"checking":[],"groups":[],"records":[],"unknownWeb":[{"count":5}]}"#.utf8)

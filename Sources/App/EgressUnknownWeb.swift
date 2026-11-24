@@ -41,7 +41,7 @@ struct EgressUnknownWebChange: Codable, Equatable {
 
 extension EgressProtection.UnknownWebRecord {
     var identityExplanation: String? {
-        lastReason == "ech" ? "上次握手带有 ECH 扩展。浏览器也可能发送这种占位扩展，App 无法确认实际访问的网站名。" : nil
+        lastReason == "ech" ? "上次握手用加密掩护名（或没有网站名）隐藏了实际网站，也对不上 VPN 里查过的地址，App 无法确认访问的是哪个网站。" : nil
     }
 
     var endpoint: EgressUnknownWebEndpoint { .init(address: address, port: port) }

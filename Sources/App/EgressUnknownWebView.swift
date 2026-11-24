@@ -48,7 +48,7 @@ struct EgressUnknownWebView: View {
                             if on { saveBlocking(true) }
                             else { pending = .turnOff }
                         }))
-                    Text("按浏览器查过的网址认，不保证认出所有程序。仍认不出网站时，会拦截发往公网网页端口的连接。")
+                    Text("能看到真实网站名的连接照常放行。网站名被加密掩护名藏起来或根本没有、又对不上 VPN 里查过的地址时，才拦下发往公网网页端口的连接。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("本次连接的拦截记录") {
