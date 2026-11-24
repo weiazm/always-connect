@@ -216,7 +216,10 @@ extension EgressProtection.Status {
             let ranges = exitChanges(for: rule).map { EgressDecision.range($0, rule: rule.name) }
             if !countries.isEmpty || !ranges.isEmpty { return countries + ranges }
             guard let state = groups.first(where: { $0.id == rule.id }), state.displayLevel == .blocked else { return [] }
-            return [.unverified(rule.id, rule: rule.name, caption: state.blockCaption ?? "出口无法核实")]
+            // Name the website that is actually blocked, not the whole rule (user report, 2026-11-24).
+            let site = state.sites?.first(where: { $0.state == "blocked" })?.host ?? state.lastBlockedHost ?? rule.name
+            let others = site == rule.name ? "" : "；\(rule.name) 的其他网站照常逐条检查"
+            return [.unverified(rule.id, rule: site, caption: "查不到它从哪里出去，按规则先拦住了" + others)]
         }
     }
 }
