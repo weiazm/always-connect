@@ -1272,6 +1272,11 @@ pub extern "C" fn ac_cisco_network_changed(e: *const cisco::Engine) {
 }
 
 #[no_mangle]
+pub extern "C" fn ac_cisco_retry_now(e: *const cisco::Engine) {
+    if let Some(e) = unsafe { e.as_ref() } { e.retry_now() }
+}
+
+#[no_mangle]
 pub extern "C" fn ac_cisco_rearm(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.rearm() }
 }
@@ -1709,6 +1714,11 @@ pub extern "C" fn ac_oc_unknown_web_exception(e: *const oc_engine::Engine, addre
     let (Some(engine), Some(ip), Some(id)) = (unsafe {e.as_ref()}, c_str(address).and_then(|s|s.parse().ok()), c_str(approval_id))
         else {return false};
     engine.unknown_web_exception(ip, port, allow, &id)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_retry_now(e: *const oc_engine::Engine) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|engine| engine.retry_now())
 }
 
 #[no_mangle]

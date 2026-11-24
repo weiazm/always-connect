@@ -139,8 +139,8 @@ struct ApprovalPromptTest {
         _ = expiry.handle(.approval, now: at(0))
         _ = expiry.handle(.gatewayReply, now: at(100))
         if case .update(let late) = expiry.handle(.expired(120), now: at(101)) {
-            check(late.title == "手机上的批准已超时" && late.subtitle(now: at(101)) == "2:00 后重新发起"
-                  && late.subtitle(now: at(220)) == "0:01 后重新发起"
+            check(late.title == "手机批准已超时" && late.subtitle(now: at(101)) == "2:00 后自动重发"
+                  && late.subtitle(now: at(220)) == "0:01 后自动重发"
                   && late.subtitle(now: at(222)) == "正在重新发起…", "expiry replaces the gateway reply and counts down")
         } else { check(false, "expiry updates the card") }
         check(expiry.handle(.expired(120), now: at(110)) == .none, "the same expiry pushed again changes nothing")
@@ -150,7 +150,7 @@ struct ApprovalPromptTest {
             check(second.request == 2 && second.subtitle(now: at(222)).hasPrefix("第 2 次请求"), "the next push counts as request 2")
         } else { check(false, "next push shows") }
         _ = expiry.handle(.expired(60), now: at(322))
-        check(expiry.card?.subtitle(now: at(322)) == "第 2 次 · 1:00 后重新发起", "later expiries name the count")
+        check(expiry.card?.subtitle(now: at(322)) == "第 2 次 · 1:00 后重发", "later expiries name the count")
         var hiddenExpiry = T()
         _ = hiddenExpiry.handle(.approval, now: at(0))
         hiddenExpiry.hide()

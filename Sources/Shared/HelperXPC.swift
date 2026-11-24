@@ -150,6 +150,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             withReply reply: @escaping (Bool, [String]) -> Void)
     func getEgressStatus(withReply reply: @escaping (String) -> Void)
+    /// Own connection: send the scheduled login retry now (an expired phone
+    /// approval, §30.9). False when no retry is waiting.
+    func retryLoginNow(withReply reply: @escaping (Bool) -> Void)
     func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void)
     /// Read-only address sample for a confirmed site. Empty method selects the trace method.
     func probeEgressSummary(_ host: String, method: String, withReply reply: @escaping (String) -> Void)

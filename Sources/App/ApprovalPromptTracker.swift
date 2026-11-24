@@ -155,7 +155,7 @@ struct ApprovalPromptTracker {
 extension ApprovalPromptTracker.Card {
     var title: String {
         switch (stage, kind) {
-        case (.expired, _): return "手机上的批准已超时"
+        case (.expired, _): return "手机批准已超时"
         case (.gatewayReply, _): return "网关已回应"
         case (.configuring, _): return "正在配置 VPN 网络"
         case (.connected, _): return "已连接"
@@ -173,9 +173,10 @@ extension ApprovalPromptTracker.Card {
         case .expired:
             // Short enough for the bubble's one line.
             let count = request > 1 ? "第 \(request) 次 · " : ""
-            guard let retryAt else { return count + "稍后重新发起" }
+            let auto = count.isEmpty ? "自动重发" : "重发"
+            guard let retryAt else { return count + "稍后" + auto }
             let left = retryAt.timeIntervalSince(now)
-            return left > 0.5 ? count + Self.clock(left) + " 后重新发起" : "正在重新发起…"
+            return left > 0.5 ? count + Self.clock(left) + " 后" + auto : "正在重新发起…"
         case .configuring: return "隧道协商完成 · " + Self.clock(now.timeIntervalSince(since))
         case .gatewayReply: return "等待连接结果 · " + Self.clock(now.timeIntervalSince(since))
         case .establishing: return "马上就好"

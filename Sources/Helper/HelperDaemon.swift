@@ -682,6 +682,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         queue.async { reply(self.engine?.egressStatus() ?? "{}") }
     }
 
+    func retryLoginNow(withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            let taken = self.engine?.retryNow() ?? false
+            if taken { HelperSession.log("login retry requested by the user") }
+            reply(taken)
+        }
+    }
+
     func setUnknownWebException(_ address: String, port: Int, allow: Bool, approvalId: String,
                                 withReply reply: @escaping (Bool) -> Void) {
         queue.async {

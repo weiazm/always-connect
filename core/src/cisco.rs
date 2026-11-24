@@ -356,6 +356,8 @@ enum Command_ {
     },
     Connect(u32),
     Disconnect(u32),
+    /// The user asked for the scheduled retry now (2026-11-24).
+    RetryNow(u32),
     Rearm,
     Refresh(u32),
     /// The routing table changed.
@@ -556,6 +558,12 @@ impl Engine {
         if self.shared.is_current(intent) {
             self.shared.post(DISCONNECTED, "正在断开…", false);
         }
+    }
+
+    /// Send the scheduled retry now (an expired phone approval). Ignored
+    /// unless the engine is waiting between attempts.
+    pub fn retry_now(&self) {
+        let _ = self.tx.send(Command_::RetryNow(self.shared.current_intent()));
     }
 
     /// The background service restarted: send it the current kill switch again.
@@ -926,6 +934,15 @@ impl Shared {
                 self.command(st, *command);
                 if !self.is_current(intent) {
                     trace.result(Outcome::Cancelled);
+                }
+            }
+            Command_::RetryNow(intent) => {
+                // Only a wait between attempts: a running login or a
+                // connected tunnel is never doubled.
+                if self.is_current(intent) && st.wanted && st.retry_at.is_some()
+                    && !self.stop_requested.load(Ordering::SeqCst) && !self.offline.load(Ordering::SeqCst) {
+                    st.retry_at = None;
+                    self.attempt(st);
                 }
             }
             Command_::Connect(intent) => {

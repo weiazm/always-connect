@@ -131,6 +131,9 @@ final class CiscoEngine {
     /// The Helper restarted: send it the current kill switch again.
     func rearm() { existing.map(ac_cisco_rearm) }
 
+    /// Send the scheduled retry now (an expired phone approval).
+    func retryNow() { existing.map(ac_cisco_retry_now) }
+
     /// Launch / panel open: adopt a tunnel Cisco already has up (the
     /// App was restarted, the session never stopped).
     func refresh() {
@@ -292,6 +295,8 @@ func ac_cisco_protection_pending(_ e: OpaquePointer, _ request: UInt64) -> Bool
 func ac_cisco_protection_reply(_ e: OpaquePointer, _ request: UInt64, _ applied: Bool)
 @_silgen_name("ac_cisco_rearm")
 func ac_cisco_rearm(_ e: OpaquePointer)
+@_silgen_name("ac_cisco_retry_now")
+func ac_cisco_retry_now(_ e: OpaquePointer)
 @_silgen_name("ac_cisco_refresh")
 func ac_cisco_refresh(_ e: OpaquePointer)
 @_silgen_name("ac_cisco_is_managing")

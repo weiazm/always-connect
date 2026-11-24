@@ -2239,6 +2239,31 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
+    /// The approval bubble's 「现在重新发起」: the next login attempt now
+    /// instead of after the backoff. Either engine ignores it unless a
+    /// retry is waiting, so it never starts a second login.
+    func retryLoginNow(completion: @escaping (Bool) -> Void = { _ in }) {
+        if let cisco {
+            cisco.retryNow()
+            completion(true)
+            return
+        }
+        guard !HelperInstaller.installedHelperOutdated, HelperInstaller.installedHelperMatchesBundle else {
+            completion(false)
+            return
+        }
+        var pending = true
+        func finish(_ taken: Bool) {
+            guard pending else { return }
+            pending = false
+            completion(taken)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }
+        ensureConnection { proxy in
+            proxy.retryLoginNow { taken in DispatchQueue.main.async { finish(taken) } }
+        }
+    }
+
     func recheckEgressRule(_ id: UInt32, completion: @escaping (Bool) -> Void) {
         if AppRole.isSettings {
             SettingsLink.shared.send("recheckEgressRule", String(id)) { completion($0 == "1") }

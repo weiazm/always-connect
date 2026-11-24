@@ -160,8 +160,11 @@ enum Event {
     DnsAnswer(dns_forwarder::Observation, Sender<bool>),
     DnsDelivered(delivered_dns::Record),
     DnsCompatibilityLoss(delivered_dns::Loss),
-    /// A scheduled retry: spawn again unless a manual stop landed first.
-    Respawn,
+    /// A scheduled retry: spawn again unless a manual stop landed first
+    /// or the user already asked for it (the epoch moved on).
+    Respawn(u64),
+    /// The user asked for the next attempt now (§30.9, 2026-11-24).
+    RetryNow,
     #[cfg(test)]
     Barrier(Sender<()>),
     Availability(bool),
@@ -411,6 +414,10 @@ mod cstp_dns;
 mod delivered_dns;
 
 struct Core {
+    /// A retry is scheduled and no attempt is running.
+    respawn_waiting: bool,
+    /// Bumped by RetryNow so the retired backoff timers do nothing.
+    respawn_epoch: u64,
     config: Config,
     protected_routes: Option<Arc<crate::egress_control::ProtectedRoutes>>,
     driver: SessionDriver,
@@ -511,6 +518,8 @@ impl Engine {
             .then(|| Arc::new(config.egress.as_ref().expect("active").protected_routes()));
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
+                respawn_waiting: false,
+                respawn_epoch: 0,
                 driver: SessionDriver::new(seed),
                 config,
                 protected_routes,
@@ -616,6 +625,17 @@ impl Engine {
     pub fn update_egress(&self, cfg: crate::egress_control::EgressConfig) {
         self.send(Event::Egress(cfg));
     }
+    /// Send the next login attempt now instead of waiting out the backoff,
+    /// e.g. after an expired phone approval. Only between attempts: never a
+    /// second login next to a running one. True when it was taken.
+    pub fn retry_now(&self) -> bool {
+        let allowed = self.shared.core.lock().expect("engine").retry_now_allowed();
+        if allowed {
+            self.send(Event::RetryNow);
+        }
+        allowed
+    }
+
     pub fn recheck_egress(&self, group: u32) -> bool {
         {
             let c = self.shared.core.lock().expect("engine");
@@ -852,6 +872,10 @@ impl Drop for Engine {
 }
 
 impl Core {
+    fn retry_now_allowed(&self) -> bool {
+        self.respawn_waiting && !self.stop_requested && self.child.is_none() && !self.finished && !self.network.paused
+    }
+
     /// A cancelled child is unavailable even after the physical path returns.
     /// Mandatory protection/retirement continues; optional permissions do not.
     fn recovery_suspended(&self) -> bool {
@@ -1091,8 +1115,17 @@ impl Shared {
                     } else { false };
                     let _ = reply.send(committed);
                 }
-                Event::Respawn => {
-                    if !c.stop_requested {
+                Event::Respawn(epoch) => {
+                    if epoch == c.respawn_epoch && !c.stop_requested {
+                        c.respawn_waiting = false;
+                        self.spawn_next(&mut c);
+                    }
+                }
+                Event::RetryNow => {
+                    if c.retry_now_allowed() {
+                        c.respawn_epoch += 1;
+                        c.respawn_waiting = false;
+                        self.report(&c, "retry requested by the user");
                         self.spawn_next(&mut c);
                     }
                 }
@@ -1724,7 +1757,7 @@ impl Shared {
                     return;
                 }
                 if let DriverAction::Reauthenticate { delay } = c.driver.on_approval_timeout() {
-                    self.respawn_after(delay.as_secs_f64());
+                    self.respawn_after(c, delay.as_secs_f64());
                 }
             }
             Timer::NetWatch => {
@@ -1737,12 +1770,14 @@ impl Shared {
     }
 
     /// A respawn that no-ops when a manual stop landed first.
-    fn respawn_after(self: &Arc<Self>, delay: f64) {
+    fn respawn_after(self: &Arc<Self>, c: &mut Core, delay: f64) {
+        c.respawn_waiting = true;
+        let epoch = c.respawn_epoch;
         let weak = Arc::downgrade(self);
         let _ = std::thread::Builder::new().stack_size(32 * 1024).spawn(move || {
             std::thread::sleep(Duration::from_secs_f64(delay.max(0.0)));
             if let Some(me) = weak.upgrade() {
-                me.send(Event::Respawn);
+                me.send(Event::Respawn(epoch));
             }
         });
     }
@@ -1796,7 +1831,7 @@ impl Shared {
             return;
         }
         if !self.require_login_hold(c) {
-            self.respawn_after(5.0);
+            self.respawn_after(c, 5.0);
             return;
         }
         // An inherited or dropped session may have failed to install its
@@ -1813,7 +1848,7 @@ impl Shared {
                         return;
                     }
                 }
-                self.respawn_after(5.0);
+                self.respawn_after(c, 5.0);
                 return;
             }
         }
@@ -2332,7 +2367,7 @@ impl Shared {
                 c.declined_approvals += 1;
                 let delay = c.config.push_backoff.first().copied().unwrap_or(DECLINED_RETRY) * jitter();
                 self.report(c, &format!("手机上的登录确认没有通过，{} 秒后重新发起", delay.round() as i64));
-                self.respawn_after(delay);
+                self.respawn_after(c, delay);
                 return;
             }
             c.driver.on_auth_outcome(AuthOutcome::Rejected);
@@ -2372,7 +2407,7 @@ impl Shared {
                     // The drop window is fail-closed again (§17.5).
                     self.load_pf(c, Some(tun), gws, false);
                 }
-                self.respawn_after(delay.as_secs_f64());
+                self.respawn_after(c, delay.as_secs_f64());
                 return;
             }
         }
@@ -2391,7 +2426,7 @@ impl Shared {
         c.saw_login_failed = false;
         let when = if delay < 90.0 { format!("{} 秒", delay.round() as i64) } else { format!("{} 分钟", (delay / 60.0).round() as i64) };
         self.report(c, &format!("手机上的批准已超时，{when}后重新发起批准"));
-        self.respawn_after(delay);
+        self.respawn_after(c, delay);
     }
 
     fn handle_post_auth_failure(self: &Arc<Self>, c: &mut Core, detail: &str) {
@@ -2400,9 +2435,9 @@ impl Shared {
         }
         if let DriverAction::Reauthenticate { delay } = c.driver.on_auth_outcome(AuthOutcome::Transient) {
             self.report(c, detail);
-            self.respawn_after(delay.as_secs_f64());
+            self.respawn_after(c, delay.as_secs_f64());
         } else if let DriverAction::Reauthenticate { delay } = c.driver.on_drop(false) {
-            self.respawn_after(delay.as_secs_f64());
+            self.respawn_after(c, delay.as_secs_f64());
         } else {
             self.finish_terminal(c, Terminal::AttemptsExhausted, detail);
         }
@@ -3313,6 +3348,44 @@ mod tests {
             core.finished = true;
         }
         // No processes, routes or real pfctl are used by this fixture.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_now_only_shortens_a_scheduled_wait_and_retires_its_timer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ac-retry-now-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let pfctl = dir.join("fake-pfctl");
+        std::fs::write(&pfctl, "#!/bin/sh\ncat >/dev/null\necho 'Token : 123' >&2\n").unwrap();
+        std::fs::set_permissions(&pfctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Arc::new(Guard::new(network_guard::Settings {
+            support_dir: dir.clone(), boot: Some("test".into()), grace: Duration::from_secs(120),
+            pfctl: Some(pfctl.to_string_lossy().into()),
+        }));
+        let engine = Engine::new(
+            Config { no_routes: true, test_active: true, support_dir: dir.to_string_lossy().into(), ..Config::default() },
+            Hooks {
+                state: Box::new(|_, _| {}), terminal: Box::new(|_| {}), network_available: Box::new(|| true),
+                physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]), system_roots: Box::new(|| None),
+                stopped: Box::new(|| {}),
+            },
+            guard,
+        );
+        {
+            let mut core = engine.shared.core.lock().unwrap();
+            assert!(!core.retry_now_allowed(), "nothing scheduled: nothing to bring forward");
+            engine.shared.respawn_after(&mut core, 3600.0);
+            assert!(core.retry_now_allowed(), "a scheduled retry may be brought forward");
+            assert_eq!(core.respawn_epoch, 0, "scheduling keeps the epoch");
+            core.stop_requested = true;
+            assert!(!core.retry_now_allowed(), "never after a manual stop");
+            core.stop_requested = false;
+            core.finished = true;
+            assert!(!core.retry_now_allowed(), "never after the session ended");
+        }
+        assert!(!engine.retry_now(), "the public entry refuses outside a wait");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

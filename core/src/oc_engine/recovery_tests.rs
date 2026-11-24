@@ -571,7 +571,7 @@ fn queued_respawn_waits_for_exit_event_after_process_is_reaped() {
             alive: Arc::new(AtomicBool::new(false)),
         });
     }
-    f.engine.shared.send(Event::Respawn);
+    f.engine.shared.send(Event::Respawn(0));
     f.barrier();
     let attempts = {
         let mut c = f.engine.shared.core.lock().unwrap();
@@ -611,7 +611,7 @@ fn restoration_after_reaping_still_fences_output_until_exited_is_consumed() {
         stdout: true,
         bytes: b"AC_HOOK connect tun=utun99 gateway=198.51.100.7\n".to_vec(),
     });
-    f.engine.shared.send(Event::Respawn);
+    f.engine.shared.send(Event::Respawn(0));
     f.barrier();
     let (waiting, hooked, attempts) = {
         let mut c = f.engine.shared.core.lock().unwrap();

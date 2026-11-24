@@ -228,7 +228,8 @@ final class ApprovalPrompt {
             onOpen: { [weak self] in
                 self?.userHid()
                 self?.openPanel()
-            })
+            },
+            onRetry: { HelperClient.shared.retryLoginNow() })
         let host = FirstClickHostingView(rootView: view)
         host.frame.size = NSSize(width: ApprovalBubbleMetrics.windowWidth,
                                  height: ApprovalBubbleMetrics.windowHeight)
