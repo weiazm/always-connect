@@ -27,6 +27,7 @@ use activity::{Denied, SiteStatus};
 
 const MAX_GROUPS: usize = 16;
 const MAX_SITES: usize = 256;
+const MAX_MATCHES: usize = 20_000;
 /// Checks running at once; more are refused until one finishes.
 const MAX_CHECKS: usize = 32;
 /// Wrong-exit servers remembered per rule (status, approval, recheck).
@@ -43,7 +44,16 @@ pub struct EgressConfig {
     pub groups: Vec<Group>,
 }
 
-/// A rule: the sites it protects (with subdomains) and the countries
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Unverified {
+    Allow,
+    #[default]
+    WhenWrong,
+    Block,
+}
+
+/// A rule: the sites and IPv4 ranges it protects, and the countries
 /// their connections may leave from (ISO 3166 alpha-2).
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +63,9 @@ pub struct Group {
     pub enabled: bool,
     pub sites: Vec<String>,
     pub expect: Vec<String>,
+    pub unverified: Unverified,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Arc<Vec<String>>>,
 }
 
 impl<'de> Deserialize<'de> for Group {
@@ -73,6 +86,8 @@ impl<'de> Deserialize<'de> for Group {
             sites: Vec<String>,
             expect: Vec<String>,
             members: Vec<Member>,
+            unverified: Unverified,
+            matches: Option<Arc<Vec<String>>>,
         }
         let f = Fields::deserialize(deserializer)?;
         let mut sites = f.sites;
@@ -85,7 +100,10 @@ impl<'de> Deserialize<'de> for Group {
                 }
             }
         }
-        Ok(Group { id: f.id, name: f.name, enabled: f.enabled, sites, expect: f.expect })
+        Ok(Group {
+            id: f.id, name: f.name, enabled: f.enabled, sites, expect: f.expect,
+            unverified: f.unverified, matches: f.matches,
+        })
     }
 }
 
@@ -94,8 +112,19 @@ impl Group {
         self.expect.iter().any(|c| c.eq_ignore_ascii_case(country))
     }
 
-    fn covers(&self, host: &str) -> bool {
-        ProtectedSites::new(&[SiteGroup { id: self.id, sites: self.sites.clone() }]).group_for(host).is_some()
+    fn site_group(&self) -> SiteGroup {
+        let sites = self.matches.as_deref().cloned().unwrap_or_else(|| {
+            self.sites.iter().filter_map(|site| {
+                if site.starts_with("geosite:") || site.starts_with("geoip:") {
+                    None
+                } else if crate::dns_forwarder::cidr_range(site).is_some() {
+                    Some(format!("ipcidr:{site}"))
+                } else {
+                    Some(site.trim().to_owned())
+                }
+            }).collect()
+        });
+        SiteGroup { id: self.id, sites }
     }
 }
 
@@ -111,7 +140,10 @@ impl EgressConfig {
         ids.len() == self.groups.len() && self.groups.len() <= MAX_GROUPS
             && self.groups.iter().all(|g| {
                 g.sites.len() <= MAX_SITES
-                    && g.sites.iter().all(|site| site.contains('.') && valid_host(site.trim()))
+                    && g.sites.iter().all(|site| valid_rule(site, false))
+                    && g.matches.as_ref().is_none_or(|entries| entries.len() <= MAX_MATCHES
+                        && (!self.enabled || !g.enabled || g.sites.is_empty() || !entries.is_empty())
+                        && entries.iter().all(|entry| valid_rule(entry, true)))
                     && g.expect.iter().all(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
                     && (!g.enabled || g.sites.is_empty() || !g.expect.is_empty())
             })
@@ -123,7 +155,7 @@ impl EgressConfig {
             return Vec::new();
         }
         self.groups.iter().filter(|g| g.enabled && !g.sites.is_empty())
-            .map(|g| SiteGroup { id: g.id, sites: g.sites.clone() }).collect()
+            .map(Group::site_group).collect()
     }
 
     pub fn protected_sites(&self) -> ProtectedSites {
@@ -136,6 +168,28 @@ impl EgressConfig {
 
     fn enabled_group(&self, id: u32) -> Option<&Group> {
         self.group(id).filter(|g| g.enabled && self.active())
+    }
+}
+
+pub fn valid_rule(raw: &str, expanded: bool) -> bool {
+    let rule = raw.trim();
+    if rule.is_empty() || raw.len() > 300 || rule.chars().any(char::is_control) {
+        return false;
+    }
+    match rule.split_once(':') {
+        Some(("full" | "domain", value)) => valid_host(value),
+        Some(("keyword", value)) => !value.is_empty(),
+        Some(("regexp", value)) => !value.is_empty() && regex_lite::Regex::new(value).is_ok(),
+        Some(("ipcidr", value)) if expanded => crate::dns_forwarder::cidr_range(value).is_some(),
+        Some(("geoip", "cn")) if !expanded => true,
+        Some(("geosite", value)) if !expanded => {
+            let identifier = |s: &str| !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-!".contains(&b));
+            value.split_once('@').map_or_else(|| identifier(value), |(n, a)| identifier(n) && identifier(a))
+        }
+        Some(_) => false,
+        None => (rule.contains('.') && valid_host(rule))
+            || (!expanded && crate::dns_forwarder::cidr_range(rule).is_some()),
     }
 }
 
@@ -242,6 +296,10 @@ pub fn read_trace(resp: &Response) -> Result<(String, Option<String>), String> {
 /// Probe `host` at the checked server `ip` through the tunnel.
 fn probe(hook: &ProbeHook, host: &str, ip: IpAddr, marker: &str, interface: &str) -> Observation {
     let mut obs = Observation { host: host.into(), peer_address: Some(ip), ..Default::default() };
+    if host.is_empty() {
+        obs.error = Some("看不到网站名".into());
+        return obs;
+    }
     let mut alpn = vec!["http/1.1".to_string()];
     if !marker.is_empty() {
         alpn.push(marker.into());
@@ -350,7 +408,7 @@ impl Status {
         } else if let Some(open) = self.records.iter_mut().find(|r| r.group == group.id && r.ended.is_none()).filter(|_| was_blocked) {
             open.observed = failing;
         } else {
-            let host = failing.first().map(|o| o.host.clone());
+            let host = failing.first().filter(|o| !o.host.is_empty()).map(|o| o.host.clone());
             self.records.push_front(BlockRecord {
                 started: at, ended: None, group: group.id, name: group.name.clone(), host,
                 observed: failing, expected: group.expect.clone(),
@@ -387,6 +445,7 @@ struct ActiveCheck {
 
 struct ControlState {
     config: EgressConfig,
+    sites: ProtectedSites,
     status: Status,
     interface: String,
     peer: Option<UnixStream>,
@@ -422,28 +481,40 @@ impl ControlState {
     fn record(&mut self, group: &Group, target: Target, mut obs: Observation) -> &'static str {
         let failed = self.failures.entry(group.id).or_default();
         let previous = failed.iter().position(|f| f.target == target).map(|i| failed.remove(i));
+        let mut remember = false;
         let verdict = match obs.country.as_deref() {
-            None => "unverified",
             Some(country) if group.allows(country) => "allow",
             Some(_) => {
                 obs.approval_id = previous.as_ref()
                     .filter(|p| p.observation.country == obs.country && p.observation.ip == obs.ip)
                     .and_then(|p| p.observation.approval_id.clone())
                     .or_else(approval_id);
-                if failed.len() >= MAX_FAILED_TARGETS {
-                    failed.remove(0);
-                }
-                failed.push(Failed { target, observation: obs.clone() });
+                remember = true;
                 "block"
             }
-        };
-        let failing: Vec<_> = failed.iter().map(|f| f.observation.clone()).collect();
-        if verdict == "unverified" {
-            self.note_unverified(group);
-            if previous.is_none() {
-                return verdict;
+            None if group.unverified == Unverified::Block => {
+                remember = true;
+                "block"
             }
+            None => {
+                // A failed probe does not establish that a wrong exit recovered.
+                if let Some(previous) = previous.as_ref().filter(|p| p.observation.country.is_some()) {
+                    failed.push(Failed { target: previous.target.clone(), observation: previous.observation.clone() });
+                }
+                if group.unverified == Unverified::WhenWrong && failed.iter().any(|f| f.observation.country.is_some()) {
+                    return "block";
+                }
+                self.note_unverified(group);
+                return "unverified";
+            }
+        };
+        if remember {
+            if failed.len() >= MAX_FAILED_TARGETS {
+                failed.remove(0);
+            }
+            failed.push(Failed { target, observation: obs.clone() });
         }
+        let failing = failed.iter().map(|f| f.observation.clone()).collect();
         self.status.apply(group, &obs, failing, now());
         verdict
     }
@@ -464,6 +535,9 @@ impl ControlState {
                 st.observed = self.failures[&st.id].iter().map(|f| f.observation.clone()).collect();
                 for r in self.status.records.iter_mut().filter(|r| r.group == st.id && r.ended.is_none()) {
                     r.observed.clone_from(&st.observed);
+                    if let Some(group) = self.config.group(st.id) {
+                        r.expected.clone_from(&group.expect);
+                    }
                 }
             }
         }
@@ -471,15 +545,18 @@ impl ControlState {
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.status.groups.retain(|st| cfg.enabled_group(st.id).is_some());
+        let sites = cfg.protected_sites();
         self.failures.retain(|id, failed| {
             let Some(group) = cfg.enabled_group(*id) else { return false };
-            failed.retain(|f| group.covers(&f.target.host)
-                && !f.observation.country.as_deref().is_some_and(|c| group.allows(c)));
+            failed.retain(|f| sites.group_for_target(&f.target.host, f.target.ip) == Some(*id)
+                && f.observation.country.as_deref().map_or(group.unverified == Unverified::Block,
+                    |country| !group.allows(country)));
             !failed.is_empty()
         });
         self.config = cfg;
+        self.sites = sites;
         self.settle();
+        self.status.groups.retain(|st| self.config.enabled_group(st.id).is_some());
         let frame = self.gate_config(marker);
         self.send(&frame);
         self.send("{\"invalidate\":true}");
@@ -521,7 +598,7 @@ impl Controller {
         let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
-                config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
+                sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
                 on_peer_loss: None,
             }),
@@ -731,10 +808,20 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         let key = (peer_id, id);
         if state.checks.contains_key(&key) { continue; }
         let host = check.host.trim_end_matches('.').to_ascii_lowercase();
-        let usable = state.config.enabled_group(check.group).is_some_and(|g| g.covers(&host))
-            && valid_host(&host) && !state.interface.is_empty() && state.checks.len() < MAX_CHECKS;
+        let usable = (host.is_empty() || valid_host(&host))
+            && state.sites.group_for_target(&host, check.ip) == Some(check.group)
+            && !state.interface.is_empty() && state.checks.len() < MAX_CHECKS;
         if !usable {
             state.send(&verdict(check.group, id, "block", None));
+            continue;
+        }
+        if host.is_empty() {
+            if let Some(rule) = state.config.enabled_group(check.group).cloned() {
+                let target = Target { host, ip: check.ip };
+                let obs = probe(&shared.hook, "", target.ip, &shared.marker, &state.interface);
+                let answer = state.record(&rule, target, obs);
+                state.send(&verdict(check.group, id, answer, None));
+            }
             continue;
         }
         let epoch = state.epoch;

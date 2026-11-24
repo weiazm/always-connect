@@ -24,6 +24,7 @@ struct ConnectionsUITest {
     @MainActor static func main() {
         _ = NSApplication.shared
         checkEgressEditing()
+        if let output = ProcessInfo.processInfo.environment["AC_EGRESS_RENDER_DIR"] { renderEgress(to: output) }
         // Use the real settings process' snapshot entry. A late engine state
         // can still say connected while the menu App reports a trust failure.
         let manager = HelperClient.shared
@@ -135,18 +136,87 @@ struct ConnectionsUITest {
         check(!initial.rulesForEditing.groups[0].enabled
               && (try! JSONDecoder().decode(EgressProtection.self, from: bytes)).groups[0].enabled,
               "old disabled master switch remains disabled and viewing doesn't mutate stored bytes")
-        guard let added = EgressRuleChange.addingSites(["example.com"], countries: ["ZZ"], config: initial) else {
-            fail("create a site rule")
+        let input = EgressRuleInput("""
+        DOMAIN-SUFFIX,example.org,Office
+        DOMAIN,exact.test,Office
+        DOMAIN-KEYWORD,fixture,Office
+        IP-CIDR,192.0.2.0/24,Network,no-resolve
+        GEOIP,CN,Network,no-resolve
+        GEOSITE,test
+        IP-CIDR,198.51.100.2
+        PROCESS-NAME,Example,Office
+        IP-CIDR,192.0.2.0/33
+        IP-CIDR6,2001:db8::/32
+        """.replacingOccurrences(of: "\n", with: "\r\n"))
+        check(input.lines.count == 7 && input.groupCount == 3
+              && input.issues.map(\.id) == [8, 9, 10] && input.issues[0].message == "不支持 PROCESS-NAME",
+              "mixed Clash rows retain actual CRLF line numbers and group names")
+        for line in input.lines {
+            let copy = EgressRuleInput.clash(line.site, group: line.group)
+            check(EgressRuleInput(copy).lines == [line], "Clash rule round trips")
         }
-        check(added.after.enabled && !added.after.groups[0].enabled && added.after.groups[1].sites == ["example.com"]
-              && added.after.groups[1].expect == ["ZZ"], "a new rule arms only itself")
+        let regex = EgressRuleInput("regexp:^node[0-9]{1,3}[.]example$")
+        check(regex.lines.count == 1
+              && EgressRuleInput(EgressRuleInput.clash(regex.lines[0].site, group: "Fixture, regex")).lines.first?.group == "Fixture, regex"
+              && EgressRuleInput("regexp:(").lines.isEmpty, "a compiled regex and quoted group round trip")
+        guard let added = EgressRuleChange.adding(input, countries: ["ZZ"], unverified: .block, config: initial) else {
+            fail("create grouped rules")
+        }
+        check(added.after.enabled && !added.after.groups[0].enabled && added.after.groups.count == 4
+              && added.after.groups[1].name == "Office" && added.after.groups[1].expect == ["ZZ"]
+              && added.after.groups[1].unverified == .block, "new groups arm with the selected policy")
         check(added.needsReconnect(connected: true) && !added.needsReconnect(connected: false)
               && added.undo.after == initial, "first rule requires a live reconnect and undo restores the original snapshot")
-        check(EgressRuleChange.addingSites([], countries: ["ZZ"], config: initial) == nil
-              && EgressRuleChange.addingSites(["example.com"], countries: [], config: initial) == nil,
-              "a rule needs a site and a country")
-        check(added.after.rule(covering: "chat.example.com")?.sites == ["example.com"]
-              && added.after.rule(covering: "badexample.com") == nil, "a site covers its subdomains only")
+        check(EgressRuleChange.adding(EgressRuleInput(""), countries: ["ZZ"], unverified: .allow, config: initial) == nil
+              && EgressRuleChange.adding(input, countries: [], unverified: .allow, config: initial) == nil,
+              "a new rule needs a site and a country")
+        let network = EgressProtection.Target(host: nil, address: "192.0.2.10")
+        let name = EgressProtection.Target(host: "chat.example.org", address: "192.0.2.10")
+        let mismatch = EgressProtection.Target(host: "badexample.org", address: "198.51.100.9")
+        let listed = EgressProtection.Target(host: "test.example.com", address: "198.51.100.9")
+        let matched = added.after.rules(covering: [network, name, mismatch, listed])
+        check(matched[network] == added.after.groups[2].id && matched[name] == added.after.groups[1].id
+              && matched[mismatch] == nil && matched[listed] == added.after.groups[3].id,
+              "the connections page uses the Rust matcher, with names before ranges")
+        check(added.after.groups.allSatisfy { $0.matches == nil }
+              && added.after.forBackgroundService.groups[2].matches?.contains(where: { $0.hasPrefix("ipcidr:") }) == true,
+              "expansion stays out of the settings model")
+        let append = EgressRuleInput("DOMAIN,additional.test,Office")
+        let merged = EgressRuleChange.adding(append, countries: ["YY"], unverified: .allow, config: added.after)?.after
+        check(merged?.groups.count == 4 && merged?.groups[1].sites.last == "full:additional.test"
+              && merged?.groups[1].expect == ["ZZ"] && merged?.groups[1].unverified == .block,
+              "an existing policy group keeps its own countries and policy")
+        print("PASS Clash rules parse, group, expand and round trip")
+    }
+
+    @MainActor private static func renderEgress(to output: String) {
+        let sample = [Fixture.row(1), Fixture.row(2)]
+        let group = EgressProtection.Group(id: 7, name: "示例保护", enabled: true,
+            sites: ["example.test", "full:exact.test", "192.0.2.0/24"], expect: ["ZZ"], unverified: .block)
+        let config = EgressProtection(enabled: true, groups: [group])
+        let render: (String, CGFloat, AnyView) -> Void = { name, height, view in
+            let bounds = NSRect(x: 0, y: 0, width: 600, height: height)
+            let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
+            let window = NSWindow(contentRect: bounds, styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.appearance = NSAppearance(named: .aqua)
+            window.contentView = host
+            host.frame = bounds
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.15))
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            guard let image = host.bitmapImageRepForCachingDisplay(in: bounds) else { fail("prepare offscreen view") }
+            host.cacheDisplay(in: bounds, to: image)
+            guard let png = image.representation(using: .png, properties: [:]) else { fail("encode offscreen view") }
+            window.close()
+            let path = URL(fileURLWithPath: output).appendingPathComponent(name + ".png")
+            do { try png.write(to: path) } catch { fail("write offscreen view") }
+        }
+        render("egress-add", 600, AnyView(EgressSiteSheet(sites: group.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
+        render("egress-detail", 560, AnyView(EgressRuleDetail(rule: group, config: config, status: nil, connected: true,
+            refresh: {}, edit: { _ in }, remove: {}, preview: sample)))
+        print("PASS offscreen add and detail views")
     }
 
     private static func findTable(in view: NSView) -> NSTableView? {

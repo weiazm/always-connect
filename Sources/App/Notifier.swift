@@ -119,7 +119,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
     }
 
-    /// A rule started blocking servers whose exit is in a wrong country.
+    /// A rule started blocking connections.
     func egressNotice(_ rule: EgressProtection.GroupState) {
         let title = "已拦截部分连接：\(rule.lastBlockedHost ?? rule.name)"
         let country = rule.lastBlockedCountry.map { "最近拦截涉及 \(egressCountryName($0))。 " } ?? ""

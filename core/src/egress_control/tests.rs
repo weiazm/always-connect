@@ -15,11 +15,12 @@ fn rule(id: u32, sites: &[&str], expect: &[&str]) -> Group {
         id, name: format!("Rule {id}"), enabled: true,
         sites: sites.iter().map(|s| s.to_string()).collect(),
         expect: expect.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 
 fn cfg() -> EgressConfig {
-    EgressConfig { enabled: true, groups: vec![rule(1, &["a.example"], &["ZZ"]), Group { enabled: false, ..rule(2, &["d.example"], &["ZZ"]) }] }
+    EgressConfig { enabled: true, groups: vec![Group { unverified: Unverified::Allow, ..rule(1, &["a.example"], &["ZZ"]) }, Group { enabled: false, ..rule(2, &["d.example"], &["ZZ"]) }] }
 }
 
 #[test]
@@ -79,7 +80,7 @@ fn rules_saved_with_website_members_become_sites() {
     assert!(old.valid());
     let saved = serde_json::to_value(&old).unwrap();
     assert_eq!(saved, json!({"enabled": true, "groups": [{"id": 3, "name": "Old", "enabled": true,
-        "sites": ["a.example", "b.example"], "expect": ["ZZ"]}]}));
+        "sites": ["a.example", "b.example"], "expect": ["ZZ"], "unverified": "whenWrong"}]}));
     let explicit: Group = serde_json::from_value(json!({"id": 4, "sites": ["c.example"], "members": [{"pattern": "a.example"}]})).unwrap();
     assert_eq!(explicit.sites, vec!["c.example".to_string()], "sites win over old members");
 }
@@ -377,4 +378,65 @@ fn a_gate_and_its_controller_release_only_allowed_exits() {
     assert!(matches!(connect(&mut gate, &mut peer, 3, 40003, "a.example").as_slice(), [Out::ToTunnel(_)]));
     let st = status(&ctl);
     assert_eq!((st["groups"][0]["state"].as_str(), st["groups"][0]["unverifiedCount"].as_u64()), (Some("blocked"), Some(1)));
+}
+
+
+#[test]
+fn unknown_exits_follow_each_rules_policy_and_never_approve_a_nameless_server() {
+    let mut config = cfg();
+    config.groups[0].sites.push("192.0.2.0/24".into());
+    config.groups[0].unverified = Unverified::WhenWrong;
+    let allow_wrong = Arc::new(AtomicBool::new(false));
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook: ProbeHook = {
+        let allow_wrong = allow_wrong.clone();
+        let probes = probes.clone();
+        Arc::new(move |request, _| {
+            probes.fetch_add(1, Ordering::Relaxed);
+            match request.host.as_str() {
+                "wrong.example" => {
+                    let country = if allow_wrong.load(Ordering::Relaxed) { "ZZ" } else { "YY" };
+                    Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={country}\n").into_bytes())
+                },
+                _ => None,
+            }
+        })
+    };
+    let dir = TestDirectory::new();
+    let path = dir.0.join("control");
+    let ctl = Controller::start(&path, config.clone(), hook).unwrap();
+    let (mut gate, _) = Peer::connect(&path);
+    assert_eq!(gate.check(1, "", "192.0.2.3", 1)["result"], "unverified");
+    assert_eq!(probes.load(Ordering::Relaxed), 0);
+    assert_eq!(gate.check(1, "wrong.example", "192.0.2.2", 2)["result"], "block");
+    assert_eq!(gate.check(1, "", "192.0.2.3", 3)["result"], "block");
+    assert_eq!(status(&ctl)["groups"][0]["observed"].as_array().unwrap().len(), 1);
+    allow_wrong.store(true, Ordering::Relaxed);
+    assert!(ctl.recheck_job(1).unwrap()());
+    assert_eq!(gate.check(1, "", "192.0.2.3", 4)["result"], "unverified");
+    assert_eq!(status(&ctl)["groups"][0]["unverifiedCount"], 2);
+    assert!(status(&ctl)["records"][0]["ended"].is_number());
+
+    config.groups[0].unverified = Unverified::Block;
+    ctl.update(config.clone());
+    assert!(gate.read()["groups"].is_array());
+    assert_eq!(gate.read()["invalidate"], true);
+    assert_eq!(gate.check(1, "", "192.0.2.3", 5)["result"], "block");
+    let status_before = status(&ctl);
+    let observation = &status_before["groups"][0]["observed"][0];
+    assert_eq!(observation["host"], "");
+    assert_eq!(observation["peerAddress"], "192.0.2.3");
+    assert!(observation["country"].is_null() && observation["approvalId"].is_null());
+    assert!(ctl.recheck_job(1).unwrap()());
+    assert_eq!(probes.load(Ordering::Relaxed), 2);
+    assert_eq!(status(&ctl)["groups"][0]["state"], "blocked");
+
+    config.groups[0].unverified = Unverified::Allow;
+    ctl.update(config);
+    assert!(gate.read()["groups"].is_array());
+    assert_eq!(gate.read()["invalidate"], true);
+    assert_eq!(gate.check(1, "", "192.0.2.3", 6)["result"], "unverified");
+    assert_eq!(gate.check(1, "", "198.51.100.3", 7)["result"], "block", "outside every range");
+    assert!(ctl.recheck_job(1).is_none());
+    assert_eq!(status(&ctl)["groups"][0]["state"], "ok");
 }

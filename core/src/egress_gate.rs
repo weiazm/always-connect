@@ -66,21 +66,14 @@ pub struct SiteGroup {
     pub sites: Vec<String>,
 }
 
-/// Which rule, if any, protects a name: a site covers itself and every
-/// name below it. Shared by the gate and the DNS forwarder (which keeps
-/// these names in the VPN and strips their ECH configs, §66.25).
+/// Ordered split-list matchers shared by the gate, controller, and DNS forwarder.
 #[derive(Clone, Debug, Default)]
-pub struct ProtectedSites(Vec<(GroupId, Vec<String>)>);
+pub struct ProtectedSites(Vec<(GroupId, crate::dns_forwarder::SplitRules)>);
 
 impl ProtectedSites {
     pub fn new(groups: &[SiteGroup]) -> Self {
-        Self(groups.iter().filter_map(|group| {
-            let mut sites: Vec<String> = group.sites.iter()
-                .map(|site| norm(site.trim().trim_start_matches("*.")))
-                .filter(|site| !site.is_empty())
-                .collect();
-            sites.dedup();
-            (!sites.is_empty()).then_some((group.id, sites))
+        Self(groups.iter().filter(|group| group.sites.iter().any(|site| !site.trim().is_empty())).map(|group| {
+            (group.id, crate::dns_forwarder::SplitRules::new(&group.sites))
         }).collect())
     }
 
@@ -90,9 +83,16 @@ impl ProtectedSites {
 
     pub fn group_for(&self, name: &str) -> Option<GroupId> {
         let name = norm(name);
-        self.0.iter().find(|(_, sites)| sites.iter().any(|site|
-            name == *site || name.strip_suffix(site.as_str()).is_some_and(|rest| rest.ends_with('.'))))
-            .map(|(group, _)| *group)
+        self.0.iter().find(|(_, rules)| rules.matches_name(&name)).map(|(id, _)| *id)
+    }
+
+    pub fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId> {
+        let IpAddr::V4(ip) = ip else { return None };
+        self.0.iter().find(|(_, rules)| rules.contains(ip)).map(|(id, _)| *id)
+    }
+
+    pub fn group_for_target(&self, host: &str, ip: IpAddr) -> Option<GroupId> {
+        self.group_for(host).or_else(|| self.group_for_ip(ip))
     }
 }
 
@@ -531,13 +531,13 @@ impl Gate {
             checks.recent.retain(|_, (_, at)| now.duration_since(*at) < reuse);
             !checks.pending.is_empty() || !checks.recent.is_empty()
         });
-        // No readable name in time: best effort, let it through.
+        // No readable name in time: fall back to the address rules.
         let stale: Vec<FlowKey> = self.flows.iter()
             .filter(|(_, f)| matches!(&f.state, State::Holding(h) if !h.checking && now.duration_since(h.since) >= self.cfg.classify_timeout))
             .map(|(k, _)| *k)
             .collect();
         for key in stale {
-            self.release(key);
+            self.classified(key, now, None, false);
         }
         let idle = self.cfg.idle;
         self.flows.retain(|_, f| matches!(f.state, State::Holding(_)) || now.duration_since(f.last_seen) < idle);
@@ -629,24 +629,33 @@ impl Gate {
         };
         let name = match sniffed {
             Sniff::Incomplete if !full => return Step::Consumed,
-            Sniff::Tls { alpn, .. } if !self.cfg.probe_alpn.is_empty() && alpn.contains(&self.cfg.probe_alpn) => None,
+            Sniff::Tls { alpn, .. } if !self.cfg.probe_alpn.is_empty() && alpn.contains(&self.cfg.probe_alpn) => {
+                return self.pass_held(key, first);
+            }
             Sniff::Tls { sni, .. } => sni,
             Sniff::Http(host) => host,
             Sniff::Incomplete | Sniff::Unknown => None,
         };
-        match name.and_then(|name| self.sites.group_for(&name).map(|group| (group, name))) {
-            Some((group, host)) => {
-                self.wait_for_check(key, group, host, now);
-                Step::Consumed
-            }
-            None if first => {
-                self.set_state(key, State::Pass);
-                Step::Forward
-            }
-            None => {
-                self.release(key);
-                Step::Consumed
-            }
+        self.classified(key, now, name, first)
+    }
+
+    fn classified(&mut self, key: FlowKey, now: Instant, name: Option<String>, first: bool) -> Step {
+        let host = name.filter(|host| host.parse::<IpAddr>().is_err()).unwrap_or_default();
+        if let Some(group) = self.sites.group_for_target(&host, key.dst) {
+            self.wait_for_check(key, group, host, now);
+            Step::Consumed
+        } else {
+            self.pass_held(key, first)
+        }
+    }
+
+    fn pass_held(&mut self, key: FlowKey, first: bool) -> Step {
+        if first {
+            self.set_state(key, State::Pass);
+            Step::Forward
+        } else {
+            self.release(key);
+            Step::Consumed
         }
     }
 

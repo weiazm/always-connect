@@ -21,7 +21,7 @@ fn egress(enabled: bool) -> crate::egress_control::EgressConfig {
     use crate::egress_control::*;
     EgressConfig {
         enabled,
-        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, sites: vec!["a.example".into()], expect: vec!["ZZ".into()] }],
+        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, sites: vec!["a.example".into()], expect: vec!["ZZ".into()], ..Default::default() }],
     }
 }
 

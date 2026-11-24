@@ -60,6 +60,8 @@ struct ConnectionsPage: View {
     @State private var egressBusy = false
     @State private var egressVisible = false
     @State private var protectedConfig = EgressProtection()
+    @State private var protectedTargets: Set<EgressProtection.Target> = []
+    @State private var protectedOwners: [EgressProtection.Target: UInt32] = [:]
     @State private var protectionStatus: EgressProtection.Status?
     @State private var selected = Set<Row.ID>()
     @State private var showEgressTip = false
@@ -129,7 +131,7 @@ struct ConnectionsPage: View {
                 .width(processColumnWidth)
                 TableColumn("地址") { row in
                     HStack(spacing: 4) {
-                        if row.via == "vpn", let rule = protectedConfig.rule(covering: row.host) {
+                        if let rule = protecting(row) {
                             Image(systemName: "shield.fill").foregroundStyle(.secondary)
                                 .help("受规则「\(rule.name)」保护")
                         }
@@ -160,8 +162,9 @@ struct ConnectionsPage: View {
                 // of its own cut "VPN 隧道本身" short (§44.3).
                 TableColumn("原因") { row in
                     HStack(spacing: 4) {
-                        let label = blockedDestination(row) ? "已拦（出口不对）" : reason(row)
-                        Text(label).foregroundStyle(blockedDestination(row) ? Color.orange : Color.secondary).lineLimit(1).help(label)
+                        let blocked = blockedDestination(row)
+                        let label = blocked ?? reason(row)
+                        Text(label).foregroundStyle(blocked != nil ? Color.orange : Color.secondary).lineLimit(1).help(label)
                         Spacer(minLength: 0)
                         action(row)
                     }
@@ -231,6 +234,8 @@ struct ConnectionsPage: View {
         .onReceive(timer) { _ in if preview == nil && egressVisible { refresh(); refreshEgressState() } }
         .onDisappear {
             egressVisible = false
+            protectedTargets = []
+            protectedOwners = [:]
             egressBusy = false
             if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } }
         }
@@ -241,11 +246,11 @@ struct ConnectionsPage: View {
         }
         .sheet(item: $egressAddition) { addition in
             EgressSiteSheet(sites: addition.site.map { [$0] } ?? [],
-                            countries: protectedConfig.groups.last?.expect ?? [], preview: preview) { sites, countries, done in
-                guard let change = EgressRuleChange.addingSites(sites, countries: countries, config:
+                            countries: protectedConfig.groups.last?.expect ?? [], preview: preview) { input, countries, unverified, done in
+                guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config:
                         ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) else { done(false); return }
                 let added = change.after.groups.first { group in !change.before.groups.contains { $0.id == group.id } }
-                let action = EgressAction(change: change, text: "已开始保护 " + sites.joined(separator: "、"), rule: added?.id)
+                let action = EgressAction(change: change, text: "已加入 \(input.lines.count) 条出口保护规则", rule: added?.id)
                 done(true)
                 if change.needsReconnect(connected: manager.showsConnected) { egressPending = action } else { applyEgress(action) }
             }
@@ -286,12 +291,8 @@ struct ConnectionsPage: View {
             ? DirectSites.choices(host: row.host, address: row.remote) : []
         // Exit protection is by site (§66.25): a VPN row with a name can be added.
         let site = row.host.flatMap { DirectSites.clean(DirectSites.site(of: $0)) }
-        let protectable = row.via == "vpn" && !manager.usesCisco && manager.protectsDrops && site != nil
-        let owner = protectedConfig.groups.first { group in
-            group.enabled && group.sites.contains { protected in
-                row.host.map { $0 == protected || $0.hasSuffix("." + protected) } ?? false
-            }
-        }
+        let owner = protecting(row)
+        let protectable = row.via == "vpn" && !manager.usesCisco && manager.protectsDrops && (site != nil || owner != nil)
         return Group {
             if row.via == "direct", let bypass, manager.ownConnection {
                 Menu("移除") { Button("从不走 VPN 的名单删除 \(bypass)") { remove(bypass) } }
@@ -346,19 +347,40 @@ struct ConnectionsPage: View {
     }
 
     private func refreshEgressState() {
-        protectedConfig = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard preview == nil, manager.showsConnected, protectedConfig.isActive else { protectionStatus = nil; return }
+        let config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let changed = config != protectedConfig
+        if changed { protectedConfig = config }
+        updateProtectedTargets(configChanged: changed)
+        guard preview == nil, manager.showsConnected, config.isActive else { protectionStatus = nil; return }
         manager.fetchEgressJSON { json in
-            guard egressVisible, protectedConfig.isActive, manager.showsConnected else { return }
+            guard egressVisible, protectedConfig == config, manager.showsConnected else { return }
             protectionStatus = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
         }
     }
 
-    private func blockedDestination(_ row: Row) -> Bool {
-        guard row.via == "vpn", let owner = protectedConfig.rule(covering: row.host),
-              let state = protectionStatus?.groups.first(where: { $0.id == owner.id }) else { return false }
-        return state.observed.contains { $0.host == row.host
-            && $0.peerAddress == row.remote && $0.country != nil && $0.isOutside(owner.expect) }
+    private func updateProtectedTargets(configChanged: Bool = false) {
+        let targets = Set(rows.lazy.filter { $0.via == "vpn" }.map { target($0) })
+        guard configChanged || targets != protectedTargets else { return }
+        protectedTargets = targets
+        protectedOwners = protectedConfig.rules(covering: Array(targets))
+    }
+
+    private func target(_ row: Row) -> EgressProtection.Target {
+        .init(host: row.host, address: row.remote)
+    }
+
+    private func protecting(_ row: Row) -> EgressProtection.Group? {
+        guard row.via == "vpn", let id = protectedOwners[target(row)] else { return nil }
+        return protectedConfig.groups.first { $0.id == id }
+    }
+
+    private func blockedDestination(_ row: Row) -> String? {
+        guard let owner = protecting(row),
+              let state = protectionStatus?.groups.first(where: { $0.id == owner.id }),
+              let observation = state.observed.first(where: {
+                  $0.host == (row.host ?? "") && $0.peerAddress == row.remote && $0.isOutside(owner.expect)
+              }) else { return nil }
+        return observation.country == nil ? "已拦（查不到出口）" : "已拦（出口不对）"
     }
 
     private func add(_ rule: String) {
@@ -438,6 +460,7 @@ struct ConnectionsPage: View {
     private func update(_ result: [ConnectionRow], speeds: Speeds? = nil) {
         updated = Date()
         rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
+        if egressVisible { updateProtectedTargets() }
         if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {
             totals = (speeds.vpn, speeds.direct)
         } else {

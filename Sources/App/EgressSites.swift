@@ -1,70 +1,133 @@
 import SwiftUI
 
-/// The sites a rule protects (DESIGN §66.25): typed in, or picked from the
-/// websites recently reached through the VPN. A site covers its subdomains.
 struct EgressSitesEditor: View {
-    @ObservedObject private var manager = HelperClient.shared
     @Binding var sites: [String]
     var preview: [ConnectionRow]? = nil
     @State private var input = ""
+
+    var body: some View {
+        let parsed = EgressRuleInput(input)
+        let added = parsed.adding(to: sites)
+        VStack(alignment: .leading, spacing: 8) {
+            FlowChips(items: sites) { site in
+                HStack(spacing: 4) {
+                    Text(EgressRuleInput.clash(site)).lineLimit(1).truncationMode(.middle)
+                    Button { sites.removeAll { $0 == site } } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(sites.count == 1)
+                    .accessibilityLabel("移除 " + EgressRuleInput.clash(site))
+                }
+                .frame(maxWidth: 470)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.secondary.opacity(0.14)))
+            }
+            EgressRuleText(input: $input, parsed: parsed, showGroups: false)
+            Button("加入规则") {
+                sites = added
+                // Keep only the lines the user still needs to correct.
+                let lines = input.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+                input = parsed.issues.map { String(lines[$0.id - 1]) }.joined(separator: "\n")
+            }
+            .disabled(added == sites || added.count > EgressRuleInput.siteLimit)
+            if added.count > EgressRuleInput.siteLimit {
+                Text("每个保护最多 256 条规则。").font(.caption).foregroundStyle(.orange)
+            }
+            EgressRecentSites(preview: preview) { site in
+                guard sites.count < EgressRuleInput.siteLimit, !sites.contains(site) else { return }
+                sites.append(site)
+            }
+        }
+    }
+}
+
+private struct EgressRuleText: View {
+    @Binding var input: String
+    let parsed: EgressRuleInput
+    let showGroups: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("每行一条，支持 Clash 写法或分流名单写法。")
+                .font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $input)
+                .font(.system(.callout, design: .monospaced))
+                .frame(height: 76)
+                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.secondary.opacity(0.35)).allowsHitTesting(false))
+                .accessibilityLabel("出口保护规则，每行一条")
+            if !input.isEmpty {
+                let groups = showGroups ? "（分成 \(parsed.groupCount) 条保护）" : ""
+                Text("识别 \(parsed.lines.count) 条\(groups) · 不支持或无效 \(parsed.issues.count) 条")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !parsed.issues.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(parsed.issues) { issue in
+                            Text("第 \(issue.id) 行  \(issue.message)")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: CGFloat(min(parsed.issues.count, 4) * 18))
+                .font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+struct EgressUnverifiedPicker: View {
+    @Binding var selection: EgressProtection.Unverified
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("查不到出口时", selection: $selection) {
+                ForEach(EgressProtection.Unverified.allCases) { policy in
+                    Text(policy.label).tag(policy)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text(selection.explanation)
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct EgressRecentSites: View {
+    var preview: [ConnectionRow]?
+    let add: (String) -> Void
     @State private var recent: [String] = []
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !sites.isEmpty {
-                FlowChips(items: sites) { site in
-                    HStack(spacing: 4) {
-                        Text(site + " 及子域名")
-                        Button { sites.removeAll { $0 == site } } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                        }
+        VStack(alignment: .leading, spacing: 6) {
+            if !recent.isEmpty {
+                Text("最近经 VPN 访问过的网站，点一下加入").font(.caption).foregroundStyle(.secondary)
+                FlowChips(items: recent) { site in
+                    Button { add(site) } label: { Label(site, systemImage: "plus").font(.callout) }
                         .buttonStyle(.borderless)
-                        .accessibilityLabel("不再保护 " + site)
-                    }
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(Capsule().fill(Color.secondary.opacity(0.14)))
-                }
-            }
-            HStack {
-                TextField("", text: $input, prompt: Text("输入域名，例如 example.com"))
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { add(input) }
-                Button("添加") { add(input) }.disabled(DirectSites.clean(input) == nil)
-            }
-            let suggestions = recent.filter { !sites.contains($0) }
-            if !suggestions.isEmpty {
-                Text("最近经 VPN 访问过的网站，点一下加入：").font(.caption).foregroundStyle(.secondary)
-                FlowChips(items: Array(suggestions.prefix(24))) { site in
-                    Button { add(site) } label: {
-                        Label(site, systemImage: "plus").font(.callout)
-                    }
-                    .buttonStyle(.borderless)
-                    .padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(Capsule().strokeBorder(Color.secondary.opacity(0.35)))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Capsule().strokeBorder(Color.secondary.opacity(0.35)))
                 }
             }
         }
         .onAppear(perform: load)
     }
 
-    private func add(_ text: String) {
-        guard let site = DirectSites.clean(text) else { return }
-        if !sites.contains(site) { sites.append(site) }
-        input = ""
-    }
-
-    /// One snapshot of the connections when the editor opens; no sampling.
     private func load() {
         func show(_ rows: [ConnectionRow]) {
             var counts: [String: Int] = [:]
             for row in rows where row.via == "vpn" {
-                guard let host = row.host, let site = DirectSites.clean(DirectSites.site(of: host)) else { continue }
+                guard let host = row.host, let site = DirectSites.clean(DirectSites.site(of: host)),
+                      !isValidIPv4Address(site) else { continue }
                 counts[site, default: 0] += 1
             }
-            recent = counts.sorted { ($0.value, $1.key) > ($1.value, $0.key) }.map(\.key)
+            recent = counts.sorted { ($0.value, $1.key) > ($1.value, $0.key) }.prefix(24).map(\.key)
         }
         if let preview { show(preview); return }
-        manager.fetchConnections { rows in show(rows ?? []) }
+        HelperClient.shared.fetchConnections { rows in show(rows ?? []) }
     }
 }
 
@@ -107,45 +170,49 @@ private struct FlowLayout: Layout {
     }
 }
 
-/// Adding a protection: the sites, then the allowed countries.
 struct EgressSiteSheet: View {
     @Environment(\.dismiss) private var dismiss
     var preview: [ConnectionRow]? = nil
-    let save: (_ sites: [String], _ countries: [String], _ done: @escaping (Bool) -> Void) -> Void
-    @State private var sites: [String] = []
+    let save: (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void
+    @State private var input: String
     @State private var countries: [String]
+    @State private var unverified = EgressProtection.Unverified.whenWrong
     @State private var saving = false
     @State private var error: String?
 
     init(sites: [String] = [], countries: [String] = [], preview: [ConnectionRow]? = nil,
-         save: @escaping ([String], [String], @escaping (Bool) -> Void) -> Void) {
+         save: @escaping (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void) {
         self.preview = preview
         self.save = save
-        _sites = State(initialValue: sites)
+        _input = State(initialValue: sites.map { EgressRuleInput.clash($0) }.joined(separator: "\n"))
         _countries = State(initialValue: countries)
     }
 
     var body: some View {
+        let parsed = EgressRuleInput(input)
         VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("添加要保护的网站").font(.title3.weight(.semibold))
-                Text("任何程序访问这些网站（含子域名）时，先确认从哪个国家出去，不对就拦下再问你。别的连接不受影响；查不出出口的先放行。")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(20)
+            Text("添加出口保护").font(.title3.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading).padding(20)
             Form {
-                Section("要保护的网站") {
-                    EgressSitesEditor(sites: $sites, preview: preview)
-                }
-                Section("只从这里出去") {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text("国家或地区")
-                        Spacer(minLength: 12)
-                        EgressCountryChips(countries: countries,
-                                           remove: { code in countries.removeAll { $0 == code } },
-                                           add: { code in if !countries.contains(code) { countries.append(code) } })
+                Section("要保护的网站或网段") {
+                    EgressRuleText(input: $input, parsed: parsed, showGroups: true)
+                    if parsed.lines.contains(where: { $0.group != nil }) {
+                        Text("有策略组名的规则按组名归入保护，同名保护沿用原来的出口设置。")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
+                    EgressRecentSites(preview: preview) { site in
+                        guard !parsed.lines.contains(where: { $0.site == site && $0.group == nil }) else { return }
+                        if !input.isEmpty && input.last?.isNewline != true { input += "\n" }
+                        input += EgressRuleInput.clash(site)
+                    }
+                }
+                Section("允许的出口") {
+                    EgressCountryChips(countries: countries,
+                                       remove: { code in countries.removeAll { $0 == code } },
+                                       add: { code in if !countries.contains(code) { countries.append(code) } })
+                }
+                Section("查不到出口时") {
+                    EgressUnverifiedPicker(selection: $unverified)
                 }
             }
             .formStyle(.grouped)
@@ -153,25 +220,23 @@ struct EgressSiteSheet: View {
             HStack(spacing: 12) {
                 if let error {
                     Label(error, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
-                } else if sites.isEmpty || countries.isEmpty {
-                    Text(sites.isEmpty ? "先加一个要保护的网站" : "再选一个允许的国家或地区").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("开始保护") {
                     saving = true
                     error = nil
-                    save(sites, countries) { ok in
+                    save(parsed, countries, unverified) { ok in
                         saving = false
-                        if ok { dismiss() } else { error = "没有保存。请稍后再试。" }
+                        if ok { dismiss() } else { error = "没有保存。请检查规则数量和出口设置。" }
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(sites.isEmpty || countries.isEmpty || saving)
+                .disabled(parsed.lines.isEmpty || countries.isEmpty || saving)
             }
             .padding(16)
         }
-        .frame(width: 580, height: 560)
+        .frame(width: 600, height: 600)
         .disabled(saving)
     }
 }

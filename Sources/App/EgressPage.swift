@@ -76,7 +76,7 @@ struct EgressProtectionPage: View {
                     }
                 }
             } footer: {
-                Text("访问受保护网站的每条新连接先确认从哪个国家出去，不对就拦下再问你；别的连接不受影响。查不出出口的先放行并记数。经 VPN 的新连接约多等半秒，也不用 QUIC。")
+                Text("命中规则的新连接先检查出口，走错国家就拦。查不到出口时按各保护的设置处理。出口保护开启时，VPN 内的 QUIC 流量会被拦。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {
@@ -122,7 +122,7 @@ struct EgressProtectionPage: View {
                 let url = try result.get()
                 let opened = url.startAccessingSecurityScopedResource()
                 defer { if opened { url.stopAccessingSecurityScopedResource() } }
-                var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url))
+                var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url)).withoutExpandedMatches
                 imported.enabled = false
                 let offline = imported.rulesForEditing
                 change { $0 = offline }
@@ -161,7 +161,7 @@ struct EgressProtectionPage: View {
                 Button("打开断线保护") { confirmDropProtection = true }
             }
             moreMenu
-            Button { sheet = .addSites } label: { Label("添加网站", systemImage: "plus") }
+            Button { sheet = .addSites } label: { Label("添加保护", systemImage: "plus") }
                 .buttonStyle(.borderedProminent)
                 .disabled(!available || busy)
         }
@@ -170,6 +170,14 @@ struct EgressProtectionPage: View {
 
     private var moreMenu: some View {
         Menu {
+            Button("拷贝为 Clash 规则") {
+                let rules = config.groups.flatMap { group in
+                    group.sites.map { EgressRuleInput.clash($0, group: group.name) }
+                }.joined(separator: "\n")
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(rules, forType: .string)
+            }
+            .disabled(!config.groups.contains { !$0.sites.isEmpty })
             Button("导入备份…") { importing = true }
             Button("导出备份…") { exporting = true }.disabled(config.groups.isEmpty)
         } label: {
@@ -177,7 +185,7 @@ struct EgressProtectionPage: View {
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         .disabled(!available || busy)
-        .help("备份：导入、导出")
+        .help("拷贝规则或管理备份")
     }
 
     private struct StatusLook {
@@ -187,31 +195,31 @@ struct EgressProtectionPage: View {
     }
 
     private var statusLook: StatusLook {
-        let sites = Set(active.flatMap(\.sites)).count
+        let ruleCount = active.count
         if preview == nil && manager.usesCisco {
             return .init(tint: .gray, line: "要先在「分流」页打开「按网站分流」才能用", lineColor: .secondary)
         }
         if !available { return .init(tint: .gray, line: "要先打开断线保护才能用", lineColor: .secondary) }
-        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加要保护的网站", lineColor: .secondary) }
+        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个保护", lineColor: .secondary) }
         if active.isEmpty { return .init(tint: .gray, line: "已全部暂停", lineColor: .secondary) }
-        guard connected else { return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · VPN 连上后开始检查") }
+        guard connected else { return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · VPN 连上后开始检查") }
         switch liveStatus?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown {
-        case .ok: return .init(tint: .green, line: "一切正常 · 正在保护 \(sites) 个网站")
+        case .ok: return .init(tint: .green, line: "一切正常 · \(ruleCount) 个保护已开启")
         case .partial:
             let count = liveStatus?.blockedCount ?? 0
-            return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 条出口不对的连接" : "有些连接出口不对，已拦下",
+            return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 次连接" : "部分连接已拦下",
                          lineColor: .orange)
-        case .unknown: return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · 有连接时核实出口")
+        case .unknown: return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · 有连接时核实出口")
         }
     }
 
     private var emptyState: some View {
         VStack(spacing: 10) {
             Image(systemName: "globe.asia.australia.fill").font(.system(size: 34)).foregroundStyle(.secondary)
-            Text("还没有受保护的网站").font(.headline)
-            Text("填上要保护的网站和允许的国家。访问这些网站的连接会先确认出口，\n不对就拦下再问你；别的连接不受影响。")
+            Text("还没有出口保护").font(.headline)
+            Text("加入要保护的网站或网段，并选择允许的出口国家。")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button("添加网站…") { sheet = .addSites }
+            Button("添加保护…") { sheet = .addSites }
                 .buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
@@ -226,7 +234,7 @@ struct EgressProtectionPage: View {
 
     private var tableHeader: some View {
         HStack(spacing: 8) {
-            Text("网站").frame(maxWidth: .infinity, alignment: .leading)
+            Text("保护规则").frame(maxWidth: .infinity, alignment: .leading)
             Text("只从这里出去").frame(width: Self.countryWidth, alignment: .leading)
             Text("状态").frame(width: Self.stateWidth, alignment: .leading)
             Text("保护").frame(width: Self.switchWidth)
@@ -248,11 +256,13 @@ struct EgressProtectionPage: View {
                             .opacity(group.enabled ? 1 : 0.45)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(group.name).fontWeight(.medium).lineLimit(1)
+                            Text("\(group.sites.count) 条规则 · 查不到出口时：\(group.unverified.label)")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                .help(group.sites.map { EgressRuleInput.clash($0) }.joined(separator: "\n"))
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
-                            } else {
-                                Text(Self.rowCaption(group, unverified: unverified))
-                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            } else if unverified > 0 {
+                                Text("\(unverified) 次查不到出口，已放行").font(.caption).foregroundStyle(.secondary)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -278,13 +288,6 @@ struct EgressProtectionPage: View {
             }
         }
         .padding(.vertical, 3)
-    }
-
-    private static func rowCaption(_ group: EgressProtection.Group, unverified: UInt64) -> String {
-        var parts: [String] = []
-        if !group.sites.isEmpty { parts.append(group.sites.joined(separator: "、")) }
-        if unverified > 0 { parts.append("\(unverified) 条查不到出口，已放行") }
-        return parts.joined(separator: " · ")
     }
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
@@ -316,14 +319,15 @@ struct EgressProtectionPage: View {
     @ViewBuilder private func sheetView(_ page: Sheet) -> some View {
         switch page {
         case .addSites:
-            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { sites, countries, done in
-                addSites(sites, countries: countries, done: done)
+            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { input, countries, unverified, done in
+                addRules(input, countries: countries, unverified: unverified, done: done)
             }
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
                                  edit: { edit in changeRule(id, edit: edit) },
-                                 remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
+                                 remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } },
+                                 preview: preview?.connections)
             }
         }
     }
@@ -337,15 +341,18 @@ struct EgressProtectionPage: View {
 
     // MARK: - Changes
 
-    private func addSites(_ sites: [String], countries: [String], done: @escaping (Bool) -> Void) {
-        var group = EgressProtection.newGroup(in: stored, name: sites.count > 1 ? "\(sites[0]) 等 \(sites.count) 个" : sites[0])
-        group.enabled = true
-        group.sites = sites
-        group.expect = countries
-        change({ $0.groups.append(group) }, completion: { ok in
-            if ok { message = nil }
-            done(ok)
-        })
+    private func addRules(_ input: EgressRuleInput, countries: [String], unverified: EgressProtection.Unverified,
+                          done: @escaping (Bool) -> Void) {
+        let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config: previous),
+              change.after.permitsActivation(comparedTo: previous) else { done(false); return }
+        if change.needsReconnect(connected: manager.showsConnected) {
+            done(true)
+            sheet = nil
+            confirm = change
+        } else {
+            apply(change, completion: done)
+        }
     }
 
     private func changeRule(_ id: UInt32, edit: (inout EgressProtection.Group) -> Void, completion: ((Bool) -> Void)? = nil) {
@@ -403,7 +410,7 @@ struct EgressConfigFile: FileDocument {
     static let readableContentTypes: [UTType] = [.json]
     let config: EgressProtection
 
-    init(config: EgressProtection) { self.config = config }
+    init(config: EgressProtection) { self.config = config.withoutExpandedMatches }
     init(configuration: ReadConfiguration) throws {
         config = try JSONDecoder().decode(EgressProtection.self, from: configuration.file.regularFileContents ?? Data())
     }

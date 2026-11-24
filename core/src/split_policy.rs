@@ -119,9 +119,9 @@ impl SplitPolicy {
         for (name, claims) in &mut self.names {
             let domain_direct = rules.matches(name).is_some();
             let protected = rules.protects_name(name);
-            claims.vpn.retain(|ip| protected || (!domain_direct && !rules.contains(*ip)));
+            claims.vpn.retain(|ip| protected || rules.protects_ip(*ip) || (!domain_direct && !rules.contains(*ip)));
             for (ip, direct) in &mut claims.current {
-                let keep = !protected && (domain_direct || rules.contains(*ip));
+                let keep = !protected && !rules.protects_ip(*ip) && (domain_direct || rules.contains(*ip));
                 if *direct && !keep { claims.vpn.insert(*ip); }
                 // New grants still require a fresh query through the right DNS.
                 *direct &= keep;
@@ -229,6 +229,24 @@ mod tests {
         assert_eq!(policy.direct().len(), 3);
         policy.revalidate(&rules);
         assert_eq!(policy.direct(), std::collections::HashSet::from([other.to_string(), unrelated.to_string()]));
+    }
+
+    #[test]
+    fn protected_network_revokes_live_name_and_address_grants() {
+        let config: crate::egress_control::EgressConfig = serde_json::from_str(r#"{
+            "enabled":true,"groups":[{"id":1,"enabled":true,"sites":["192.0.2.0/25"],"expect":["ZZ"]}]
+        }"#).unwrap();
+        let rules = SplitRules::new(&["example.test", "ipcidr:192.0.2.0/24"])
+            .with_protection(Some(std::sync::Arc::new(config.protected_sites())));
+        let inside = "192.0.2.10".parse().unwrap();
+        let outside = "192.0.2.200".parse().unwrap();
+        assert!(rules.protects_ip(inside));
+        assert!(!rules.contains(inside));
+        assert!(rules.contains(outside));
+        let mut policy = SplitPolicy::default();
+        policy.observe("example.test".into(), &[inside, outside], &[inside, outside]);
+        policy.revalidate(&rules);
+        assert_eq!(policy.direct(), std::collections::HashSet::from([outside.to_string()]));
     }
 
     #[test]

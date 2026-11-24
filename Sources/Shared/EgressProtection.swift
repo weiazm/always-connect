@@ -6,7 +6,7 @@ struct EgressProtection: Codable, Equatable {
     var enabled = false
     var groups: [Group] = []
 
-    var isActive: Bool { enabled && groups.contains(where: \.enabled) }
+    var isActive: Bool { enabled && groups.contains { $0.enabled && !$0.sites.isEmpty } }
 
     @discardableResult
     mutating func disableGroup(_ id: UInt32) -> Bool {
@@ -24,20 +24,28 @@ struct EgressProtection: Codable, Equatable {
         }
     }
 
+    enum Unverified: String, Codable, CaseIterable, Identifiable {
+        case allow, whenWrong, block
+        var id: Self { self }
+    }
+
     struct Group: Codable, Equatable, Identifiable {
         var id: UInt32
         var name: String
         var enabled = false
-        /// The sites this rule protects, with subdomains.
+        /// Canonical split-list entries.
         var sites: [String] = []
         /// Allowed exit countries (ISO 3166 alpha-2).
         var expect: [String] = []
+        var unverified: Unverified = .whenWrong
+        /// Transient expanded entries, sent only to the background service.
+        var matches: [String]? = nil
+    }
 
-        /// Whether a host is one of the sites or below one.
-        func covers(_ host: String) -> Bool {
-            let host = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            return sites.contains { site in host == site || host.hasSuffix("." + site) }
-        }
+    var withoutExpandedMatches: Self {
+        var result = self
+        for index in result.groups.indices { result.groups[index].matches = nil }
+        return result
     }
 
     /// What one check saw for one site at one server.
@@ -49,6 +57,7 @@ struct EgressProtection: Codable, Equatable {
         var peerAddress: String? = nil
         /// Set on a wrong-country observation the user may approve.
         var approvalId: String? = nil
+        var displayedHost: String { host.isEmpty ? (peerAddress ?? "无网站名") : host }
         var id: String { host + " " + (peerAddress ?? "") }
     }
 
@@ -107,6 +116,8 @@ extension EgressProtection.Group {
         id = try values.decode(UInt32.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
         enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        unverified = try values.decodeIfPresent(EgressProtection.Unverified.self, forKey: .unverified) ?? .whenWrong
+        matches = try values.decodeIfPresent([String].self, forKey: .matches)
         expect = try values.decodeIfPresent([String].self, forKey: .expect) ?? []
         var sites = try values.decodeIfPresent([String].self, forKey: .sites) ?? []
         if sites.isEmpty {

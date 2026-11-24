@@ -102,7 +102,7 @@ def serve_udp(ip, port, log):
 
 def cmd_server(a):
     for fn, args in [(serve_tls, (a.ip, a.cert, a.key, a.log)), (serve_http, (a.ip, a.log)),
-                     (serve_raw, (a.range_ip, 7000, a.log)), (serve_udp, (a.ip, 443, a.log)),
+                     (serve_raw, (a.ip, 7000, a.log)), (serve_raw, (a.range_ip, 7000, a.log)), (serve_udp, (a.ip, 443, a.log)),
                      (serve_udp, (a.ip, 9999, a.log))]:
         threading.Thread(target=fn, args=args, daemon=True).start()
     open(a.ready, "w").close()
@@ -128,22 +128,27 @@ def cmd_controller(a):
     srv.listen(1)
     open(a.ready, "w").close()
     conn, _ = srv.accept()
-    cfg = {"probe_alpn": marker, "groups": [{"id": g, "sites": v["sites"]} for g, v in GROUPS.items()]}
+    groups = {**GROUPS, 4: {"sites": [f"ipcidr:{a.range_ip}/32"], "expect": ["ZZ"]}}
+    cfg = {"probe_alpn": marker, "groups": [{"id": g, "sites": v["sites"]} for g, v in groups.items()]}
     conn.sendall((json.dumps(cfg) + "\n").encode())
     lock = threading.Lock()
 
     def check(group, host, dest, request_id):
         t0 = time.time()
         loc, at = None, None
-        try:
-            out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", host,
-                                  "--ip", dest, "--alpn", marker, "--ca", a.ca],
-                                 capture_output=True, text=True, timeout=3)
-            loc = out.stdout.strip() or None
-            at = time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000
-        except Exception:
-            pass
-        result = "unverified" if loc is None else "allow" if loc in GROUPS[group]["expect"] else "block"
+        if host:
+            try:
+                out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", host,
+                                      "--ip", dest, "--alpn", marker, "--ca", a.ca],
+                                     capture_output=True, text=True, timeout=3)
+                loc = out.stdout.strip() or None
+                at = time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if loc is None:
+            result = "block" if group == 4 else "unverified"
+        else:
+            result = "allow" if loc in groups[group]["expect"] else "block"
         jlog(a.log, kind="check", group=group, host=host, ip=dest, loc=loc, result=result, ms=int((time.time() - t0) * 1000))
         verdict = {"group": group, "requestId": request_id, "result": result}
         if result == "allow":
@@ -194,7 +199,7 @@ def main():
     s.add_argument("--ip"); s.add_argument("--range-ip"); s.add_argument("--cert"); s.add_argument("--key")
     s.add_argument("--log"); s.add_argument("--ready")
     c = sub.add_parser("controller")
-    c.add_argument("--sock"); c.add_argument("--ns"); c.add_argument("--ca"); c.add_argument("--site-ip")
+    c.add_argument("--sock"); c.add_argument("--ns"); c.add_argument("--ca"); c.add_argument("--range-ip", required=True)
     c.add_argument("--log"); c.add_argument("--ready")
     r = sub.add_parser("probe")
     r.add_argument("--host"); r.add_argument("--ip"); r.add_argument("--alpn"); r.add_argument("--ca")

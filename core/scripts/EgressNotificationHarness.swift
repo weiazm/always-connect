@@ -195,10 +195,17 @@ struct EgressNotificationHarness {
         let unread = EgressProtection.Observation(host: "tested.example", country: nil, ip: nil, error: "no answer",
                                                   peerAddress: "2001:db8:9::7")
         for changed in [group("blocked", observed: [observation(address: "198.51.100.8")]),
-                        group("blocked", observed: [observation(), unread]), unknown, ok] {
+                        group("blocked", observed: [unread]), unknown, ok] {
             check(!status(changed).permits(approval, in: local) && status(changed).approvals(for: partial.id).isEmpty,
                   "stale or unread observations cannot be approved")
         }
+        var rangeRule = local
+        rangeRule.groups[0].sites = ["192.0.2.0/24"]
+        let mixed = status(group("blocked", observed: [observation(), unread]))
+        check(mixed.permits(approval, in: rangeRule) && mixed.approvals(for: partial.id).count == 1,
+              "an address rule can approve a known wrong exit without approving unreadable ones")
+        check(group("blocked", observed: [unread]).blockCaption?.contains("查不到出口") == true,
+              "strictly blocked unknown exits describe why they were blocked")
         let historical = try! JSONDecoder().decode(EgressProtection.Observation.self, from: Data(
             #"{"host":"old.example","method":"trace","evidence":"member","country":"YY"}"#.utf8))
         check(EgressProtection.wrongExits([historical], expected: ["ZZ"]) == nil,
@@ -207,7 +214,7 @@ struct EgressNotificationHarness {
         check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
         let legacy = try! JSONDecoder().decode(EgressProtection.Group.self, from: Data(
             #"{"id":3,"name":"Old","enabled":true,"members":[{"pattern":"site.example","method":"trace"},{"pattern":"*.site.example"},{"pattern":"geosite:list"}],"cidrs":[],"expect":["ZZ"]}"#.utf8))
-        check(legacy.sites == ["site.example"] && legacy.expect == ["ZZ"] && legacy.enabled && legacy.covers("a.site.example"),
+        check(legacy.sites == ["site.example"] && legacy.expect == ["ZZ"] && legacy.enabled && legacy.unverified == .whenWrong,
               "a rule saved with website members becomes the sites it named")
     }
 }

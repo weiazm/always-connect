@@ -11,9 +11,11 @@ struct EgressRuleDetail: View {
     let refresh: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
     let remove: () -> Void
+    var preview: [ConnectionRow]? = nil
     @State private var renaming = false
     @State private var name = ""
     @State private var showDelete = false
+    @State private var rechecking = false
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
     private var badge: EgressRuleBadge { .of(rule, config: config, state: state, connected: connected) }
@@ -29,16 +31,42 @@ struct EgressRuleDetail: View {
                         EgressDecisionList(decisions: decisions, refresh: refresh)
                     }
                 }
+                if connected, let state, state.blocked {
+                    if rule.unverified == .whenWrong && state.observed.contains(where: { $0.country != nil }) {
+                        Text("有服务器出口不对，查不到出口的连接也先拦住。")
+                            .font(.callout).foregroundStyle(.orange)
+                    }
+                    if state.observed.contains(where: { $0.country == nil }) {
+                        Section("查不到出口的服务器") {
+                            ForEach(state.observed.filter { $0.country == nil }) { observation in
+                                Text(observation.plainCaption)
+                            }
+                            Button(rechecking ? "正在检查…" : "重新检查") {
+                                rechecking = true
+                                HelperClient.shared.recheckEgressRule(rule.id) { _ in
+                                    rechecking = false
+                                    refresh()
+                                }
+                            }
+                            .disabled(rechecking)
+                        }
+                    }
+                }
+                Section("查不到出口时") {
+                    EgressUnverifiedPicker(selection: Binding(get: { rule.unverified }, set: { value in
+                        edit { $0.unverified = value }
+                    }))
+                }
                 Section {
                     EgressSitesEditor(sites: Binding(get: { rule.sites }, set: { sites in
                         // A rule needs at least one site; delete the rule instead.
                         guard !sites.isEmpty else { return }
                         edit { $0.sites = sites }
-                    }))
+                    }), preview: preview)
                 } header: {
-                    Text("要保护的网站")
+                    Text("要保护的网站或网段")
                 } footer: {
-                    Text("任何程序访问这里的网站（含子域名）时检查出口，别的连接不受影响。至少留一个。")
+                    Text("粘贴到这里的规则都加入当前保护。至少保留一条。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -53,7 +81,7 @@ struct EgressRuleDetail: View {
                                            add: { code in edit { if !$0.expect.contains(code) { $0.expect.append(code) } } })
                     }
                     if let unverified = state?.unverifiedCount, unverified > 0, connected {
-                        Text("这次连接有 \(unverified) 条查不到出口（对方服务器不支持查询），已先放行。")
+                        Text("这次连接有 \(unverified) 次查不到出口，已放行。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 } header: {
@@ -82,7 +110,7 @@ struct EgressRuleDetail: View {
             Button("取消", role: .cancel) {}
             Button("保存") {
                 let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !value.isEmpty && value != rule.name { edit { $0.name = value } }
+                if !value.isEmpty && !value.contains(where: \.isNewline) && value != rule.name { edit { $0.name = value } }
             }
         } message: { Text("只是给自己看的名字，不影响保护。") }
         .alert("删除「\(rule.name)」的出口保护？", isPresented: $showDelete) {
@@ -153,9 +181,9 @@ struct EgressRuleDetail: View {
 extension EgressProtection.Observation {
     /// The record line without lookup jargon: host, server, where it left from.
     var plainCaption: String {
-        let server = peerAddress.map { "（服务器 \($0)）" } ?? ""
-        let place = country.map { "从 \(egressCountryLabel($0)) 出去" } ?? "没查到出口"
+        let server = host.isEmpty ? "" : peerAddress.map { "（服务器 \($0)）" } ?? ""
+        let place = country.map { "从 \(egressCountryLabel($0)) 出去" } ?? (host.isEmpty ? "看不到网站名" : "查不到出口")
         let exit = ip.map { "，出口 \($0)" } ?? ""
-        return host + server + " " + place + exit
+        return displayedHost + server + " " + place + exit
     }
 }

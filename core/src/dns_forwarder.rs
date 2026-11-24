@@ -20,7 +20,7 @@
 
 use regex_lite::Regex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
@@ -458,10 +458,10 @@ fn sanitize_service_answer(answer: &[u8], direct: bool, strip_ech: bool) -> Opti
 /// anywhere), "regexp:" (a regular expression), and "ipcidr:a.b.c.d/n"
 /// (a name whose IPv4 answer falls in it). Anything else is ignored, so
 /// an older App's plain list keeps working.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SplitRules {
-    suffixes: HashSet<String>,
-    fulls: HashSet<String>,
+    suffixes: Vec<String>,
+    fulls: Vec<String>,
     keywords: Vec<String>,
     regexes: Vec<Regex>,
     ranges: Vec<(u32, u32)>,
@@ -507,7 +507,7 @@ impl SplitRules {
         for raw in list {
             let item = raw.as_ref().trim_matches(|c: char| c == ' ' || c == '\t');
             if let Some(v) = item.strip_prefix("full:") {
-                r.fulls.insert(v.to_lowercase());
+                r.fulls.push(v.to_lowercase());
             } else if let Some(v) = item.strip_prefix("keyword:") {
                 if !v.is_empty() {
                     r.keywords.push(v.to_lowercase());
@@ -523,16 +523,27 @@ impl SplitRules {
             } else if let Some(v) = item.strip_prefix("domain:") {
                 let d = trim_domain(v);
                 if !d.is_empty() {
-                    r.suffixes.insert(d);
+                    r.suffixes.push(d);
                 }
             } else {
                 let d = trim_domain(item);
                 if !d.is_empty() && d.contains('.') && !d.contains(':') {
-                    r.suffixes.insert(d);
+                    r.suffixes.push(d);
                 }
             }
         }
-        r.ranges.sort_by_key(|r| r.0);
+        for names in [&mut r.suffixes, &mut r.fulls] {
+            names.sort_unstable();
+            names.dedup();
+            names.shrink_to_fit();
+        }
+        r.ranges.sort_unstable();
+        let mut end = 0;
+        for range in &mut r.ranges {
+            // Prefix maximum: an inner network cannot hide a broader one.
+            end = end.max(range.1);
+            range.1 = end;
+        }
         r
     }
 
@@ -547,29 +558,30 @@ impl SplitRules {
         if n.is_empty() || self.protects_name(&n) {
             return None;
         }
-        if self.fulls.contains(&n) {
-            return Some(n);
-        }
-        let mut rest = n.as_str();
+        self.named_rule(&n).map(str::to_owned)
+            .or_else(|| self.matches_pattern(&n).then(|| site_name(&n)))
+    }
+
+    pub(crate) fn matches_name(&self, name: &str) -> bool {
+        !name.is_empty() && (self.named_rule(name).is_some() || self.matches_pattern(name))
+    }
+
+    fn named_rule<'a>(&self, name: &'a str) -> Option<&'a str> {
+        if self.fulls.binary_search_by(|entry| entry.as_str().cmp(name)).is_ok() { return Some(name); }
+        let mut rest = name;
         loop {
-            if self.suffixes.contains(rest) {
-                return Some(rest.to_string());
-            }
-            match rest.find('.') {
-                Some(dot) => rest = &rest[dot + 1..],
-                None => break,
-            }
+            if self.suffixes.binary_search_by(|entry| entry.as_str().cmp(rest)).is_ok() { return Some(rest); }
+            rest = rest.split_once('.')?.1;
         }
-        if self.keywords.iter().any(|k| n.contains(k.as_str())) {
-            return Some(site_name(&n));
-        }
-        if self.regexes.iter().any(|re| re.is_match(&n)) {
-            return Some(site_name(&n));
-        }
-        None
+    }
+
+    fn matches_pattern(&self, name: &str) -> bool {
+        self.keywords.iter().any(|k| name.contains(k.as_str()))
+            || self.regexes.iter().any(|re| re.is_match(name))
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        if self.protects_ip(ip) { return false; }
         let v = u32::from(ip);
         // The last range starting at or below v.
         let idx = self.ranges.partition_point(|r| r.0 <= v);
@@ -579,6 +591,10 @@ impl SplitRules {
     pub(crate) fn with_protection(mut self, protection: Option<Arc<crate::egress_gate::ProtectedSites>>) -> Self {
         self.protected = protection;
         self
+    }
+
+    pub(crate) fn protects_ip(&self, ip: Ipv4Addr) -> bool {
+        self.protected.as_ref().is_some_and(|sites| sites.group_for_ip(ip.into()).is_some())
     }
 
     pub(crate) fn protects_name(&self, name: &str) -> bool {
@@ -1082,7 +1098,7 @@ impl Inner {
         addresses.sort_unstable(); addresses.dedup();
         let protected = rules.protects_name(&q.name);
         let direct: Vec<_> = addresses.iter().copied()
-            .filter(|_| !protected)
+            .filter(|ip| !protected && !rules.protects_ip(*ip))
             .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
         if self.settings.read().unwrap().epoch != epoch { return None; }
         if q.qtype == TYPE_A {

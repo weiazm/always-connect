@@ -2037,7 +2037,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     private func sendEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
-        guard let data = try? JSONEncoder().encode(config) else { completion(false); return }
+        guard let data = try? JSONEncoder().encode(config.forBackgroundService), data.count <= 524_288 else {
+            completion(false)
+            return
+        }
         let json = String(decoding: data, as: UTF8.self)
         egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
     }

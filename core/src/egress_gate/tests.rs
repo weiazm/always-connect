@@ -209,6 +209,53 @@ fn protected_sites_cover_their_subdomains_only() {
 }
 
 #[test]
+fn expanded_rules_match_names_and_ipv4_in_order() {
+    let s = ProtectedSites::new(&[
+        SiteGroup { id: 1, sites: vec!["ipcidr:198.51.100.0/24".into(), "ipcidr:198.51.100.4/32".into()] },
+        SiteGroup { id: 2, sites: ["domain:family.example", "full:exact.example", "keyword:fixture",
+            r"regexp:^node[0-9]+\.example$"].map(str::to_owned).to_vec() },
+    ]);
+    let ip = "198.51.100.10".parse().unwrap();
+    for name in ["family.example", "a.family.example", "exact.example", "a.fixture.example", "node12.example"] {
+        assert_eq!(s.group_for_target(name, ip), Some(2), "{name} wins over IPv4");
+    }
+    for name in ["a.exact.example", "notfamily.example", "node.example", ""] {
+        assert_eq!(s.group_for(name), None);
+        assert_eq!(s.group_for_target(name, ip), Some(1));
+    }
+    assert_eq!(s.group_for_ip("2001:db8::1".parse().unwrap()), None);
+}
+
+#[test]
+fn network_rules_check_nameless_connections_without_trapping_the_own_probe() {
+    let mut g = gate();
+    g.sites = ProtectedSites::new(&[SiteGroup { id: 4, sites: vec!["ipcidr:198.51.100.0/24".into()] }]);
+    let now = Instant::now();
+    let (step, _) = connect_and_send(&mut g, 40_000, SITE, b"raw payload", now);
+    assert_eq!(step, Step::Consumed);
+    assert_eq!(checks(&drain(&mut g)), vec![(4, String::new())]);
+    let (step, _) = connect_and_send(&mut g, 40_001, OTHER, b"raw payload", now);
+    assert_eq!(step, Step::Forward);
+    let (step, _) = connect_and_send(&mut g, 40_002, SITE, b"GET / HTTP/1.1\r\nHost: 198.51.100.10\r\n\r\n", now);
+    assert_eq!(step, Step::Consumed);
+    assert!(drain(&mut g).is_empty(), "shares the nameless check for this destination");
+    let probe = hello(Some("probe.example"), &[b"ac-probe-test"], false, 0);
+    let (step, _) = connect_and_send(&mut g, 40_003, SITE, &probe, now);
+    assert_eq!(step, Step::Forward);
+
+    let mut g = Gate::new(GateConfig::default(), g.sites);
+    let (step, _) = connect_and_send(&mut g, 40_004, SITE, b"GE", now);
+    assert_eq!(step, Step::Consumed);
+    assert!(drain(&mut g).is_empty());
+    g.tick(now + Duration::from_secs(3));
+    assert_eq!(checks(&drain(&mut g)), vec![(4, String::new())]);
+    let (step, _) = connect_and_send(&mut g, 40_005, SITE,
+        b"GET / HTTP/1.1\r\nHost: outside.example\r\n\r\n", now + Duration::from_secs(3));
+    assert_eq!(step, Step::Consumed);
+    assert_eq!(checks(&drain(&mut g)), vec![(4, "outside.example".into())]);
+}
+
+#[test]
 fn other_sites_pass_at_their_first_packet() {
     let mut g = gate();
     let now = Instant::now();

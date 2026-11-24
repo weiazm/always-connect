@@ -56,6 +56,7 @@ impl GroupStatus {
             site.state = match obs.country.as_deref() {
                 Some(country) if group.allows(country) => "ok",
                 Some(_) => "blocked",
+                None if group.unverified == Unverified::Block => "blocked",
                 None => "unknown",
             }
             .into();

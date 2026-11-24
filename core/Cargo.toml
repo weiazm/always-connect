@@ -22,5 +22,5 @@ libc = "0.2"
 # The split list's regexp: rules; small, no Unicode tables.
 regex-lite = "0.1"
 # The network gate's record (guard.json), compatible with the Swift-written one.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

@@ -61,7 +61,7 @@ extension EgressProtection {
     }
 
     static func wrongExits(_ observations: [Observation], expected: [String]) -> Set<WrongExit>? {
-        let failed = observations.filter { $0.isOutside(expected) }
+        let failed = observations.filter { $0.country != nil && $0.isOutside(expected) }
         guard !failed.isEmpty else { return nil }
         let exits = failed.compactMap(\.wrongExit)
         return exits.count == failed.count ? Set(exits) : nil
@@ -76,7 +76,7 @@ extension EgressProtection.Observation {
 
     var observationCaption: String {
         let address = peerAddress.map { "（目的地址 \($0)）" } ?? ""
-        return "\(host)\(address)：\(countryAndAddress)"
+        return "\(host.isEmpty ? "无网站名" : host)\(address)：\(countryAndAddress)"
     }
 
     func isOutside(_ expected: [String]) -> Bool {
@@ -104,6 +104,9 @@ extension EgressProtection.GroupState {
     var blockCaption: String? {
         guard displayLevel == .partial else { return nil }
         let count = blockedCount ?? 0
+        if !observed.isEmpty && observed.allSatisfy({ $0.country == nil }) {
+            return count > 0 ? "已拦下 \(count) 次连接 · 查不到出口" : "有服务器查不到出口，已拦下"
+        }
         return count > 0 ? "已拦下 \(count) 次连接，其他服务器照常逐条检查" : "有些服务器出口不对，已拦下；其他照常检查"
     }
 }
@@ -160,9 +163,8 @@ extension EgressProtection.Status {
               let group = groups.first(where: { $0.id == approval.group }),
               let record = records.first(where: { $0.group == approval.group && $0.started == approval.started }),
               record.expected == rule.expect,
-              let target = approval.observation.wrongExit,
-              record.wrongExitsToTrust(current: group)?.contains(target) == true else { return false }
-        return rule.covers(target.host)
+              let target = approval.observation.wrongExit else { return false }
+        return record.wrongExitsToTrust(current: group)?.contains(target) == true
     }
 
     func approvals(for id: UInt32) -> [EgressCountryApproval] {

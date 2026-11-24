@@ -9,7 +9,7 @@
 #   - a protected site is checked first, then passes (probe before request);
 #   - a protected site (or subdomain) whose exit country is wrong is refused
 #     with a reset and no request reaches the site;
-#   - plain HTTP is decided by Host; a connection without a name passes;
+#   - plain HTTP is decided by Host; nameless TCP is checked only within a protected range;
 #   - a protected site whose exit cannot be read passes (best effort);
 #   - UDP 443 (QUIC) never leaves, other UDP does;
 #   - concurrent connections share one check;
@@ -86,7 +86,7 @@ ip link set acgdummy up
 python3 -I "$PY" server --ip "$SITE" --range-ip "$RANGE" --cert "$W/site.pem" --key "$W/site.key" \
   --log "$W/site.log" --ready "$W/site.ready" &
 PIDS+=($!)
-python3 -I "$PY" controller --sock "$W/control.sock" --ns "$NS" --ca "$W/ca.pem" --site-ip "$SITE" \
+python3 -I "$PY" controller --sock "$W/control.sock" --ns "$NS" --ca "$W/ca.pem" --range-ip "$RANGE" \
   --log "$W/controller.log" --ready "$W/controller.ready" &
 CTL=$!
 PIDS+=($CTL)
@@ -151,10 +151,15 @@ elif [ "$(count '"host": "blocked.test"' "$W/site.log")" = 0 ]; then
   pass "plain HTTP to a blocked host is refused by Host"
 else fail "plain HTTP request reached the site"; fi
 checks=$(count '"kind": "check"' "$W/controller.log")
-out=$(nsx python3 -I -c "import socket;s=socket.create_connection(('$RANGE',7000),5);s.sendall(b'ping');print(s.recv(16).decode())" 2>&1 || true)
+out=$(nsx python3 -I -c "import socket;s=socket.create_connection(('$SITE',7000),5);s.sendall(b'free ping');print(s.recv(16).decode())" 2>&1 || true)
 if [ "$out" = "pong" ] && [ "$(count '"kind": "check"' "$W/controller.log")" = "$checks" ]; then
   pass "a connection that shows no name passes without a check"
 else fail "nameless: '$out'"; fi
+if nsx python3 -I -c "import socket;s=socket.create_connection(('$RANGE',7000),5);s.settimeout(5);s.sendall(b'protected ping');assert s.recv(16)==b'pong'" >/dev/null 2>&1; then
+  fail "a nameless connection in the protected range was let through"
+elif [ "$(count '"group": 4, "host": ""' "$W/controller.log")" = 1 ]     && [ "$(count 'protected ping' "$W/site.log")" = 0 ]; then
+  pass "nameless TCP in the protected range is checked with an empty host and blocked before payload"
+else fail "the protected range did not send an empty-host check, or the payload reached the server"; fi
 out=$(nsx "${CURL[@]}" --resolve untraced.test:443:$SITE https://untraced.test/ 2>&1 || true)
 if [ "$out" = "ok untraced.test" ] && [ "$(count '"result": "unverified"' "$W/controller.log")" -ge 1 ]; then
   pass "a protected site whose exit cannot be read passes"

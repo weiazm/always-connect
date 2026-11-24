@@ -1730,6 +1730,31 @@ pub extern "C" fn ac_egress_config_valid(json: *const c_char) -> bool {
 }
 
 #[no_mangle]
+pub extern "C" fn ac_egress_rule_valid(rule: *const c_char) -> bool {
+    c_str(rule).is_some_and(|rule| crate::egress_control::valid_rule(&rule, false))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_egress_match_targets(config: *const c_char, targets: *const c_char) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Target {
+        host: Option<String>,
+        address: String,
+    }
+    let match_all = || {
+        let cfg: crate::egress_control::EgressConfig = serde_json::from_str(&c_str(config)?).ok()?;
+        let targets: Vec<Target> = serde_json::from_str(&c_str(targets)?).ok()?;
+        let sites = cfg.protected_sites();
+        let matched: Vec<_> = targets.into_iter().map(|target| {
+            sites.group_for(target.host.as_deref().unwrap_or(""))
+                .or_else(|| sites.group_for_ip(target.address.parse().ok()?))
+        }).collect();
+        serde_json::to_string(&matched).ok()
+    };
+    match_all().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_oc_egress_status(e: *const oc_engine::Engine) -> *mut c_char {
     owned(unsafe { e.as_ref() }.map(|e| e.egress_status()).unwrap_or_else(|| "{}".into()))
 }
