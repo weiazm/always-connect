@@ -91,6 +91,9 @@ struct ConnectionsUITest {
         }
 
         let defaultViewport = scroll.contentView.bounds.size
+        let scopes = ConnectionsPage.egressChoices(host: "a.edge.example.com", address: "192.0.2.9").map(\.rule)
+        check(scopes == ["example.com", "edge.example.com", "full:a.edge.example.com", "192.0.2.9/32"],
+              "adding a row to an existing protection offers the site, its subdomains, the name alone and the address")
         check(table.rect(ofColumn: 5).maxX <= scroll.documentVisibleRect.maxX,
               "all columns fit at the default window size")
         for size in [SettingsWindow.size, SettingsWindow.minimumSize] {
