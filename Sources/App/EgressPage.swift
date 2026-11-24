@@ -228,6 +228,7 @@ struct EgressProtectionPage: View {
     private static let countryWidth: CGFloat = 160
     private static let stateWidth: CGFloat = 96
     private static let switchWidth: CGFloat = 56
+    private static let deleteWidth: CGFloat = 24
 
     private var tableHeader: some View {
         HStack(spacing: 8) {
@@ -235,6 +236,7 @@ struct EgressProtectionPage: View {
             Text("只从这里出去").frame(width: Self.countryWidth, alignment: .leading)
             Text("状态").frame(width: Self.stateWidth, alignment: .leading)
             Text("保护").frame(width: Self.switchWidth)
+            Color.clear.frame(width: Self.deleteWidth, height: 1)
         }
         .font(.caption).foregroundStyle(.secondary)
     }
@@ -253,9 +255,12 @@ struct EgressProtectionPage: View {
                             .opacity(group.enabled ? 1 : 0.45)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(group.name).fontWeight(.medium).lineLimit(1)
+                            // The rules themselves, not only how many (user, 2026-11-24).
+                            Text(group.sites.joined(separator: "、"))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                                .help(group.sites.joined(separator: "\n"))
                             Text("\(group.sites.count) 条规则 · 查不到出口时：\(group.unverified.label)")
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                .help(group.sites.joined(separator: "\n"))
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
                             } else if unverified > 0 {
@@ -279,12 +284,30 @@ struct EgressProtectionPage: View {
                 .labelsHidden().toggleStyle(.always).fixedSize()
                 .frame(width: Self.switchWidth)
                 .help(group.enabled ? "暂停这个保护" : "恢复保护")
+                // Deleting is one click away on the row (user, 2026-11-24:
+                // "应该直接漏出一个删除的能力"); the banner offers 撤销.
+                Button { deleteRule(group.id) } label: {
+                    Image(systemName: "trash").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .frame(width: Self.deleteWidth)
+                .help("删除这个保护（可以撤销）")
+                .accessibilityLabel("删除「\(group.name)」")
             }
             if !decisions.isEmpty {
                 EgressDecisionList(decisions: decisions, refresh: refresh)
             }
         }
         .padding(.vertical, 3)
+        .contextMenu {
+            Button("查看详情") { sheet = .details(group.id) }
+            Button(group.enabled ? "暂停" : "恢复") {
+                if !group.enabled && !canEnable { sheet = .details(group.id); return }
+                changeRule(group.id) { $0.enabled = !group.enabled }
+            }
+            Divider()
+            Button("删除", role: .destructive) { deleteRule(group.id) }
+        }
     }
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
@@ -323,7 +346,7 @@ struct EgressProtectionPage: View {
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
                                  edit: { edit in changeRule(id, edit: edit) },
-                                 remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } },
+                                 remove: { deleteRule(id) },
                                  saveSites: { original, sites, done in
                                      replaceSites(id, original: original, sites: sites, done: done)
                                  })
@@ -402,6 +425,23 @@ struct EgressProtectionPage: View {
             message = ok ? nil : "没有保存。设置可能刚被改过，请关掉设置窗口再打开试试。"
             refresh()
             completion?(ok)
+        }
+    }
+
+    /// Deletes at once and offers 撤销; when it is the last protection
+    /// switched on and the VPN is up, the reconnect question comes first.
+    private func deleteRule(_ id: UInt32) {
+        guard preview == nil else { return }
+        let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard let name = previous.groups.first(where: { $0.id == id })?.name else { return }
+        let change = EgressRuleChange(config: previous) { $0.groups.removeAll { $0.id == id } }
+        sheet = nil
+        if change.needsReconnect(connected: manager.showsConnected) {
+            confirm = change
+            return
+        }
+        apply(change) { ok in
+            if ok { notice = EgressChangeNotice(text: "已删除「\(name)」。", change: change) }
         }
     }
 

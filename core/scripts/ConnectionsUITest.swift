@@ -256,7 +256,11 @@ struct ConnectionsUITest {
         render("egress-add", 600, AnyView(EgressSiteSheet(sites: group.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
         render("egress-detail", 560, AnyView(EgressRuleDetail(rule: group, config: config, status: nil, connected: true,
             refresh: {}, edit: { _ in }, remove: {}, saveSites: { _, _, done in done(nil) })))
-        print("PASS offscreen add and detail views")
+        let second = EgressProtection.Group(id: 8, name: "第二个保护", enabled: false,
+            sites: ["example.org", "geosite:test"], expect: ["ZZ", "YY"], unverified: .whenWrong)
+        render("egress-page", 360, AnyView(EgressProtectionPage(preview: EgressPagePreview(
+            config: EgressProtection(enabled: true, groups: [group, second]), status: nil, connected: false))))
+        print("PASS offscreen add, detail and page views")
     }
 
     private static func findTable(in view: NSView) -> NSTableView? {
