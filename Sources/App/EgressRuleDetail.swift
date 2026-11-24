@@ -11,11 +11,32 @@ struct EgressRuleDetail: View {
     let refresh: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
     let remove: () -> Void
-    var preview: [ConnectionRow]? = nil
+    let saveSites: (_ original: [String], _ replacement: [String], _ done: @escaping (String?) -> Void) -> Void
+    @State private var originalSites: [String]
+    @State private var input: String
+    @State private var issues: [EgressRuleInput.Issue] = []
+    @State private var saveError: String?
+    @State private var saving = false
     @State private var renaming = false
     @State private var name = ""
     @State private var showDelete = false
     @State private var rechecking = false
+
+    init(rule: EgressProtection.Group, config: EgressProtection, status: EgressProtection.Status?, connected: Bool,
+         refresh: @escaping () -> Void, edit: @escaping ((inout EgressProtection.Group) -> Void) -> Void,
+         remove: @escaping () -> Void,
+         saveSites: @escaping ([String], [String], @escaping (String?) -> Void) -> Void) {
+        self.rule = rule
+        self.config = config
+        self.status = status
+        self.connected = connected
+        self.refresh = refresh
+        self.edit = edit
+        self.remove = remove
+        self.saveSites = saveSites
+        _originalSites = State(initialValue: rule.sites)
+        _input = State(initialValue: EgressRuleInput.clashText(rule.sites))
+    }
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
     private var badge: EgressRuleBadge { .of(rule, config: config, state: state, connected: connected) }
@@ -58,17 +79,12 @@ struct EgressRuleDetail: View {
                     }))
                 }
                 Section {
-                    EgressSitesEditor(sites: Binding(get: { rule.sites }, set: { sites in
-                        // A rule needs at least one site; delete the rule instead.
-                        guard !sites.isEmpty else { return }
-                        edit { $0.sites = sites }
-                    }), preview: preview)
+                    EgressRuleText(input: $input, height: 145)
+                    EgressRuleIssues(issues: issues)
                 } header: {
                     Text("要保护的网站或网段")
-                } footer: {
-                    Text("粘贴到这里的规则都加入当前保护。至少保留一条。")
-                        .font(.caption).foregroundStyle(.secondary)
                 }
+
                 Section {
                     HStack(alignment: .firstTextBaseline) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -104,11 +120,20 @@ struct EgressRuleDetail: View {
                 Button("删除这个保护…", role: .destructive) { showDelete = true }
                     .buttonStyle(.borderless).foregroundStyle(.red)
                 Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+                if let saveError {
+                    Text(saveError).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+                Button(saving ? "正在保存…" : "完成", action: finish).keyboardShortcut(.defaultAction)
             }
             .padding(16)
         }
         .frame(width: 600, height: 560)
+        .disabled(saving)
+        .interactiveDismissDisabled(saving)
+        .onChange(of: input) { _ in
+            issues = []
+            saveError = nil
+        }
         .onAppear(perform: refresh)
         .alert("改名", isPresented: $renaming) {
             TextField("名称", text: $name)
@@ -122,6 +147,35 @@ struct EgressRuleDetail: View {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive, action: remove)
         } message: { Text("以后不再核对出口。只想临时停一下，可以用右上角的开关暂停。") }
+    }
+
+    private func finish() {
+        if input == EgressRuleInput.clashText(originalSites) {
+            dismiss()
+            return
+        }
+        let parsed = EgressRuleInput(input)
+        issues = parsed.issues
+        guard let sites = parsed.replacementSites else {
+            if !issues.isEmpty {
+                saveError = "第 \(issues[0].id) 行有问题，请修正后保存。"
+            } else if parsed.lines.isEmpty {
+                saveError = "请至少保留一条规则。"
+            } else {
+                saveError = "每个保护最多 \(EgressRuleInput.siteLimit) 条规则。"
+            }
+            return
+        }
+        if sites == originalSites {
+            dismiss()
+            return
+        }
+        saving = true
+        saveError = nil
+        saveSites(originalSites, sites) { error in
+            saving = false
+            if let error { saveError = error } else { dismiss() }
+        }
     }
 
     private var header: some View {

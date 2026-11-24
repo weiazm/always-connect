@@ -327,7 +327,9 @@ struct EgressProtectionPage: View {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
                                  edit: { edit in changeRule(id, edit: edit) },
                                  remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } },
-                                 preview: preview?.connections)
+                                 saveSites: { original, sites, done in
+                                     replaceSites(id, original: original, sites: sites, done: done)
+                                 })
             }
         }
     }
@@ -352,6 +354,24 @@ struct EgressProtectionPage: View {
             confirm = change
         } else {
             apply(change, completion: done)
+        }
+    }
+
+    private func replaceSites(_ id: UInt32, original: [String], sites: [String], done: @escaping (String?) -> Void) {
+        guard preview == nil else { done(nil); return }
+        let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        guard let change = EgressRuleChange.replacingSites(sites, expected: original, group: id, in: previous) else {
+            done("规则已在别处更新。可先复制草稿，再重新打开详情。")
+            return
+        }
+        if change.needsReconnect(connected: manager.showsConnected) {
+            sheet = nil
+            confirm = change
+            done(nil)
+        } else {
+            apply(change) { ok in
+                done(ok ? nil : "保存失败。草稿已保留，可以重试。")
+            }
         }
     }
 

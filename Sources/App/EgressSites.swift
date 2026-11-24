@@ -1,51 +1,8 @@
 import SwiftUI
 
-struct EgressSitesEditor: View {
-    @Binding var sites: [String]
-    var preview: [ConnectionRow]? = nil
-    @State private var input = ""
-
-    var body: some View {
-        let parsed = EgressRuleInput(input)
-        let added = parsed.adding(to: sites)
-        VStack(alignment: .leading, spacing: 8) {
-            FlowChips(items: sites) { site in
-                HStack(spacing: 4) {
-                    Text(EgressRuleInput.clash(site)).lineLimit(1).truncationMode(.middle)
-                    Button { sites.removeAll { $0 == site } } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(sites.count == 1)
-                    .accessibilityLabel("移除 " + EgressRuleInput.clash(site))
-                }
-                .frame(maxWidth: 470)
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Capsule().fill(Color.secondary.opacity(0.14)))
-            }
-            EgressRuleText(input: $input, parsed: parsed, showGroups: false)
-            Button("加入规则") {
-                sites = added
-                // Keep only the lines the user still needs to correct.
-                let lines = input.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-                input = parsed.issues.map { String(lines[$0.id - 1]) }.joined(separator: "\n")
-            }
-            .disabled(added == sites || added.count > EgressRuleInput.siteLimit)
-            if added.count > EgressRuleInput.siteLimit {
-                Text("每个保护最多 256 条规则。").font(.caption).foregroundStyle(.orange)
-            }
-            EgressRecentSites(preview: preview) { site in
-                guard sites.count < EgressRuleInput.siteLimit, !sites.contains(site) else { return }
-                sites.append(site)
-            }
-        }
-    }
-}
-
-private struct EgressRuleText: View {
+struct EgressRuleText: View {
     @Binding var input: String
-    let parsed: EgressRuleInput
-    let showGroups: Bool
+    var height: CGFloat = 76
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -53,26 +10,28 @@ private struct EgressRuleText: View {
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $input)
                 .font(.system(.callout, design: .monospaced))
-                .frame(height: 76)
+                .frame(height: height)
                 .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.secondary.opacity(0.35)).allowsHitTesting(false))
                 .accessibilityLabel("出口保护规则，每行一条")
-            if !input.isEmpty {
-                let groups = showGroups ? "（分成 \(parsed.groupCount) 条保护）" : ""
-                Text("识别 \(parsed.lines.count) 条\(groups) · 不支持或无效 \(parsed.issues.count) 条")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            if !parsed.issues.isEmpty {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(parsed.issues) { issue in
-                            Text("第 \(issue.id) 行  \(issue.message)")
-                        }
+        }
+    }
+}
+
+struct EgressRuleIssues: View {
+    let issues: [EgressRuleInput.Issue]
+
+    var body: some View {
+        if !issues.isEmpty {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(issues) { issue in
+                        Text("第 \(issue.id) 行  \(issue.message)")
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(height: CGFloat(min(parsed.issues.count, 4) * 18))
-                .font(.caption).foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(height: CGFloat(min(issues.count, 4) * 18))
+            .font(.caption).foregroundStyle(.orange)
         }
     }
 }
@@ -184,7 +143,7 @@ struct EgressSiteSheet: View {
          save: @escaping (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void) {
         self.preview = preview
         self.save = save
-        _input = State(initialValue: sites.map { EgressRuleInput.clash($0) }.joined(separator: "\n"))
+        _input = State(initialValue: EgressRuleInput.clashText(sites))
         _countries = State(initialValue: countries)
     }
 
@@ -195,7 +154,12 @@ struct EgressSiteSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading).padding(20)
             Form {
                 Section("要保护的网站或网段") {
-                    EgressRuleText(input: $input, parsed: parsed, showGroups: true)
+                    EgressRuleText(input: $input)
+                    if !input.isEmpty {
+                        Text("识别 \(parsed.lines.count) 条（分成 \(parsed.groupCount) 条保护） · 不支持或无效 \(parsed.issues.count) 条")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    EgressRuleIssues(issues: parsed.issues)
                     if parsed.lines.contains(where: { $0.group != nil }) {
                         Text("有策略组名的规则按组名归入保护，同名保护沿用原来的出口设置。")
                             .font(.caption).foregroundStyle(.secondary)

@@ -123,6 +123,17 @@ struct EgressRuleInput {
         return old + lines.map(\.site).filter { seen.insert($0).inserted }
     }
 
+    /// Editing replaces the whole list. Every non-comment line must parse.
+    var replacementSites: [String]? {
+        guard issues.isEmpty else { return nil }
+        let sites = adding(to: [])
+        return (1...Self.siteLimit).contains(sites.count) ? sites : nil
+    }
+
+    static func clashText(_ sites: [String]) -> String {
+        sites.map { clash($0) }.joined(separator: "\n")
+    }
+
     static func clash(_ site: String, group: String? = nil) -> String {
         let pair = site.split(separator: ":", maxSplits: 1)
         let kind: String
@@ -258,6 +269,13 @@ struct EgressRuleChange: Identifiable, Equatable {
     var undo: Self { .init(before: after, after: before) }
     var confirmationTitle: String { after.isActive ? "开启并重连" : "关闭并重连" }
     static let reconnectCaption = "需要重新连接一次 VPN。通常不用在手机上确认，已打开的网页可能需要刷新。"
+
+    static func replacingSites(_ sites: [String], expected: [String], group id: UInt32, in config: EgressProtection) -> Self? {
+        guard let index = config.groups.firstIndex(where: { $0.id == id && $0.sites == expected }) else { return nil }
+        var updated = config
+        updated.groups[index].sites = sites
+        return Self(before: config, after: updated)
+    }
 
     static func adding(_ input: EgressRuleInput, countries: [String], unverified: EgressProtection.Unverified,
                        config: EgressProtection) -> Self? {

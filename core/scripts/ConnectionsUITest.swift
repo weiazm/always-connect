@@ -189,6 +189,43 @@ struct ConnectionsUITest {
         check(merged?.groups.count == 4 && merged?.groups[1].sites.last == "full:additional.test"
               && merged?.groups[1].expect == ["ZZ"] && merged?.groups[1].unverified == .block,
               "an existing policy group keeps its own countries and policy")
+        let old = Data(#"{"enabled":true,"groups":[{"id":7,"name":"Fixture","enabled":true,"expect":["ZZ"],"members":[{"pattern":"*.legacy.example"},{"pattern":"archive.example"}]}]}"#.utf8)
+        let legacy = try! JSONDecoder().decode(EgressProtection.self, from: old)
+        let original = legacy.groups[0].sites
+        check(EgressRuleInput.clashText(original) == "DOMAIN-SUFFIX,legacy.example\nDOMAIN-SUFFIX,archive.example",
+              "opening an older rule prefills the original entries in order")
+
+        let changed = EgressRuleInput("""
+        DOMAIN,EXACT.EXAMPLE.,Ignored group
+        192.0.2.4
+        DOMAIN-SUFFIX,legacy.example
+        full:exact.example
+        """)
+        let expected = ["full:exact.example", "192.0.2.4/32", "legacy.example"]
+        guard let sites = changed.replacementSites,
+              let replacement = EgressRuleChange.replacingSites(sites, expected: original, group: 7, in: legacy)
+        else { fail("make a complete rule replacement") }
+        var expectedSettings = legacy
+        expectedSettings.groups[0].sites = expected
+        check(replacement.before == legacy && replacement.after == expectedSettings && !replacement.needsReconnect(connected: true),
+              "completion deletes omitted entries, normalizes edits and preserves all other settings")
+        let update = EgressConfigUpdate(config: replacement.after, previous: replacement.before)
+        let reopened = try! JSONDecoder().decode(EgressConfigUpdate.self, from: JSONEncoder().encode(update)).config
+        check(EgressRuleInput(EgressRuleInput.clashText(reopened.groups[0].sites)).replacementSites == expected,
+              "reopening shows the saved normalized list")
+
+        let invalid = EgressRuleInput("DOMAIN,valid.example\nPROCESS-NAME,Fixture\nIP-CIDR,192.0.2.0/33")
+        let tooMany = EgressRuleInput((0...EgressRuleInput.siteLimit).map { "example-\($0).test" }.joined(separator: "\n"))
+        check(invalid.issues.map(\.id) == [2, 3] && invalid.replacementSites == nil
+              && EgressRuleInput("# comment only").replacementSites == nil && tooMany.replacementSites == nil,
+              "invalid, empty or oversized drafts do not produce a save payload")
+        check(EgressRuleChange.replacingSites(sites, expected: original, group: 7, in: reopened) == nil,
+              "a stale editor cannot overwrite a rule already changed elsewhere")
+        let mixed = ["legacy.example", "full:exact.example", "keyword:fixture", "regexp:^node[0-9]{1,3}[.]example$",
+                     "geosite:test", "geoip:cn", "192.0.2.0/24"]
+        check(EgressRuleInput(EgressRuleInput.clashText(mixed)).replacementSites == mixed,
+              "all existing rule types retain their meaning when reopened")
+        print("PASS exit rule detail normalizes a complete edit and rejects an invalid or stale draft")
         print("PASS Clash rules parse, group, expand and round trip")
     }
 
@@ -218,7 +255,7 @@ struct ConnectionsUITest {
         }
         render("egress-add", 600, AnyView(EgressSiteSheet(sites: group.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
         render("egress-detail", 560, AnyView(EgressRuleDetail(rule: group, config: config, status: nil, connected: true,
-            refresh: {}, edit: { _ in }, remove: {}, preview: sample)))
+            refresh: {}, edit: { _ in }, remove: {}, saveSites: { _, _, done in done(nil) })))
         print("PASS offscreen add and detail views")
     }
 
