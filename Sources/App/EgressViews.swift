@@ -24,7 +24,10 @@ struct EgressRuleBadge: Equatable {
     static func of(_ group: EgressProtection.Group, config: EgressProtection,
                    state: EgressProtection.GroupState?, connected: Bool) -> Self {
         if !group.enabled { return .init(text: "已暂停", tone: .neutral, problem: nil) }
-        if config.directMembers(in: group).isEmpty || group.expect.isEmpty {
+        if group.expect.isEmpty {
+            return .init(text: "要处理", tone: .bad, problem: "还没选允许的国家或地区")
+        }
+        if !group.byApp && config.directMembers(in: group).isEmpty {
             return .init(text: "要处理", tone: .bad, problem: "没有能直接检查出口的网站：连上 VPN 后这些网站会被拦住")
         }
         guard connected else { return .init(text: "待命", tone: .neutral, problem: nil) }

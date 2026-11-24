@@ -141,6 +141,20 @@ impl Failures {
     }
 
     pub fn plan(&self, cfg: &EgressConfig, group: &Group, check: &CheckMsg) -> Vec<Target> {
+        if group.by_app() {
+            // A protected app's connection is probed at its own destination,
+            // with the name it showed (a cover name still reaches the same edge).
+            let (Some(host), Some(method)) = (check.host.as_ref(), cfg.method(super::PRESET_TRACE)) else { return Vec::new() };
+            if !super::valid_host(host) { return Vec::new(); }
+            return vec![Target {
+                host: host.to_ascii_lowercase(),
+                method,
+                peer: Some((check.ip, check.port.get())),
+                borrowed: false,
+                named_flow: check.host_confirmed,
+                alternative: None,
+            }];
+        }
         let mut targets = Vec::new();
         let direct: Vec<_> = probe_targets(cfg, group, check.host.as_deref())
             .into_iter()

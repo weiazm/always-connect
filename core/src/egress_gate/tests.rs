@@ -1516,3 +1516,58 @@ fn grease_with_a_plain_name_passes_but_cover_and_published_public_names_wait_for
     // An ECH hello without any outer name stays unidentified.
     assert_eq!(connect_and_send(&mut g, 45184, PUBLIC, &hello(None, &[], true, 0), now).0, Step::Consumed);
 }
+
+/// Protected apps by local port, for the app-mode tests (§66.24).
+struct PortOwners(HashMap<(u8, u16), GroupId>);
+
+impl owners::FlowOwners for PortOwners {
+    fn active(&self) -> bool {
+        true
+    }
+    fn group_for(&mut self, proto: u8, local_port: u16, _: Instant) -> Option<GroupId> {
+        self.0.get(&(proto, local_port)).copied()
+    }
+}
+
+fn app_gate() -> Gate {
+    let mut g = gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    g.set_owners(Box::new(PortOwners(HashMap::from([((6, 47000), 1), ((6, 47001), 1), ((6, 47002), 1), ((17, 47010), 1)]))));
+    g
+}
+
+#[test]
+fn app_mode_leaves_every_other_program_alone() {
+    let mut g = app_gate();
+    let now = Instant::now();
+    // What the name-based mode blocked as unidentified passes untouched.
+    for (port, payload) in [(47100, hello(Some("cloudflare-ech.com"), &[], true, 0)), (47101, hello(None, &[], false, 0)),
+                            (47102, b"opaque".to_vec())] {
+        assert_eq!(connect_and_send(&mut g, port, PUBLIC, &payload, now).0, Step::Forward);
+    }
+    // Even a protected name from another program is not this mode's business.
+    assert_eq!(connect_and_send(&mut g, 47103, SITE, &hello(Some("a.protected.example"), &[], false, 0), now).0, Step::Forward);
+    assert!(drain(&mut g).is_empty());
+    assert!(g.take_unknown_web().is_none());
+    // Only the protected app's QUIC is dropped.
+    assert_eq!(g.outbound(&udp4(MAC, 47110, PUBLIC, 443, b"QUIC"), now), Step::Forward);
+    assert_eq!(g.outbound(&udp4(MAC, 47010, PUBLIC, 443, b"QUIC"), now), Step::Consumed);
+    assert_eq!(g.outbound(&udp4(MAC, 47010, PUBLIC, 443, b"QUIC"), now), Step::Consumed);
+}
+
+#[test]
+fn a_protected_apps_connection_is_held_and_checked_by_what_it_shows() {
+    let mut g = app_gate();
+    let now = Instant::now();
+    let (step, _) = connect_and_send(&mut g, 47000, PUBLIC, &hello(Some("chat.ordinary.example"), &[], false, 0), now);
+    assert_eq!(step, Step::Consumed);
+    let out = drain(&mut g);
+    assert!(matches!(out.as_slice(), [Out::Check { group: 1, host: Some(host), host_confirmed: true, destination, .. }]
+        if host == "chat.ordinary.example" && *destination == SocketAddr::from((PUBLIC, 443))), "{out:?}");
+    // With the ECH extension the name may be a cover name: not confirmed.
+    connect_and_send(&mut g, 47001, OTHER, &hello(Some("cloudflare-ech.com"), &[], true, 0), now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 1, host: Some(_), host_confirmed: false, .. }]));
+    // No name at all: still checked, by address.
+    connect_and_send(&mut g, 47002, RANGE_IP, b"opaque-protocol-bytes", now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 1, host: None, host_confirmed: false, .. }]));
+}

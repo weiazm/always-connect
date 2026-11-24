@@ -817,3 +817,26 @@ fn delivered_dns_stream_scopes_withdrawals_and_fences_loss_across_epoch_updates(
     drop(ctl);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn an_app_group_probes_the_connection_itself_and_never_by_member_names() {
+    let cfg = EgressConfig { enabled: true, groups: vec![Group {
+        id: 1, name: "Example app".into(), enabled: true, expect: vec!["ZZ".into()],
+        apps: vec!["/Applications/Example.app".into(), "example-cli".into()], ..Group::default()
+    }], ..EgressConfig::default() };
+    let group = cfg.groups[0].clone();
+    assert!(group.by_app() && cfg.has_direct_method(&group), "an app group can be switched on without members");
+    let named = target_check(1, "198.51.100.9", Some("Chat.Example.com"));
+    let plan = Failures::default().plan(&cfg, &group, &named);
+    assert_eq!(plan.len(), 1);
+    assert_eq!((plan[0].host.as_str(), plan[0].peer, plan[0].direct_flow()),
+               ("chat.example.com", Some(("198.51.100.9".parse().unwrap(), 443)), true));
+    let mut cover = target_check(2, "198.51.100.9", Some("cloudflare-ech.com"));
+    cover.host_confirmed = false;
+    assert!(!Failures::default().plan(&cfg, &group, &cover)[0].direct_flow(), "a possible cover name is not direct evidence");
+    assert!(Failures::default().plan(&cfg, &group, &target_check(3, "198.51.100.9", None)).is_empty(),
+            "no name: nothing to probe, the controller lets it through (best effort)");
+    assert!(crate::egress_gate::Classifier::group_for_name(&cfg.protected_routes(), "chat.example.com").is_none(), "app groups route and rewrite no names");
+    let gate = cfg.gate_groups();
+    assert_eq!(gate[0]["apps"], serde_json::json!(["/Applications/Example.app", "example-cli"]));
+}

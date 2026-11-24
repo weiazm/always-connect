@@ -29,6 +29,7 @@
 //! in its own network namespace).
 
 use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
+use alwaysconnect_core::egress_gate::owners::ProcessOwners;
 use alwaysconnect_core::egress_gate::{DeniedGroup, DnsEvidenceUpdate, Gate, GateConfig, GroupId, Out, RequestId, Step, UnknownWebEndpoint, UnknownWebPolicy, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
@@ -362,6 +363,7 @@ fn main() {
         ..GateConfig::default()
     };
     let mut gate = Gate::new(gcfg, Box::new(groups));
+    gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&cfg.groups))));
     log(&format!("up on {ifname}"));
     if let Some(c) = &mut control {
         let _ = c.stream.write_all((serde_json::json!({ "up": { "ifname": ifname } }).to_string() + "\n").as_bytes());
@@ -397,6 +399,7 @@ fn main() {
                             if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
                                 log("new configuration");
                                 gate.set_unknown_web(m.unknown_web.policy(&groups));
+                                gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&groups))));
                                 gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
                             }
                             if m.invalidate == Some(true) {

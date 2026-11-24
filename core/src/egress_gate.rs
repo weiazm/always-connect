@@ -19,6 +19,7 @@ use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 mod dns_evidence;
+pub mod owners;
 mod unknown_web;
 use dns_evidence::{DnsEvidence, DnsMatch};
 pub use dns_evidence::{DnsEvidenceKind, DnsEvidenceUpdate, DnsEvidenceValue};
@@ -360,6 +361,10 @@ pub struct Gate {
     unknown_web_counts: UnknownWebCounts,
     dns_evidence: DnsEvidence,
     clock: fn() -> Option<u64>,
+    /// Protected apps (§66.24): when active, only their connections are
+    /// held and checked; every other connection passes untouched.
+    owners: Box<dyn owners::FlowOwners>,
+    app_flows: HashMap<FlowKey, GroupId>,
 }
 
 impl Gate {
@@ -381,7 +386,20 @@ impl Gate {
             unknown_web_counts: UnknownWebCounts::default(),
             dns_evidence: DnsEvidence::default(),
             clock: evidence_clock_ms,
+            owners: Box::new(owners::NoOwners),
+            app_flows: HashMap::new(),
         }
+    }
+
+    /// Protect by app instead of by name (§66.24). Connections already
+    /// decided keep their decision; new ones are attributed to their owner.
+    pub fn set_owners(&mut self, owners: Box<dyn owners::FlowOwners>) {
+        self.owners = owners;
+        self.app_flows.clear();
+    }
+
+    fn app_mode(&self) -> bool {
+        self.owners.active()
     }
 
     /// Actions produced since the last drain, in order.
@@ -685,13 +703,31 @@ impl Gate {
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
+            if let Some(&group) = self.app_flows.get(&k) {
+                self.wait_for_check(k, group, None, false, now);
+                continue;
+            }
             let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified, None);
         }
         let idle = self.cfg.idle;
         self.flows.retain(|_, f| matches!(f.state, State::Holding(_)) || now.duration_since(f.last_seen) < idle);
+        let flows = &self.flows;
+        self.app_flows.retain(|key, _| flows.contains_key(key));
     }
 
     fn outbound_udp(&mut self, pkt: &[u8], p: &Packet, sport: u16, dport: u16, now: Instant) -> Step {
+        if self.app_mode() {
+            // Only a protected app's QUIC is dropped, so it falls back to TCP,
+            // which can be checked; every other datagram passes.
+            let key = FlowKey { proto: 17, src: p.src, sport, dst: p.dst, dport };
+            if let Some(f) = self.flows.get_mut(&key) {
+                f.last_seen = now;
+                return if matches!(f.state, State::Blocked) { Step::Consumed } else { Step::Forward };
+            }
+            let protected = dport == 443 && self.owners.group_for(17, sport, now).is_some();
+            self.insert(key, if protected { State::Blocked } else { State::Pass }, now);
+            return if protected { Step::Consumed } else { Step::Forward };
+        }
         if self.cfg.block_quic && dport == 443 {
             return Step::Consumed;
         }
@@ -733,6 +769,9 @@ impl Gate {
         let seg = ClientSeg { seq: t.seq, ack: t.ack, has_ack: t.flags & ACK != 0, syn: t.flags & SYN != 0, len: p.payload.len() as u32 };
         let syn = t.flags & SYN != 0;
         let data_start = if syn { t.seq.wrapping_add(1) } else { t.seq };
+        if !self.flows.contains_key(&key) && self.app_mode() {
+            return self.outbound_new_app_tcp(pkt, key, seg, syn, data_start, p.payload.is_empty(), now);
+        }
         if !self.flows.contains_key(&key) {
             if syn {
                 if !self.insert(key, State::Fresh { next: data_start }, now) {
@@ -826,8 +865,69 @@ impl Gate {
         }
     }
 
+    /// A new connection in app mode: only a protected app's is held for a
+    /// check, by the name it shows (if any) and its destination address.
+    #[allow(clippy::too_many_arguments)]
+    fn outbound_new_app_tcp(&mut self, pkt: &[u8], key: FlowKey, seg: ClientSeg, syn: bool, data_start: u32,
+                            empty: bool, now: Instant) -> Step {
+        let Some(group) = self.owners.group_for(6, key.sport, now) else {
+            self.insert(key, State::Pass, now);
+            return Step::Forward;
+        };
+        if syn {
+            if !self.insert(key, State::Fresh { next: data_start }, now) {
+                self.reset(key, seg);
+                return Step::Consumed;
+            }
+            self.app_flows.insert(key, group);
+            return Step::Forward;
+        }
+        if empty {
+            return Step::Forward;
+        }
+        // Mid-stream (older than the gate): no start to read, check by address.
+        if pkt.len() <= self.cfg.max_held_bytes {
+            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: seg.seq.wrapping_add(seg.len),
+                              since: now, checking: false, client_isn: None, last: Some(seg) };
+            if self.insert(key, State::Holding(Box::new(held)), now) {
+                self.app_flows.insert(key, group);
+                self.wait_for_check(key, group, None, false, now);
+                return Step::Consumed;
+            }
+        }
+        self.reset(key, seg);
+        Step::Consumed
+    }
+
+    /// A protected app's held connection: check it with whatever name its
+    /// first bytes show. The name may be an ECH cover name; the check is
+    /// about this destination address either way.
+    fn after_hold_app(&mut self, key: FlowKey, group: GroupId, now: Instant) -> Step {
+        let (verdict, full) = {
+            let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };
+            (sniff(&h.stream), h.bytes >= self.cfg.max_held_bytes)
+        };
+        let (host, confirmed) = match verdict {
+            Sniff::Incomplete if !full => return Step::Consumed,
+            Sniff::Tls { sni: Some(name), ech, .. } => {
+                let confirmed = !ech && is_site_name(&name);
+                (Some(name), confirmed)
+            }
+            Sniff::Http(Some(name)) => {
+                let confirmed = is_site_name(&name);
+                (Some(name), confirmed)
+            }
+            _ => (None, false),
+        };
+        self.wait_for_check(key, group, host, confirmed, now);
+        Step::Consumed
+    }
+
     /// Try to classify a holding connection from what it has sent so far.
     fn after_hold(&mut self, key: FlowKey, now: Instant, first: bool) -> Step {
+        if let Some(&group) = self.app_flows.get(&key) {
+            return self.after_hold_app(key, group, now);
+        }
         let (verdict, full) = {
             let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };
             (sniff(&h.stream), h.bytes >= self.cfg.max_held_bytes)

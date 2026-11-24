@@ -32,14 +32,12 @@ struct EgressProtectionPage: View {
     @State private var confirmDropProtection = false
 
     enum Sheet: Identifiable {
-        case add(UInt32?), details(UInt32), advanced(UInt32), unknownWeb, methods
+        case add(UInt32?), details(UInt32), unknownWeb
         var id: String {
             switch self {
             case .add(let id): return "add-\(id ?? 0)"
             case .details(let id): return "details-\(id)"
-            case .advanced(let id): return "advanced-\(id)"
             case .unknownWeb: return "unknown-web"
-            case .methods: return "methods"
             }
         }
     }
@@ -53,7 +51,13 @@ struct EgressProtectionPage: View {
         _sheet = State(initialValue: sheet)
     }
 
-    private var config: EgressProtection { stored.rulesForEditing }
+    /// Only app rules are shown and edited (§66.24); website rules are retired.
+    private var config: EgressProtection {
+        var result = stored.rulesForEditing
+        result.groups.removeAll { !$0.byApp }
+        return result
+    }
+    private var legacyRules: [EgressProtection.Group] { stored.groups.filter { !$0.byApp } }
     private var connected: Bool { preview?.connected ?? manager.showsConnected }
     private var available: Bool { preview?.available ?? (!manager.usesCisco && manager.protectsDrops) }
     private var active: [EgressProtection.Group] { config.groups.filter(\.enabled) }
@@ -64,12 +68,11 @@ struct EgressProtectionPage: View {
         Form {
             Section {
                 statusBar
-                if let count = liveStatus?.unknownWebCount, count > 0, config.isActive, config.blocksUnidentifiedWeb {
-                    HStack {
-                        Label("认不出网站名的网页连接，这次拦下 \(count) 条", systemImage: "questionmark.diamond")
-                            .font(.callout).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("查看…") { sheet = .unknownWeb }.buttonStyle(.borderless)
+                if !legacyRules.isEmpty {
+                    EgressCallout(icon: "arrow.triangle.2.circlepath", tint: .accentColor,
+                                  text: "出口保护改成了按 App 保护",
+                                  caption: "以前按网站设的 \(legacyRules.count) 个保护\(stored.isActive ? "还在生效" : "已不再使用")；添加 App 后会自动替换。") {
+                        Button("现在移除") { change { _ in } }
                     }
                 }
                 if let confirm {
@@ -87,7 +90,7 @@ struct EgressProtectionPage: View {
                     }
                 }
             } footer: {
-                Text("选好的网站只从你认可的国家或地区出去；出口一变，先拦住再问你。开着时每条新连接约多等半秒，走 VPN 的连接不用 QUIC（浏览器会自动改用普通 HTTPS）。")
+                Text("选好的 App 经 VPN 的每条新连接先确认从哪个国家出去，不对就拦下再问你；别的程序完全不受影响。查不到出口的连接先放行并记数。选中 App 的连接约多等半秒，也不用 QUIC。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {
@@ -138,7 +141,8 @@ struct EgressProtectionPage: View {
                 imported.enabled = false
                 imported.blockUnidentifiedWeb = nil
                 for index in imported.groups.indices { imported.groups[index].exitRangeCheck = false }
-                let offline = imported.rulesForEditing
+                var offline = imported.rulesForEditing
+                offline.groups.removeAll { !$0.byApp }
                 change { $0 = offline }
                 if message == nil {
                     notice = nil
@@ -175,7 +179,7 @@ struct EgressProtectionPage: View {
                 Button("打开断线保护") { confirmDropProtection = true }
             }
             moreMenu
-            Button { sheet = .add(nil) } label: { Label("添加网站", systemImage: "plus") }
+            Button { sheet = .add(nil) } label: { Label("添加 App", systemImage: "plus") }
                 .buttonStyle(.borderedProminent)
                 .disabled(!available || busy)
         }
@@ -184,11 +188,6 @@ struct EgressProtectionPage: View {
 
     private var moreMenu: some View {
         Menu {
-            if config.isActive {
-                Button("认不出网站的连接…") { sheet = .unknownWeb }
-            }
-            Button("检查出口的方法…") { sheet = .methods }
-            Divider()
             Button("导入备份…") { importing = true }
             Button("导出备份…") { exporting = true }.disabled(config.groups.isEmpty)
         } label: {
@@ -196,7 +195,7 @@ struct EgressProtectionPage: View {
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
         .disabled(!available || busy)
-        .help("更多：认不出网站的连接、检查出口的方法、备份")
+        .help("备份：导入、导出")
     }
 
     private struct StatusLook {
@@ -206,32 +205,32 @@ struct EgressProtectionPage: View {
     }
 
     private var statusLook: StatusLook {
-        let sites = Set(active.flatMap(\.websiteNames)).count
+        let sites = Set(active.flatMap(\.apps)).count
         if preview == nil && manager.usesCisco {
             return .init(tint: .gray, line: "要先在「分流」页打开「按网站分流」才能用", lineColor: .secondary)
         }
         if !available { return .init(tint: .gray, line: "要先打开断线保护才能用", lineColor: .secondary) }
-        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个网站", lineColor: .secondary) }
+        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个 App", lineColor: .secondary) }
         if active.isEmpty { return .init(tint: .gray, line: "已全部暂停", lineColor: .secondary) }
-        guard connected else { return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · VPN 连上后开始检查") }
+        guard connected else { return .init(tint: .accentColor, line: "\(sites) 个 App 受保护 · VPN 连上后开始检查") }
         switch liveStatus?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown {
-        case .ok: return .init(tint: .green, line: "一切正常 · 正在保护 \(sites) 个网站")
+        case .ok: return .init(tint: .green, line: "一切正常 · 正在保护 \(sites) 个 App")
         case .partial:
             let count = liveStatus?.blockedCount ?? 0
             return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 条出口不对的连接" : "有些连接出口不对，已拦下",
                          lineColor: .orange)
-        case .blocked: return .init(tint: .red, line: "有网站被拦住了，需要你决定", lineColor: .red)
-        case .unknown: return .init(tint: .accentColor, line: "正在核实出口… · \(sites) 个网站受保护")
+        case .blocked: return .init(tint: .red, line: "有连接被拦住了，需要你决定", lineColor: .red)
+        case .unknown: return .init(tint: .accentColor, line: "\(sites) 个 App 受保护 · 等它们连网时核实出口")
         }
     }
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "globe.asia.australia.fill").font(.system(size: 34)).foregroundStyle(.secondary)
-            Text("还没有受保护的网站").font(.headline)
-            Text("添加后，App 会记下它现在从哪个国家出去。\n以后出口变了，就先拦住再问你。")
+            Image(systemName: "app.badge.checkmark").font(.system(size: 34)).foregroundStyle(.secondary)
+            Text("还没有受保护的 App").font(.headline)
+            Text("选好 App 和允许的国家。它经 VPN 的每条连接都会先确认出口，\n不对就拦下再问你；别的程序不受影响。")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button("添加网站…") { sheet = .add(nil) }
+            Button("添加 App…") { sheet = .add(nil) }
                 .buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
@@ -246,7 +245,7 @@ struct EgressProtectionPage: View {
 
     private var tableHeader: some View {
         HStack(spacing: 8) {
-            Text("网站").frame(maxWidth: .infinity, alignment: .leading)
+            Text("App").frame(maxWidth: .infinity, alignment: .leading)
             Text("只从这里出去").frame(width: Self.countryWidth, alignment: .leading)
             Text("状态").frame(width: Self.stateWidth, alignment: .leading)
             Text("保护").frame(width: Self.switchWidth)
@@ -257,19 +256,22 @@ struct EgressProtectionPage: View {
     private func ruleRow(_ group: EgressProtection.Group, decisions: [EgressDecision]) -> some View {
         let state = liveStatus?.groups.first { $0.id == group.id }
         let badge = EgressRuleBadge.of(group, config: config, state: state, connected: connected)
-        let canEnable = !config.directMembers(in: group).isEmpty && !group.expect.isEmpty
-        let sites = group.websiteNames.map { $0.hasSuffix("/32") ? String($0.dropLast(3)) : $0 }
+        let canEnable = (group.byApp || !config.directMembers(in: group).isEmpty) && !group.expect.isEmpty
         let problem = group.enabled && decisions.isEmpty ? badge.problem : nil
+        let unverified = connected ? state?.unverifiedCount ?? 0 : 0
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Button { sheet = .details(group.id) } label: {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(nsImage: EgressApps.icon(group.apps.first ?? "")).resizable().frame(width: 26, height: 26)
+                            .opacity(group.enabled ? 1 : 0.45)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(group.name).fontWeight(.medium).lineLimit(1)
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
                             } else {
-                                Text(sites.joined(separator: "、") + (group.exitRangeCheck ? " · 核对出口地址" : ""))
+                                Text(group.appNames.joined(separator: "、")
+                                     + (unverified > 0 ? " · \(unverified) 条查不到出口，已放行" : ""))
                                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                             }
                         }
@@ -289,7 +291,7 @@ struct EgressProtectionPage: View {
                 }))
                 .labelsHidden().toggleStyle(.always).fixedSize()
                 .frame(width: Self.switchWidth)
-                .help(group.enabled ? "暂停保护这个网站" : "恢复保护")
+                .help(group.enabled ? "暂停保护这个 App" : "恢复保护")
             }
             if !decisions.isEmpty {
                 EgressDecisionList(decisions: decisions, refresh: refresh, pause: pause)
@@ -327,28 +329,20 @@ struct EgressProtectionPage: View {
 
     @ViewBuilder private func sheetView(_ page: Sheet) -> some View {
         switch page {
-        case .add(let rule):
-            EgressAddSheet(rule: rule, preview: preview?.connections) { change, site in
-                notice = .init(text: "已开始保护 \(site)", change: change)
-                refresh()
+        case .add(let id):
+            EgressAppPicker(rule: config.groups.first { $0.id == id },
+                            countries: config.groups.last?.expect ?? []) { apps, countries, done in
+                addApps(apps, countries: countries, to: id, done: done)
             }
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
-                                 addWebsite: { sheet = .add(id) }, advanced: { sheet = .advanced(id) },
+                                 addApp: { sheet = .add(id) },
                                  edit: { edit in changeRule(id, edit: edit) }, pause: pause,
                                  remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
             }
-        case .advanced(let id):
-            if let group = config.groups.first(where: { $0.id == id }) {
-                EgressGroupEditor(group: group, config: config) { group, done in
-                    changeRule(id, edit: { $0 = group }, completion: done)
-                }
-            }
         case .unknownWeb:
             EgressUnknownWebView(config: stored, status: liveStatus, refresh: refresh)
-        case .methods:
-            EgressMethodsSheet(config: config) { edit, done in change(edit, completion: done) }
         }
     }
 
@@ -368,6 +362,24 @@ struct EgressProtectionPage: View {
 
     private func pause(_ id: UInt32) { changeRule(id) { $0.enabled = false } }
 
+    private func addApps(_ apps: [String], countries: [String], to id: UInt32?, done: @escaping (Bool) -> Void) {
+        let names = apps.map(EgressApps.displayName)
+        if let id {
+            changeRule(id, edit: { rule in
+                for app in apps where !rule.apps.contains(app) { rule.apps.append(app) }
+            }, completion: done)
+            return
+        }
+        var group = EgressProtection.newGroup(in: stored, name: names.count > 1 ? "\(names[0]) 等 \(names.count) 个" : names[0])
+        group.enabled = true
+        group.apps = apps
+        group.expect = countries
+        change({ $0.groups.append(group) }, completion: { ok in
+            if ok { message = nil }
+            done(ok)
+        })
+    }
+
     private func changeRule(_ id: UInt32, edit: (inout EgressProtection.Group) -> Void, completion: ((Bool) -> Void)? = nil) {
         change({ config in
             if let index = config.groups.firstIndex(where: { $0.id == id }) { edit(&config.groups[index]) }
@@ -377,9 +389,13 @@ struct EgressProtectionPage: View {
     private func change(_ edit: (inout EgressProtection) -> Void, completion: ((Bool) -> Void)? = nil) {
         guard preview == nil else { return }
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        let change = EgressRuleChange(config: previous, edit: edit)
+        // Website rules are retired (§66.24): any save keeps only app rules.
+        let change = EgressRuleChange(config: previous) { config in
+            config.groups.removeAll { !$0.byApp }
+            edit(&config)
+        }
         guard change.after.permitsActivation(comparedTo: previous) else {
-            message = "先加一个能直接检查出口的网站，才能打开这个保护。"
+            message = "先选允许的国家或地区，才能打开这个保护。"
             completion?(false)
             return
         }
@@ -431,69 +447,5 @@ struct EgressConfigFile: FileDocument {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return FileWrapper(regularFileWithContents: try encoder.encode(config))
-    }
-}
-
-/// The ways of looking up a website's exit country. Two built in; the
-/// rest are for people who know what a response header is.
-struct EgressMethodsSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let config: EgressProtection
-    let change: ((inout EgressProtection) -> Void, @escaping (Bool) -> Void) -> Void
-    @State private var editing: EgressProtection.Method?
-
-    var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("检查出口的方法").font(.title3.weight(.semibold))
-                Text("App 用这些方法问网站「你看到我从哪个国家来」。自带的两种覆盖大多数网站；只有某个网站一直查不出出口时，才需要加新的。")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(20)
-            Form {
-                Section {
-                    ForEach(config.availableMethods) { method in
-                        let custom = config.methods.contains { $0.id == method.id }
-                            && !EgressProtection.Method.presets.contains { $0.id == method.id }
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(method.name)
-                                Text(method.isDirect ? "直接问网站本身，结果可以用来放行或拦截" : "问第三方，只作参考")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("编辑…") { editing = method }
-                            if custom {
-                                Button("删除", role: .destructive) {
-                                    change({ $0.methods.removeAll { $0.id == method.id } }, { _ in })
-                                }
-                            }
-                        }
-                    }
-                    Button {
-                        editing = .init(id: UUID().uuidString, name: "", url: "https://{host}/",
-                                        extract: .init(kind: .json, key: "country"))
-                    } label: { Label("添加方法…", systemImage: "plus.circle.fill") }
-                    .buttonStyle(.borderless)
-                }
-            }
-            .formStyle(.grouped)
-            Divider()
-            HStack {
-                Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
-            }
-            .padding(16)
-        }
-        .frame(width: 520, height: 420)
-        .sheet(item: $editing) { method in
-            EgressMethodEditor(method: method) { value, done in
-                change({ current in
-                    current.methods.removeAll { $0.id == value.id }
-                    current.methods.append(value)
-                }, done)
-            }
-        }
     }
 }

@@ -35,7 +35,7 @@ struct EgressProtection: Codable, Equatable {
     func permitsActivation(comparedTo previous: Self) -> Bool {
         guard enabled else { return true }
         return groups.allSatisfy { group in
-            !group.enabled || !directMembers(in: group).isEmpty
+            !group.enabled || group.byApp || !directMembers(in: group).isEmpty
                 || (previous.enabled && previous.groups.contains { $0.id == group.id && $0.enabled })
         }
     }
@@ -49,6 +49,12 @@ struct EgressProtection: Codable, Equatable {
         var expect: [String] = []
         var exitRangeCheck = false
         var exitRanges: [String] = []
+        /// Protected apps (DESIGN §66.24): bundle paths ("/Applications/X.app")
+        /// or executable names ("x-cli"). A group with apps is checked by
+        /// connection owner; website members are no longer used.
+        var apps: [String] = []
+
+        var byApp: Bool { apps.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
     }
 
     struct Member: Codable, Equatable, Identifiable {
@@ -153,6 +159,7 @@ struct EgressProtection: Codable, Equatable {
         var reason: String? = nil
         var level: String? = nil
         var blockedCount: UInt64? = nil
+        var unverifiedCount: UInt64? = nil
         var lastBlockedHost: String? = nil
         var lastBlockedCountry: String? = nil
         var sites: [SiteState]? = nil
@@ -211,5 +218,6 @@ extension EgressProtection.Group {
         expect = try values.decode([String].self, forKey: .expect)
         exitRangeCheck = try values.decodeIfPresent(Bool.self, forKey: .exitRangeCheck) ?? false
         exitRanges = try values.decodeIfPresent([String].self, forKey: .exitRanges) ?? []
+        apps = try values.decodeIfPresent([String].self, forKey: .apps) ?? []
     }
 }

@@ -87,6 +87,18 @@ impl GroupStatus {
 }
 
 impl ControlState {
+    pub(super) fn note_unverified(&mut self, id: u32) {
+        let Some(group) = self.config.group(id).cloned() else { return };
+        let status = match self.status.groups.iter_mut().find(|g| g.id == id) {
+            Some(status) => status,
+            None => {
+                self.status.groups.push(GroupStatus { id, name: group.name.clone(), state: "ok".into(), ..Default::default() });
+                self.status.groups.last_mut().expect("pushed")
+            }
+        };
+        status.unverified_count = status.unverified_count.saturating_add(1);
+    }
+
     pub(super) fn denied_counts(&mut self, reports: Vec<Denied>) {
         for report in reports.into_iter().take(MAX_GROUPS) {
             let Some(group) = self

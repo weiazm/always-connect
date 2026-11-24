@@ -61,6 +61,15 @@ pub struct Group {
     pub expect: Vec<String>,
     pub exit_range_check: bool,
     pub exit_ranges: Vec<String>,
+    /// Protected apps (§66.24): bundle paths or executable names. A group
+    /// with apps is checked by connection owner, not by name.
+    pub apps: Vec<String>,
+}
+
+impl Group {
+    pub fn by_app(&self) -> bool {
+        self.apps.iter().any(|app| !app.trim().is_empty())
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -123,6 +132,17 @@ pub struct GateGroup {
     names: Vec<String>,
     #[serde(default)]
     cidrs: Vec<String>,
+    #[serde(default)]
+    apps: Vec<String>,
+}
+
+impl GateGroup {
+    /// The gate's app rules; empty unless some group protects apps.
+    pub fn app_rules(groups: &[GateGroup]) -> Vec<crate::egress_gate::owners::AppRule> {
+        groups.iter().filter(|g| !g.apps.is_empty())
+            .map(|g| crate::egress_gate::owners::AppRule { group: g.id, patterns: g.apps.clone() })
+            .collect()
+    }
 }
 
 struct ProtectedGroup {
@@ -225,10 +245,12 @@ impl EgressConfig {
     }
 
     pub fn protected_routes(&self) -> ProtectedRoutes {
-        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled).map(|g| GateGroup {
+        // App groups protect by owner: no names or addresses to route or rewrite.
+        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled && !g.by_app()).map(|g| GateGroup {
             id: g.id,
             names: g.members.iter().map(|m| m.pattern.trim().to_string()).collect(),
             cidrs: g.cidrs.clone(),
+            apps: Vec::new(),
         }).collect::<Vec<_>>())
     }
 
@@ -260,11 +282,18 @@ impl EgressConfig {
         self.groups
             .iter()
             .filter(|g| g.enabled)
-            .map(|g| serde_json::json!({ "id": g.id, "names": g.members.iter().map(|m| m.pattern.trim().to_ascii_lowercase()).collect::<Vec<_>>(), "cidrs": g.cidrs }))
+            .map(|g| if g.by_app() {
+                serde_json::json!({ "id": g.id, "names": [], "cidrs": [], "apps": g.apps })
+            } else {
+                serde_json::json!({ "id": g.id, "names": g.members.iter().map(|m| m.pattern.trim().to_ascii_lowercase()).collect::<Vec<_>>(), "cidrs": g.cidrs })
+            })
             .collect()
     }
 
     fn has_direct_method(&self, group: &Group) -> bool {
+        if group.by_app() {
+            return self.method(PRESET_TRACE).is_some_and(|m| m.is_direct());
+        }
         group.members.iter().filter_map(|m| self.method(m.method.as_deref()?)).any(|m| m.is_direct())
     }
 
@@ -545,6 +574,9 @@ pub fn decide(group: &Group, obs: &[Observation]) -> bool {
 pub struct GroupStatus {
     pub level: String,
     pub blocked_count: u64,
+    /// A protected app's connections let through because no exit could be
+    /// read for them (best effort, §66.24).
+    pub unverified_count: u64,
     pub last_blocked_host: Option<String>,
     pub last_blocked_country: Option<String>,
     pub sites: Vec<SiteStatus>,
@@ -1062,6 +1094,13 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
                 continue;
             }
             let targets = state.failures.get(&group.id).unwrap_or(&Failures::default()).plan(&state.config, &group, &check);
+            if group.by_app() && targets.is_empty() {
+                // Best effort (§66.24): a protected app's connection that shows
+                // no name cannot be probed; let it through and count it.
+                state.note_unverified(group.id);
+                if !timed_out { state.send(&verdict(group.id, id, true, false, None)); }
+                continue;
+            }
             let workers: usize = state.checks.values().map(|c| c.targets.len()).sum();
             if timed_out || state.status.interface.is_empty() || state.checks.len() >= MAX_GROUPS
                 || workers + targets.len() > MAX_GROUPS * MAX_PROBES_PER_GROUP
@@ -1141,6 +1180,12 @@ fn finish_check(state: &mut ControlState, group: &Group, host: Option<&str>, key
         if o.country.is_some() && !o.evidence_at_ms.is_some_and(fresh_evidence) {
             o.error=Some("出口观测已过期，需要重新核验".into());
         }
+    }
+    if group.by_app() && !results.iter().any(|(_, o)| o.country.is_some()) {
+        // Best effort (§66.24): no exit could be read for this destination.
+        state.note_unverified(group.id);
+        if key.0 != 0 { state.send(&verdict(group.id, key.1, true, false, None)); }
+        return true;
     }
     let ok = state.record(group, host, active.generation, results);
     if key.0 != 0 { state.send(&verdict(group.id,key.1,ok,direct,earliest)); }
