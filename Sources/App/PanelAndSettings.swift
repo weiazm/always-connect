@@ -344,6 +344,49 @@ struct PanelView: View {
         }
     }
 
+    /// 出口保护 in the panel, laid out like the other rows: icon, title and
+    /// state on the left, a chevron to the 出口保护 page on the right
+    /// (user, 2026-11-24: the centred row looked broken).
+    private func egressRow(_ line: String) -> some View {
+        let blocked = !manager.egressNotices.isEmpty
+        let tint: Color = blocked ? .red : {
+            switch manager.egressLevel {
+            case .ok: return .green
+            case .partial: return .orange
+            case .blocked: return .red
+            case .unknown: return .secondary
+            }
+        }()
+        return Button { onOpenSettings("egress") } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("出口保护")
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(tint)
+                        .lineLimit(blocked ? 3 : 2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let count = manager.egressUnknownWebCount, count > 0 {
+                        Text("认不出名字的网页连接已拦 \(count) 条")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.vertical, 8)
+        .help("打开出口保护")
+    }
+
     /// 按网站分流 in the panel (§26.12): the switch, and in one line what
     /// it is doing right now.
     private var splitRow: some View {
@@ -455,59 +498,50 @@ struct PanelView: View {
             splitRow
             if !manager.gatewayTrustFailed, let line = manager.egressLine {
                 Divider()
-                if manager.egressNotices.isEmpty {
-                    Button { onOpenSettings("egress") } label: {
-                        rowLabel("shield.lefthalf.filled", "出口保护", line,
-                                 captionLines: manager.egressLevel == .blocked ? 2 : 1,
-                                 captionColor: manager.egressLevel.color)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.vertical, 8)
-                } else {
-                    rowLabel("shield.lefthalf.filled", "出口保护", line, captionLines: 3)
-                        .foregroundStyle(.red)
-                        .padding(.top, 8)
-                    HStack {
-                        Button("查看规则") { onOpenSettings("egress") }
+                egressRow(line)
+                if !manager.egressNotices.isEmpty || manager.egressRecheckRule != nil {
+                    HStack(spacing: 12) {
+                        if let id = manager.egressRecheckRule {
+                            Button(egressRechecking ? "正在重新检查…" : "重新检查") {
+                                egressRechecking = true
+                                manager.recheckEgressRule(id) { ok in
+                                    egressRechecking = false
+                                    egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
+                                }
+                            }.disabled(egressRechecking)
+                        }
                         if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
-                            Button("停用规则", role: .destructive) { askToDisableEgressGroup(notice.id) }
-                        } else {
-                            Menu("停用规则") {
+                            Button("暂停保护", role: .destructive) { askToDisableEgressGroup(notice.id) }
+                        } else if !manager.egressNotices.isEmpty {
+                            Menu("暂停保护") {
                                 ForEach(manager.egressNotices) { notice in
                                     Button(notice.name, role: .destructive) { askToDisableEgressGroup(notice.id) }
                                 }
                             }
+                            .fixedSize()
                         }
+                        Spacer()
                     }
                     .buttonStyle(.borderless)
-                    .padding(.vertical, 6)
-                }
-                if let id = manager.egressRecheckRule {
-                    Button(egressRechecking ? "正在重新检查…" : "重新检查") {
-                        egressRechecking = true
-                        manager.recheckEgressRule(id) { ok in
-                            egressRechecking = false
-                            egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
-                        }
-                    }.disabled(egressRechecking)
-                }
-                if let count = manager.egressUnknownWebCount, count > 0 {
-                    Button { onOpenSettings("unknown-egress") } label: {
-                        Label(EgressUnknownWebText.count(count), systemImage: "shield")
-                            .font(.caption).foregroundStyle(.orange)
-                    }
-                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .padding(.leading, 28)
                     .padding(.bottom, 8)
                 }
                 if let id = egressStopConfirmation {
-                    Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
-                    HStack {
-                        Button("取消") { egressStopConfirmation = nil }
-                        Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Button("取消") { egressStopConfirmation = nil }
+                            Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 28).padding(.bottom, 8)
                 }
                 if let egressActionError {
                     Text(egressActionError).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 28).padding(.bottom, 8)
                 }
             }
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
