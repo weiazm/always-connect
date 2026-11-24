@@ -936,6 +936,31 @@ pub struct Observation {
 }
 pub type AnswerHook = Box<dyn Fn(Observation) -> bool + Send + Sync>;
 
+/// The addresses to answer a protected name's A query with, None to keep
+/// the resolver's (DESIGN §66.28). Called off the settings lock; must not
+/// wait for the engine.
+pub type ProtectedAnswerHook = Box<dyn Fn(&str, &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> + Send + Sync>;
+
+/// A protected name's answer lives at most this long in other caches, so
+/// a better entry found after a block is used within a minute (§66.28).
+const PROTECTED_TTL: u32 = 60;
+
+/// A plain NOERROR answer to an IN A `query` with these addresses.
+fn a_answer(query: &[u8], addrs: &[Ipv4Addr], ttl: u32) -> Option<Vec<u8>> {
+    let mut out = empty_answer(query)?;
+    if out.len() < 16 || out[out.len() - 4..] != [0, 1, 0, 1] || addrs.is_empty() || addrs.len() > 16 {
+        return None;
+    }
+    out[7] = addrs.len() as u8;
+    for ip in addrs {
+        out.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&[0, 4]);
+        out.extend_from_slice(&ip.octets());
+    }
+    Some(out)
+}
+
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 struct Settings {
     epoch: u64,
@@ -966,6 +991,7 @@ pub struct Inner {
     acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
+    protected_answer: RwLock<Option<ProtectedAnswerHook>>,
     inflight: AtomicUsize,
     /// [company DNS, direct/local DNS] upstream exchanges in progress.
     path_inflight: [AtomicUsize; 2],
@@ -1121,6 +1147,15 @@ impl Inner {
             }
         }
 
+        // A protected name answers with entries whose exit was verified when
+        // the controller knows better ones, always with a short TTL (§66.28).
+        let protected_answer = (protected && q.qtype == TYPE_A && entry.is_none() && !addresses.is_empty()).then(|| {
+            let steered = self.protected_answer.read().unwrap().as_ref()
+                .and_then(|hook| hook(&trim_dots(&q.name), &addresses))
+                .filter(|ips| !ips.is_empty());
+            a_answer(query, steered.as_deref().unwrap_or(&addresses), PROTECTED_TTL)
+        }).flatten();
+
         // Legacy harness hook is protected against concurrent updates too.
         // Production uses on_answer, which commits under the engine's queue.
         let settings = self.settings.read().unwrap();
@@ -1136,7 +1171,7 @@ impl Inner {
                 sanitize_service_answer(&answer, entry.is_some(), false)
             }
         } else {
-            Some(answer)
+            Some(protected_answer.unwrap_or(answer))
         };
         drop(settings);
         bytes.or_else(|| empty_answer(query))
@@ -1264,6 +1299,7 @@ impl Forwarder {
                 acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
+                protected_answer: RwLock::new(None),
                 inflight: AtomicUsize::new(0),
                 path_inflight: [AtomicUsize::new(0), AtomicUsize::new(0)],
                 pool: Pool::default(),
@@ -1275,6 +1311,10 @@ impl Forwarder {
 
     pub fn inner(&self) -> &Arc<Inner> {
         &self.inner
+    }
+
+    pub(crate) fn set_protected_answer_hook(&self, hook: Option<ProtectedAnswerHook>) {
+        *self.inner.protected_answer.write().unwrap() = hook;
     }
 
     pub fn set_rules(&self, direct: &[String]) {
@@ -1873,6 +1913,35 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0, "old reply must not add a route");
         upstream.join().unwrap();
       }
+    }
+
+    #[test]
+    fn protected_names_answer_with_verified_entries_and_a_short_ttl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = socket.local_addr().unwrap().to_string();
+        let upstream = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            for _ in 0..2 {
+                let (n, from) = socket.recv_from(&mut buf).unwrap();
+                socket.send_to(&answer(&buf[..n], [203, 0, 113, 1], false), from).unwrap();
+            }
+        });
+        let fwd = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53, Duration::from_secs(1), vec![],
+            Upstreams { tunnel: vec![server], local: vec![], physical_if: None, tunnel_if: Some(loopback_interface().into()) },
+            None);
+        let sites = crate::egress_gate::ProtectedSites::new(&[crate::egress_gate::SiteGroup { id: 1, sites: vec!["protected.example".into()] }]);
+        fwd.set_parsed_rules(SplitRules::new(&Vec::<String>::new()).with_protection(Some(Arc::new(sites))));
+        fwd.set_protected_answer_hook(Some(Box::new(|name, answer| {
+            (name == "protected.example" && answer == [Ipv4Addr::new(203, 0, 113, 1)]).then(|| vec![Ipv4Addr::new(198, 51, 100, 7)])
+        })));
+        let reply = fwd.inner().resolve(&query("Protected.example", TYPE_A, 7)).unwrap();
+        assert_eq!(ipv4_answers(&reply), vec![Ipv4Addr::new(198, 51, 100, 7)], "the verified entry replaces the answer");
+        assert_eq!(&reply[..2], &[0, 7]);
+        assert_eq!(u32::from_be_bytes(reply[reply.len() - 10..reply.len() - 6].try_into().unwrap()), 60, "a short TTL");
+        let other = fwd.inner().resolve(&query("other.example", TYPE_A, 8)).unwrap();
+        assert_eq!(ipv4_answers(&other), vec![Ipv4Addr::new(203, 0, 113, 1)], "unprotected names keep the resolver's answer");
+        upstream.join().unwrap();
+        assert_eq!(a_answer(&query("x.example", TYPE_AAAA, 1), &[Ipv4Addr::LOCALHOST], 60), None, "only IN A questions");
     }
 
     #[test]

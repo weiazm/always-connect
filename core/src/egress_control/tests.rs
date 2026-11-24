@@ -440,3 +440,32 @@ fn unknown_exits_follow_each_rules_policy_and_never_approve_a_nameless_server() 
     assert!(ctl.recheck_job(1).is_none());
     assert_eq!(status(&ctl)["groups"][0]["state"], "ok");
 }
+
+#[test]
+fn a_wrong_cloudflare_entry_is_bypassed_by_one_verified_for_the_name() {
+    let dir = TestDirectory::new();
+    let sock = dir.0.join("egress.sock");
+    let (hook, seen) = exits(&[("104.16.0.1", Some("ZZ")), ("104.16.0.2", Some("YY"))]);
+    let config = EgressConfig { enabled: true, groups: vec![Group { unverified: Unverified::WhenWrong, ..rule(1, &["a.example"], &["ZZ"]) }] };
+    let ctl = Controller::start(&sock, config, hook).unwrap();
+    let (mut gate, _) = Peer::connect(&sock);
+    let right: std::net::Ipv4Addr = "104.16.0.1".parse().unwrap();
+    let wrong: std::net::Ipv4Addr = "104.16.0.2".parse().unwrap();
+    assert_eq!(gate.check(1, "www.a.example", "104.16.0.1", 1)["result"], "allow");
+    assert_eq!(ctl.steer("www.a.example", &[right]), None, "a good answer stays as it is");
+    assert_eq!(gate.check(1, "x.a.example", "104.16.0.2", 2)["result"], "block");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while status(&ctl)["groups"][0]["state"] != "ok" {
+        assert!(std::time::Instant::now() < deadline, "no verified entry found: {}", ctl.status_json());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(seen.lock().unwrap().iter().any(|r| r.host == "x.a.example" && r.connect_ip == Some(IpAddr::V4(right))),
+            "the search probes the name itself at the other entry");
+    assert_eq!(status(&ctl)["groups"][0]["steered"], json!(["x.a.example"]));
+    assert!(status(&ctl)["records"][0]["ended"].is_number(), "the bypassed wrong entry no longer holds the block");
+    assert_eq!(ctl.steer("x.a.example", &[wrong]), Some(vec![right]));
+    assert_eq!(ctl.steer("b.example", &[wrong]), None, "only protected names");
+    assert_eq!(gate.check(1, "x.a.example", "104.16.0.2", 3)["result"], "block", "the gate still checks the wrong entry");
+    ctl.invalidate();
+    assert_eq!(ctl.steer("x.a.example", &[wrong]), None, "a network change forgets the exits");
+}

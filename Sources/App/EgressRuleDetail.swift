@@ -84,6 +84,11 @@ struct EgressRuleDetail: View {
                         Text("这次连接有 \(unverified) 次查不到出口，已放行。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    if let steered = state?.steered, !steered.isEmpty, connected {
+                        Text("已为 \(steered.prefix(3).joined(separator: "、"))\(steered.count > 3 ? " 等 \(steered.count) 个" : "") 换到出口正确的入口（同一 CDN，仍走 VPN）。")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 } header: {
                     Text("允许的出口")
                 }

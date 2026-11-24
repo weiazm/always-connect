@@ -1222,6 +1222,13 @@ impl Shared {
         let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
             Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
         if c.protected_sites.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
+        // Protected names answer with entries whose exit was verified (§66.28).
+        let weak = Arc::downgrade(self);
+        forwarder.set_protected_answer_hook(Some(Box::new(move |name, answer| {
+            let engine = weak.upgrade()?;
+            let controller = engine.egress.try_lock().ok()?;
+            controller.as_ref()?.steer(name, answer)
+        })));
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {

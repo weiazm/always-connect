@@ -79,6 +79,9 @@ struct EgressProtection: Codable, Equatable {
         let observed: [Observation]
         var blockedCount: UInt64? = nil
         var unverifiedCount: UInt64? = nil
+        /// Names answered with another entry of their CDN whose exit was
+        /// verified (DESIGN §66.28).
+        var steered: [String]? = nil
         var lastBlockedHost: String? = nil
         var lastBlockedCountry: String? = nil
         var sites: [SiteState]? = nil

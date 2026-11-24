@@ -24,6 +24,8 @@ use crate::egress_gate::{evidence_clock_ms, ProtectedSites, SiteGroup};
 
 mod activity;
 use activity::{Denied, SiteStatus};
+mod steer;
+use steer::Ledger;
 
 const MAX_GROUPS: usize = 16;
 const MAX_SITES: usize = 256;
@@ -348,6 +350,9 @@ pub struct GroupStatus {
     pub last_blocked_host: Option<String>,
     pub last_blocked_country: Option<String>,
     pub sites: Vec<SiteStatus>,
+    /// Names recently answered with another entry of their CDN whose
+    /// exit was verified (§66.28).
+    pub steered: Vec<String>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -455,6 +460,8 @@ struct ControlState {
     checks: HashMap<(u64, u64), ActiveCheck>,
     failures: HashMap<u32, Vec<Failed>>,
     peer_counts: HashMap<u32, Denied>,
+    /// Exits seen per (name, address), for steering DNS answers (§66.28).
+    ledger: Ledger,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -479,6 +486,9 @@ impl ControlState {
 
     /// Note one probe result. Returns the gate's verdict for it.
     fn record(&mut self, group: &Group, target: Target, mut obs: Observation) -> &'static str {
+        if let Some(country) = obs.country.as_deref() {
+            self.ledger.note(&target.host, target.ip, country, std::time::Instant::now());
+        }
         let failed = self.failures.entry(group.id).or_default();
         let previous = failed.iter().position(|f| f.target == target).map(|i| failed.remove(i));
         let mut remember = false;
@@ -545,6 +555,7 @@ impl ControlState {
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.ledger.clear();
         let sites = cfg.protected_sites();
         self.failures.retain(|id, failed| {
             let Some(group) = cfg.enabled_group(*id) else { return false };
@@ -564,6 +575,7 @@ impl ControlState {
 
     fn retire_checks(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.ledger.clear();
     }
 
     fn disconnect(&mut self) {
@@ -600,7 +612,7 @@ impl Controller {
             state: Mutex::new(ControlState {
                 sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
-                on_peer_loss: None,
+                ledger: Ledger::default(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
         });
@@ -840,7 +852,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
     if state.peer_id == peer_id { state.peer_lost(); }
 }
 
-fn run_check(shared: &Shared, group: u32, targets: Vec<Target>, interface: &str, key: (u64, u64)) -> bool {
+fn run_check(shared: &Arc<Shared>, group: u32, targets: Vec<Target>, interface: &str, key: (u64, u64)) -> bool {
     let results: Vec<(Target, Observation)> = std::thread::scope(|scope| {
         let workers: Vec<_> = targets.iter().map(|target| {
             let worker = std::thread::Builder::new().spawn_scoped(scope, ||
@@ -861,12 +873,24 @@ fn run_check(shared: &Shared, group: u32, targets: Vec<Target>, interface: &str,
     let Some(rule) = state.config.enabled_group(group).cloned() else { return false };
     let mut answer = "block";
     let mut at = None;
+    let mut searches = Vec::new();
     for (target, obs) in results {
         at = obs.evidence_at_ms;
+        let wrong_cloudflare = obs.country.is_some() && matches!(target.ip, IpAddr::V4(ip) if steer::cloudflare(ip));
+        let host = target.host.clone();
         answer = state.record(&rule, target, obs);
+        // A wrong exit at a Cloudflare entry: look for a verified one now,
+        // so the next DNS answer can point there (§66.28).
+        if answer == "block" && wrong_cloudflare {
+            searches.extend(state.search_job(shared, &rule, &host));
+        }
     }
     if key.0 != 0 {
         state.send(&verdict(group, key.1, answer, at));
+    }
+    drop(state);
+    for job in searches {
+        let _ = std::thread::Builder::new().name("egress-steer".into()).spawn(job);
     }
     true
 }
