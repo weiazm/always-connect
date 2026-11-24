@@ -260,24 +260,8 @@ struct SessionHarness {
             check(prepare("198.51.100.7") == true, "a previously verified candidate may be used")
             check(disconnect(session) && !NetworkGuard.shared.isHolding, "manual disconnect releases the pre-login hold")
         case "egress-drop-dependency":
-            let disabledSummary: String? = sync { reply in
-                session.probeEgressSummary("site.example", method: "", withReply: reply)
-            }
-            let disabled = disabledSummary.flatMap { json in
-                (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
-            }
-            check(disabled?["status"] as? String == "unavailable"
-                && disabled?["error"] as? String == "tunnelUnavailable"
-                && (disabled?["results"] as? [Any])?.isEmpty == true, "summary without an own tunnel has no observations")
-            let invalidSummary: String? = sync { reply in
-                session.probeEgressSummary("site.example\0.other", method: "", withReply: reply)
-            }
-            check(invalidSummary?.contains("invalidHost") == true, "embedded NUL is rejected before the C bridge")
-            let legacy: String? = sync { reply in session.probeEgress("site.example", withReply: reply) }
-            check(legacy == "[]", "legacy settings probe still replies with an array")
-            check(loads() == 0, "read-only settings probes do not change firewall policy")
             let group = EgressProtection.Group(id: 1, name: "Fixture", enabled: true,
-                members: [.init(pattern: "site.example", method: "trace")], expect: ["ZZ"])
+                sites: ["site.example"], expect: ["ZZ"])
             let config = EgressProtection(enabled: true, groups: [group])
             let json = String(decoding: try! JSONEncoder().encode(config), as: UTF8.self)
             func apply() -> Bool? { sync { reply in session.setEgressProtection(json, withReply: reply) } }

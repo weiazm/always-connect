@@ -47,13 +47,12 @@ final class SettingsLink {
             transport?.send(["type": "show", "tab": tab ?? "", "egressRule": egressRule.map(String.init) ?? ""])
             return
         }
-        if let tab { UserDefaults.standard.set(tab == "unknown-egress" ? "egress" : tab, forKey: "settingsTab") }
+        if let tab { UserDefaults.standard.set(tab, forKey: "settingsTab") }
         guard let executable = Bundle.main.executableURL else { return }
         let p = Process()
         p.executableURL = executable
         p.arguments = ["--settings"] + (egressRule.map { ["--egress-rule", String($0)] } ?? [])
             + (tab == "egress" ? ["--focus-egress"] : [])
-            + (tab == "unknown-egress" ? ["--focus-unknown-egress"] : [])
         guard let pair = PrivateDescriptors.pair(kind: 1) else { return }
         let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
         p.standardInput = child
@@ -141,43 +140,12 @@ final class SettingsLink {
         case "egressStatus":
             client.fetchEgressJSON { [weak self] json in self?.reply(id, json) }
             return
-        case "probeEgress":
-            client.probeEgressJSON(argument) { [weak self] json in self?.reply(id, json) }
-            return
-        case "probeEgressSetup":
-            guard let request = try? JSONDecoder().decode(EgressSetupRequest.self, from: Data(argument.utf8)) else {
-                reply(id, nil)
-                return
-            }
-            client.probeEgressSetupJSON(host: request.host, method: request.method) { [weak self] result in self?.reply(id, result) }
-            return
         case "allowEgressCountry":
             guard let approval = try? JSONDecoder().decode(EgressCountryApproval.self, from: Data(argument.utf8)) else {
                 reply(id, "0")
                 return
             }
             client.allowEgressCountry(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
-            return
-        case "confirmExitRangeSetup":
-            guard let setup = try? JSONDecoder().decode(EgressExitRangeSetup.self, from: Data(argument.utf8)) else {
-                reply(id, "0")
-                return
-            }
-            client.confirmExitRangeSetup(setup) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
-            return
-        case "allowEgressRange":
-            guard let approval = try? JSONDecoder().decode(EgressExitRangeApproval.self, from: Data(argument.utf8)) else {
-                reply(id, "0")
-                return
-            }
-            client.allowEgressRange(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
-            return
-        case "changeUnknownWebException":
-            guard let change = try? JSONDecoder().decode(EgressUnknownWebChange.self, from: Data(argument.utf8)) else {
-                reply(id, "0")
-                return
-            }
-            client.changeUnknownWebException(change) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
             return
         case "recheckEgressRule":
             guard let group = UInt32(argument) else { reply(id, "0"); return }

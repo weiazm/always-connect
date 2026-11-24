@@ -129,55 +129,24 @@ struct ConnectionsUITest {
 
     private static func checkEgressEditing() {
         let initial = EgressProtection(enabled: false, groups: [
-            .init(id: 1, name: "Retained", enabled: true,
-                  members: [.init(pattern: "retained.example.com", method: "trace")], expect: ["ZZ"])
+            .init(id: 1, name: "Retained", enabled: true, sites: ["retained.example.com"], expect: ["ZZ"])
         ])
         let bytes = try! JSONEncoder().encode(initial)
         check(!initial.rulesForEditing.groups[0].enabled
               && (try! JSONDecoder().decode(EgressProtection.self, from: bytes)).groups[0].enabled,
               "old disabled master switch remains disabled and viewing doesn't mutate stored bytes")
-        guard let site = EgressWebsiteScope("https://chat.example.com:8443/path?x=1", includesSubdomains: true),
-              let another = EgressWebsiteScope("auth.example.com", includesSubdomains: true) else { fail("normalize a named website") }
-        check(site.host == "chat.example.com" && site.website == "example.com",
-              "the input shows the normalized whole-site scope")
-        check(EgressWebsiteScope("https://198.51.100.7", includesSubdomains: true) == nil
-              && EgressWebsiteScope.unique([site, another]).count == 1, "selection rejects IP-only rows and deduplicates websites")
-
-        let data = Data(#"{"host":"chat.example.com","method":"trace","status":"ok","resolvedAddressCount":5,"probedAddressCount":5,"truncated":false,"coverageIncomplete":false,"results":[{"address":"198.51.100.1","method":"trace","status":"ok","country":"ZZ"},{"address":"198.51.100.2","method":"trace","status":"ok","country":"ZZ"},{"address":"198.51.100.3","method":"trace","status":"ok","country":"ZZ"},{"address":"198.51.100.4","method":"trace","status":"ok","country":"ZZ"},{"address":"198.51.100.5","method":"trace","status":"ok","country":"YY"}]}"#.utf8)
-        let summary = try! JSONDecoder().decode(EgressProtection.SetupProbe.self, from: data)
-        check(summary.suggestedCountry == "ZZ" && summary.caption.contains("4 个") && summary.caption.contains("1 个")
-              && EgressProtection.SetupProbe.unavailable(site.host).suggestedCountry == nil, "only a uniquely supported country is suggested")
-        let probes = [site.host: summary]
-        let methods = verifiedMethods(probes, config: initial)
-        guard let added = EgressWebsiteScope.adding([site], to: initial, rule: nil, newRuleID: 2,
-            methods: methods, countries: [summary.suggestedCountry!]) else { fail("create a verified rule") }
-        check(added.after.enabled && !added.after.groups[0].enabled && added.after.groups[1].expect == ["ZZ"]
-              && added.after.groups[1].members.map(\.pattern) == ["example.com", "*.example.com"], "new rule arms only its confirmed scope")
+        guard let added = EgressRuleChange.addingSites(["example.com"], countries: ["ZZ"], config: initial) else {
+            fail("create a site rule")
+        }
+        check(added.after.enabled && !added.after.groups[0].enabled && added.after.groups[1].sites == ["example.com"]
+              && added.after.groups[1].expect == ["ZZ"], "a new rule arms only itself")
         check(added.needsReconnect(connected: true) && !added.needsReconnect(connected: false)
               && added.undo.after == initial, "first rule requires a live reconnect and undo restores the original snapshot")
-        let second = EgressWebsiteScope("static.fixture.example", includesSubdomains: true)!
-        guard let batch = EgressWebsiteScope.adding([second], to: added.after, rule: 2, newRuleID: 3,
-            methods: [:], countries: ["YY"], activateExisting: false) else { fail("add following websites to a verified rule") }
-        check(!batch.needsReconnect(connected: true) && batch.after.groups[1].expect == ["ZZ"],
-              "adding to an existing rule cannot silently widen countries or reconnect")
-        let moved = EgressRuleChange.move(host: site.host, source: 2, target: 1, config: batch.after)
-        check(moved?.patterns == ["example.com", "*.example.com"] && moved?.change.after.groups[0].enabled == false
-              && moved?.change.undo.after == batch.after, "moving shows and transfers the scope while preserving destination settings")
-
-        let history = EgressRecentVisits()
-        let start = Date(timeIntervalSince1970: 100)
-        func row(_ host: String?, _ process: String = "Example Browser", _ via: String = "vpn") -> ConnectionRow {
-            .init(process: process, pid: 1, proto: "tcp", remote: "198.51.100.9", port: 443,
-                  host: host, via: via, interface: "utun0", reason: "VPN")
-        }
-        history.record([row(site.host)], at: start)
-        let source = history.visits
-        history.record([row(site.host), row("related.test"), row("other.test", "Other App"),
-                        row("direct.test", "Example Browser", "direct"), row(nil), row("listed.test")], at: start + 5)
-        history.record([row("expired.test")], at: start + 20)
-        let direct = [DirectSite(name: "Fixture", domains: ["listed.test"])]
-        check(history.recommendations(for: source, config: added.after, direct: direct) == ["related.test"],
-              "recommendations use the same process and time window with no protected, direct or unnamed rows")
+        check(EgressRuleChange.addingSites([], countries: ["ZZ"], config: initial) == nil
+              && EgressRuleChange.addingSites(["example.com"], countries: [], config: initial) == nil,
+              "a rule needs a site and a country")
+        check(added.after.rule(covering: "chat.example.com")?.sites == ["example.com"]
+              && added.after.rule(covering: "badexample.com") == nil, "a site covers its subdomains only")
     }
 
     private static func findTable(in view: NSView) -> NSTableView? {

@@ -115,7 +115,7 @@ struct EgressRuleDetail: View {
             }
             .toggleStyle(.always)
             .fixedSize()
-            .disabled(!rule.enabled && (!rule.simple || rule.expect.isEmpty))
+            .disabled(!rule.enabled && (rule.sites.isEmpty || rule.expect.isEmpty))
         }
     }
 
@@ -157,8 +157,7 @@ extension EgressProtection.Observation {
         let server = peerAddress.map { "（服务器 \($0)）" } ?? ""
         let place = country.map { "从 \(egressCountryLabel($0)) 出去" } ?? "没查到出口"
         let exit = ip.map { "，出口 \($0)" } ?? ""
-        let cause = exitRangeFailureCaption.map { "：\($0)" } ?? ""
         let reference = evidenceKind == .thirdParty ? "（第三方查询，仅供参考）" : ""
-        return host + server + " " + place + exit + reference + cause
+        return host + server + " " + place + exit + reference
     }
 }

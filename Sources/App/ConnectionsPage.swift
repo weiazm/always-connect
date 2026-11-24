@@ -241,7 +241,7 @@ struct ConnectionsPage: View {
         }
         .sheet(item: $egressAddition) { addition in
             EgressSiteSheet(sites: addition.site.map { [$0] } ?? [],
-                            countries: protectedConfig.groups.last(where: \.simple)?.expect ?? [], preview: preview) { sites, countries, done in
+                            countries: protectedConfig.groups.last?.expect ?? [], preview: preview) { sites, countries, done in
                 guard let change = EgressRuleChange.addingSites(sites, countries: countries, config:
                         ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) else { done(false); return }
                 let added = change.after.groups.first { group in !change.before.groups.contains { $0.id == group.id } }
@@ -317,14 +317,6 @@ struct ConnectionsPage: View {
             }
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).controlSize(.small).font(.caption).fixedSize()
-    }
-
-    private func move(_ host: String, from source: UInt32, to target: UInt32?) {
-        let latest = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let (change, patterns) = EgressRuleChange.move(host: host, source: source, target: target, config: latest) else { return }
-        let destination = target.flatMap { id in latest.rulesForEditing.groups.first(where: { $0.id == id }) }
-        let label = destination.map { "移到「\($0.name)」" + ($0.enabled ? "，沿用它允许的国家" : "，它现在暂停中") } ?? "移出出口保护"
-        egressPending = .init(change: change, text: label + "：" + patterns.sorted().joined(separator: "、"), rule: target)
     }
 
     private func applyEgress(_ action: EgressAction, showNotice: Bool = true) {
@@ -444,7 +436,6 @@ struct ConnectionsPage: View {
     }
 
     private func update(_ result: [ConnectionRow], speeds: Speeds? = nil) {
-        if preview == nil, egressVisible { EgressRecentVisits.shared.record(result) }
         updated = Date()
         rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
         if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {

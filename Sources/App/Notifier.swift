@@ -22,7 +22,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let heldCategory = "network-held"
     static let restoreAction = "restore-direct"
     static let egressCategory = "egress-rule"
-    static let unknownEgressCategory = "egress-unknown-web"
     static let reviewEgressAction = "review-egress"
 
     private override init() { super.init() }
@@ -94,7 +93,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             UNNotificationCategory(identifier: Self.heldCategory, actions: [restore],
                                    intentIdentifiers: [], options: []),
             UNNotificationCategory(identifier: Self.egressCategory, actions: [review], intentIdentifiers: [], options: []),
-            UNNotificationCategory(identifier: Self.unknownEgressCategory, actions: [review], intentIdentifiers: [], options: []),
         ])
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
@@ -142,11 +140,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post(title: title, body: body, category: Self.egressCategory, info: ["group": rule.id])
     }
 
-    func unknownEgressNotice(count: UInt64) {
-        post(title: "已拦截认不出网站的连接", body: EgressUnknownWebText.count(count) + "。可查看本次 VPN 会话的记录。",
-             category: Self.unknownEgressCategory)
-    }
-
     // MARK: - UNUserNotificationCenterDelegate
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -156,11 +149,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             DispatchQueue.main.async { HelperClient.shared.disconnect() }
         } else if [Self.reviewEgressAction, UNNotificationDefaultActionIdentifier].contains(response.actionIdentifier) {
             let content = response.notification.request.content
-            if content.categoryIdentifier == Self.unknownEgressCategory {
-                DispatchQueue.main.async { SettingsWindow.shared.show(tab: "unknown-egress") }
-            } else if content.categoryIdentifier == Self.egressCategory,
-                      let group = content.userInfo["group"] as? NSNumber {
-                DispatchQueue.main.async { SettingsWindow.shared.show(tab: "split", egressRule: group.uint32Value) }
+            if content.categoryIdentifier == Self.egressCategory,
+               let group = content.userInfo["group"] as? NSNumber {
+                DispatchQueue.main.async { SettingsWindow.shared.show(tab: "egress", egressRule: group.uint32Value) }
             }
         }
         completionHandler()

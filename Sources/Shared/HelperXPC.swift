@@ -140,22 +140,13 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
-    func confirmEgressRangeSetup(_ proposed: String, previous: String, group: UInt32, proof: String,
-                                withReply reply: @escaping (Bool) -> Void)
-    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
-                          withReply reply: @escaping (Bool, [String]) -> Void)
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void)
-    func setUnknownWebException(_ address: String, port: Int, allow: Bool, approvalId: String,
-                                withReply reply: @escaping (Bool) -> Void)
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             withReply reply: @escaping (Bool, [String]) -> Void)
     func getEgressStatus(withReply reply: @escaping (String) -> Void)
     /// Own connection: send the scheduled login retry now (an expired phone
     /// approval, §30.9). False when no retry is waiting.
     func retryLoginNow(withReply reply: @escaping (Bool) -> Void)
-    func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void)
-    /// Read-only address sample for a confirmed site. Empty method selects the trace method.
-    func probeEgressSummary(_ host: String, method: String, withReply reply: @escaping (String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the
     /// engine loads no pf set and a drop gives the local network back
     /// while it retries. In force at once in a running session, else

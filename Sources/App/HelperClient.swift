@@ -94,15 +94,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var egressLevel: EgressProtection.Level = .unknown
     @Published private(set) var egressNotices: [EgressProtection.BlockedGroupNotice] = []
     @Published private(set) var egressRecheckRule: UInt32?
-    @Published private(set) var egressUnknownWebCount: UInt64?
     private var egressTimer: Timer?
     private var egressPollPending = false
     private var egressCheckSeen: Date?
     private var egressNotifications = EgressNoticeLedger()
     private var egressSession = UUID()
     private var egressActiveRules = Set<UInt32>()
-    private var egressBlocksUnknownWeb = true
-    private var egressNotifiedUnknownWeb = false
     private var egressSavePending = false
 
     /// Drop episodes → DropRecords (DESIGN.md §21.22).
@@ -2040,7 +2037,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     private func sendEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
-        guard let data = try? JSONEncoder().encode(config.forService()) else { completion(false); return }
+        guard let data = try? JSONEncoder().encode(config) else { completion(false); return }
         let json = String(decoding: data, as: UTF8.self)
         egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
     }
@@ -2083,63 +2080,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         egressRPC({ $0.getEgressStatus(withReply: $1) }, completion: completion)
     }
 
-    func probeEgressJSON(_ host: String, completion: @escaping (String?) -> Void) {
-        if AppRole.isSettings { SettingsLink.shared.send("probeEgress", host, done: completion); return }
-        guard !usesCisco, state == .connected else { completion(nil); return }
-        egressRPC({ $0.probeEgress(host, withReply: $1) }, completion: completion)
-    }
-
     func connectForEgressSetup() {
         if AppRole.isSettings { SettingsLink.shared.send("connect"); return }
         _ = connectWithStoredCredentials(manual: true)
-    }
-
-    func probeEgressSetup(host: String, method: String, completion: @escaping (EgressProtection.SetupProbe?) -> Void) {
-        let decode: (String?) -> Void = { json in
-            completion(json.flatMap { try? JSONDecoder().decode(EgressProtection.SetupProbe.self, from: Data($0.utf8)) })
-        }
-        if AppRole.isSettings {
-            let request = EgressSetupRequest(host: host, method: method)
-            guard let json = try? JSONEncoder().encode(request) else { completion(nil); return }
-            SettingsLink.shared.send("probeEgressSetup", String(decoding: json, as: UTF8.self), done: decode)
-            return
-        }
-        probeEgressSetupJSON(host: host, method: method, completion: decode)
-    }
-
-    func probeEgressSetupJSON(host: String, method: String, completion: @escaping (String?) -> Void) {
-        guard !usesCisco, showsConnected, protectsDrops else { completion(nil); return }
-        egressRPC({ $0.probeEgressSummary(host, method: method, withReply: $1) }, completion: completion)
-    }
-
-    /// The caller owns this short-lived probe sequence and cancels it when
-    /// selection or the settings view changes.
-    func probeEgressWebsites(_ hosts: [String], method: String? = nil,
-                            isCurrent: @escaping () -> Bool,
-                            completion: @escaping ([String: EgressProtection.SetupProbe]) -> Void) {
-        let methods = (ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()).availableMethods.filter(\.isDirect)
-        let preferred = method ?? methods.first?.id ?? ""
-        let alternate = method == nil ? methods.dropFirst().first?.id : nil
-        var results: [String: EgressProtection.SetupProbe] = [:]
-        func next(_ index: Int) {
-            guard isCurrent() else { return }
-            guard hosts.indices.contains(index) else { completion(results); return }
-            let host = hosts[index]
-            func received(_ result: EgressProtection.SetupProbe?) {
-                guard isCurrent() else { return }
-                results[host] = result.flatMap { $0.host == host ? $0 : nil } ?? .unavailable(host)
-                next(index + 1)
-            }
-            probeEgressSetup(host: host, method: preferred) { result in
-                guard isCurrent() else { return }
-                if result?.status == "unsupported", let alternate {
-                    self.probeEgressSetup(host: host, method: alternate, completion: received)
-                } else {
-                    received(result)
-                }
-            }
-        }
-        next(0)
     }
 
     func allowEgressCountry(_ approval: EgressCountryApproval, completion: @escaping (Bool) -> Void) {
@@ -2170,69 +2113,6 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                           sameSession: self.egressSession == session) else { completion(false); return }
                 latest.egressProtection = updated
                 ProfileStore.saveAppSettings(latest, updatingEgress: true)
-                self.refreshEgress()
-                completion(true)
-            }
-        }
-    }
-
-    func confirmExitRangeSetup(_ setup: EgressExitRangeSetup, completion: @escaping (Bool) -> Void) {
-        if AppRole.isSettings {
-            guard let data = try? JSONEncoder().encode(setup) else { completion(false); return }
-            SettingsLink.shared.send("confirmExitRangeSetup", String(decoding: data, as: UTF8.self)) { completion($0 == "1") }
-            return
-        }
-        let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard showsConnected, !usesCisco, protectsDrops, !egressSavePending, stored == setup.previous,
-              let before = try? JSONEncoder().encode(setup.previous.forService()),
-              let after = try? JSONEncoder().encode(setup.proposed.forService()) else { completion(false); return }
-        let session = egressSession
-        egressSavePending = true
-        egressRPC({ proxy, done in
-            proxy.confirmEgressRangeSetup(String(decoding: after, as: UTF8.self),
-                                          previous: String(decoding: before, as: UTF8.self),
-                                          group: setup.group, proof: setup.proof, withReply: done)
-        }) { accepted in
-            self.egressSavePending = false
-            var settings = ProfileStore.loadAppSettings()
-            guard settings.isDropProtectionOn, !self.usesCisco,
-                  let updated = setup.applying(accepted: accepted, now: settings.egressProtection ?? EgressProtection(),
-                                               sameSession: self.egressSession == session) else { completion(false); return }
-            settings.egressProtection = updated
-            ProfileStore.saveAppSettings(settings, updatingEgress: true)
-            self.updateEgressMonitoring()
-            completion(true)
-        }
-    }
-
-    func allowEgressRange(_ approval: EgressExitRangeApproval, completion: @escaping (Bool) -> Void) {
-        if AppRole.isSettings {
-            guard let data = try? JSONEncoder().encode(approval) else { completion(false); return }
-            SettingsLink.shared.send("allowEgressRange", String(decoding: data, as: UTF8.self)) { completion($0 == "1") }
-            return
-        }
-        fetchEgressJSON { json in
-            guard let json, self.showsConnected, !self.egressSavePending,
-                  let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
-                  let evidence = try? JSONEncoder().encode(approval.observation) else { completion(false); return }
-            let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-            guard status.permits(approval, in: stored) else { completion(false); return }
-            let session = self.egressSession
-            self.egressSavePending = true
-            self.egressRPC({ proxy, done in
-                proxy.allowEgressRange(approval.cidr, group: approval.group, started: approval.started,
-                                       evidence: String(decoding: evidence, as: UTF8.self)) { ok, ranges in
-                    done(ok ? ranges : [])
-                }
-            }) { (ranges: [String]?) in
-                self.egressSavePending = false
-                var fresh = ProfileStore.loadAppSettings()
-                guard fresh.isDropProtectionOn, let config = fresh.egressProtection,
-                      let updated = approval.applying(ranges, then: stored, now: config,
-                                                     sameSession: self.egressSession == session)
-                else { completion(false); return }
-                fresh.egressProtection = updated
-                ProfileStore.saveAppSettings(fresh, updatingEgress: true)
                 self.refreshEgress()
                 completion(true)
             }
@@ -2276,48 +2156,6 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
-    func changeUnknownWebException(_ change: EgressUnknownWebChange, completion: @escaping (Bool) -> Void) {
-        if AppRole.isSettings {
-            guard let data = try? JSONEncoder().encode(change) else { completion(false); return }
-            SettingsLink.shared.send("changeUnknownWebException", String(decoding: data, as: UTF8.self)) {
-                completion($0 == "1")
-            }
-            return
-        }
-        let settings = ProfileStore.loadAppSettings()
-        guard showsConnected, !usesCisco, settings.isDropProtectionOn,
-              let config = settings.egressProtection, config.isActive, !egressSavePending else { completion(false); return }
-        let session = egressSession
-        fetchEgressJSON { json in
-            guard self.egressSession == session, self.showsConnected, !self.egressSavePending,
-                  ProfileStore.loadAppSettings().egressProtection == config,
-                  let json, let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
-                  status.permits(change, config: config) else { completion(false); return }
-            self.egressSavePending = true
-            self.egressRPC({ service, reply in
-                service.setUnknownWebException(change.endpoint.address, port: Int(change.endpoint.port),
-                                               allow: change.allow, approvalId: change.approvalId, withReply: reply)
-            }) { accepted in
-                guard accepted == true, self.egressSession == session else {
-                    self.egressSavePending = false
-                    self.refreshEgress()
-                    completion(false)
-                    return
-                }
-                self.fetchEgressJSON { json in
-                    self.egressSavePending = false
-                    self.refreshEgress()
-                    let latest = ProfileStore.loadAppSettings()
-                    guard self.egressSession == session, self.showsConnected,
-                          latest.isDropProtectionOn, latest.egressProtection == config,
-                          let json, let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8))
-                    else { completion(false); return }
-                    completion(status.applied(change))
-                }
-            }
-        }
-    }
-
     func disableEgressGroup(_ id: UInt32, completion: @escaping (Bool) -> Void) {
         let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
         var config = stored.rulesForEditing
@@ -2335,7 +2173,6 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let groups = settings.egressProtection?.groups ?? []
         egressNotifications.retain(Set(groups.map(\.id)))
         egressActiveRules = Set(groups.filter(\.enabled).map(\.id))
-        egressBlocksUnknownWeb = settings.egressProtection?.blocksUnidentifiedWeb ?? true
         let enabled = !usesCisco && settings.isDropProtectionOn && settings.egressProtection?.isActive == true
         guard enabled, state == .connected else {
             egressTimer?.invalidate()
@@ -2344,11 +2181,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if egressLevel != .unknown { egressLevel = .unknown }
             if !egressNotices.isEmpty { egressNotices = [] }
             if egressRecheckRule != nil { egressRecheckRule = nil }
-            if egressUnknownWebCount != nil { egressUnknownWebCount = nil }
             egressCheckSeen = nil
             if state == .disconnected {
                 egressNotifications = EgressNoticeLedger()
-                egressNotifiedUnknownWeb = false
                 egressSession = UUID()
             }
             return
@@ -2370,7 +2205,6 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             self.egressPollPending = false
             guard self.egressTimer != nil, self.egressSession == session else { return }
             let status = json.flatMap { EgressProtection.Status.monitoring(Data($0.utf8)) }
-            let unknownCount = status?.unknownWebCount
             let notices = status?.blockingNotices ?? []
             let now = Date()
             if status?.checking.isEmpty == false {
@@ -2386,14 +2220,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if self.egressLevel != level { self.egressLevel = level }
             if self.egressNotices != notices { self.egressNotices = notices }
             if self.egressRecheckRule != recheckRule { self.egressRecheckRule = recheckRule }
-            if self.egressUnknownWebCount != unknownCount { self.egressUnknownWebCount = unknownCount }
             guard let status, status.running else { return }
             for event in self.egressNotifications.update(status.groups.filter { self.egressActiveRules.contains($0.id) }) {
                 Notifier.shared.egressNotice(event)
-            }
-            if self.egressBlocksUnknownWeb, let unknownCount, unknownCount > 0, !self.egressNotifiedUnknownWeb {
-                self.egressNotifiedUnknownWeb = true
-                Notifier.shared.unknownEgressNotice(count: unknownCount)
             }
         }
     }

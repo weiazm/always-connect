@@ -29,24 +29,13 @@ struct EgressCountryApproval: Codable, Equatable, Identifiable {
 
     func applying(_ countries: [String]?, then stored: EgressProtection, now current: EgressProtection,
                   sameSession: Bool) -> EgressProtection? {
-        guard sameSession, current.enabled, current.methods == stored.methods,
+        guard sameSession, current.enabled,
               let rule = stored.groups.first(where: { $0.id == group && $0.enabled }),
               let countries, Set(countries).count == countries.count, Set(countries) == Set(rule.expect + [country]),
               let index = current.groups.firstIndex(of: rule) else { return nil }
         var updated = current
         updated.groups[index].expect = countries
         return updated
-    }
-}
-
-extension EgressProtection.Method {
-    static let thirdPartyCaption = "第三方查询点：仅供参考，不参与放行或拦截"
-    var scopeCaption: String { isDirect ? "直接检查网站" : Self.thirdPartyCaption }
-
-    static func preferredDirectMethod(_ methods: [Self], observations: [EgressProtection.Observation]) -> String? {
-        methods.first { method in
-            method.isDirect && observations.contains { $0.method == method.id && $0.country != nil }
-        }?.id
     }
 }
 
@@ -81,7 +70,7 @@ extension EgressProtection {
             switch self {
             case .direct: return "直接观测（同名、固定目的地址）"
             case .proxy: return "按借用身份查到（代理观测）"
-            case .thirdParty: return Method.thirdPartyCaption
+            case .thirdParty: return "第三方查询点：仅供参考，不参与放行或拦截"
             case .member: return "按网站名查询（组内成员）"
             case .unknown: return "来源未记录"
             }
@@ -106,14 +95,6 @@ extension EgressProtection {
 }
 
 extension EgressProtection.Observation {
-    var exitRangeFailureCaption: String? {
-        switch failureReason {
-        case "exit-range-mismatch": return "出口地址不在允许范围，已先拦住新连接"
-        case "exit-ip-unavailable": return "查不到出口地址，已先拦住新连接"
-        default: return nil
-        }
-    }
-
     var evidenceKind: EgressProtection.Evidence {
         evidence.flatMap(EgressProtection.Evidence.init(rawValue:)) ?? .unknown
     }
@@ -125,8 +106,7 @@ extension EgressProtection.Observation {
 
     var observationCaption: String {
         let address = peerAddress.map { "（目的地址 \($0)）" } ?? ""
-        let cause = exitRangeFailureCaption.map { " · \($0)" } ?? ""
-        return "\(host)\(address)：\(countryAndAddress) · \(evidenceKind.caption)" + cause
+        return "\(host)\(address)：\(countryAndAddress) · \(evidenceKind.caption)"
     }
 
     func isOutside(_ expected: [String]) -> Bool {
@@ -156,7 +136,6 @@ extension EgressProtection.GroupState {
 
     var blockCaption: String? {
         if let reason = blockReason { return reason.caption }
-        if blocked, let reason = observed.lazy.compactMap(\.exitRangeFailureCaption).first { return reason }
         switch displayLevel {
         case .ok: return nil
         case .partial:
@@ -181,11 +160,9 @@ extension EgressProtection.Status {
             let running: Bool
             let checking: [UInt32]
             let groups: [EgressProtection.GroupState]
-            let unknownWebCount: UInt64?
         }
         return (try? JSONDecoder().decode(Snapshot.self, from: data)).map {
-            .init(running: $0.running, checking: $0.checking, groups: $0.groups, records: [],
-                  unknownWebCount: $0.running ? $0.unknownWebCount : nil)
+            .init(running: $0.running, checking: $0.checking, groups: $0.groups, records: [])
         }
     }
 
@@ -219,9 +196,7 @@ extension EgressProtection.Status {
         case .blocked:
             return groups.first { $0.displayLevel == .blocked }?.blockCaption ?? "有网站暂时打不开"
         case .partial:
-            return groups.lazy.filter { $0.blocked && (expectedRules?.contains($0.id) ?? true) }
-                .flatMap(\.observed).compactMap(\.exitRangeFailureCaption).first
-                ?? (blockedCount > 0 ? "本次已拦下 \(blockedCount) 次连接" : "部分地址已拦截")
+            return blockedCount > 0 ? "本次已拦下 \(blockedCount) 次连接" : "部分地址已拦截"
         case .ok: return "正常"
         case .unknown:
             if running && !checking.isEmpty && checkingFor >= 1 { return "正在核对出口" }
@@ -237,7 +212,7 @@ extension EgressProtection.Status {
               record.expected == rule.expect,
               let target = approval.observation.directTarget,
               record.directTargetsToTrust(current: group)?.contains(target) == true else { return false }
-        return config.directMembers(in: rule).contains { $0.method == target.method && $0.matchesSite(target.host) }
+        return rule.covers(target.host)
     }
 
     func approvals(for id: UInt32) -> [EgressCountryApproval] {

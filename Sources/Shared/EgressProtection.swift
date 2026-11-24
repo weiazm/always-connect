@@ -1,27 +1,12 @@
 import Foundation
 
+/// Exit protection (DESIGN §66.25): for each rule, the sites to protect
+/// (with subdomains) and the countries their connections may leave from.
 struct EgressProtection: Codable, Equatable {
     var enabled = false
     var groups: [Group] = []
-    var methods: [Method] = []
-    var blockUnidentifiedWeb: Bool?
 
     var isActive: Bool { enabled && groups.contains(where: \.enabled) }
-    var blocksUnidentifiedWeb: Bool { blockUnidentifiedWeb ?? true }
-
-    var availableMethods: [Method] {
-        Method.presets.map { method($0.id) ?? $0 }
-            + methods.filter { item in !Method.presets.contains { $0.id == item.id } }
-    }
-
-    func method(_ id: String?) -> Method? {
-        guard let id else { return nil }
-        return methods.first { $0.id == id } ?? Method.presets.first { $0.id == id }
-    }
-
-    func directMembers(in group: Group) -> [Member] {
-        group.members.filter { $0.concreteHost != nil && method($0.method)?.isDirect == true }
-    }
 
     @discardableResult
     mutating func disableGroup(_ id: UInt32) -> Bool {
@@ -30,12 +15,11 @@ struct EgressProtection: Codable, Equatable {
         return true
     }
 
-    /// Existing active groups stay armed when an edit removes their last direct method.
-    /// Turning protection on, or enabling an additional group, requires a direct method.
+    /// An enabled rule needs a site and an allowed country.
     func permitsActivation(comparedTo previous: Self) -> Bool {
         guard enabled else { return true }
         return groups.allSatisfy { group in
-            !group.enabled || group.simple || !directMembers(in: group).isEmpty
+            !group.enabled || (!group.sites.isEmpty && !group.expect.isEmpty)
                 || (previous.enabled && previous.groups.contains { $0.id == group.id && $0.enabled })
         }
     }
@@ -44,84 +28,16 @@ struct EgressProtection: Codable, Equatable {
         var id: UInt32
         var name: String
         var enabled = false
-        var members: [Member] = []
-        var cidrs: [String] = []
-        var expect: [String] = []
-        var exitRangeCheck = false
-        var exitRanges: [String] = []
-        /// Protected apps (DESIGN §66.24): bundle paths ("/Applications/X.app")
-        /// or executable names ("x-cli"). A group with apps is checked by
-        /// connection owner; website members are no longer used.
-        var apps: [String] = []
-        /// The sites this rule protects, with subdomains (DESIGN §66.25).
-        /// Without apps the rule covers every program's connections to them.
+        /// The sites this rule protects, with subdomains.
         var sites: [String] = []
+        /// Allowed exit countries (ISO 3166 alpha-2).
+        var expect: [String] = []
 
-        var byApp: Bool { apps.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
-        /// Apps and/or sites; the retired kind has website members instead.
-        var simple: Bool { byApp || sites.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
-    }
-
-    struct Member: Codable, Equatable, Identifiable {
-        var pattern: String
-        var method: String?
-        var probeHost: String?
-        var id: String { pattern }
-        var concreteHost: String? {
-            let name = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard name.hasPrefix("*.") else { return Self.validHost(name) ? name : nil }
-            guard let probeHost, Self.validHost(probeHost), matchesSite(probeHost) else { return nil }
-            return probeHost
+        /// Whether a host is one of the sites or below one.
+        func covers(_ host: String) -> Bool {
+            let host = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return sites.contains { site in host == site || host.hasSuffix("." + site) }
         }
-
-        func matchesSite(_ host: String) -> Bool {
-            let dots = CharacterSet(charactersIn: ".")
-            let name = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased().trimmingCharacters(in: dots)
-            let target = host.lowercased().trimmingCharacters(in: dots)
-            return name.hasPrefix("*.") ? target.hasSuffix(String(name.dropFirst())) : target == name
-        }
-
-        private static func validHost(_ host: String) -> Bool {
-            let name = host.last == "." ? host.dropLast() : host[...]
-            return host.utf8.count <= 253 && !name.isEmpty
-                && name.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
-                    !label.isEmpty && label.utf8.count <= 63 && label.utf8.allSatisfy {
-                        (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45
-                    }
-                }
-        }
-    }
-
-    struct Method: Codable, Equatable, Identifiable {
-        var id: String
-        var name: String
-        var url: String
-        var head = false
-        var extract: Extract
-
-        var isDirect: Bool {
-            guard url.hasPrefix("https://") else { return false }
-            let authority = url.dropFirst("https://".count).prefix { $0 != "/" }
-            if authority == "{host}" { return true }
-            guard authority.hasPrefix("{host}:"),
-                  let port = UInt16(authority.dropFirst("{host}:".count)) else { return false }
-            return port != 0
-        }
-
-        static let presets = [
-            Self(id: "trace", name: "网站自己的检测地址", url: "https://{host}/cdn-cgi/trace",
-                 extract: .init(kind: .kv, key: "loc")),
-            Self(id: "cdn-node", name: "CDN 节点（近似）", url: "https://{host}/", head: true,
-                 extract: .init(kind: .header, key: "cf-ray,x-amz-cf-pop,x-served-by")),
-        ]
-    }
-
-    struct Extract: Codable, Equatable {
-        enum Kind: String, Codable, CaseIterable { case kv, json, header }
-        var kind: Kind
-        var key: String
-        var regex: String?
     }
 
     struct Observation: Codable, Equatable, Identifiable {
@@ -142,17 +58,6 @@ struct EgressProtection: Codable, Equatable {
         let checking: [UInt32]
         let groups: [GroupState]
         let records: [BlockRecord]
-        var unknownWeb: [UnknownWebRecord]? = nil
-        var unknownWebCount: UInt64? = nil
-    }
-
-    struct UnknownWebRecord: Decodable, Equatable {
-        var lastReason: String? = nil
-        let address: String
-        let port: UInt16
-        let count: UInt64
-        let allowed: Bool
-        let approvalId: String?
     }
 
     struct GroupState: Decodable, Identifiable {
@@ -180,27 +85,6 @@ struct EgressProtection: Codable, Equatable {
         var id: String { host }
     }
 
-    struct SetupProbe: Decodable {
-        struct Result: Decodable {
-            let address: String
-            let method: String
-            let status: String
-            let country: String?
-            let error: String?
-            var exitIP: String? = nil
-        }
-        let host: String
-        let method: String
-        let status: String
-        let error: String?
-        let resolvedAddressCount: Int
-        let probedAddressCount: Int
-        let truncated: Bool
-        let coverageIncomplete: Bool
-        let results: [Result]
-        var proofId: String? = nil
-    }
-
     struct BlockRecord: Decodable {
         let started: Double
         let ended: Double?
@@ -213,17 +97,27 @@ struct EgressProtection: Codable, Equatable {
 }
 
 extension EgressProtection.Group {
+    private enum LegacyKeys: String, CodingKey { case members }
+    private struct LegacyMember: Decodable { let pattern: String }
+
+    /// Rules saved before §66.25 listed website members ("example.com",
+    /// "*.example.com", "geosite:…"); they become the sites they named.
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UInt32.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
-        enabled = try values.decode(Bool.self, forKey: .enabled)
-        members = try values.decode([EgressProtection.Member].self, forKey: .members)
-        cidrs = try values.decode([String].self, forKey: .cidrs)
-        expect = try values.decode([String].self, forKey: .expect)
-        exitRangeCheck = try values.decodeIfPresent(Bool.self, forKey: .exitRangeCheck) ?? false
-        exitRanges = try values.decodeIfPresent([String].self, forKey: .exitRanges) ?? []
-        apps = try values.decodeIfPresent([String].self, forKey: .apps) ?? []
-        sites = try values.decodeIfPresent([String].self, forKey: .sites) ?? []
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        expect = try values.decodeIfPresent([String].self, forKey: .expect) ?? []
+        var sites = try values.decodeIfPresent([String].self, forKey: .sites) ?? []
+        if sites.isEmpty {
+            let legacy = try decoder.container(keyedBy: LegacyKeys.self)
+            let members = (try? legacy.decodeIfPresent([LegacyMember].self, forKey: .members)) ?? nil
+            for member in members ?? [] {
+                let site = member.pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    .replacingOccurrences(of: "*.", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                if !site.isEmpty, !site.contains(":"), site.contains("."), !sites.contains(site) { sites.append(site) }
+            }
+        }
+        self.sites = sites
     }
 }

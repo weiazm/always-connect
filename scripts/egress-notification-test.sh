@@ -10,8 +10,6 @@ trap 'rm -rf "$WORK"' EXIT
 sed 's/^import UserNotifications$/import Foundation/' "$ROOT/Sources/App/Notifier.swift" > "$WORK/Notifier.swift"
 swiftc -parse-as-library "$WORK/Notifier.swift" \
     "$ROOT/Sources/Shared/EgressProtection.swift" "$ROOT/Sources/App/EgressPresentation.swift" \
-    "$ROOT/Sources/App/EgressExitRange.swift" \
-    "$ROOT/Sources/App/EgressUnknownWeb.swift" \
     "$ROOT/core/scripts/EgressNotificationHarness.swift" \
     -o "$WORK/harness"
 "$WORK/harness"

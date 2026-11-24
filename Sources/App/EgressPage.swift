@@ -32,12 +32,11 @@ struct EgressProtectionPage: View {
     @State private var confirmDropProtection = false
 
     enum Sheet: Identifiable {
-        case addSites, details(UInt32), unknownWeb
+        case addSites, details(UInt32)
         var id: String {
             switch self {
             case .addSites: return "add-sites"
             case .details(let id): return "details-\(id)"
-            case .unknownWeb: return "unknown-web"
             }
         }
     }
@@ -51,13 +50,7 @@ struct EgressProtectionPage: View {
         _sheet = State(initialValue: sheet)
     }
 
-    /// Only app rules are shown and edited (§66.24); website rules are retired.
-    private var config: EgressProtection {
-        var result = stored.rulesForEditing
-        result.groups.removeAll { !$0.simple }
-        return result
-    }
-    private var legacyRules: [EgressProtection.Group] { stored.groups.filter { !$0.simple } }
+    private var config: EgressProtection { stored.rulesForEditing }
     private var connected: Bool { preview?.connected ?? manager.showsConnected }
     private var available: Bool { preview?.available ?? (!manager.usesCisco && manager.protectsDrops) }
     private var active: [EgressProtection.Group] { config.groups.filter(\.enabled) }
@@ -68,13 +61,6 @@ struct EgressProtectionPage: View {
         Form {
             Section {
                 statusBar
-                if !legacyRules.isEmpty {
-                    EgressCallout(icon: "arrow.triangle.2.circlepath", tint: .accentColor,
-                                  text: "出口保护改成了按域名保护",
-                                  caption: "以前按网站设的 \(legacyRules.count) 个保护\(stored.isActive ? "还在生效" : "已不再使用")；添加网站后会自动替换。") {
-                        Button("现在移除") { change { _ in } }
-                    }
-                }
                 if let confirm {
                     EgressReconnectPrompt(change: confirm, cancel: { self.confirm = nil }) {
                         self.confirm = nil
@@ -119,7 +105,6 @@ struct EgressProtectionPage: View {
         .onAppear { visible = true; refresh(); openRequestedRule() }
         .onDisappear { visible = false; status = nil }
         .onChange(of: window.egressRuleToOpen) { _ in openRequestedRule() }
-        .onChange(of: window.unknownEgressRequested) { _ in openRequestedRule() }
         .onChange(of: manager.showsConnected) { _ in refresh() }
         .background {
             if visible && config.isActive && preview == nil {
@@ -139,10 +124,7 @@ struct EgressProtectionPage: View {
                 defer { if opened { url.stopAccessingSecurityScopedResource() } }
                 var imported = try JSONDecoder().decode(EgressProtection.self, from: Data(contentsOf: url))
                 imported.enabled = false
-                imported.blockUnidentifiedWeb = nil
-                for index in imported.groups.indices { imported.groups[index].exitRangeCheck = false }
-                var offline = imported.rulesForEditing
-                offline.groups.removeAll { !$0.simple }
+                let offline = imported.rulesForEditing
                 change { $0 = offline }
                 if message == nil {
                     notice = nil
@@ -256,7 +238,7 @@ struct EgressProtectionPage: View {
     private func ruleRow(_ group: EgressProtection.Group, decisions: [EgressDecision]) -> some View {
         let state = liveStatus?.groups.first { $0.id == group.id }
         let badge = EgressRuleBadge.of(group, config: config, state: state, connected: connected)
-        let canEnable = (group.simple || !config.directMembers(in: group).isEmpty) && !group.expect.isEmpty
+        let canEnable = !group.sites.isEmpty && !group.expect.isEmpty
         let problem = group.enabled && decisions.isEmpty ? badge.problem : nil
         let unverified = connected ? state?.unverifiedCount ?? 0 : 0
         return VStack(alignment: .leading, spacing: 8) {
@@ -308,8 +290,7 @@ struct EgressProtectionPage: View {
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
         let date = Date(timeIntervalSince1970: record.started)
-        let cause = record.observed.lazy.compactMap(\.exitRangeFailureCaption).first
-            ?? record.observed.first(where: { $0.country != nil && $0.isOutside(record.expected) })
+        let cause = record.observed.first(where: { $0.country != nil && $0.isOutside(record.expected) })
                 .map { "出口在 \(egressCountryLabel($0.country ?? ""))，不在允许范围" }
             ?? "没能核实出口"
         let open = record.ended == nil
@@ -345,18 +326,11 @@ struct EgressProtectionPage: View {
                                  edit: { edit in changeRule(id, edit: edit) }, pause: pause,
                                  remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
             }
-        case .unknownWeb:
-            EgressUnknownWebView(config: stored, status: liveStatus, refresh: refresh)
         }
     }
 
     private func openRequestedRule() {
         guard visible, preview == nil else { return }
-        if window.unknownEgressRequested {
-            window.unknownEgressRequested = false
-            if config.isActive && available { sheet = .unknownWeb }
-            return
-        }
         guard let id = window.egressRuleToOpen else { return }
         window.egressRuleToOpen = nil
         if config.groups.contains(where: { $0.id == id }) { sheet = .details(id) }
@@ -386,11 +360,7 @@ struct EgressProtectionPage: View {
     private func change(_ edit: (inout EgressProtection) -> Void, completion: ((Bool) -> Void)? = nil) {
         guard preview == nil else { return }
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        // Website rules are retired (§66.24): any save keeps only app rules.
-        let change = EgressRuleChange(config: previous) { config in
-            config.groups.removeAll { !$0.simple }
-            edit(&config)
-        }
+        let change = EgressRuleChange(config: previous, edit: edit)
         guard change.after.permitsActivation(comparedTo: previous) else {
             message = "先选允许的国家或地区，才能打开这个保护。"
             completion?(false)

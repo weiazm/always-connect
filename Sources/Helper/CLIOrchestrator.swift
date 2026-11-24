@@ -206,20 +206,6 @@ final class CLIOrchestrator {
     func updateEgress(_ json: String) { ac_oc_update_egress(handle, json) }
     func recheckEgressFailures(_ group: UInt32) -> Bool { ac_oc_recheck_egress(handle, group) }
     func retryNow() -> Bool { ac_oc_retry_now(handle) }
-    func setUnknownWebException(_ address: String, port: UInt16, allow: Bool, approvalId: String) -> Bool {
-        ac_oc_unknown_web_exception(handle, address, port, allow, approvalId)
-    }
-
-    func confirmRangeSetup(_ previous: String, proposed: String, group: UInt32, proof: String) -> Bool {
-        ac_oc_confirm_range_setup(handle, previous, proposed, group, proof)
-    }
-    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
-                          expected: EgressProtection) -> [String]? {
-        guard let cfg = try? JSONEncoder().encode(expected),
-              let json = NetworkGuard.take(ac_oc_allow_egress_range(handle, String(decoding: cfg, as: UTF8.self),
-                                                                    group, started, cidr, evidence)) else { return nil }
-        return try? JSONDecoder().decode([String].self, from: Data(json.utf8))
-    }
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             expected: EgressProtection) -> [String]? {
         guard let cfg = try? JSONEncoder().encode(expected),
@@ -228,10 +214,6 @@ final class CLIOrchestrator {
         return try? JSONDecoder().decode([String].self, from: Data(json.utf8))
     }
     func egressStatus() -> String { NetworkGuard.take(ac_oc_egress_status(handle)) ?? "{}" }
-    func probeEgress(_ host: String) -> String { NetworkGuard.take(ac_oc_egress_probe_host(handle, host)) ?? "[]" }
-    func probeEgressSummary(_ host: String, method: String) -> String {
-        NetworkGuard.take(ac_oc_egress_probe_summary(handle, host, method)) ?? "{}"
-    }
 
     func updateAllowNetworks(_ networks: [String]) {
         ac_oc_update_allow_networks(handle, networks.joined(separator: ","))
@@ -363,15 +345,6 @@ func ac_oc_set_egress_probe_with_peer(_ e: OpaquePointer, _ ctx: UnsafeMutableRa
 private func ac_oc_recheck_egress(_ e: OpaquePointer, _ group: UInt32) -> Bool
 @_silgen_name("ac_oc_retry_now")
 private func ac_oc_retry_now(_ e: OpaquePointer) -> Bool
-@_silgen_name("ac_oc_unknown_web_exception")
-private func ac_oc_unknown_web_exception(_ e: OpaquePointer, _ address: UnsafePointer<CChar>, _ port: UInt16,
-                                         _ allow: Bool, _ approvalId: UnsafePointer<CChar>) -> Bool
-@_silgen_name("ac_oc_confirm_range_setup")
-private func ac_oc_confirm_range_setup(_ e: OpaquePointer, _ previous: UnsafePointer<CChar>, _ proposed: UnsafePointer<CChar>,
-                                       _ group: UInt32, _ proof: UnsafePointer<CChar>) -> Bool
-@_silgen_name("ac_oc_allow_egress_range")
-private func ac_oc_allow_egress_range(_ e: OpaquePointer, _ cfg: UnsafePointer<CChar>, _ group: UInt32, _ started: Double,
-                                      _ cidr: UnsafePointer<CChar>, _ evidence: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_oc_allow_egress_country")
 private func ac_oc_allow_egress_country(_ e: OpaquePointer, _ cfg: UnsafePointer<CChar>, _ group: UInt32, _ started: Double,
                                         _ country: UnsafePointer<CChar>, _ evidence: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -379,11 +352,6 @@ private func ac_oc_allow_egress_country(_ e: OpaquePointer, _ cfg: UnsafePointer
 func ac_oc_update_egress(_ e: OpaquePointer, _ json: UnsafePointer<CChar>)
 @_silgen_name("ac_oc_egress_status")
 func ac_oc_egress_status(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("ac_oc_egress_probe_host")
-func ac_oc_egress_probe_host(_ e: OpaquePointer, _ host: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("ac_oc_egress_probe_summary")
-func ac_oc_egress_probe_summary(_ e: OpaquePointer, _ host: UnsafePointer<CChar>,
-                                _ method: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_egress_config_valid")
 func ac_egress_config_valid(_ json: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_oc_update_allow_networks") func ac_oc_update_allow_networks(_ e: OpaquePointer, _ n: UnsafePointer<CChar>)

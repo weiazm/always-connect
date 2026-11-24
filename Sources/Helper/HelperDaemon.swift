@@ -237,7 +237,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var dropProtection = true
     private var egress = EgressProtection()
     private var egressConfigured = false
-    private var probingEgress = false
     private var lastStateCode = 0
     private var lastDetail = ""
     /// Last terminal reason code + drop-episode retries, for
@@ -625,13 +624,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             guard ac_egress_config_valid(json),
                   let config = try? JSONDecoder().decode(EgressProtection.self, from: Data(json.utf8)),
                   !config.enabled || self.dropProtection else { reply(false); return }
-            // The first profile hydration may restore already confirmed prefixes. A live
-            // edit that enables or expands source trust must use a confirmation endpoint.
-            if (self.egressConfigured || self.engine != nil) && config.groups.contains(where: { next in
-                guard next.exitRangeCheck else { return false }
-                let old = self.egress.groups.first { $0.id == next.id }
-                return old?.exitRangeCheck != true || !Set(next.exitRanges).isSubset(of: Set(old?.exitRanges ?? []))
-            }) { reply(false); return }
             self.applyEgressConfiguration(config, json: json)
             reply(true)
         }
@@ -648,36 +640,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         if relay != nil && !(modeChanged && restartForEgressChange()) { engine?.updateEgress(json) }
     }
 
-    func confirmEgressRangeSetup(_ proposed: String, previous: String, group: UInt32, proof: String,
-                                withReply reply: @escaping (Bool) -> Void) {
-        queue.async {
-            guard self.dropProtection, !self.userReleased, self.relay != nil,
-                  ac_egress_config_valid(proposed),
-                  let old = try? JSONDecoder().decode(EgressProtection.self, from: Data(previous.utf8)),
-                  let new = try? JSONDecoder().decode(EgressProtection.self, from: Data(proposed.utf8)),
-                  self.egress == old,
-                  self.engine?.confirmRangeSetup(previous, proposed: proposed, group: group, proof: proof) == true else {
-                reply(false); return
-            }
-            self.applyEgressConfiguration(new, json: proposed)
-            reply(true)
-        }
-    }
-
-    func allowEgressRange(_ cidr: String, group: UInt32, started: Double, evidence: String,
-                          withReply reply: @escaping (Bool, [String]) -> Void) {
-        queue.async {
-            guard self.dropProtection, self.egress.isActive,
-                  let index = self.egress.groups.firstIndex(where: { $0.id == group && $0.enabled && $0.exitRangeCheck }),
-                  let ranges = self.engine?.allowEgressRange(cidr, group: group, started: started,
-                                                             evidence: evidence, expected: self.egress) else {
-                reply(false, []); return
-            }
-            self.egress.groups[index].exitRanges = ranges
-            reply(true, ranges)
-        }
-    }
-
     func getEgressStatus(withReply reply: @escaping (String) -> Void) {
         queue.async { reply(self.engine?.egressStatus() ?? "{}") }
     }
@@ -687,15 +649,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             let taken = self.engine?.retryNow() ?? false
             if taken { HelperSession.log("login retry requested by the user") }
             reply(taken)
-        }
-    }
-
-    func setUnknownWebException(_ address: String, port: Int, allow: Bool, approvalId: String,
-                                withReply reply: @escaping (Bool) -> Void) {
-        queue.async {
-            guard self.dropProtection, self.egress.isActive, !self.userReleased, [80,443,8443].contains(port),
-                  let engine = self.engine else { reply(false); return }
-            reply(engine.setUnknownWebException(address, port: UInt16(port), allow: allow, approvalId: approvalId))
         }
     }
 
@@ -721,52 +674,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             }
             self.egress.groups[index].expect = countries
             reply(true, countries)
-        }
-    }
-
-    func probeEgress(_ host: String, withReply reply: @escaping (String) -> Void) {
-        queue.async {
-            guard self.relay != nil, !self.probingEgress, let engine = self.engine else { reply("[]"); return }
-            self.probingEgress = true
-            DispatchQueue.global(qos: .userInitiated).async {
-                let result = engine.probeEgress(host)
-                self.queue.async {
-                    self.probingEgress = false
-                    reply(self.engine === engine ? result : "[]")
-                }
-            }
-        }
-    }
-
-    func probeEgressSummary(_ host: String, method: String, withReply reply: @escaping (String) -> Void) {
-        func failure(_ reason: String, status: String = "unavailable") -> String {
-            let fields: [String: Any] = [
-                "host": "", "method": "", "status": status, "error": reason,
-                "resolvedAddressCount": 0, "probedAddressCount": 0,
-                "truncated": false, "coverageIncomplete": true, "results": [],
-            ]
-            guard let data = try? JSONSerialization.data(withJSONObject: fields) else { return "{}" }
-            return String(decoding: data, as: UTF8.self)
-        }
-        queue.async {
-            guard host.utf8.count <= 254, !host.utf8.contains(0) else {
-                reply(failure("invalidHost", status: "invalid")); return
-            }
-            guard method.utf8.count <= 524_288, !method.utf8.contains(0) else {
-                reply(failure("invalidMethod", status: "invalid")); return
-            }
-            guard self.relay != nil, !self.userReleased, let engine = self.engine else {
-                reply(failure("tunnelUnavailable")); return
-            }
-            guard !self.probingEgress else { reply(failure("busy")); return }
-            self.probingEgress = true
-            DispatchQueue.global(qos: .userInitiated).async {
-                let result = engine.probeEgressSummary(host, method: method)
-                self.queue.async {
-                    self.probingEgress = false
-                    reply(self.engine === engine && !self.userReleased ? result : failure("tunnelUnavailable"))
-                }
-            }
         }
     }
 

@@ -369,11 +369,6 @@ struct PanelView: View {
                         .foregroundStyle(tint)
                         .lineLimit(blocked ? 3 : 2)
                         .fixedSize(horizontal: false, vertical: true)
-                    if let count = manager.egressUnknownWebCount, count > 0 {
-                        Text("认不出名字的网页连接已拦 \(count) 条")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
                 }
                 Spacer(minLength: 6)
                 Image(systemName: "chevron.right")
