@@ -119,9 +119,9 @@ impl SplitPolicy {
         for (name, claims) in &mut self.names {
             let domain_direct = rules.matches(name).is_some();
             let protected = rules.protects_name(name);
-            claims.vpn.retain(|ip| protected || rules.protects_ip(*ip) || (!domain_direct && !rules.contains(*ip)));
+            claims.vpn.retain(|ip| protected || (!domain_direct && !rules.contains(*ip)));
             for (ip, direct) in &mut claims.current {
-                let keep = !protected && !rules.protects_ip(*ip) && (domain_direct || rules.contains(*ip));
+                let keep = !protected && (domain_direct || rules.contains(*ip));
                 if *direct && !keep { claims.vpn.insert(*ip); }
                 // New grants still require a fresh query through the right DNS.
                 *direct &= keep;
@@ -214,24 +214,21 @@ mod tests {
     }
 
     #[test]
-    fn protection_revokes_direct_grants_even_for_shared_addresses_and_cidrs() {
+    fn protection_revokes_direct_grants_even_for_shared_addresses() {
         let config: crate::egress_control::EgressConfig = serde_json::from_value(serde_json::json!({
-            "enabled": true, "groups": [{
-                "id": 1, "enabled": true, "cidrs": ["203.0.113.0/24"],
-                "members": [{"pattern":"protected.example"}]
-            }]
+            "enabled": true, "groups": [{ "id": 1, "enabled": true, "sites": ["protected.example"], "expect": ["ZZ"] }]
         })).unwrap();
         let names = ["example.test", "protected.example", "shared.example"];
-        let rules = SplitRules::new(&names).with_protection(Some(std::sync::Arc::new(config.protected_routes())));
+        let rules = SplitRules::new(&names).with_protection(Some(std::sync::Arc::new(config.protected_sites())));
         let mut policy = SplitPolicy::default();
-        let covered = Ipv4Addr::new(203, 0, 113, 8);
+        let other = Ipv4Addr::new(203, 0, 113, 8);
         let unrelated = Ipv4Addr::new(198, 51, 100, 2);
         policy.observe("protected.example".into(), &[ip(1)], &[ip(1)]);
         policy.observe("shared.example".into(), &[ip(1)], &[ip(1)]);
-        policy.observe("example.test".into(), &[covered, unrelated], &[covered, unrelated]);
+        policy.observe("example.test".into(), &[other, unrelated], &[other, unrelated]);
         assert_eq!(policy.direct().len(), 3);
         policy.revalidate(&rules);
-        assert_eq!(policy.direct(), std::collections::HashSet::from([unrelated.to_string()]));
+        assert_eq!(policy.direct(), std::collections::HashSet::from([other.to_string(), unrelated.to_string()]));
     }
 
     #[test]

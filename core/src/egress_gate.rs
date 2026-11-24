@@ -1,13 +1,15 @@
-//! Egress gate (DESIGN.md §66.5): the per-packet decision logic that sits in
-//! the own connection's tunnel path when egress protection is on.
+//! Egress gate (DESIGN.md §66.5, §66.25): the per-packet decision logic that
+//! sits in the own connection's tunnel path when exit protection is on.
 //!
 //! openconnect runs in `--script-tun` mode and hands every IP packet to the
 //! gate program; this module decides, per packet, whether it goes on into the
-//! tunnel now, waits, or is dropped. Every new connection's first data packet
-//! is held until the gate knows where the connection goes (TLS SNI, HTTP Host,
-//! or the destination address). Connections to a protected group wait for an
-//! egress check of their destination. A failed check drops the packets
-//! waiting for that result and answers the Mac with a TCP RST.
+//! tunnel now, waits, or is dropped. A new TCP connection's first data is
+//! held until the gate can read the name it shows (TLS SNI or HTTP Host).
+//! A name that is one of the protected sites, or below one, waits for an
+//! exit check of that connection's own destination; everything else passes
+//! at once. A failed check drops the waiting packets and answers the Mac
+//! with a TCP RST. A connection that shows no readable name passes (best
+//! effort), and so does one whose exit the controller cannot read.
 //!
 //! The module does no I/O: the caller feeds packets and verdicts and carries
 //! out the returned actions. It is pure Rust so it is tested on Linux.
@@ -18,22 +20,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
-mod dns_evidence;
-pub mod owners;
-mod unknown_web;
-use dns_evidence::{DnsEvidence, DnsMatch};
-pub use dns_evidence::{DnsEvidenceKind, DnsEvidenceUpdate, DnsEvidenceValue};
-use unknown_web::{is_site_name, UnknownWebCounts};
-pub use unknown_web::{UnknownWebCount, UnknownWebEndpoint, UnknownWebPolicy, UnknownWebReason};
-
-/// A protected group (DESIGN.md §66.3); the caller's identifier.
+/// A protection rule (DESIGN.md §66.25); the controller's identifier.
 pub type GroupId = u32;
 pub type RequestId = NonZeroU64;
 
+/// The controller's answer to an [`Out::Check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
+    /// Wrong exit: refuse the waiting connections.
     Block,
-    AllowDirect,
-    AllowDependent,
+    /// The exit is allowed, as observed at this boot-clock time.
+    Allow { evidence_at_ms: u64 },
+    /// No exit could be read for this destination: let it through (best
+    /// effort, §66.25). The controller counts these.
+    Unverified,
 }
 
 const MAX_PENDING_PER_GROUP: usize = 16;
@@ -42,17 +42,6 @@ const MAX_REPORTED_FLOWS: usize = 4096;
 const MAX_REPORTED_GROUPS: usize = 16;
 const MAX_REPORTED_HOSTS: usize = 32;
 const EVIDENCE_AGE_MS: u64 = 1_000;
-const MAX_WARM_IDENTITIES: usize = 256;
-const MAX_WARMS_PER_WINDOW: usize = 8;
-const WARM_WINDOW: Duration = Duration::from_secs(1);
-const WARM_NAME_LIFETIME: Duration = Duration::from_secs(60);
-
-/// A held connection of any program, to be matched against site rules by
-/// the name it shows (rule ids are never 0).
-const ANY_PROGRAM: GroupId = 0;
-
-/// Outer names that real ECH deployments use to hide the site.
-const ECH_COVER_NAMES: &[&str] = &["cloudflare-ech.com"];
 
 /// Same boot-relative, sleep-inclusive clock in the gate and its controller.
 pub fn evidence_clock_ms() -> Option<u64> {
@@ -70,11 +59,41 @@ pub fn evidence_clock_ms() -> Option<u64> {
         .checked_add(u64::try_from(value.tv_nsec).ok()? / 1_000_000)
 }
 
-/// Which group, if any, a name or address belongs to. Backed by the rule
-/// engine in production; the gate only asks.
-pub trait Classifier {
-    fn group_for_name(&self, name: &str) -> Option<GroupId>;
-    fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId>;
+/// One rule's protected sites, as the controller sends them to the gate.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SiteGroup {
+    pub id: GroupId,
+    pub sites: Vec<String>,
+}
+
+/// Which rule, if any, protects a name: a site covers itself and every
+/// name below it. Shared by the gate and the DNS forwarder (which keeps
+/// these names in the VPN and strips their ECH configs, §66.25).
+#[derive(Clone, Debug, Default)]
+pub struct ProtectedSites(Vec<(GroupId, Vec<String>)>);
+
+impl ProtectedSites {
+    pub fn new(groups: &[SiteGroup]) -> Self {
+        Self(groups.iter().filter_map(|group| {
+            let mut sites: Vec<String> = group.sites.iter()
+                .map(|site| norm(site.trim().trim_start_matches("*.")))
+                .filter(|site| !site.is_empty())
+                .collect();
+            sites.dedup();
+            (!sites.is_empty()).then_some((group.id, sites))
+        }).collect())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn group_for(&self, name: &str) -> Option<GroupId> {
+        let name = norm(name);
+        self.0.iter().find(|(_, sites)| sites.iter().any(|site|
+            name == *site || name.strip_suffix(site.as_str()).is_some_and(|rest| rest.ends_with('.'))))
+            .map(|(group, _)| *group)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -87,20 +106,14 @@ pub struct GateConfig {
     /// A check not answered within this blocks the waiting connections.
     pub check_timeout: Duration,
     /// How long a connection may trickle an incomplete ClientHello or HTTP
-    /// request before the gate decides by destination address alone.
+    /// request before it passes unread (best effort).
     pub classify_timeout: Duration,
     /// Bytes held per connection before deciding with what is there.
     pub max_held_bytes: usize,
     /// Connection table bound; only passed or blocked entries are evicted.
     pub max_flows: usize,
-    /// Learned "protected name -> address" entries (from tunnel DNS answers).
-    pub max_learned: usize,
-    /// Connections idle this long are forgotten; a later packet of one is
-    /// treated as a mid-stream connection and decided by address (§66.5).
+    /// Connections idle this long are forgotten.
     pub idle: Duration,
-    /// Drop all UDP 443 (QUIC) into the tunnel (§66.5).
-    pub block_quic: bool,
-    pub unknown_web: UnknownWebPolicy,
 }
 
 impl Default for GateConfig {
@@ -112,10 +125,7 @@ impl Default for GateConfig {
             classify_timeout: Duration::from_secs(3),
             max_held_bytes: 64 * 1024,
             max_flows: 32 * 1024,
-            max_learned: 4096,
             idle: Duration::from_secs(15 * 60),
-            block_quic: true,
-            unknown_web: UnknownWebPolicy::default(),
         }
     }
 }
@@ -136,26 +146,10 @@ pub enum Out {
     ToTunnel(Vec<u8>),
     /// Revalidate an approval immediately before writing the first held packet.
     SendChecked(u64),
-    /// Advisory only. No permission is granted until a regular check answers.
-    Warm { group: GroupId, host: String, destination: SocketAddr },
     /// A packet for the Mac side (a RST for a blocked connection).
     ToHost(Vec<u8>),
-    /// Ask the background service to check this exact destination.
-    Check {
-        group: GroupId,
-        host: Option<String>,
-        host_confirmed: bool,
-        destination: SocketAddr,
-        request_id: RequestId,
-    },
-    /// Record a local deadline failure before sending another check.
-    TimedOut {
-        group: GroupId,
-        host: Option<String>,
-        host_confirmed: bool,
-        destination: SocketAddr,
-        request_id: RequestId,
-    },
+    /// Ask the controller to check the exit of this exact destination.
+    Check { group: GroupId, host: String, destination: SocketAddr, request_id: RequestId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -179,8 +173,7 @@ struct ClientSeg {
 enum State {
     /// Handshake seen, no data yet. `next` is the first data sequence number.
     Fresh { next: u32 },
-    /// First data held while the gate learns where the connection goes, or
-    /// while its group is being checked.
+    /// First data held while the gate reads the name, or while it is checked.
     Holding(Box<Held>),
     Pass,
     Blocked,
@@ -189,27 +182,19 @@ enum State {
 struct Held {
     packets: Vec<Vec<u8>>,
     bytes: usize,
-    /// In-order client bytes from the first data byte (TCP) or the first
-    /// datagram (UDP), for parsing.
+    /// In-order client bytes from the first data byte, for parsing.
     stream: Vec<u8>,
     next: u32,
     since: Instant,
-    /// Set once classified as protected: the request holds this flow's key.
+    /// Set once a check holds this flow's key.
     checking: bool,
-    /// A TCP flow first seen without its SYN cannot be counted as new.
-    client_isn: Option<u32>,
-    last: Option<ClientSeg>,
+    client_isn: u32,
+    last: ClientSeg,
 }
 
 struct Flow {
     state: State,
     last_seen: Instant,
-}
-
-enum BlockReason<'a> {
-    Protection(GroupId, Option<&'a str>),
-    UnidentifiedWeb(UnknownWebReason),
-    Internal,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -236,18 +221,13 @@ struct BlockedFlows {
 }
 
 impl BlockedFlows {
-    fn first_denial(&mut self, flow: FlowKey, client_isn: Option<u32>) -> bool {
-        if self.seen.len() >= MAX_REPORTED_FLOWS || (flow.proto == 6 && client_isn.is_none()) {
-            return false;
+    fn record(&mut self, flow: FlowKey, client_isn: u32, group: GroupId, host: &str) {
+        if self.seen.len() >= MAX_REPORTED_FLOWS {
+            return;
         }
         // Keep a bounded fingerprint even if the packet table evicts the
         // flow. A collision can only lower this best-effort count.
-        let flow_id = self.seen.hasher().hash_one((flow, client_isn));
-        self.seen.insert(flow_id)
-    }
-
-    fn record(&mut self, flow: FlowKey, client_isn: Option<u32>, group: GroupId, host: Option<&str>) {
-        if !self.first_denial(flow, client_isn) {
+        if !self.seen.insert(self.seen.hasher().hash_one((flow, client_isn))) {
             return;
         }
         if self.groups.len() == MAX_REPORTED_GROUPS && !self.groups.contains_key(&group) {
@@ -257,8 +237,8 @@ impl BlockedFlows {
         stats.count += 1;
         let mut reported_host = None;
         // DNS names on the wire use ASCII (including IDNA A-labels). Keep
-        // optional reports ASCII too so a short write cannot split UTF-8.
-        if let Some(host) = host.filter(|host| host.len() <= 253 && host.is_ascii()) {
+        // reports ASCII too so a short write cannot split UTF-8.
+        if host.len() <= 253 && host.is_ascii() {
             if let Some(entry) = stats.hosts.iter_mut().find(|entry| entry.host == host) {
                 entry.count += 1;
                 reported_host = Some(host);
@@ -280,8 +260,7 @@ impl BlockedFlows {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckTarget {
-    host: Option<String>,
-    host_confirmed: bool,
+    host: String,
     destination: SocketAddr,
 }
 
@@ -294,49 +273,26 @@ struct PendingCheck {
 }
 
 #[derive(Clone, Copy)]
-struct Evidence {
-    at_ms: u64,
-    direct: bool,
-    request_id: RequestId,
-}
-
-impl Evidence {
-    fn age(self, clock: fn() -> Option<u64>) -> Option<u64> {
-        if self.at_ms == 0 {
-            return None;
-        }
-        clock()?.checked_sub(self.at_ms)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CachedDecision {
-    evidence: Option<Evidence>,
-    at: Instant,
+enum Cached {
+    Allowed(u64),
+    Unverified,
+    Blocked,
 }
 
 struct CheckedRelease {
     key: FlowKey,
     group: GroupId,
     target: CheckTarget,
-    evidence: Evidence,
+    evidence_at_ms: u64,
+    id: RequestId,
     started: Instant,
     retried: bool,
 }
 
-struct WarmIdentity {
-    name: String,
-    valid_until: Instant,
-    eligible_until: Option<Instant>,
-    shared: bool,
-    last_warm: Option<Instant>,
-}
-
 #[derive(Default)]
 struct GroupCheck {
-    recent: HashMap<CheckTarget, CachedDecision>,
+    recent: HashMap<CheckTarget, (Cached, Instant)>,
     pending: Vec<PendingCheck>,
-    failure_cutoff: u64,
 }
 
 impl GroupCheck {
@@ -350,92 +306,31 @@ impl GroupCheck {
 
 pub struct Gate {
     cfg: GateConfig,
-    classifier: Box<dyn Classifier + Send>,
+    sites: ProtectedSites,
     flows: HashMap<FlowKey, Flow>,
     groups: HashMap<GroupId, GroupCheck>,
     last_request: u64,
     releases: HashMap<u64, CheckedRelease>,
     last_release: u64,
-    learned: HashMap<IpAddr, (GroupId, String, Instant)>,
-    warm_names: HashMap<IpAddr, WarmIdentity>,
-    next_warm_prune: Option<Instant>,
-    warm_sent: VecDeque<Instant>,
     out: Vec<Out>,
     blocked_flows: BlockedFlows,
-    unknown_web_counts: UnknownWebCounts,
-    dns_evidence: DnsEvidence,
     clock: fn() -> Option<u64>,
-    /// Protected apps (§66.24): when active, only their connections are
-    /// held and checked; every other connection passes untouched.
-    owners: Box<dyn owners::FlowOwners>,
-    app_flows: HashMap<FlowKey, GroupId>,
-    /// Per rule: the sites it protects, with subdomains (§66.25). A rule
-    /// without apps applies to every program; with apps, only to theirs.
-    rule_sites: HashMap<GroupId, Vec<String>>,
-    /// Rules with sites and no apps, in order.
-    site_rules: Vec<GroupId>,
 }
 
 impl Gate {
-    pub fn new(cfg: GateConfig, classifier: Box<dyn Classifier + Send>) -> Self {
+    pub fn new(cfg: GateConfig, sites: ProtectedSites) -> Self {
         Gate {
             cfg,
-            classifier,
+            sites,
             flows: HashMap::new(),
             groups: HashMap::new(),
             last_request: 0,
             releases: HashMap::new(),
             last_release: 0,
-            learned: HashMap::new(),
-            warm_names: HashMap::new(),
-            next_warm_prune: None,
-            warm_sent: VecDeque::new(),
             out: Vec::new(),
             blocked_flows: BlockedFlows::default(),
-            unknown_web_counts: UnknownWebCounts::default(),
-            dns_evidence: DnsEvidence::default(),
             clock: evidence_clock_ms,
-            owners: Box::new(owners::NoOwners),
-            app_flows: HashMap::new(),
-            rule_sites: HashMap::new(),
-            site_rules: Vec::new(),
         }
-    }
-
-    /// Protect by app instead of by name (§66.24). Connections already
-    /// decided keep their decision; new ones are attributed to their owner.
-    pub fn set_owners(&mut self, owners: Box<dyn owners::FlowOwners>) {
-        self.owners = owners;
-        self.app_flows.clear();
-    }
-
-    /// The sites each rule protects (§66.25). `app_rules` are the rules
-    /// that also name apps; the others cover every program.
-    pub fn set_rule_sites(&mut self, sites: HashMap<GroupId, Vec<String>>, app_rules: &HashSet<GroupId>) {
-        self.rule_sites = sites.into_iter()
-            .map(|(group, sites)| (group, sites.iter().map(|s| norm(s).trim_start_matches("*.").to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()))
-            .filter(|(_, sites)| !sites.is_empty())
-            .collect();
-        let mut site_rules: Vec<_> = self.rule_sites.keys().copied().filter(|group| !app_rules.contains(group)).collect();
-        site_rules.sort_unstable();
-        self.site_rules = site_rules;
-        self.app_flows.clear();
-    }
-
-    fn site_matches(sites: &[String], host: &str) -> bool {
-        let host = norm(host);
-        sites.iter().any(|site| host == *site || host.strip_suffix(site.as_str()).is_some_and(|rest| rest.ends_with('.')))
-    }
-
-    /// A name the connection really shows: not a known ECH cover name.
-    fn visible_name(name: &str, ech: bool) -> bool {
-        is_site_name(name) && !(ech && ECH_COVER_NAMES.contains(&norm(name).as_str()))
-    }
-
-    /// Rules by app or by site (§66.24, §66.25): only their connections are
-    /// held; everything else passes at its first packet.
-    fn app_mode(&self) -> bool {
-        self.owners.active() || !self.site_rules.is_empty()
     }
 
     /// Actions produced since the last drain, in order.
@@ -443,64 +338,31 @@ impl Gate {
         std::mem::take(&mut self.out)
     }
 
-    /// A changed group's cumulative counts for this gate's control peer.
+    /// A changed rule's cumulative counts for this gate's control peer.
     pub fn take_denied_group(&mut self) -> Option<&DeniedGroup> {
         let id = self.blocked_flows.dirty.pop_front()?;
         self.blocked_flows.groups.get(&id)
     }
 
-    pub fn take_unknown_web(&mut self) -> Option<Vec<UnknownWebCount>> {
-        self.unknown_web_counts.snapshot()
-    }
-
-    pub fn set_unknown_web(&mut self, policy: UnknownWebPolicy) {
-        self.cfg.unknown_web = policy;
-    }
-
-    pub fn reset_dns_evidence(&mut self, generation: u64) {
-        self.dns_evidence.enable(generation);
-    }
-
-    /// Only the private controller calls this with the final forwarded RRset.
-    pub fn update_dns_evidence(&mut self, update: DnsEvidenceUpdate) {
-        if let Some(now) = (self.clock)() {
-            self.dns_evidence.update(update, now);
-        }
-    }
-
-    pub fn controller_lost(&mut self) {
-        self.cfg.unknown_web.revoke_exemptions();
-        self.invalidate();
-    }
-
-    /// Forget every verdict (reconnect, network change, wake: §66.6).
+    /// Forget every verdict (reconnect, network change, wake, lost
+    /// controller: §66.6). Connections waiting for one are refused.
     pub fn invalidate(&mut self) {
         let groups = std::mem::take(&mut self.groups);
         let releases = std::mem::take(&mut self.releases);
-        self.out.retain(|out| !matches!(out, Out::Check { .. } | Out::SendChecked(_) | Out::Warm { .. }));
-        self.warm_names.clear();
-        self.next_warm_prune = None;
-        self.warm_sent.clear();
-        self.dns_evidence.clear();
+        self.out.retain(|out| !matches!(out, Out::Check { .. } | Out::SendChecked(_)));
         for release in releases.into_values() {
-            self.block(release.key, BlockReason::Internal);
+            self.block(release.key, None);
         }
         for key in groups.into_values().flat_map(|group| group.pending).flat_map(|check| check.waiting) {
-            self.block(key, BlockReason::Internal);
+            self.block(key, None);
         }
     }
 
-    /// New groups or probe marker from the controller (§66.6): established
-    /// connections keep their decision; verdicts and learned addresses,
-    /// which name the old groups, are dropped.
-    pub fn reconfigure(&mut self, probe_alpn: Vec<u8>, classifier: Box<dyn Classifier + Send>) {
+    /// New sites or probe marker from the controller: established
+    /// connections keep their decision; verdicts are dropped.
+    pub fn reconfigure(&mut self, probe_alpn: Vec<u8>, sites: ProtectedSites) {
         self.cfg.probe_alpn = probe_alpn;
-        self.classifier = classifier;
-        self.learned.retain(|_, (group, name, _)| {
-            let Some(next) = self.classifier.group_for_name(name) else { return false };
-            *group = next;
-            true
-        });
+        self.sites = sites;
         self.invalidate();
     }
 
@@ -512,117 +374,75 @@ impl Gate {
     pub fn outbound(&mut self, pkt: &[u8], now: Instant) -> Step {
         let Some(p) = parse_ip(pkt) else { return Step::Forward };
         match p.l4 {
-            L4::Udp { sport, dport } => self.outbound_udp(pkt, &p, sport, dport, now),
+            // QUIC hides which site a datagram is for: while any site is
+            // protected, it is dropped so browsers fall back to TCP (§66.5).
+            L4::Udp { dport: 443, .. } if !self.sites.is_empty() => Step::Consumed,
             L4::Tcp(t) => self.outbound_tcp(pkt, &p, t, now),
-            L4::Other => Step::Forward,
+            L4::Udp { .. } | L4::Other => Step::Forward,
         }
     }
 
-    /// A packet from the tunnel to the Mac. Always delivered by the caller;
-    /// the gate only learns protected names' addresses from DNS answers.
-    pub fn inbound(&mut self, pkt: &[u8], now: Instant) {
-        let Some(p) = parse_ip(pkt) else { return };
-        if let L4::Udp { sport: 53, .. } = p.l4 {
-            if let Some((name, addrs)) = parse_dns_answer(p.payload) {
-                let group = self.classifier.group_for_name(&name);
-                for (ip, ttl) in addrs {
-                    let lifetime = Duration::from_secs(u64::from(ttl)).min(WARM_NAME_LIFETIME);
-                    if !lifetime.is_zero() {
-                        self.observe_warm_identity(ip, &name, lifetime, group.is_some(), now);
-                    }
-                    if let Some(group) = group {
-                        self.learn(ip, group, &name, now);
-                    }
-                }
-            }
-        }
-    }
-
-    /// The background service's answer to an [`Out::Check`].
-    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, verdict: Verdict, evidence_at_ms: Option<u64>, now: Instant) {
+    /// The controller's answer to an [`Out::Check`].
+    pub fn verdict(&mut self, group: GroupId, request_id: RequestId, verdict: Verdict, now: Instant) {
         self.expire_group(group, now);
         let Some(checks) = self.groups.get_mut(&group) else { return };
         let Some(index) = checks.pending.iter().position(|check| check.id == request_id) else { return };
+        let check = checks.pending.swap_remove(index);
         match verdict {
-            Verdict::Block => self.fail_check(group, index, now),
-            Verdict::AllowDependent | Verdict::AllowDirect => {
-                let check = checks.pending.swap_remove(index);
-                // DNS hints and unnamed traffic cannot assert a flow's host.
-                let direct = matches!(verdict, Verdict::AllowDirect) && check.target.host_confirmed;
-                if !direct && request_id.get() <= checks.failure_cutoff {
-                    self.block_waiting(group, &check);
-                    return;
-                }
-                let proof = evidence_at_ms.map(|at_ms| Evidence { at_ms, direct, request_id });
-                match proof.and_then(|proof| proof.age(self.clock).map(|age| (proof, age))) {
-                    Some((proof, age)) if age < EVIDENCE_AGE_MS => {
-                        if checks.recent.len() < MAX_CACHED_PER_GROUP {
-                            let decision = CachedDecision { evidence: Some(proof), at: now };
-                            checks.recent.insert(check.target.clone(), decision);
-                        }
-                        for key in check.waiting {
-                            self.queue_release(CheckedRelease {
-                                key, group, target: check.target.clone(), evidence: proof,
-                                started: check.started, retried: check.retried,
-                            });
-                        }
-                    }
-                    Some(_) => self.retry_check(group, check, now),
-                    None => self.block_waiting(group, &check),
+            Verdict::Block => self.fail_check(group, check, now),
+            Verdict::Unverified => {
+                self.cache(group, &check.target, Cached::Unverified, now);
+                for key in check.waiting {
+                    self.release(key);
                 }
             }
+            Verdict::Allow { evidence_at_ms } => match self.evidence_age(evidence_at_ms) {
+                Some(age) if age < EVIDENCE_AGE_MS => {
+                    self.cache(group, &check.target, Cached::Allowed(evidence_at_ms), now);
+                    for &key in &check.waiting {
+                        self.queue_release(CheckedRelease {
+                            key, group, target: check.target.clone(), evidence_at_ms, id: check.id,
+                            started: check.started, retried: check.retried,
+                        });
+                    }
+                }
+                Some(_) => self.retry_check(group, check, now),
+                None => self.block_waiting(group, &check),
+            },
         }
     }
 
-    /// The controller has suspended this group. Any subsequent new check
-    /// goes to the controller for a fresh decision.
-    pub fn block_group(&mut self, group: GroupId) {
-        let Some(checks) = self.groups.get_mut(&group) else { return };
-        checks.recent.retain(|_, decision| decision.evidence.is_none());
-        let pending = std::mem::take(&mut checks.pending);
-        self.out.retain(|out| !matches!(out, Out::Check { group: id, .. } | Out::Warm { group: id, .. } if *id == group));
-        for check in pending {
-            self.block_waiting(group, &check);
+    fn cache(&mut self, group: GroupId, target: &CheckTarget, outcome: Cached, now: Instant) {
+        let checks = self.groups.entry(group).or_default();
+        if checks.recent.len() < MAX_CACHED_PER_GROUP || checks.recent.contains_key(target) {
+            checks.recent.insert(target.clone(), (outcome, now));
         }
-        self.revoke_group_releases(group, false);
+    }
+
+    fn evidence_age(&self, at_ms: u64) -> Option<u64> {
+        if at_ms == 0 {
+            return None;
+        }
+        (self.clock)()?.checked_sub(at_ms)
     }
 
     fn expire_group(&mut self, group: GroupId, now: Instant) {
         while let Some(index) = self.groups.get(&group)
             .and_then(|checks| checks.expired(now, self.cfg.check_timeout))
         {
-            let check = &self.groups[&group].pending[index];
-            self.out.push(Out::TimedOut {
-                group,
-                host: check.target.host.clone(),
-                host_confirmed: check.target.host_confirmed,
-                destination: check.target.destination,
-                request_id: check.id,
-            });
-            self.fail_check(group, index, now);
+            let check = self.groups.get_mut(&group).expect("pending group").pending.swap_remove(index);
+            self.fail_check(group, check, now);
         }
     }
 
-    fn fail_check(&mut self, group: GroupId, index: usize, now: Instant) {
-        let checks = self.groups.get_mut(&group).expect("pending group");
-        let failed = checks.pending.swap_remove(index);
-        // A dependent result may already be on the wire when a local
-        // deadline fires. Independent results still speak for their own key.
-        checks.failure_cutoff = self.last_request;
-        checks.recent.retain(|_, decision|
-            decision.evidence.is_none() && now.duration_since(decision.at) < self.cfg.reuse);
-        self.out.retain(|out| !matches!(out, Out::Check { request_id, .. } if *request_id == failed.id));
+    fn fail_check(&mut self, group: GroupId, failed: PendingCheck, now: Instant) {
         self.block_waiting(group, &failed);
-        let checks = self.groups.get_mut(&group).expect("pending group");
-        if checks.recent.len() < MAX_CACHED_PER_GROUP {
-            checks.recent.insert(failed.target, CachedDecision { evidence: None, at: now });
-        }
-        self.revoke_group_releases(group, true);
+        self.cache(group, &failed.target, Cached::Blocked, now);
     }
 
     fn block_waiting(&mut self, group: GroupId, check: &PendingCheck) {
         for &key in &check.waiting {
-            self.block(key, BlockReason::Protection(group, check.target.host.as_deref()));
+            self.block(key, Some((group, &check.target.host)));
         }
     }
 
@@ -650,15 +470,14 @@ impl Gate {
         check.id = id;
         check.retried = true;
         self.out.push(Out::Check {
-            group, host: check.target.host.clone(), host_confirmed: check.target.host_confirmed,
-            destination: check.target.destination, request_id: id,
+            group, host: check.target.host.clone(), destination: check.target.destination, request_id: id,
         });
         checks.pending.push(check);
     }
 
     fn queue_release(&mut self, release: CheckedRelease) {
         let Some(id) = self.last_release.checked_add(1) else {
-            self.block(release.key, BlockReason::Protection(release.group, release.target.host.as_deref()));
+            self.block(release.key, Some((release.group, &release.target.host)));
             return;
         };
         if let Some(Flow { state: State::Holding(held), .. }) = self.flows.get_mut(&release.key) {
@@ -666,17 +485,6 @@ impl Gate {
             self.last_release = id;
             self.releases.insert(id, release);
             self.out.push(Out::SendChecked(id));
-        }
-    }
-
-    fn revoke_group_releases(&mut self, group: GroupId, dependent_only: bool) {
-        let revoked: Vec<_> = self.releases.iter().filter_map(|(&id, release)|
-            (release.group == group && (!dependent_only || !release.evidence.direct)).then_some(id)
-        ).collect();
-        for id in revoked {
-            if let Some(release) = self.take_release(id) {
-                self.block(release.key, BlockReason::Protection(group, release.target.host.as_deref()));
-            }
         }
     }
 
@@ -692,160 +500,63 @@ impl Gate {
     /// first packet write. Failure to enqueue a packet leaves the flow blocked.
     pub fn send_checked(&mut self, id: u64, now: Instant, send: impl FnOnce(&[Vec<u8>]) -> bool) {
         let Some(release) = self.take_release(id) else { return };
-        let CheckedRelease { key, group, target, evidence, started, retried } = release;
-        if !target.host_confirmed && self.dns_address_match(key.dst, None).conflicts_with(Some(group)) {
-            self.block(key, BlockReason::Internal);
-            return;
-        }
-        let Some(Flow { state: State::Holding(held), .. }) = self.flows.get(&key) else { return };
-        match evidence.age(self.clock) {
+        let Some(Flow { state: State::Holding(held), .. }) = self.flows.get(&release.key) else { return };
+        match self.evidence_age(release.evidence_at_ms) {
             Some(age) if age < EVIDENCE_AGE_MS => {
                 if send(&held.packets) {
-                    self.set_state(key, State::Pass);
-                    if let Some(name) = target.host.filter(|_| evidence.direct) {
-                        self.observe_warm_identity(key.dst, &name, WARM_NAME_LIFETIME, true, now);
-                    }
+                    self.set_state(release.key, State::Pass);
                 } else {
-                    self.block(key, BlockReason::Internal);
+                    self.block(release.key, None);
                 }
             }
-            Some(_) => self.retry_check(group, PendingCheck {
-                id: evidence.request_id, target, started, retried, waiting: vec![key],
-            }, now),
-            None => self.block(key, BlockReason::Protection(group, target.host.as_deref())),
+            Some(_) => {
+                let CheckedRelease { key, group, target, id, started, retried, .. } = release;
+                self.retry_check(group, PendingCheck { id, target, started, retried, waiting: vec![key] }, now);
+            }
+            None => self.block(release.key, Some((release.group, &release.target.host))),
         }
     }
 
     /// Timers: checks that took too long, ClientHellos that never finished,
     /// idle connections.
     pub fn tick(&mut self, now: Instant) {
-        self.dns_evidence.sweep(self.clock);
-        let timed_out: Vec<_> = self
-            .groups
-            .iter()
+        let timed_out: Vec<_> = self.groups.iter()
             .filter_map(|(&id, checks)| checks.expired(now, self.cfg.check_timeout).is_some().then_some(id))
             .collect();
         for group in timed_out {
             self.expire_group(group, now);
         }
+        let reuse = self.cfg.reuse;
         self.groups.retain(|_, checks| {
-            checks.recent.retain(|_, decision| now.duration_since(decision.at) < self.cfg.reuse);
+            checks.recent.retain(|_, (_, at)| now.duration_since(*at) < reuse);
             !checks.pending.is_empty() || !checks.recent.is_empty()
         });
-        let stale: Vec<FlowKey> = self
-            .flows
-            .iter()
+        // No readable name in time: best effort, let it through.
+        let stale: Vec<FlowKey> = self.flows.iter()
             .filter(|(_, f)| matches!(&f.state, State::Holding(h) if !h.checking && now.duration_since(h.since) >= self.cfg.classify_timeout))
             .map(|(k, _)| *k)
             .collect();
-        for k in stale {
-            if let Some(&group) = self.app_flows.get(&k) {
-                if group == ANY_PROGRAM {
-                    self.app_flows.remove(&k);
-                    self.release(k);
-                } else {
-                    self.wait_for_check(k, group, None, false, now);
-                }
-                continue;
-            }
-            let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified, None);
+        for key in stale {
+            self.release(key);
         }
         let idle = self.cfg.idle;
         self.flows.retain(|_, f| matches!(f.state, State::Holding(_)) || now.duration_since(f.last_seen) < idle);
-        let flows = &self.flows;
-        self.app_flows.retain(|key, _| flows.contains_key(key));
-    }
-
-    fn outbound_udp(&mut self, pkt: &[u8], p: &Packet, sport: u16, dport: u16, now: Instant) -> Step {
-        if self.app_mode() {
-            // Only a protected app's QUIC is dropped, so it falls back to TCP,
-            // which can be checked; every other datagram passes.
-            let key = FlowKey { proto: 17, src: p.src, sport, dst: p.dst, dport };
-            if let Some(f) = self.flows.get_mut(&key) {
-                f.last_seen = now;
-                return if matches!(f.state, State::Blocked) { Step::Consumed } else { Step::Forward };
-            }
-            // A site rule covers every program, and QUIC hides which site a
-            // datagram is for: all QUIC falls back to TCP, as before (§66.5).
-            let protected = dport == 443 && (!self.site_rules.is_empty() || self.owners.group_for(17, sport, now).is_some());
-            self.insert(key, if protected { State::Blocked } else { State::Pass }, now);
-            return if protected { Step::Consumed } else { Step::Forward };
-        }
-        if self.cfg.block_quic && dport == 443 {
-            return Step::Consumed;
-        }
-        let key = FlowKey { proto: 17, src: p.src, sport, dst: p.dst, dport };
-        if let Some(f) = self.flows.get_mut(&key) {
-            f.last_seen = now;
-            return match &mut f.state {
-                State::Pass => Step::Forward,
-                State::Blocked => Step::Consumed,
-                State::Holding(h) => {
-                    if h.bytes.saturating_add(pkt.len()) > self.cfg.max_held_bytes { return Step::Consumed; }
-                    h.packets.push(pkt.to_vec());
-                    h.bytes += pkt.len();
-                    Step::Consumed
-                }
-                State::Fresh { .. } => Step::Forward,
-            };
-        }
-        // A new datagram flow: only an address can tell where it goes.
-        match self.ip_group(p.dst) {
-            None => {
-                self.insert(key, State::Pass, now);
-                Step::Forward
-            }
-            Some((group, host)) => {
-                if pkt.len() <= self.cfg.max_held_bytes {
-                    let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: 0, since: now, checking: false, client_isn: None, last: None };
-                    if self.insert(key, State::Holding(Box::new(held)), now) {
-                        self.wait_for_check(key, group, host, false, now);
-                    }
-                }
-                Step::Consumed
-            }
-        }
     }
 
     fn outbound_tcp(&mut self, pkt: &[u8], p: &Packet, t: Tcp, now: Instant) -> Step {
         let key = FlowKey { proto: 6, src: p.src, sport: t.sport, dst: p.dst, dport: t.dport };
-        let seg = ClientSeg { seq: t.seq, ack: t.ack, has_ack: t.flags & ACK != 0, syn: t.flags & SYN != 0, len: p.payload.len() as u32 };
         let syn = t.flags & SYN != 0;
+        let seg = ClientSeg { seq: t.seq, ack: t.ack, has_ack: t.flags & ACK != 0, syn, len: p.payload.len() as u32 };
         let data_start = if syn { t.seq.wrapping_add(1) } else { t.seq };
-        if !self.flows.contains_key(&key) && self.app_mode() {
-            return self.outbound_new_app_tcp(pkt, key, seg, syn, data_start, p.payload.is_empty(), now);
-        }
         if !self.flows.contains_key(&key) {
-            if syn {
-                if !self.insert(key, State::Fresh { next: data_start }, now) {
-                    self.reset(key, seg);
-                    return Step::Consumed;
-                }
-                if p.payload.is_empty() {
-                    self.warm_known_address(key, now);
-                }
-            } else if p.payload.is_empty() {
+            // Nothing protected, or a connection older than the gate (no
+            // start of stream to read): best effort, it passes.
+            if !syn || self.sites.is_empty() {
                 return Step::Forward;
-            } else {
-                // Mid-stream (forgotten or older than the gate): no start of
-                // stream to parse, so decide by address.
-                return match self.ip_group(p.dst) {
-                    None => {
-                        self.insert(key, State::Pass, now);
-                        Step::Forward
-                    }
-                    Some((group, host)) => {
-                        if pkt.len() <= self.cfg.max_held_bytes {
-                            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: t.seq.wrapping_add(seg.len), since: now, checking: false, client_isn: None, last: Some(seg) };
-                            if self.insert(key, State::Holding(Box::new(held)), now) {
-                                self.wait_for_check(key, group, host, false, now);
-                                return Step::Consumed;
-                            }
-                        }
-                        self.reset(key, seg);
-                        Step::Consumed
-                    }
-                };
+            }
+            if !self.insert(key, State::Fresh { next: data_start }, now) {
+                self.reset(key, seg);
+                return Step::Consumed;
             }
         }
         let f = self.flows.get_mut(&key).expect("present");
@@ -868,13 +579,14 @@ impl Gate {
                     return Step::Consumed;
                 }
                 let next = *next;
-                let mut held = Held { packets: Vec::new(), bytes: 0, stream: Vec::new(), next, since: now, checking: false, client_isn: Some(next.wrapping_sub(1)), last: Some(seg) };
+                let mut held = Held {
+                    packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next, since: now,
+                    checking: false, client_isn: next.wrapping_sub(1), last: seg,
+                };
                 if data_start == next {
                     held.stream.extend_from_slice(p.payload);
                     held.next = next.wrapping_add(seg.len);
                 }
-                held.packets.push(pkt.to_vec());
-                held.bytes = pkt.len();
                 f.state = State::Holding(Box::new(held));
                 self.after_hold(key, now, true)
             }
@@ -898,7 +610,7 @@ impl Gate {
                 }
                 h.packets.push(pkt.to_vec());
                 h.bytes += pkt.len();
-                h.last = Some(seg);
+                h.last = seg;
                 if h.checking {
                     Step::Consumed
                 } else {
@@ -908,318 +620,74 @@ impl Gate {
         }
     }
 
-    /// A new connection in app mode: only a protected app's is held for a
-    /// check, by the name it shows (if any) and its destination address.
-    #[allow(clippy::too_many_arguments)]
-    fn outbound_new_app_tcp(&mut self, pkt: &[u8], key: FlowKey, seg: ClientSeg, syn: bool, data_start: u32,
-                            empty: bool, now: Instant) -> Step {
-        let owned = if self.owners.active() { self.owners.group_for(6, key.sport, now) } else { None };
-        let Some(group) = owned.or_else(|| (!self.site_rules.is_empty()).then_some(ANY_PROGRAM)) else {
-            self.insert(key, State::Pass, now);
-            return Step::Forward;
-        };
-        if group == ANY_PROGRAM && !syn && !empty {
-            // Mid-stream with no name to read: best effort, let it pass.
-            self.insert(key, State::Pass, now);
-            return Step::Forward;
-        }
-        if syn {
-            if !self.insert(key, State::Fresh { next: data_start }, now) {
-                self.reset(key, seg);
-                return Step::Consumed;
-            }
-            self.app_flows.insert(key, group);
-            return Step::Forward;
-        }
-        if empty {
-            return Step::Forward;
-        }
-        // Mid-stream (older than the gate): no start to read, check by address.
-        if pkt.len() <= self.cfg.max_held_bytes {
-            let held = Held { packets: vec![pkt.to_vec()], bytes: pkt.len(), stream: Vec::new(), next: seg.seq.wrapping_add(seg.len),
-                              since: now, checking: false, client_isn: None, last: Some(seg) };
-            if self.insert(key, State::Holding(Box::new(held)), now) {
-                self.app_flows.insert(key, group);
-                self.wait_for_check(key, group, None, false, now);
-                return Step::Consumed;
-            }
-        }
-        self.reset(key, seg);
-        Step::Consumed
-    }
-
-    /// A protected app's held connection: check it with whatever name its
-    /// first bytes show. The name may be an ECH cover name; the check is
-    /// about this destination address either way.
-    fn after_hold_app(&mut self, key: FlowKey, group: GroupId, now: Instant, first: bool) -> Step {
-        let (verdict, full) = {
-            let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };
-            (sniff(&h.stream), h.bytes >= self.cfg.max_held_bytes)
-        };
-        let (host, ech) = match verdict {
-            Sniff::Incomplete if !full => return Step::Consumed,
-            Sniff::Tls { sni: Some(name), ech, .. } => (Some(name), ech),
-            Sniff::Http(Some(name)) => (Some(name), false),
-            _ => (None, false),
-        };
-        let visible = host.as_deref().filter(|name| Self::visible_name(name, ech));
-        let target = if group == ANY_PROGRAM {
-            // A site rule: only a connection that shows a protected name.
-            visible.and_then(|name| self.site_rules.iter().copied()
-                .find(|rule| self.rule_sites.get(rule).is_some_and(|sites| Self::site_matches(sites, name))))
-        } else {
-            // An app rule: with sites, a shown name outside them passes; a
-            // hidden one is checked, it may be one of them.
-            match (self.rule_sites.get(&group), visible) {
-                (Some(sites), Some(name)) if !Self::site_matches(sites, name) => None,
-                _ => Some(group),
-            }
-        };
-        let Some(group) = target else {
-            self.app_flows.remove(&key);
-            if first {
-                self.set_state(key, State::Pass);
-                return Step::Forward;
-            }
-            self.release(key);
-            return Step::Consumed;
-        };
-        let confirmed = !ech && host.as_deref().is_some_and(is_site_name);
-        self.wait_for_check(key, group, host, confirmed, now);
-        Step::Consumed
-    }
-
-    /// Try to classify a holding connection from what it has sent so far.
+    /// Read the name a held connection shows; a protected one waits for a
+    /// check, anything else passes.
     fn after_hold(&mut self, key: FlowKey, now: Instant, first: bool) -> Step {
-        if let Some(&group) = self.app_flows.get(&key) {
-            return self.after_hold_app(key, group, now, first);
-        }
-        let (verdict, full) = {
+        let (sniffed, full) = {
             let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };
             (sniff(&h.stream), h.bytes >= self.cfg.max_held_bytes)
         };
-        let target = match verdict {
+        let name = match sniffed {
             Sniff::Incomplete if !full => return Step::Consumed,
-            Sniff::Incomplete | Sniff::Unknown => Target::Address(UnknownWebReason::Unidentified),
-            Sniff::Tls { sni, alpn, ech } => {
-                if !self.cfg.probe_alpn.is_empty() && alpn.contains(&self.cfg.probe_alpn) {
-                    Target::Pass
-                } else {
-                    match sni {
-                        Some(name) if !ech => self.classify_named(key.dst, name, now),
-                        Some(name) => match self.classifier.group_for_name(&name) {
-                            Some(group) => Target::Group(group, name, false),
-                            None => Target::EchAddress(name),
-                        },
-                        None if ech => Target::Address(UnknownWebReason::Ech),
-                        None => Target::Address(UnknownWebReason::Unidentified),
-                    }
-                }
-            }
-            Sniff::Http(Some(name)) => self.classify_named(key.dst, name, now),
-            Sniff::Http(None) => Target::Address(UnknownWebReason::Unidentified),
+            Sniff::Tls { alpn, .. } if !self.cfg.probe_alpn.is_empty() && alpn.contains(&self.cfg.probe_alpn) => None,
+            Sniff::Tls { sni, .. } => sni,
+            Sniff::Http(host) => host,
+            Sniff::Incomplete | Sniff::Unknown => None,
         };
-        let only_current = first;
-        match target {
-            Target::Pass => {
-                if only_current {
-                    self.set_state(key, State::Pass);
-                    Step::Forward
-                } else {
-                    self.release(key);
-                    Step::Consumed
-                }
+        match name.and_then(|name| self.sites.group_for(&name).map(|group| (group, name))) {
+            Some((group, host)) => {
+                self.wait_for_check(key, group, host, now);
+                Step::Consumed
             }
-            Target::Address(reason) => self.decide_by_address(key, now, only_current, reason, None),
-            Target::EchAddress(name) => self.decide_by_address(key, now, only_current, UnknownWebReason::Ech, Some(&name)),
-            Target::Group(group, host, confirmed) => {
-                self.wait_for_check(key, group, Some(host), confirmed, now);
+            None if first => {
+                self.set_state(key, State::Pass);
+                Step::Forward
+            }
+            None => {
+                self.release(key);
                 Step::Consumed
             }
         }
     }
 
-    fn classify_named(&mut self, ip: IpAddr, name: String, now: Instant) -> Target {
-        let group = self.classifier.group_for_name(&name);
-        let identified = is_site_name(&name);
-        if group.is_none() && self.cfg.unknown_web.active() && !identified {
-            return Target::Address(UnknownWebReason::Unidentified);
-        }
-        if identified {
-            self.observe_warm_identity(ip, &name, WARM_NAME_LIFETIME, false, now);
-        }
-        match group {
-            Some(group) => Target::Group(group, name, identified),
-            None => Target::Pass,
-        }
-    }
-
-    fn observe_warm_identity(&mut self, ip: IpAddr, name: &str, lifetime: Duration, eligible: bool, now: Instant) {
-        if name.is_empty() || name.len() > 253 || !name.is_ascii() {
-            return;
-        }
-        if self.warm_names.len() >= MAX_WARM_IDENTITIES && !self.warm_names.contains_key(&ip) {
-            if self.next_warm_prune.is_none_or(|at| at <= now) {
-                self.warm_names.retain(|_, identity| identity.valid_until > now);
-                self.next_warm_prune = Some(now + WARM_WINDOW);
-            }
-            if self.warm_names.len() >= MAX_WARM_IDENTITIES {
-                return;
-            }
-        }
-        let until = now + lifetime;
-        let identity = self.warm_names.entry(ip).or_insert_with(|| WarmIdentity {
-            name: name.to_owned(), valid_until: now, eligible_until: None, shared: false, last_warm: None,
-        });
-        if identity.valid_until <= now {
-            identity.name.clear();
-            identity.name.push_str(name);
-            identity.shared = false;
-            identity.eligible_until = None;
-        } else if identity.name != name {
-            identity.shared = true;
-        }
-        identity.valid_until = identity.valid_until.max(until);
-        if eligible && !identity.shared {
-            identity.eligible_until = Some(identity.eligible_until.unwrap_or(until).max(until));
-        }
-    }
-
-    fn warm_known_address(&mut self, key: FlowKey, now: Instant) {
-        let Some(identity) = self.warm_names.get_mut(&key.dst) else { return };
-        if identity.shared || identity.eligible_until.is_none_or(|until| until <= now)
-            || identity.last_warm.is_some_and(|last| now.duration_since(last) < WARM_WINDOW)
-        {
-            return;
-        }
-        let Some(group) = self.classifier.group_for_name(&identity.name) else { return };
-        if self.groups.get(&group).is_some_and(|checks| checks.pending.iter()
-            .any(|check| check.target.destination.ip() == key.dst))
-        {
-            return;
-        }
-        while self.warm_sent.front().is_some_and(|at| now.duration_since(*at) >= WARM_WINDOW) {
-            self.warm_sent.pop_front();
-        }
-        if self.warm_sent.len() >= MAX_WARMS_PER_WINDOW {
-            return;
-        }
-        self.warm_sent.push_back(now);
-        identity.last_warm = Some(now);
-        self.out.push(Out::Warm {
-            group, host: identity.name.clone(), destination: SocketAddr::new(key.dst, key.dport),
-        });
-    }
-
-    fn dns_address_match(&self, address: IpAddr, outer: Option<&str>) -> DnsMatch {
-        if self.dns_evidence.active() {
-            if let Some(clock) = (self.clock)() {
-                return self.dns_evidence.classify(address, outer, clock, self.classifier.as_ref());
-            }
-        }
-        DnsMatch::Unknown
-    }
-
-    /// A ClientHello with the ECH extension shows either the real site
-    /// (GREASE, what Chromium sends when the site has no ECH) or a cover name
-    /// (real ECH). Without matching DNS evidence, a plain site name that is
-    /// neither a known cover name nor a public name from a live HTTPS/SVCB
-    /// answer is taken as the real site: blocking every such connection
-    /// stopped ordinary apps that resolve names their own way (maintainer,
-    /// 2026-11-24, DESIGN §66.23). Protected names never reach this point.
-    fn visible_ordinary_name(&self, outer: &str) -> bool {
-        let name = norm(outer);
-        if !is_site_name(&name) || ECH_COVER_NAMES.contains(&name.as_str()) {
-            return false;
-        }
-        if self.classifier.group_for_name(&name).is_some() {
-            return false;
-        }
-        !(self.dns_evidence.active()
-            && (self.clock)().is_none_or(|now| self.dns_evidence.is_public_name(&name, now)))
-    }
-
-    /// Decide a holding connection by its destination address.
-    fn decide_by_address(&mut self, key: FlowKey, now: Instant, only_current: bool, reason: UnknownWebReason, outer: Option<&str>) -> Step {
-        let known = self.ip_group(key.dst);
-        let association = self.dns_address_match(key.dst, outer);
-        if association.conflicts_with(known.as_ref().map(|(group, _)| *group)) {
-            self.block(key, BlockReason::UnidentifiedWeb(reason));
-            return Step::Consumed;
-        }
-        if let Some((group, host)) = known {
-            self.wait_for_check(key, group, host, false, now);
-            return Step::Consumed;
-        }
-        if let DnsMatch::Protected(group, host) = association {
-            self.wait_for_check(key, group, host.map(|host| host.to_string()), false, now);
-            return Step::Consumed;
-        }
-        let ordinary = matches!(association, DnsMatch::Ordinary)
-            || (reason == UnknownWebReason::Ech && matches!(association, DnsMatch::Unknown)
-                && outer.is_some_and(|name| self.visible_ordinary_name(name)));
-        if !ordinary && self.cfg.unknown_web.blocks(SocketAddr::new(key.dst, key.dport)) {
-            self.block(key, BlockReason::UnidentifiedWeb(reason));
-            Step::Consumed
-        } else if only_current {
-            self.set_state(key, State::Pass);
-            Step::Forward
-        } else {
-            self.release(key);
-            Step::Consumed
-        }
-    }
-
-    fn wait_for_check(&mut self, key: FlowKey, group: GroupId, host: Option<String>, host_confirmed: bool, now: Instant) {
-        let target = CheckTarget {
-            host,
-            host_confirmed,
-            destination: SocketAddr::new(key.dst, key.dport),
-        };
+    fn wait_for_check(&mut self, key: FlowKey, group: GroupId, host: String, now: Instant) {
+        let target = CheckTarget { host, destination: SocketAddr::new(key.dst, key.dport) };
         self.expire_group(group, now);
         let reuse = self.cfg.reuse;
         let checks = self.groups.entry(group).or_default();
-        if let Some(&decision) = checks.recent.get(&target) {
-            if now.duration_since(decision.at) < reuse {
-                match decision.evidence {
-                    Some(evidence) if evidence.age(self.clock).is_some_and(|age| age < EVIDENCE_AGE_MS) => {
-                        self.queue_release(CheckedRelease {
-                            key, group, target, evidence, started: now, retried: false,
-                        });
+        if let Some(&(cached, at)) = checks.recent.get(&target) {
+            if now.duration_since(at) < reuse {
+                match cached {
+                    Cached::Allowed(evidence_at_ms) if self.evidence_age(evidence_at_ms).is_some_and(|age| age < EVIDENCE_AGE_MS) => {
+                        let id = RequestId::MIN;
+                        self.queue_release(CheckedRelease { key, group, target, evidence_at_ms, id, started: now, retried: false });
                         return;
                     }
-                    None => {
-                        self.block(key, BlockReason::Protection(group, target.host.as_deref()));
+                    Cached::Unverified => {
+                        self.release(key);
                         return;
                     }
-                    Some(_) => {}
+                    Cached::Blocked => {
+                        self.block(key, Some((group, &target.host)));
+                        return;
+                    }
+                    Cached::Allowed(_) => {}
                 }
             }
         }
+        let checks = self.groups.entry(group).or_default();
         if let Some(check) = checks.pending.iter_mut().find(|check| check.target == target) {
             check.waiting.push(key);
         } else {
             let Some(id) = self.last_request.checked_add(1).and_then(RequestId::new)
                 .filter(|_| checks.pending.len() < MAX_PENDING_PER_GROUP)
             else {
-                self.block(key, BlockReason::Internal);
+                self.block(key, None);
                 return;
             };
             self.last_request = id.get();
-            self.out.push(Out::Check {
-                group,
-                host: target.host.clone(),
-                host_confirmed: target.host_confirmed,
-                destination: target.destination,
-                request_id: id,
-            });
-            checks.pending.push(PendingCheck {
-                id,
-                target,
-                started: now,
-                retried: false,
-                waiting: vec![key],
-            });
+            self.out.push(Out::Check { group, host: target.host.clone(), destination: target.destination, request_id: id });
+            checks.pending.push(PendingCheck { id, target, started: now, retried: false, waiting: vec![key] });
         }
         if let Some(Flow { state: State::Holding(held), .. }) = self.flows.get_mut(&key) {
             held.checking = true;
@@ -1235,23 +703,15 @@ impl Gate {
         }
     }
 
-    fn block(&mut self, key: FlowKey, reason: BlockReason<'_>) {
+    /// Refuse a held connection. `rule` counts it as a protection denial;
+    /// None is an internal refusal (lost controller, full tables).
+    fn block(&mut self, key: FlowKey, rule: Option<(GroupId, &str)>) {
         let Some(f) = self.flows.get_mut(&key) else { return };
         if let State::Holding(h) = std::mem::replace(&mut f.state, State::Blocked) {
-            match reason {
-                BlockReason::Protection(group, host) => {
-                    self.blocked_flows.record(key, h.client_isn, group, host);
-                }
-                BlockReason::UnidentifiedWeb(reason) => {
-                    if self.blocked_flows.first_denial(key, h.client_isn) {
-                        self.unknown_web_counts.record(SocketAddr::new(key.dst, key.dport), reason);
-                    }
-                }
-                BlockReason::Internal => {}
+            if let Some((group, host)) = rule {
+                self.blocked_flows.record(key, h.client_isn, group, host);
             }
-            if let (6, Some(last)) = (key.proto, h.last) {
-                self.reset(key, last);
-            }
+            self.reset(key, h.last);
         }
     }
 
@@ -1281,9 +741,7 @@ impl Gate {
     /// Drop the oldest eighth of passed/blocked connections. Holding ones are
     /// never evicted: their packets would be lost or, worse, passed unchecked.
     fn evict(&mut self) {
-        let mut idle: Vec<(Instant, FlowKey)> = self
-            .flows
-            .iter()
+        let mut idle: Vec<(Instant, FlowKey)> = self.flows.iter()
             .filter(|(_, f)| matches!(f.state, State::Pass | State::Blocked))
             .map(|(k, f)| (f.last_seen, *k))
             .collect();
@@ -1293,29 +751,6 @@ impl Gate {
             self.flows.remove(&k);
         }
     }
-
-    fn ip_group(&self, ip: IpAddr) -> Option<(GroupId, Option<String>)> {
-        if let Some((g, name, _)) = self.learned.get(&ip) {
-            return Some((*g, Some(name.clone())));
-        }
-        self.classifier.group_for_ip(ip).map(|g| (g, None))
-    }
-
-    fn learn(&mut self, ip: IpAddr, group: GroupId, name: &str, now: Instant) {
-        if !self.learned.contains_key(&ip) && self.learned.len() >= self.cfg.max_learned {
-            if let Some(oldest) = self.learned.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| *k) {
-                self.learned.remove(&oldest);
-            }
-        }
-        self.learned.insert(ip, (group, name.to_string(), now));
-    }
-}
-
-enum Target {
-    Pass,
-    Address(UnknownWebReason),
-    EchAddress(String),
-    Group(GroupId, String, bool),
 }
 
 // ---------------------------------------------------------------- packets
@@ -1336,7 +771,7 @@ struct Tcp {
 #[derive(Clone, Copy, Debug)]
 enum L4 {
     Tcp(Tcp),
-    Udp { sport: u16, dport: u16 },
+    Udp { dport: u16 },
     Other,
 }
 
@@ -1425,7 +860,7 @@ fn parse_ip(pkt: &[u8]) -> Option<Packet<'_>> {
             if b.len() < 8 {
                 return None;
             }
-            Some(Packet { src, dst, l4: L4::Udp { sport: be16(b, 0), dport: be16(b, 2) }, payload: &b[8..] })
+            Some(Packet { src, dst, l4: L4::Udp { dport: be16(b, 2) }, payload: &b[8..] })
         }
         _ => Some(Packet { src, dst, l4: L4::Other, payload: &[] }),
     }
@@ -1519,7 +954,7 @@ fn build_rst(k: &FlowKey, seg: ClientSeg) -> Option<Vec<u8>> {
 enum Sniff {
     Incomplete,
     Unknown,
-    Tls { sni: Option<String>, alpn: Vec<Vec<u8>>, ech: bool },
+    Tls { sni: Option<String>, alpn: Vec<Vec<u8>> },
     Http(Option<String>),
 }
 
@@ -1531,7 +966,7 @@ fn sniff(b: &[u8]) -> Sniff {
         return match client_hello(b) {
             Hello::Incomplete => Sniff::Incomplete,
             Hello::Other => Sniff::Unknown,
-            Hello::Found { sni, alpn, ech } => Sniff::Tls { sni, alpn, ech },
+            Hello::Found { sni, alpn } => Sniff::Tls { sni, alpn },
         };
     }
     match http_host(b) {
@@ -1545,7 +980,7 @@ fn sniff(b: &[u8]) -> Sniff {
 enum Hello {
     Incomplete,
     Other,
-    Found { sni: Option<String>, alpn: Vec<Vec<u8>>, ech: bool },
+    Found { sni: Option<String>, alpn: Vec<Vec<u8>> },
 }
 
 const MAX_HELLO: usize = 16 * 1024;
@@ -1605,14 +1040,14 @@ fn parse_hello_body(h: &[u8]) -> Hello {
     }
     p += 1 + h[p] as usize;
     if h.len() < p + 2 {
-        return Hello::Found { sni: None, alpn: Vec::new(), ech: false };
+        return Hello::Found { sni: None, alpn: Vec::new() };
     }
     let end = p + 2 + be16(h, p) as usize;
     if end > h.len() {
         return bad;
     }
     p += 2;
-    let (mut sni, mut alpn, mut ech) = (None, Vec::new(), false);
+    let (mut sni, mut alpn) = (None, Vec::new());
     while p + 4 <= end {
         let (ty, len) = (be16(h, p), be16(h, p + 2) as usize);
         p += 4;
@@ -1638,12 +1073,11 @@ fn parse_hello_body(h: &[u8]) -> Hello {
                     q += 1 + n;
                 }
             }
-            0xfe0d => ech = true,
             _ => {}
         }
         p += len;
     }
-    Hello::Found { sni, alpn, ech }
+    Hello::Found { sni, alpn }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1686,93 +1120,6 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> {
 
 fn norm(s: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
-}
-
-// -------------------------------------------------------------- DNS answers
-
-/// The question name and A/AAAA addresses of a DNS response.
-fn parse_dns_answer(m: &[u8]) -> Option<(String, Vec<(IpAddr, u32)>)> {
-    if m.len() < 12 || m[2] & 0x80 == 0 {
-        return None;
-    }
-    let (qd, an) = (be16(m, 4), be16(m, 6) as usize);
-    if qd != 1 {
-        return None;
-    }
-    let (name, mut p) = dns_name(m, 12)?;
-    if p + 4 > m.len() {
-        return None;
-    }
-    let question_type = be16(m, p);
-    let question_class = be16(m, p + 2);
-    p += 4;
-    let mut addrs = Vec::new();
-    let mut chain_ttl = if m[2] & 0x7a == 0 && m[3] & 0x0f == 0 { u32::MAX } else { 0 };
-    for _ in 0..an.min(64) {
-        let (owner, q) = dns_name(m, p)?;
-        p = q;
-        if p + 10 > m.len() {
-            return None;
-        }
-        let (ty, rdlen) = (be16(m, p), be16(m, p + 8) as usize);
-        // A foreign-name answer remains a routing hint, but does not
-        // qualify for an advisory check before the flow identifies itself.
-        let ttl = if question_class == 1 && be16(m, p + 2) == 1 &&
-            (ty == question_type || ty == 5) && owner.eq_ignore_ascii_case(&name)
-        {
-            be32(m, p + 4)
-        } else {
-            0
-        };
-        if ty == 5 {
-            chain_ttl = chain_ttl.min(ttl);
-        }
-        p += 10;
-        if p + rdlen > m.len() {
-            return None;
-        }
-        match (ty, rdlen) {
-            (1, 4) => addrs.push((IpAddr::V4(Ipv4Addr::new(m[p], m[p + 1], m[p + 2], m[p + 3])), ttl)),
-            (28, 16) => {
-                let mut a = [0u8; 16];
-                a.copy_from_slice(&m[p..p + 16]);
-                addrs.push((IpAddr::V6(Ipv6Addr::from(a)), ttl));
-            }
-            _ => {}
-        }
-        p += rdlen;
-    }
-    for (_, ttl) in &mut addrs {
-        *ttl = (*ttl).min(chain_ttl);
-    }
-    Some((norm(&name), addrs))
-}
-
-fn dns_name(m: &[u8], mut p: usize) -> Option<(String, usize)> {
-    let mut out = String::new();
-    let mut end = None;
-    for _ in 0..64 {
-        let len = *m.get(p)? as usize;
-        if len == 0 {
-            return Some((out, end.unwrap_or(p + 1)));
-        }
-        if len & 0xc0 == 0xc0 {
-            let ptr = (len & 0x3f) << 8 | *m.get(p + 1)? as usize;
-            end.get_or_insert(p + 2);
-            if ptr >= p {
-                return None;
-            }
-            p = ptr;
-            continue;
-        }
-        let label = m.get(p + 1..p + 1 + len)?;
-        if !out.is_empty() {
-            out.push('.');
-        }
-        out.push_str(std::str::from_utf8(label).ok()?);
-        p += 1 + len;
-    }
-    None
 }
 
 #[cfg(test)]

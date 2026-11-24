@@ -2214,15 +2214,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                                             expectedRules: self.egressActiveRules)
                 ?? "尚未取得保护状态"
             let level = status?.displayLevel(expectedRules: self.egressActiveRules) ?? .unknown
-            let recheckRule = status?.groups.first { $0.displayLevel == .blocked && $0.reason == nil
-                && $0.observed.contains { $0.country == nil } }?.id
+            let recheckRule = notices.first?.id
             if self.egressLine != line { self.egressLine = line }
             if self.egressLevel != level { self.egressLevel = level }
             if self.egressNotices != notices { self.egressNotices = notices }
             if self.egressRecheckRule != recheckRule { self.egressRecheckRule = recheckRule }
             guard let status, status.running else { return }
-            for event in self.egressNotifications.update(status.groups.filter { self.egressActiveRules.contains($0.id) }) {
-                Notifier.shared.egressNotice(event)
+            for rule in self.egressNotifications.update(status.groups.filter { self.egressActiveRules.contains($0.id) }) {
+                Notifier.shared.egressNotice(rule)
             }
         }
     }

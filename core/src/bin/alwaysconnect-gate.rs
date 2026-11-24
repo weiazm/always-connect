@@ -8,18 +8,13 @@
 //! delegated to a controller over a UNIX stream socket (`$AC_GATE_CONTROL`),
 //! one JSON object per line:
 //!
-//! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"names":["a.example","*.a.example"],"cidrs":["203.0.113.0/24"]}]}`
-//! - gate -> controller: `{"check":{"group":1,"host":"a.example","hostConfirmed":true,"ip":"192.0.2.1","port":443,"requestId":1}}`
-//! - gate -> controller, advisory: `{"warm":{"group":1,"host":"a.example","ip":"192.0.2.1","port":443}}`
-//! - gate -> controller on deadline: the same fields under `"timedOut"`, before another check
+//! - controller -> gate, first line: `{"probe_alpn":"...","groups":[{"id":1,"sites":["a.example"]}]}`
+//!   (a site covers its subdomains); the same shape again replaces it
+//! - gate -> controller: `{"check":{"group":1,"host":"www.a.example","ip":"192.0.2.1","port":443,"requestId":1}}`
 //! - gate -> controller statistics: `{"denied":[{"group":1,"count":2,"hosts":[{"host":"a.example","count":2}],"hostsTruncated":false,"lastHost":"a.example"}]}`
 //!   Cumulative for this peer and sent only after a real denial.
-//! - gate -> controller, unidentified Web denials: `{"unknownWeb":[{"address":"192.0.2.1","port":443,"count":1}]}`
-//! - configuration may include `blockUnidentifiedWeb`, `unknownWebExceptions` and `unknownWebInternalCidrs`
-//! - controller -> gate, trusted DNS: `{"dnsReset":4}`, then
-//!   `{"dnsEvidence":{"generation":4,"name":"a.example","kind":"ipv4","qtype":1,"observedAtMs":1234,"values":[{"value":"192.0.2.1","ttl":60}]}}`
-//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"ok":true,"direct":true,"evidenceAtMs":1234}}`,
-//!   `{"blockGroup":1}` or `{"invalidate":true}`
+//! - controller -> gate: `{"verdict":{"group":1,"requestId":1,"result":"allow","evidenceAtMs":1234}}`
+//!   (`result` is `allow`, `block` or `unverified`), or `{"invalidate":true}`
 //!
 //! Without a controller every check times out and protected connections
 //! are refused: the gate fails closed.
@@ -28,9 +23,7 @@
 //! `linux:<name>[:netns=<ns>]` (the CI harness, which keeps the client side
 //! in its own network namespace).
 
-use alwaysconnect_core::egress_control::{GateGroup, ProtectedRoutes};
-use alwaysconnect_core::egress_gate::owners::ProcessOwners;
-use alwaysconnect_core::egress_gate::{DeniedGroup, DnsEvidenceUpdate, Gate, GateConfig, GroupId, Out, RequestId, Step, UnknownWebEndpoint, UnknownWebPolicy, Verdict};
+use alwaysconnect_core::egress_gate::{DeniedGroup, Gate, GateConfig, GroupId, Out, ProtectedSites, RequestId, SiteGroup, Step, Verdict};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -48,29 +41,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 #[derive(Deserialize)]
 struct ControllerCfg {
     probe_alpn: String,
-    groups: Vec<GateGroup>,
-    #[serde(flatten)]
-    unknown_web: UnknownWebCfg,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UnknownWebCfg {
-    block_unidentified_web: Option<bool>,
-    #[serde(default)]
-    unknown_web_exceptions: Vec<UnknownWebEndpoint>,
-    #[serde(default)]
-    unknown_web_internal_cidrs: Vec<String>,
-}
-
-impl UnknownWebCfg {
-    fn policy(&self, groups: &[GateGroup]) -> UnknownWebPolicy {
-        UnknownWebPolicy::new(
-            !groups.is_empty() && self.block_unidentified_web.unwrap_or(true),
-            &self.unknown_web_exceptions,
-            &self.unknown_web_internal_cidrs,
-        )
-    }
+    groups: Vec<SiteGroup>,
 }
 
 #[derive(Deserialize)]
@@ -78,28 +49,28 @@ struct ControlVerdict {
     group: GroupId,
     #[serde(rename = "requestId")]
     request_id: RequestId,
-    ok: bool,
-    #[serde(default)]
-    direct: bool,
+    result: String,
     #[serde(rename = "evidenceAtMs")]
     evidence_at_ms: Option<u64>,
+}
+
+impl ControlVerdict {
+    fn verdict(&self) -> Verdict {
+        match (self.result.as_str(), self.evidence_at_ms) {
+            ("allow", Some(evidence_at_ms)) => Verdict::Allow { evidence_at_ms },
+            ("unverified", _) => Verdict::Unverified,
+            _ => Verdict::Block,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct ControlMsg {
     verdict: Option<ControlVerdict>,
-    #[serde(rename = "blockGroup")]
-    block_group: Option<GroupId>,
     invalidate: Option<bool>,
-    #[serde(rename = "dnsReset")]
-    dns_reset: Option<u64>,
-    #[serde(rename = "dnsEvidence")]
-    dns_evidence: Option<DnsEvidenceUpdate>,
     /// A new configuration while running (same shape as the first line).
     probe_alpn: Option<String>,
-    groups: Option<Vec<GateGroup>>,
-    #[serde(flatten)]
-    unknown_web: UnknownWebCfg,
+    groups: Option<Vec<SiteGroup>>,
 }
 
 fn log(msg: &str) {
@@ -356,16 +327,8 @@ fn main() {
         }
     };
     let mut control = Some(controller);
-    let groups = ProtectedRoutes::new(&cfg.groups);
-    let gcfg = GateConfig {
-        probe_alpn: cfg.probe_alpn.into_bytes(),
-        unknown_web: cfg.unknown_web.policy(&cfg.groups),
-        ..GateConfig::default()
-    };
-    let mut gate = Gate::new(gcfg, Box::new(groups));
-    gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&cfg.groups))));
-    let (sites, app_rules) = GateGroup::rule_sites(&cfg.groups);
-    gate.set_rule_sites(sites, &app_rules);
+    let gcfg = GateConfig { probe_alpn: cfg.probe_alpn.into_bytes(), ..GateConfig::default() };
+    let mut gate = Gate::new(gcfg, ProtectedSites::new(&cfg.groups));
     log(&format!("up on {ifname}"));
     if let Some(c) = &mut control {
         let _ = c.stream.write_all((serde_json::json!({ "up": { "ifname": ifname } }).to_string() + "\n").as_bytes());
@@ -400,32 +363,14 @@ fn main() {
                         Ok(m) => {
                             if let (Some(alpn), Some(groups)) = (m.probe_alpn, m.groups) {
                                 log("new configuration");
-                                gate.set_unknown_web(m.unknown_web.policy(&groups));
-                                gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&groups))));
-                                let (sites, app_rules) = GateGroup::rule_sites(&groups);
-                                gate.set_rule_sites(sites, &app_rules);
-                                gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
+                                gate.reconfigure(alpn.into_bytes(), ProtectedSites::new(&groups));
                             }
                             if m.invalidate == Some(true) {
                                 gate.invalidate();
                             }
-                            if let Some(generation) = m.dns_reset {
-                                gate.reset_dns_evidence(generation);
-                            }
-                            if let Some(evidence) = m.dns_evidence {
-                                gate.update_dns_evidence(evidence);
-                            }
-                            if let Some(group) = m.block_group {
-                                gate.block_group(group);
-                            }
                             if let Some(v) = m.verdict {
-                                log(&format!("verdict group={} request={} ok={}", v.group, v.request_id, v.ok));
-                                let verdict = match (v.ok, v.direct) {
-                                    (false, _) => Verdict::Block,
-                                    (true, false) => Verdict::AllowDependent,
-                                    (true, true) => Verdict::AllowDirect,
-                                };
-                                gate.verdict(v.group, v.request_id, verdict, v.evidence_at_ms, Instant::now());
+                                log(&format!("verdict group={} request={} result={}", v.group, v.request_id, v.result));
+                                gate.verdict(v.group, v.request_id, v.verdict(), Instant::now());
                             }
                         }
                         Err(e) => log(&format!("bad control line: {e}")),
@@ -442,11 +387,11 @@ fn main() {
             }
             if lost {
                 log("controller gone: protected connections will be refused (fail closed)");
-                gate.controller_lost();
+                gate.invalidate();
                 control = None;
             }
-            // Apply only after buffered invalidations and group blocks have
-            // had a chance to retire permits from earlier frames.
+            // Apply only after buffered invalidations have had a chance to
+            // retire permits from earlier frames.
             apply(&mut gate, &vpn, tun.as_ref(), &mut control);
         }
         let now = Instant::now();
@@ -474,7 +419,6 @@ fn main() {
                     break;
                 }
                 Ok(n) => {
-                    gate.inbound(&buf[..n], now);
                     let _ = tun.write(&buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -490,9 +434,6 @@ fn main() {
             if let Some(control) = &mut control {
                 if let Some(denied) = gate.take_denied_group() {
                     control.report_denied(denied);
-                }
-                if let Some(unknown) = gate.take_unknown_web() {
-                    control.write_optional(serde_json::json!({ "unknownWeb": unknown }).to_string() + "\n");
                 }
             }
             last_tick = now;
@@ -527,22 +468,15 @@ fn send_checked(vpn: &OwnedFd, packets: &[Vec<u8>]) -> bool {
     true
 }
 
-fn check_line(kind: &str, group: GroupId, host: Option<&str>, host_confirmed: bool, destination: SocketAddr, request_id: RequestId) -> String {
+fn check_line(group: GroupId, host: &str, destination: SocketAddr, request_id: RequestId) -> String {
     serde_json::json!({
-        (kind): {
+        "check": {
             "group": group,
             "host": host,
-            "hostConfirmed": host_confirmed,
             "ip": destination.ip(),
             "port": destination.port(),
             "requestId": request_id,
         },
-    }).to_string() + "\n"
-}
-
-fn warm_line(group: GroupId, host: &str, destination: SocketAddr) -> String {
-    serde_json::json!({
-        "warm": { "group": group, "host": host, "ip": destination.ip(), "port": destination.port() },
     }).to_string() + "\n"
 }
 
@@ -553,41 +487,29 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
         actions = gate.drain().into_iter();
         actions.next()
     }) {
-        let (kind, group, host, host_confirmed, destination, request_id) = match o {
+        match o {
             Out::ToTunnel(p) => {
                 let _ = send(vpn, &p);
-                continue;
             }
             Out::ToHost(p) => {
                 let _ = tun.write(&p);
-                continue;
             }
             Out::SendChecked(id) => {
                 gate.send_checked(id, Instant::now(), |packets| control.is_some() && send_checked(vpn, packets));
-                continue;
             }
-            Out::Warm { group, host, destination } => {
+            Out::Check { group, host, destination, request_id } => {
                 if let Some(c) = control {
-                    c.write_optional(warm_line(group, &host, destination));
+                    log(&format!("check group={group} request={request_id}"));
+                    if let Err(error) = c.write_required(check_line(group, &host, destination, request_id)) {
+                        log(&format!("controller write failed: {error}"));
+                        *control = None;
+                    }
                 }
-                continue;
-            }
-            Out::Check { group, host, host_confirmed, destination, request_id } =>
-                ("check", group, host, host_confirmed, destination, request_id),
-            Out::TimedOut { group, host, host_confirmed, destination, request_id } =>
-                ("timedOut", group, host, host_confirmed, destination, request_id),
-        };
-        if let Some(c) = control {
-            log(&format!("{kind} group={group} request={request_id}"));
-            let line = check_line(kind, group, host.as_deref(), host_confirmed, destination, request_id);
-            if let Err(error) = c.write_required(line) {
-                log(&format!("controller write failed: {error}"));
-                *control = None;
             }
         }
     }
     if had_controller && control.is_none() {
-        gate.controller_lost();
+        gate.invalidate();
         for action in gate.drain() {
             if let Out::ToHost(packet) = action {
                 let _ = tun.write(&packet);
@@ -599,21 +521,8 @@ fn apply(gate: &mut Gate, vpn: &OwnedFd, tun: &dyn Tun, control: &mut Option<Con
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alwaysconnect_core::egress_gate::Classifier;
     use std::cell::RefCell;
-    use std::net::IpAddr;
     use std::os::unix::net::UnixDatagram;
-
-    struct ExampleRoutes;
-
-    impl Classifier for ExampleRoutes {
-        fn group_for_name(&self, _: &str) -> Option<GroupId> { None }
-
-        fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId> {
-            let IpAddr::V4(ip) = ip else { return None };
-            Some(u32::from(ip.octets()[3]))
-        }
-    }
 
     #[derive(Default)]
     struct TestTun(RefCell<Vec<Vec<u8>>>);
@@ -627,116 +536,70 @@ mod tests {
         }
     }
 
-    fn hold_packet(gate: &mut Gate, dst: u8, now: Instant) {
-        // The gate sees only synthetic midstream TCP data.
-        let mut packet = [0; 41];
+    fn tcp(dst: u8, flags: u8, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0; 40];
         packet[0] = 0x45;
-        packet[3] = packet.len() as u8;
+        packet[2..4].copy_from_slice(&((40 + payload.len()) as u16).to_be_bytes());
         packet[9] = 6;
         packet[12..20].copy_from_slice(&[192, 0, 2, 10, 198, 51, 100, dst]);
         packet[20..24].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
+        packet[24..28].copy_from_slice(&seq.to_be_bytes());
         packet[32] = 0x50;
-        packet[33] = 0x18;
-        assert_eq!(gate.outbound(&packet, now), Step::Consumed);
+        packet[33] = flags;
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    /// A connection to `dst` whose first data is a plain HTTP request for `host`.
+    fn hold_request(gate: &mut Gate, dst: u8, host: &str, now: Instant) {
+        assert_eq!(gate.outbound(&tcp(dst, 0x02, 1000, &[]), now), Step::Forward);
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert_eq!(gate.outbound(&tcp(dst, 0x18, 1001, request.as_bytes()), now), Step::Consumed);
+    }
+
+    fn gate() -> Gate {
+        Gate::new(GateConfig::default(), ProtectedSites::new(&[SiteGroup { id: 7, sites: vec!["a.example".into()] }]))
     }
 
     #[test]
     fn check_carries_the_numeric_destination_and_request_id() {
         let destination = "[2001:db8::1]:8443".parse().unwrap();
         let id = RequestId::new(u64::MAX).unwrap();
-        let line = check_line("check", 7, Some("a.example"), true, destination, id);
+        let line = check_line(7, "www.a.example", destination, id);
         assert!(line.ends_with('\n'));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&line).unwrap(),
             serde_json::json!({
-                "check": {"group": 7, "host": "a.example", "hostConfirmed": true, "ip": "2001:db8::1", "port": 8443, "requestId": u64::MAX},
+                "check": {"group": 7, "host": "www.a.example", "ip": "2001:db8::1", "port": 8443, "requestId": u64::MAX},
             })
         );
     }
 
     #[test]
-    fn verdict_requires_a_nonzero_request_id() {
-        let line = r#"{"verdict":{"group":7,"requestId":42,"ok":true}}"#;
-        assert_eq!(serde_json::from_str::<ControlMsg>(line).unwrap().verdict.unwrap().request_id.get(), 42);
+    fn verdicts_require_a_request_id_and_fail_closed() {
+        let parse = |line: &str| serde_json::from_str::<ControlMsg>(line).map(|m| m.verdict.unwrap().verdict());
+        assert_eq!(parse(r#"{"verdict":{"group":7,"requestId":42,"result":"allow","evidenceAtMs":81234}}"#).unwrap(),
+                   Verdict::Allow { evidence_at_ms: 81234 });
+        assert_eq!(parse(r#"{"verdict":{"group":7,"requestId":42,"result":"unverified"}}"#).unwrap(), Verdict::Unverified);
+        assert_eq!(parse(r#"{"verdict":{"group":7,"requestId":42,"result":"allow"}}"#).unwrap(), Verdict::Block,
+                   "an allow without its evidence time");
+        assert_eq!(parse(r#"{"verdict":{"group":7,"requestId":42,"result":"later"}}"#).unwrap(), Verdict::Block);
         for invalid in [
-            r#"{"verdict":{"group":7,"requestId":0,"ok":true}}"#,
-            r#"{"verdict":{"group":7,"ok":true}}"#,
+            r#"{"verdict":{"group":7,"requestId":0,"result":"allow"}}"#,
+            r#"{"verdict":{"group":7,"result":"allow"}}"#,
         ] {
             assert!(serde_json::from_str::<ControlMsg>(invalid).is_err());
         }
     }
 
     #[test]
-    fn control_frames_distinguish_direct_evidence_from_group_dependent_results() {
-        let legacy = r#"{"verdict":{"group":7,"requestId":42,"ok":true}}"#;
-        let direct = r#"{"verdict":{"group":7,"requestId":42,"ok":true,"direct":true,"evidenceAtMs":81234}}"#;
-        let legacy = serde_json::from_str::<ControlMsg>(legacy).unwrap().verdict.unwrap();
-        assert!(!legacy.direct);
-        assert_eq!(legacy.evidence_at_ms, None);
-        let direct = serde_json::from_str::<ControlMsg>(direct).unwrap().verdict.unwrap();
-        assert!(direct.direct);
-        assert_eq!(direct.evidence_at_ms, Some(81234));
-        let blocked = serde_json::from_str::<ControlMsg>(r#"{"blockGroup":7}"#).unwrap();
-        assert_eq!(blocked.block_group, Some(7));
-        assert!(blocked.verdict.is_none());
-    }
-
-    #[test]
-    fn advisory_warm_requests_carry_no_permission_ticket() {
-        let line = warm_line(1, "a.example", "192.0.2.1:443".parse().unwrap());
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({
-            "warm": {"group":1,"host":"a.example","ip":"192.0.2.1","port":443},
-        }));
-    }
-
-    #[test]
-    fn dns_control_frames_require_the_authoritative_generation_and_exact_qtype() {
-        let reset = serde_json::from_str::<ControlMsg>(r#"{"dnsReset":6}"#).unwrap();
-        assert_eq!(reset.dns_reset, Some(6));
-        assert!(reset.dns_evidence.is_none());
-        let update = r#"{"dnsEvidence":{"generation":6,"name":"a.example","kind":"ech","qtype":65,"observedAtMs":1234,"values":[]}}"#;
-        let frame = serde_json::from_str::<ControlMsg>(update).unwrap().dns_evidence.unwrap();
-        assert_eq!((frame.generation, frame.qtype, frame.observed_at_ms), (6, 65, 1234));
-        assert!(frame.values.is_empty());
-        let missing = update.replace(r#""qtype":65,"#, "");
-        assert!(serde_json::from_str::<ControlMsg>(&missing).is_err());
-    }
-
-    #[test]
-    fn unidentified_web_defaults_on_only_for_active_groups_and_accepts_exact_wire_entries() {
-        let cases = [
-            (r#"{"probe_alpn":"","groups":[]}"#, Step::Forward),
-            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}]}"#, Step::Consumed),
-            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"blockUnidentifiedWeb":false}"#, Step::Forward),
-            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"unknownWebExceptions":[{"address":"93.184.216.44","port":443}]}"#, Step::Forward),
-            (r#"{"probe_alpn":"","groups":[{"id":1,"names":["a.example"],"cidrs":[]}],"unknownWebInternalCidrs":["93.184.216.0/24"]}"#, Step::Forward),
-        ];
-        for (config, expected) in cases {
-            let cfg: ControllerCfg = serde_json::from_str(config).unwrap();
-            let routes = Box::new(ProtectedRoutes::new(&cfg.groups));
-            let settings = GateConfig { unknown_web: cfg.unknown_web.policy(&cfg.groups), ..GateConfig::default() };
-            let mut gate = Gate::new(settings, routes);
-            let mut packet = [0; 41];
-            packet[0] = 0x45;
-            packet[3] = 40;
-            packet[9] = 6;
-            packet[12..20].copy_from_slice(&[192, 0, 2, 10, 93, 184, 216, 44]);
-            packet[20..24].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
-            packet[32] = 0x50;
-            packet[33] = 0x02;
-            let now = Instant::now();
-            assert_eq!(gate.outbound(&packet[..40], now), Step::Forward);
-            packet[3] = 41;
-            packet[27] = 1;
-            packet[33] = 0x18;
-            assert_eq!(gate.outbound(&packet, now), expected, "{config}");
-            if expected == Step::Consumed {
-                let counts = gate.take_unknown_web().unwrap();
-                assert_eq!(serde_json::json!({"unknownWeb": counts}), serde_json::json!({
-                    "unknownWeb":[{"address":"93.184.216.44","port":443,"count":1}],
-                }));
-            }
-        }
+    fn configuration_frames_name_sites_per_rule() {
+        let cfg: ControllerCfg = serde_json::from_str(r#"{"probe_alpn":"m","groups":[{"id":1,"sites":["a.example"]}]}"#).unwrap();
+        let sites = ProtectedSites::new(&cfg.groups);
+        assert_eq!(sites.group_for("www.a.example"), Some(1));
+        assert_eq!(sites.group_for("b.example"), None);
+        let update = serde_json::from_str::<ControlMsg>(r#"{"probe_alpn":"m","groups":[]}"#).unwrap();
+        assert!(update.groups.unwrap().is_empty());
     }
 
     #[test]
@@ -747,7 +610,7 @@ mod tests {
         control.stream.write_all(b"{\"denied\":[").unwrap();
         control.report_denied(&DeniedGroup { group: 7, count: 2, ..Default::default() });
         assert!(!control.partial_optional);
-        let check = check_line("check", 7, None, false, "192.0.2.1:443".parse().unwrap(), RequestId::new(42).unwrap());
+        let check = check_line(7, "a.example", "192.0.2.1:443".parse().unwrap(), RequestId::new(42).unwrap());
         control.write_required(check).unwrap();
 
         let mut lines = BufReader::new(peer).lines();
@@ -762,56 +625,24 @@ mod tests {
     }
 
     #[test]
-    fn deadline_frame_precedes_the_next_check_on_the_control_stream() {
-        let (stream, peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut peer = BufReader::new(peer);
-        let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_optional: false });
-        let (vpn, _remote) = UnixDatagram::pair().unwrap();
-        let vpn = vpn.into();
-        let tun = TestTun::default();
-        let cfg = GateConfig::default();
-        let deadline = cfg.check_timeout;
-        let mut gate = Gate::new(cfg, Box::new(ExampleRoutes));
-        let now = Instant::now();
-        hold_packet(&mut gate, 1, now);
-        apply(&mut gate, &vpn, &tun, &mut control);
-        gate.tick(now + deadline);
-        hold_packet(&mut gate, 2, now + deadline);
-        apply(&mut gate, &vpn, &tun, &mut control);
-
-        let frames: Vec<serde_json::Value> = (&mut peer).lines().take(3)
-            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
-            .collect();
-        assert_eq!(frames[0]["check"], frames[1]["timedOut"]);
-        assert_eq!(frames[1]["timedOut"]["ip"], "198.51.100.1");
-        assert_eq!(frames[2]["check"]["ip"], "198.51.100.2");
-        assert_ne!(frames[2]["check"]["requestId"], frames[1]["timedOut"]["requestId"]);
-        assert_eq!(tun.0.borrow().len(), 1);
-    }
-
-    #[test]
-    fn a_failed_deadline_write_retires_the_other_pending_results() {
+    fn a_failed_check_write_refuses_the_other_waiting_connections() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let mut control = Some(Control { reader: BufReader::new(stream.try_clone().unwrap()), stream, partial_optional: false });
         let (vpn, remote) = UnixDatagram::pair().unwrap();
         remote.set_nonblocking(true).unwrap();
         let vpn = vpn.into();
         let tun = TestTun::default();
-        let cfg = GateConfig::default();
-        let deadline = cfg.check_timeout;
-        let mut gate = Gate::new(cfg, Box::new(ExampleRoutes));
+        let mut gate = gate();
         let now = Instant::now();
-        hold_packet(&mut gate, 1, now);
-        hold_packet(&mut gate, 2, now + Duration::from_secs(1));
+        hold_request(&mut gate, 1, "a.example", now);
         apply(&mut gate, &vpn, &tun, &mut control);
         drop(peer);
 
-        gate.tick(now + deadline);
+        hold_request(&mut gate, 2, "www.a.example", now);
         apply(&mut gate, &vpn, &tun, &mut control);
         assert!(control.is_none());
-        assert_eq!(tun.0.borrow().len(), 2);
-        gate.verdict(2, RequestId::new(2).unwrap(), Verdict::AllowDirect, None, now + deadline);
+        assert_eq!(tun.0.borrow().len(), 2, "both connections were reset");
+        gate.verdict(7, RequestId::new(2).unwrap(), Verdict::Unverified, now);
         apply(&mut gate, &vpn, &tun, &mut control);
         assert_eq!(remote.recv(&mut [0; 128]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }

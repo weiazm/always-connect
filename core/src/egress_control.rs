@@ -1,12 +1,13 @@
-//! Egress protection controller (DESIGN.md §66.3–66.7): the background
-//! service's side of the gate. It owns the user's groups and probe methods,
-//! answers the gate's checks by probing through the tunnel, and keeps the
-//! status and the last block records for the App.
+//! Exit protection controller (DESIGN.md §66.3–66.7, §66.25): the
+//! background service's side of the gate. It owns the user's rules (sites
+//! to protect and the countries they may leave from), answers the gate's
+//! checks by probing the connection's own destination through the tunnel,
+//! and keeps the status and the last block records for the App.
 //!
 //! The HTTPS request itself is made by a thin platform hook (Network.framework
 //! on macOS: TLS, the ALPN marker, the tunnel interface); everything else —
-//! building the request, parsing the answer, extracting the country, the
-//! group decision, the records — is here and tested on Linux.
+//! building the request, parsing the answer, the decision, the records — is
+//! here and tested on Linux.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -19,320 +20,122 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-mod airports;
+use crate::egress_gate::{evidence_clock_ms, ProtectedSites, SiteGroup};
+
 mod activity;
-mod unknown_web;
-mod dns_evidence;
-use unknown_web::{UnknownCount,UnknownWeb};
 use activity::{Denied, SiteStatus};
-mod recheck;
-mod warm;
-pub(crate) mod setup_probe;
-use recheck::{Failures, Target};
+
+const MAX_GROUPS: usize = 16;
+const MAX_SITES: usize = 256;
+/// Checks running at once; more are refused until one finishes.
+const MAX_CHECKS: usize = 32;
+/// Wrong-exit servers remembered per rule (status, approval, recheck).
+const MAX_FAILED_TARGETS: usize = 8;
+const PROBE_TIMEOUT_MS: u64 = 2_400;
+pub const MAX_RECORDS: usize = 10;
 
 // ------------------------------------------------------------------ config
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EgressConfig {
-    pub block_unidentified_web: bool,
-    pub enabled: bool,
-    pub groups: Vec<Group>,
-    /// User-defined methods; the presets ([`preset_methods`]) are always
-    /// available under their own ids.
-    pub methods: Vec<ProbeMethod>,
-}
-
-impl Default for EgressConfig {
-    fn default() -> Self { Self { enabled:false, groups:Vec::new(), methods:Vec::new(), block_unidentified_web:true } }
-}
-
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
+pub struct EgressConfig {
+    pub enabled: bool,
+    pub groups: Vec<Group>,
+}
+
+/// A rule: the sites it protects (with subdomains) and the countries
+/// their connections may leave from (ISO 3166 alpha-2).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Group {
     pub id: u32,
     pub name: String,
     pub enabled: bool,
-    pub members: Vec<Member>,
-    /// Address ranges that belong to this group (hard-coded addresses).
-    pub cidrs: Vec<String>,
-    /// Expected countries (ISO 3166 alpha-2). Empty: not locked yet, every
-    /// check fails closed.
-    pub expect: Vec<String>,
-    pub exit_range_check: bool,
-    pub exit_ranges: Vec<String>,
-    /// Protected apps (§66.24): bundle paths or executable names. A group
-    /// with apps is checked by connection owner, not by name.
-    pub apps: Vec<String>,
-    /// The sites this rule protects, with subdomains (§66.25). Without
-    /// apps the rule covers every program's connections to them.
     pub sites: Vec<String>,
+    pub expect: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for Group {
+    /// Rules saved before §66.25 listed website members ("example.com",
+    /// "*.example.com", "geosite:…"); they become the sites they named.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Member {
+            pattern: String,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Fields {
+            id: u32,
+            name: String,
+            enabled: bool,
+            sites: Vec<String>,
+            expect: Vec<String>,
+            members: Vec<Member>,
+        }
+        let f = Fields::deserialize(deserializer)?;
+        let mut sites = f.sites;
+        if sites.is_empty() {
+            for member in f.members {
+                let site = member.pattern.trim().to_ascii_lowercase().replace("*.", "");
+                let site = site.trim_matches('.');
+                if !site.is_empty() && !site.contains(':') && site.contains('.') && !sites.iter().any(|s| s == site) {
+                    sites.push(site.to_owned());
+                }
+            }
+        }
+        Ok(Group { id: f.id, name: f.name, enabled: f.enabled, sites, expect: f.expect })
+    }
 }
 
 impl Group {
-    pub fn by_app(&self) -> bool {
-        self.apps.iter().any(|app| !app.trim().is_empty())
+    pub fn allows(&self, country: &str) -> bool {
+        self.expect.iter().any(|c| c.eq_ignore_ascii_case(country))
     }
 
-    /// A rule of the simple kind (§66.24, §66.25): apps and/or sites,
-    /// checked at the connection's own destination; no website members.
-    pub fn simple(&self) -> bool {
-        self.by_app() || self.sites.iter().any(|site| !site.trim().is_empty())
+    fn covers(&self, host: &str) -> bool {
+        ProtectedSites::new(&[SiteGroup { id: self.id, sites: self.sites.clone() }]).group_for(host).is_some()
     }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Member {
-    /// `a.example` or `*.a.example`.
-    pub pattern: String,
-    /// Probe method id; None = "follow the group" (§66.3).
-    pub method: Option<String>,
-    /// Concrete name to probe for a wildcard member when no connection named
-    /// one (set up time, or a check triggered by an address).
-    pub probe_host: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ProbeMethod {
-    pub id: String,
-    pub name: String,
-    /// `https://{host}/...`; `{host}` is the member's site.
-    pub url: String,
-    #[serde(default)]
-    pub head: bool,
-    pub extract: Extract,
-}
-
-impl ProbeMethod {
-    pub fn is_direct(&self) -> bool {
-        let Some(url) = self.url.strip_prefix("https://") else { return false };
-        let authority = url.split('/').next().unwrap_or_default();
-        authority == "{host}" || authority.strip_prefix("{host}:")
-            .is_some_and(|port| port.parse::<std::num::NonZeroU16>().is_ok())
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Extract {
-    pub kind: ExtractKind,
-    /// kv: the key (`loc`); json: a dot path (`country`); header: header
-    /// names, comma separated, tried in order.
-    pub key: String,
-    /// Optional regular expression; capture group 1 is the code.
-    #[serde(default)]
-    pub regex: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ExtractKind {
-    Kv,
-    Json,
-    Header,
-}
-
-#[derive(Deserialize)]
-pub struct GateGroup {
-    id: u32,
-    #[serde(default)]
-    names: Vec<String>,
-    #[serde(default)]
-    cidrs: Vec<String>,
-    #[serde(default)]
-    apps: Vec<String>,
-    #[serde(default)]
-    sites: Vec<String>,
-}
-
-impl GateGroup {
-    /// The gate's protected sites per rule, and which rules also name apps.
-    pub fn rule_sites(groups: &[GateGroup]) -> (std::collections::HashMap<u32, Vec<String>>, std::collections::HashSet<u32>) {
-        let sites = groups.iter().filter(|g| !g.sites.is_empty()).map(|g| (g.id, g.sites.clone())).collect();
-        let apps = groups.iter().filter(|g| !g.apps.is_empty()).map(|g| g.id).collect();
-        (sites, apps)
-    }
-
-    /// The gate's app rules; empty unless some group protects apps.
-    pub fn app_rules(groups: &[GateGroup]) -> Vec<crate::egress_gate::owners::AppRule> {
-        groups.iter().filter(|g| !g.apps.is_empty())
-            .map(|g| crate::egress_gate::owners::AppRule { group: g.id, patterns: g.apps.clone() })
-            .collect()
-    }
-}
-
-struct ProtectedGroup {
-    id: u32,
-    exact: std::collections::HashSet<String>,
-    wildcards: Vec<String>,
-    lists: crate::dns_forwarder::SplitRules,
-    cidrs: Vec<(IpAddr, u8)>,
-}
-
-pub struct ProtectedRoutes(Vec<ProtectedGroup>);
-
-impl ProtectedRoutes {
-    pub fn new(groups: &[GateGroup]) -> Self {
-        Self(groups.iter().map(|group| {
-            let mut exact = std::collections::HashSet::new();
-            let mut wildcards = Vec::new();
-            let mut lists = Vec::new();
-            for name in &group.names {
-                if name.starts_with("*.") {
-                    wildcards.push(name.to_string());
-                } else if name.contains(':') {
-                    lists.push(name.to_string());
-                } else {
-                    exact.insert(name.trim_end_matches('.').to_ascii_lowercase());
-                }
-            }
-            ProtectedGroup { id: group.id, exact, wildcards,
-                lists: crate::dns_forwarder::SplitRules::new(&lists),
-                cidrs: group.cidrs.iter().filter_map(|cidr| parse_cidr(cidr)).collect() }
-        }).collect())
-    }
-
-    pub fn overlaps(&self, range: &str) -> bool {
-        let Some((addr, len)) = parse_cidr(range) else { return false };
-        self.0.iter().any(|group| group.cidrs.iter().any(|&(other, bits)|
-            in_net(addr, other, len.min(bits))))
-    }
-}
-
-impl crate::egress_gate::Classifier for ProtectedRoutes {
-    fn group_for_name(&self, name: &str) -> Option<u32> {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
-        self.0.iter().find(|group| group.exact.contains(&name)
-            || group.wildcards.iter().any(|pattern| pattern_matches(pattern, &name))
-            || group.lists.matches(&name).is_some()).map(|group| group.id)
-    }
-
-    fn group_for_ip(&self, ip: IpAddr) -> Option<u32> {
-        self.0.iter().find(|group| group.cidrs.iter().any(|&(net, len)| in_net(ip, net, len)))
-            .map(|group| group.id)
-    }
-}
-
-fn in_net(ip: IpAddr, net: IpAddr, len: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(a), IpAddr::V4(n)) => len <= 32 && (len == 0 || (u32::from(a) ^ u32::from(n)) >> (32 - len as u32) == 0),
-        (IpAddr::V6(a), IpAddr::V6(n)) => len <= 128 && (len == 0 || (u128::from(a) ^ u128::from(n)) >> (128 - len as u32) == 0),
-        _ => false,
-    }
-}
-
-fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
-    let (ip, len) = s.split_once('/').unwrap_or((s, ""));
-    let ip: IpAddr = ip.trim().parse().ok()?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    let len = if len.is_empty() { max } else { len.trim().parse().ok()? };
-    (len <= max).then_some((ip, len))
-}
-
-pub const PRESET_TRACE: &str = "trace";
-pub const PRESET_CDN: &str = "cdn-node";
-const MAX_METHODS: usize = 8;
-const MAX_GROUPS: usize = 16;
-const MAX_PROBES_PER_GROUP: usize = 8;
-
-/// Built-in methods (§66.4). Generic, no company or service names.
-pub fn preset_methods() -> Vec<ProbeMethod> {
-    vec![
-        ProbeMethod {
-            id: PRESET_TRACE.into(),
-            name: "网站自己的检测地址".into(),
-            url: "https://{host}/cdn-cgi/trace".into(),
-            head: false,
-            extract: Extract { kind: ExtractKind::Kv, key: "loc".into(), regex: None },
-        },
-        ProbeMethod {
-            id: PRESET_CDN.into(),
-            name: "CDN 节点（近似）".into(),
-            url: "https://{host}/".into(),
-            head: true,
-            extract: Extract { kind: ExtractKind::Header, key: "cf-ray,x-amz-cf-pop,x-served-by".into(), regex: None },
-        },
-    ]
 }
 
 impl EgressConfig {
     pub fn active(&self) -> bool {
-        self.enabled && self.groups.iter().any(|g| g.enabled)
+        self.enabled && self.groups.iter().any(|g| g.enabled && !g.sites.is_empty())
     }
 
-    pub fn protected_routes(&self) -> ProtectedRoutes {
-        // App groups protect by owner: no names or addresses to route or rewrite.
-        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled && (!g.by_app() || !g.sites.is_empty())).map(|g| GateGroup {
-            id: g.id,
-            // A site rule's names still go through the VPN and lose their ECH
-            // configs in local DNS, so the gate can read them (§66.25).
-            names: if g.simple() {
-                g.sites.iter().flat_map(|s| { let s = s.trim().trim_start_matches("*.").to_ascii_lowercase(); [s.clone(), format!("*.{s}")] }).collect()
-            } else {
-                g.members.iter().map(|m| m.pattern.trim().to_string()).collect()
-            },
-            cidrs: g.cidrs.clone(),
-            apps: Vec::new(),
-            sites: Vec::new(),
-        }).collect::<Vec<_>>())
-    }
-
+    /// At most 16 rules with unique ids; sites are host names; countries
+    /// are two capital letters; an enabled rule with sites has a country.
     pub fn valid(&self) -> bool {
-        let group_ids: std::collections::HashSet<_> = self.groups.iter().map(|g| g.id).collect();
-        let method_ids: std::collections::HashSet<_> = self.methods.iter().map(|m| &m.id).collect();
-        group_ids.len() == self.groups.len() && method_ids.len() == self.methods.len()
-            && self.methods.len() <= MAX_METHODS && self.groups.len() <= MAX_GROUPS
+        let ids: std::collections::HashSet<_> = self.groups.iter().map(|g| g.id).collect();
+        ids.len() == self.groups.len() && self.groups.len() <= MAX_GROUPS
             && self.groups.iter().all(|g| {
-                let checkable = g.members.iter().filter(|m| m.method.is_some()).count();
-                g.members.len() <= 2_048 && g.cidrs.len() <= 256 && g.exit_ranges.len() <= 256
-                    && crate::egress_source::SourcePolicy::from_config(g.exit_range_check, &g.exit_ranges).is_ok()
-                    && g.cidrs.iter().all(|range| parse_cidr(range).is_some())
-                    && g.expect.iter().all(|country| country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()))
-                    && checkable <= MAX_PROBES_PER_GROUP
-                    && (!g.enabled || (!g.expect.is_empty() && checkable > 0 && probe_targets(self, g, None).len() == checkable))
+                g.sites.len() <= MAX_SITES
+                    && g.sites.iter().all(|site| site.contains('.') && valid_host(site.trim()))
+                    && g.expect.iter().all(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
+                    && (!g.enabled || g.sites.is_empty() || !g.expect.is_empty())
             })
-            && self.methods.iter().all(|m| !m.extract.key.is_empty()
-                && m.extract.regex.as_ref().is_none_or(|pattern| regex_lite::Regex::new(pattern).is_ok())
-                && build_request(m, "site.example").is_ok())
     }
 
-    pub fn method(&self, id: &str) -> Option<ProbeMethod> {
-        self.methods.iter().find(|m| m.id == id).cloned().or_else(|| preset_methods().into_iter().find(|m| m.id == id))
-    }
-
-    /// The gate's view: names and ranges per enabled group.
-    pub fn gate_groups(&self) -> Vec<serde_json::Value> {
-        self.groups
-            .iter()
-            .filter(|g| g.enabled)
-            .map(|g| if g.simple() {
-                serde_json::json!({ "id": g.id, "names": [], "cidrs": [], "apps": g.apps, "sites": g.sites })
-            } else {
-                serde_json::json!({ "id": g.id, "names": g.members.iter().map(|m| m.pattern.trim().to_ascii_lowercase()).collect::<Vec<_>>(), "cidrs": g.cidrs })
-            })
-            .collect()
-    }
-
-    fn has_direct_method(&self, group: &Group) -> bool {
-        if group.simple() {
-            return self.method(PRESET_TRACE).is_some_and(|m| m.is_direct());
+    /// The sites of each enabled rule, for the gate and the DNS forwarder.
+    pub fn site_groups(&self) -> Vec<SiteGroup> {
+        if !self.enabled {
+            return Vec::new();
         }
-        group.members.iter().filter_map(|m| self.method(m.method.as_deref()?)).any(|m| m.is_direct())
+        self.groups.iter().filter(|g| g.enabled && !g.sites.is_empty())
+            .map(|g| SiteGroup { id: g.id, sites: g.sites.clone() }).collect()
+    }
+
+    pub fn protected_sites(&self) -> ProtectedSites {
+        ProtectedSites::new(&self.site_groups())
     }
 
     pub fn group(&self, id: u32) -> Option<&Group> {
         self.groups.iter().find(|g| g.id == id)
     }
-}
 
-pub fn pattern_matches(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => name.len() > suffix.len() && name.ends_with(&suffix) && name.as_bytes()[name.len() - suffix.len() - 1] == b'.',
-        None => pattern == name,
+    fn enabled_group(&self, id: u32) -> Option<&Group> {
+        self.group(id).filter(|g| g.enabled && self.active())
     }
 }
 
@@ -343,7 +146,7 @@ pub fn pattern_matches(pattern: &str, name: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct ProbeRequest {
     pub host: String,
-    /// Numeric destination of a triggering same-site flow. TLS and HTTP keep the original site name.
+    /// The checked connection's destination; TLS and HTTP keep the site name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_ip: Option<IpAddr>,
     pub port: u16,
@@ -351,66 +154,41 @@ pub struct ProbeRequest {
     pub request: String,
     /// ALPN list: `http/1.1` plus the gate's marker.
     pub alpn: Vec<String>,
-    /// Tunnel interface to bind to (empty: let routing decide).
+    /// Tunnel interface to bind to.
     pub interface: String,
     pub timeout_ms: u64,
 }
 
-/// Raw response bytes, or None (connect/TLS/timeout failure).
+/// Raw response bytes, or None (connect/TLS/timeout failure). The second
+/// argument receives the address actually connected to.
 pub type ProbeHook = Arc<dyn Fn(&ProbeRequest, &mut Option<IpAddr>) -> Option<Vec<u8>> + Send + Sync>;
 
+/// What one probe saw for one site at one server.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Observation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<String>,
+    pub host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_address: Option<IpAddr>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_reason: Option<String>,
+    pub country: Option<String>,
+    pub ip: Option<String>,
+    pub error: Option<String>,
+    /// Set on a wrong-country observation the user may approve.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     #[serde(skip)]
     pub evidence_at_ms: Option<u64>,
-    pub host: String,
-    pub method: String,
-    pub country: Option<String>,
-    pub ip: Option<String>,
-    pub error: Option<String>,
-}
-
-pub fn build_request(method: &ProbeMethod, host: &str) -> Result<(String, u16, String), String> {
-    if !valid_host(host) { return Err("需要具体的网站名".into()); }
-    let url = method.url.replace("{host}", host);
-    let rest = url.strip_prefix("https://").ok_or("只接受 https 地址")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, suffix) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, suffix) = bracketed.split_once(']').ok_or("地址里缺网站名")?;
-        if host.parse::<std::net::Ipv6Addr>().is_err() { return Err("地址里缺网站名".into()); }
-        (host, suffix)
-    } else {
-        let (host, suffix) = authority.find(':').map_or((authority, ""), |i| authority.split_at(i));
-        if !valid_host(host) { return Err("地址里缺网站名".into()); }
-        (host, suffix)
-    };
-    let port = if suffix.is_empty() { 443 } else {
-        suffix.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0).ok_or("端口不对")?
-    };
-    if !path.bytes().all(|c| c.is_ascii_graphic() && c != b'#') {
-        return Err("请求路径格式不对".into());
-    }
-    let verb = if method.head { "HEAD" } else { "GET" };
-    let req = format!("{verb} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
-    Ok((host.into(), port, req))
 }
 
 pub fn valid_host(host: &str) -> bool {
     host.len() <= 253 && host.trim_end_matches('.').split('.').all(|label|
         !label.is_empty() && label.len() <= 63
             && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// The site's own trace page (§66.4): `GET https://{host}/cdn-cgi/trace`.
+pub fn trace_request(host: &str) -> String {
+    format!("GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\nConnection: close\r\n\r\n")
 }
 
 pub struct Response {
@@ -447,149 +225,50 @@ fn dechunk(b: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Country (and address when the answer has one) from a response.
-pub fn extract(method: &ProbeMethod, resp: &Response) -> Result<(String, Option<String>), String> {
-    if resp.status >= 400 && method.extract.kind != ExtractKind::Header {
+/// Country (`loc=`) and exit address (`ip=`) from a trace answer.
+pub fn read_trace(resp: &Response) -> Result<(String, Option<String>), String> {
+    if resp.status >= 400 {
         return Err(format!("网站回答 {}", resp.status));
     }
-    let x = &method.extract;
-    let (raw, ip) = match x.kind {
-        ExtractKind::Kv => {
-            let text = String::from_utf8_lossy(&resp.body);
-            let kv: HashMap<&str, &str> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
-            (kv.get(x.key.as_str()).map(|s| s.to_string()), kv.get("ip").map(|s| s.to_string()))
-        }
-        ExtractKind::Json => {
-            let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|_| "回答不是 JSON")?;
-            let mut cur = &v;
-            for part in x.key.split('.') {
-                cur = cur.get(part).unwrap_or(&serde_json::Value::Null);
-            }
-            let ip = v.get("ip").and_then(|i| i.as_str()).map(str::to_string);
-            (cur.as_str().map(str::to_string), ip)
-        }
-        ExtractKind::Header => {
-            let mut found = None;
-            for name in x.key.split(',').map(|n| n.trim().to_ascii_lowercase()) {
-                if let Some((_, v)) = resp.headers.iter().find(|(k, _)| *k == name) {
-                    found = if x.regex.is_some() { Some(v.clone()) } else { pop_code(&name, v) };
-                    if found.is_some() {
-                        break;
-                    }
-                }
-            }
-            (found, None)
-        }
-    };
-    let mut code = raw.ok_or("回答里没有国家信息")?;
-    if let Some(re) = &x.regex {
-        let re = regex_lite::Regex::new(re).map_err(|_| "正则写错了")?;
-        code = re.captures(&code).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).ok_or("正则没匹配上")?;
+    let text = String::from_utf8_lossy(&resp.body);
+    let value = |key: &str| text.lines().find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == key).map(|(_, v)| v.trim().to_owned()));
+    let code = value("loc").ok_or("回答里没有国家信息")?.to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(format!("不认识的国家代码 {code}"));
     }
-    let code = code.trim().to_ascii_uppercase();
-    let country = match code.len() {
-        2 if code.chars().all(|c| c.is_ascii_alphabetic()) => code,
-        3 => airports::country(&code).map(str::to_string).ok_or_else(|| format!("不认识的节点代码 {code}"))?,
-        _ => return Err(format!("不认识的国家代码 {code}")),
-    };
-    let ip = ip.filter(|s| s.parse::<IpAddr>().is_ok());
-    Ok((country, ip))
+    Ok((code, value("ip").filter(|s| s.parse::<IpAddr>().is_ok())))
 }
 
-/// The CDN node's airport code in the usual headers (§66.4).
-fn pop_code(name: &str, v: &str) -> Option<String> {
-    let code = match name {
-        "cf-ray" => v.rsplit('-').next()?.to_string(),
-        "x-amz-cf-pop" => v.get(..3)?.to_string(),
-        "x-served-by" => v.rsplit(',').next()?.trim().rsplit('-').next()?.to_string(),
-        _ => v.to_string(),
-    };
-    (code.len() == 3 && code.chars().all(|c| c.is_ascii_alphabetic())).then(|| code.to_ascii_uppercase())
-}
-
-fn probe_once(hook: &ProbeHook, method: &ProbeMethod, host: &str, alpn: &str, interface: &str,
-              connect_ip: Option<IpAddr>, evidence: &str, timeout_ms: u64) -> (Observation, bool) {
-    let mut obs = Observation { host: host.into(), method: method.id.clone(), evidence: Some(evidence.into()),
-        peer_address: connect_ip, ..Default::default() };
-    let (h, port, request) = match build_request(method, host) {
-        Ok(x) => x,
-        Err(e) => {
-            obs.error = Some(e);
-            return (obs, false);
-        }
-    };
-    let mut list = vec!["http/1.1".to_string()];
-    if !alpn.is_empty() {
-        list.push(alpn.into());
+/// Probe `host` at the checked server `ip` through the tunnel.
+fn probe(hook: &ProbeHook, host: &str, ip: IpAddr, marker: &str, interface: &str) -> Observation {
+    let mut obs = Observation { host: host.into(), peer_address: Some(ip), ..Default::default() };
+    let mut alpn = vec!["http/1.1".to_string()];
+    if !marker.is_empty() {
+        alpn.push(marker.into());
     }
-    let req = ProbeRequest { host: h, connect_ip, port, request, alpn: list, interface: interface.into(), timeout_ms };
+    let req = ProbeRequest {
+        host: host.into(), connect_ip: Some(ip), port: 443, request: trace_request(host), alpn,
+        interface: interface.into(), timeout_ms: PROBE_TIMEOUT_MS,
+    };
     let mut peer = None;
-    let started_at = crate::egress_gate::evidence_clock_ms();
+    let started_at = evidence_clock_ms();
     let raw = hook(&req, &mut peer);
-    if connect_ip.is_some() && peer.is_some() && peer != connect_ip {
+    if peer.is_some_and(|peer| peer != ip) {
         obs.error = Some("探测对端与指定地址不符".into());
-        return (obs, false);
+        return obs;
     }
-    obs.peer_address = connect_ip.or(peer);
-    let response = raw.as_deref().and_then(parse_response);
-    let received = response.is_some();
-    match response {
+    match raw.as_deref().and_then(parse_response) {
         None => obs.error = Some("连不上或没有回答".into()),
-        Some(resp) => match extract(method, &resp) {
-            Ok((c, ip)) => {
+        Some(resp) => match read_trace(&resp) {
+            Ok((country, exit)) => {
                 obs.evidence_at_ms = started_at;
-                obs.country = Some(c);
-                obs.ip = ip;
+                obs.country = Some(country);
+                obs.ip = exit;
             }
             Err(e) => obs.error = Some(e),
         },
     }
-    (obs, received)
-}
-
-// --------------------------------------------------------------- decisions
-
-/// Which (host, method) pairs a check for `group` triggered by `host` probes
-/// (§66.6): every checkable member, using the actual name for matching wildcards.
-pub fn probe_targets(cfg: &EgressConfig, group: &Group, host: Option<&str>) -> Vec<(String, ProbeMethod)> {
-    let concrete = |m: &Member| -> Option<String> {
-        if !m.pattern.starts_with("*.") {
-            valid_host(m.pattern.trim()).then(|| m.pattern.trim().to_ascii_lowercase())
-        } else {
-            m.probe_host.clone().filter(|h| valid_host(h) && pattern_matches(&m.pattern, h))
-        }
-    };
-    group
-        .members
-        .iter()
-        .filter_map(|m| {
-            let target = host.filter(|h| pattern_matches(&m.pattern, h))
-                .map(str::to_ascii_lowercase).or_else(|| concrete(m))?;
-            Some((target, cfg.method(m.method.as_deref()?)?))
-        })
-        .collect()
-}
-
-pub fn probe_methods(cfg: &EgressConfig, host: &str, hook: &ProbeHook, marker: &str, iface: &str) -> Vec<Observation> {
-    if !valid_host(host) || iface.is_empty() { return Vec::new(); }
-    std::thread::scope(|scope| {
-        let mut methods = preset_methods();
-        for preset in &mut methods {
-            if let Some(custom) = cfg.methods.iter().find(|method| method.id == preset.id) {
-                *preset = custom.clone();
-            }
-        }
-        methods.extend(cfg.methods.iter().filter(|method| method.id != PRESET_TRACE && method.id != PRESET_CDN).cloned());
-        methods.into_iter().filter_map(|method| std::thread::Builder::new().spawn_scoped(scope, move || probe_once(hook, &method, host, marker, iface, None,
-                if method.is_direct() { "member" } else { "third-party" }, 2400).0).ok())
-            .collect::<Vec<_>>().into_iter().filter_map(|worker| worker.join().ok()).collect()
-    })
-}
-
-pub fn decide(group: &Group, obs: &[Observation]) -> bool {
-    !obs.is_empty()
-        && !group.expect.is_empty()
-        && obs.iter().all(|o| o.failure_reason.is_none() && o.error.is_none() && o.country.as_deref().is_some_and(|c| group.expect.iter().any(|e| e.eq_ignore_ascii_case(c))))
+    obs
 }
 
 // ------------------------------------------------------------ status/records
@@ -597,22 +276,20 @@ pub fn decide(group: &Group, obs: &[Observation]) -> bool {
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupStatus {
-    pub level: String,
+    pub id: u32,
+    pub name: String,
+    /// "ok", "blocked" (some servers exit from a wrong country), "unknown".
+    pub state: String,
+    pub last_check: f64,
+    /// The wrong-exit servers while blocked, else the latest observation.
+    pub observed: Vec<Observation>,
     pub blocked_count: u64,
-    /// A protected app's connections let through because no exit could be
-    /// read for them (best effort, §66.24).
+    /// Connections let through because their exit could not be read
+    /// (best effort, §66.25).
     pub unverified_count: u64,
     pub last_blocked_host: Option<String>,
     pub last_blocked_country: Option<String>,
     pub sites: Vec<SiteStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    pub id: u32,
-    pub name: String,
-    /// "ok", "blocked", "unknown".
-    pub state: String,
-    pub last_check: f64,
-    pub observed: Vec<Observation>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -627,16 +304,11 @@ pub struct BlockRecord {
     pub expected: Vec<String>,
 }
 
-pub const MAX_RECORDS: usize = 10;
-
 #[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    pub unknown_web_count: u64,
-    pub unknown_web: Vec<UnknownWeb>,
     pub running: bool,
     pub checking: Vec<u32>,
-    pub interface: String,
     pub groups: Vec<GroupStatus>,
     pub records: VecDeque<BlockRecord>,
 }
@@ -646,26 +318,43 @@ fn now() -> f64 {
 }
 
 impl Status {
-    /// Record a check's outcome; a block opens a record once, a pass closes it.
-    pub fn apply(&mut self, group: &Group, host: Option<&str>, obs: Vec<Observation>, ok: bool, at: f64) {
-        let st = match self.groups.iter_mut().find(|g| g.id == group.id) {
-            Some(s) => s,
+    fn group(&mut self, group: &Group) -> &mut GroupStatus {
+        let index = match self.groups.iter().position(|g| g.id == group.id) {
+            Some(index) => index,
             None => {
-                self.groups.push(GroupStatus { id: group.id, name: group.name.clone(), ..Default::default() });
-                self.groups.last_mut().expect("pushed")
+                self.groups.push(GroupStatus { id: group.id, state: "unknown".into(), ..Default::default() });
+                self.groups.len() - 1
             }
         };
-        st.name = group.name.clone();
+        let st = &mut self.groups[index];
+        st.name.clone_from(&group.name);
+        st
+    }
+
+    /// A rule's state after a check: blocked while any server is known to
+    /// exit wrong. A block opens a record once and keeps it listing the
+    /// current wrong-exit servers (what an approval refers to); recovery
+    /// closes it.
+    fn apply(&mut self, group: &Group, latest: &Observation, failing: Vec<Observation>, at: f64) {
+        let st = self.group(group);
         st.last_check = at;
-        st.observed = obs.clone();
+        st.observe_site(group, latest, at);
         let was_blocked = st.state == "blocked";
-        st.state = if ok { "ok" } else { "blocked" }.into();
-        if ok {
+        let blocked = !failing.is_empty();
+        st.state = if blocked { "blocked" } else { "ok" }.into();
+        st.observed = if blocked { failing.clone() } else { vec![latest.clone()] };
+        if !blocked {
             for r in self.records.iter_mut().filter(|r| r.group == group.id && r.ended.is_none()) {
                 r.ended = Some(at);
             }
-        } else if !was_blocked {
-            self.records.push_front(BlockRecord { started: at, ended: None, group: group.id, name: group.name.clone(), host: host.map(str::to_string), observed: obs, expected: group.expect.clone() });
+        } else if let Some(open) = self.records.iter_mut().find(|r| r.group == group.id && r.ended.is_none()).filter(|_| was_blocked) {
+            open.observed = failing;
+        } else {
+            let host = failing.first().map(|o| o.host.clone());
+            self.records.push_front(BlockRecord {
+                started: at, ended: None, group: group.id, name: group.name.clone(), host,
+                observed: failing, expected: group.expect.clone(),
+            });
             self.records.truncate(MAX_RECORDS);
         }
     }
@@ -680,57 +369,40 @@ struct Shared {
     stop: AtomicBool,
 }
 
-struct ControlState {
-    config: EgressConfig,
-    status: Status,
-    peer: Option<UnixStream>,
-    peer_id: u64,
-    epoch: u64,
-    // Retired workers count towards the bound until they exit.
-    checks: HashMap<(u64, u64), ActiveCheck>,
-    failures: HashMap<u32, Failures>,
-    peer_counts: HashMap<u32, Denied>,
-    unknown_counts: HashMap<std::net::SocketAddr,u64>,
-    internal_cidrs: Vec<String>,
-    source_policies: HashMap<u32, crate::egress_source::SourcePolicy>,
-    warm: warm::WarmProbes,
-    dns_evidence: dns_evidence::EvidenceScope,
-    on_peer_loss: Option<Box<dyn Fn() + Send>>,
+#[derive(Clone, PartialEq)]
+struct Target {
+    host: String,
+    ip: IpAddr,
+}
+
+struct Failed {
+    target: Target,
+    observation: Observation,
 }
 
 struct ActiveCheck {
     group: u32,
     epoch: u64,
-    generation: u64,
-    trigger: Option<String>,
-    targets: Vec<Target>,
 }
 
-fn source_policies(cfg: &EgressConfig) -> HashMap<u32, crate::egress_source::SourcePolicy> {
-    cfg.groups.iter().filter(|g| g.enabled && g.exit_range_check).filter_map(|g|
-        crate::egress_source::SourcePolicy::from_config(true, &g.exit_ranges).ok().map(|p| (g.id,p))).collect()
+struct ControlState {
+    config: EgressConfig,
+    status: Status,
+    interface: String,
+    peer: Option<UnixStream>,
+    peer_id: u64,
+    epoch: u64,
+    /// Keyed by (gate peer, request id); explicit rechecks use peer 0.
+    checks: HashMap<(u64, u64), ActiveCheck>,
+    failures: HashMap<u32, Vec<Failed>>,
+    peer_counts: HashMap<u32, Denied>,
+    on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
-fn failure_reason(group: &Group, policy: Option<&crate::egress_source::SourcePolicy>, obs: &Observation) -> Option<&'static str> {
-    use crate::egress_source::SourceEvidence;
-    if obs.error.is_some() || obs.country.is_none() { return Some("unconfirmed"); }
-    if !group.expect.iter().any(|c| obs.country.as_ref().is_some_and(|country| c.eq_ignore_ascii_case(country))) { return Some("country-mismatch"); }
-    if !group.exit_range_check { return None; }
-    // A proxy observation still connected to the flow's own destination, so the exit IP
-    // it reports is the exit used for that destination; only the site identity is borrowed.
-    let evidence = if matches!(obs.evidence.as_deref(), Some("direct" | "member" | "proxy")) && obs.peer_address.is_some() {
-        obs.ip.as_deref().and_then(|v| v.parse().ok()).map_or(SourceEvidence::Unverified, SourceEvidence::Direct)
-    } else { SourceEvidence::Unverified };
-    match policy { Some(p) => p.evaluate(evidence).failure_reason(), None => Some("exit-ip-unavailable") }
-}
-
-pub(crate) fn approvable_source(prefix: &str, ip: IpAddr) -> bool {
-    use crate::egress_source::{SourceEvidence, SourceSuggestion};
-    let Some(choice) = SourceSuggestion::from_evidence(SourceEvidence::Direct(ip), true) else { return false };
-    let exact = format!("{}/{}", choice.address, if choice.address.is_ipv4() { 32 } else { 128 });
-    let explicit_v6 = ip.is_ipv6() && ip.to_canonical().is_ipv6() && prefix.ends_with("/64")
-        && prefix.parse::<crate::egress_source::SourcePrefix>().is_ok_and(|p| p.to_string()==prefix && p.contains(ip));
-    prefix == exact || explicit_v6 || choice.suggested_prefix.is_some_and(|p| p.to_string() == prefix)
+fn approval_id() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    (unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0)
+        .then(|| format!("{:032x}", u128::from_be_bytes(bytes)))
 }
 
 impl ControlState {
@@ -742,78 +414,79 @@ impl ControlState {
         }
     }
 
-    fn record(&mut self, group: &Group, host: Option<&str>, generation: u64,
-              mut results: Vec<(Target, Observation)>) -> bool {
-        let policy = self.source_policies.get(&group.id);
-        for (_, obs) in &mut results {
-            obs.failure_reason = failure_reason(group, policy, obs).map(str::to_owned);
-        }
-        let failures = self.failures.entry(group.id).or_default();
-        for (_, obs) in &mut results {
-            if obs.evidence.as_deref()==Some("direct") && obs.peer_address.is_some()
-                && matches!(obs.failure_reason.as_deref(), Some("country-mismatch" | "exit-range-mismatch")) {
-                obs.approval_id = failures.approval_for(obs);
+    fn gate_config(&self, marker: &str) -> String {
+        serde_json::json!({ "probe_alpn": marker, "groups": self.config.site_groups() }).to_string()
+    }
+
+    /// Note one probe result. Returns the gate's verdict for it.
+    fn record(&mut self, group: &Group, target: Target, mut obs: Observation) -> &'static str {
+        let failed = self.failures.entry(group.id).or_default();
+        let previous = failed.iter().position(|f| f.target == target).map(|i| failed.remove(i));
+        let verdict = match obs.country.as_deref() {
+            None => "unverified",
+            Some(country) if group.allows(country) => "allow",
+            Some(_) => {
+                obs.approval_id = previous.as_ref()
+                    .filter(|p| p.observation.country == obs.country && p.observation.ip == obs.ip)
+                    .and_then(|p| p.observation.approval_id.clone())
+                    .or_else(approval_id);
+                if failed.len() >= MAX_FAILED_TARGETS {
+                    failed.remove(0);
+                }
+                failed.push(Failed { target, observation: obs.clone() });
+                "block"
+            }
+        };
+        let failing: Vec<_> = failed.iter().map(|f| f.observation.clone()).collect();
+        if verdict == "unverified" {
+            self.note_unverified(group);
+            if previous.is_none() {
+                return verdict;
             }
         }
-        let was_overflowed = failures.overflowed();
-        let ok = failures.evaluate(group, generation, &results);
-        let unresolved = failures.observed_failures();
-        let blocked = !unresolved.is_empty() || !ok;
-        let reason = if failures.overflowed() { Some("failed-target-overflow") }
-            else if !self.config.has_direct_method(group) { Some("no-direct-method") } else { None };
-        let mut observations: Vec<_> = results.into_iter().map(|(_, obs)| obs).collect();
-        if let Some(problem) = failures.diagnostic() { observations.push(problem); }
-        if !was_overflowed && failures.overflowed() {
-            if let Some(record) = self.status.records.iter_mut().find(|r| r.group == group.id && r.ended.is_none()) {
-                if let Some(problem) = failures.diagnostic() { record.observed.push(problem); }
+        self.status.apply(group, &obs, failing, now());
+        verdict
+    }
+
+    /// Settle each rule's state with its remaining failures (after an edit
+    /// or an approval removed some).
+    fn settle(&mut self) {
+        let at = now();
+        for st in &mut self.status.groups {
+            let failing = self.failures.get(&st.id).map_or(0, Vec::len);
+            if st.state == "blocked" && failing == 0 {
+                st.state = "ok".into();
+                st.observed.clear();
+                for r in self.status.records.iter_mut().filter(|r| r.group == st.id && r.ended.is_none()) {
+                    r.ended = Some(at);
+                }
+            } else if failing > 0 {
+                st.observed = self.failures[&st.id].iter().map(|f| f.observation.clone()).collect();
+                for r in self.status.records.iter_mut().filter(|r| r.group == st.id && r.ended.is_none()) {
+                    r.observed.clone_from(&st.observed);
+                }
             }
-            self.send(&serde_json::json!({"blockGroup":group.id}).to_string());
         }
-        self.status.apply(group, host, observations, !blocked, now());
-        if let Some(st) = self.status.groups.iter_mut().find(|s| s.id == group.id) {
-            st.reason = reason.map(str::to_owned);
-            let last = st.last_check;
-            let latest = std::mem::take(&mut st.observed);
-            st.observe_sites(group, &latest, last);
-            st.observe_sites(group, &unresolved, last);
-            st.observed = if unresolved.is_empty() { latest } else { unresolved };
-            st.level = st.level().into();
-        }
-        ok
     }
 
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
-        self.warm.invalidate();
-        self.invalidate_delivered_dns();
-        if !cfg.active() || !cfg.block_unidentified_web { self.status.unknown_web.clear(); }
         self.epoch = self.epoch.wrapping_add(1);
-        self.status.groups.retain(|group| cfg.active() && cfg.group(group.id).is_some_and(|g| g.enabled));
-        self.source_policies = source_policies(&cfg);
-        let previous = std::mem::replace(&mut self.config, cfg);
-        let ControlState { failures, config, .. } = self;
-        failures.retain(|id, failed| {
-            let Some(group) = config.group(*id).filter(|g| config.active() && g.enabled) else { return false };
-            failed.reset_if_edited(&previous, config, group);
-            failed.update(config, group);
-            failed.invalidate_dns();
-            true
+        self.status.groups.retain(|st| cfg.enabled_group(st.id).is_some());
+        self.failures.retain(|id, failed| {
+            let Some(group) = cfg.enabled_group(*id) else { return false };
+            failed.retain(|f| group.covers(&f.target.host)
+                && !f.observation.country.as_deref().is_some_and(|c| group.allows(c)));
+            !failed.is_empty()
         });
-        self.send(&self.gate_config(marker));
+        self.config = cfg;
+        self.settle();
+        let frame = self.gate_config(marker);
+        self.send(&frame);
         self.send("{\"invalidate\":true}");
     }
 
     fn retire_checks(&mut self) {
-        self.warm.invalidate();
-        self.invalidate_delivered_dns();
-        let checks: Vec<_> = self.checks.values().filter(|c| c.epoch == self.epoch).map(|c|
-            (c.group, c.trigger.clone(), c.generation, recheck::unconfirmed(&c.targets, "出口检查被中断"))).collect();
-        for (id, host, generation, observed) in checks {
-            if let Some(group) = self.config.group(id).cloned() {
-                self.record(&group, host.as_deref(), generation, observed);
-            }
-        }
         self.epoch = self.epoch.wrapping_add(1);
-        for failed in self.failures.values_mut() { failed.invalidate_dns(); }
     }
 
     fn disconnect(&mut self) {
@@ -821,16 +494,16 @@ impl ControlState {
             let _ = peer.shutdown(std::net::Shutdown::Both);
         }
         self.peer_counts.clear();
-        self.unknown_counts.clear();
-        self.internal_cidrs.clear();
-        self.status.interface.clear();
+        self.interface.clear();
         self.peer_id = self.peer_id.wrapping_add(1);
         self.retire_checks();
     }
 
     fn peer_lost(&mut self) {
         self.disconnect();
-        if let Some(notify) = &self.on_peer_loss { notify(); }
+        if let Some(notify) = &self.on_peer_loss {
+            notify();
+        }
     }
 }
 
@@ -848,8 +521,9 @@ impl Controller {
         let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
-                dns_evidence: Default::default(), warm: Default::default(), source_policies: source_policies(&cfg), config: cfg, status: Status::default(), peer: None, peer_id: 0,
-                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(), internal_cidrs:Vec::new(),unknown_counts:HashMap::new(), on_peer_loss: None,
+                config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
+                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
+                on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
         });
@@ -866,12 +540,6 @@ impl Controller {
         self.shared.marker.clone()
     }
 
-    pub(crate) fn setup_probe_context(&self) -> Option<(String, u64)> {
-        let state = self.shared.state.lock().expect("controller");
-        state.peer.as_ref()?;
-        Some((self.marker(), state.epoch))
-    }
-
     /// Retire the previous script's reader before starting another VPN process.
     pub(crate) fn watch_next_launch(&self, notify: Box<dyn Fn() + Send>) {
         let mut state = self.shared.state.lock().expect("controller");
@@ -883,100 +551,69 @@ impl Controller {
         self.shared.state.lock().expect("controller").peer.is_some()
     }
 
-    pub(crate) fn wrong_dns_addresses(&self, group: u32, name: &str, candidates: &[std::net::Ipv4Addr],
-                                      interface: &str) -> Vec<std::net::Ipv4Addr> {
-        let Ok(state) = self.shared.state.try_lock() else { return Vec::new() };
-        if state.peer.is_none() || state.status.interface != interface || !state.config.active() { return Vec::new(); }
-        let Some(g) = state.config.group(group).filter(|g| g.enabled) else { return Vec::new() };
-        state.failures.get(&group).map_or_else(Vec::new, |f| f.wrong_ipv4(g, name, candidates))
-    }
-
     pub fn status_json(&self) -> String {
         let state = self.shared.state.lock().expect("controller");
         let mut status = state.status.clone();
         status.running = state.peer.is_some();
-        for group in state.config.groups.iter().filter(|g| g.enabled && state.config.active() && !state.config.has_direct_method(g)) {
-            if let Some(st) = status.groups.iter_mut().find(|s| s.id == group.id) {
-                st.state = "blocked".into();
-                st.reason = Some("no-direct-method".into());
-            } else {
-                status.groups.push(GroupStatus { id: group.id, name: group.name.clone(), state: "blocked".into(),
-                    reason: Some("no-direct-method".into()), ..Default::default() });
-            }
-        }
         status.checking = state.checks.values().filter(|c| c.epoch == state.epoch).map(|c| c.group).collect();
-        for st in &mut status.groups { st.level = st.level().into(); }
         status.checking.sort_unstable();
         status.checking.dedup();
         serde_json::to_string(&status).unwrap_or_else(|_| "{}".into())
     }
 
-    /// Send the new rules. A probe started before this configuration can no longer release packets.
+    /// Send the new rules. A probe started before this configuration can
+    /// no longer release packets.
     pub fn update(&self, cfg: EgressConfig) {
         let mut state = self.shared.state.lock().expect("controller");
         state.replace_config(cfg, &self.shared.marker);
     }
 
+    /// Probe a rule's wrong-exit servers again ("重新检查").
     pub fn recheck_job(&self, id: u32) -> Option<impl FnOnce() -> bool + Send + 'static> {
         let mut state = self.shared.state.lock().ok()?;
-        let group = state.config.group(id).filter(|g| g.enabled && state.config.active())?.clone();
-        let failed = state.failures.get(&id)?;
-        let targets = failed.pending_targets();
-        let generation = failed.generation;
+        state.config.enabled_group(id)?;
+        let targets: Vec<Target> = state.failures.get(&id)?.iter().map(|f| f.target.clone()).collect();
         let key = (0, u64::from(id)); // gate peer ids start at one
-        if failed.overflowed() || targets.is_empty() || state.status.interface.is_empty() || state.peer.is_none()
-            || state.checks.contains_key(&key) || state.checks.len() >= MAX_GROUPS
-            || targets.len() + state.checks.values().map(|c| c.targets.len()).sum::<usize>() > MAX_GROUPS * MAX_PROBES_PER_GROUP { return None; }
+        if targets.is_empty() || state.interface.is_empty() || state.peer.is_none()
+            || state.checks.contains_key(&key) || state.checks.len() >= MAX_CHECKS { return None; }
         let epoch = state.epoch;
-        let iface = state.status.interface.clone();
-        state.checks.insert(key, ActiveCheck { group: id, epoch, generation, trigger: None, targets: targets.clone() });
+        let interface = state.interface.clone();
+        state.checks.insert(key, ActiveCheck { group: id, epoch });
         let shared = self.shared.clone();
-        Some(move || run_check(&shared, group, None, targets, iface, key, None))
+        Some(move || run_check(&shared, id, targets, &interface, key))
     }
 
+    /// Add `country` to a rule after the user approved one of its current
+    /// wrong-exit observations. Returns the new configuration.
     pub fn allow_country(&self, expected: &EgressConfig, group_id: u32, started: f64, country: &str,
                          evidence: &Observation) -> Option<EgressConfig> {
-        self.approve(expected, group_id, started, country, false, evidence)
-    }
-
-    pub(crate) fn approve(&self, expected: &EgressConfig, group_id: u32, started: f64, value: &str,
-                          range: bool, evidence: &Observation) -> Option<EgressConfig> {
-        if !started.is_finite() || evidence.evidence.as_deref()!=Some("direct") || evidence.peer_address.is_none()
-            || evidence.error.is_some() { return None; }
-        let reason = if range { "exit-range-mismatch" } else { "country-mismatch" };
-        let matches = |o: &Observation| o.evidence == evidence.evidence && o.peer_address == evidence.peer_address
-            && o.method == evidence.method && o.host.eq_ignore_ascii_case(&evidence.host)
-            && o.country == evidence.country && o.ip == evidence.ip && o.error.is_none()
-            && o.approval_id.is_some() && o.approval_id == evidence.approval_id;
+        if !started.is_finite() || evidence.peer_address.is_none() || evidence.error.is_some()
+            || evidence.approval_id.is_none() || evidence.country.as_deref() != Some(country)
+            || country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) { return None; }
         let mut state = self.shared.state.lock().ok()?;
         state.status.records.iter().find(|r| r.group == group_id && r.started == started && r.ended.is_none())?;
-        let failed = state.failures.get(&group_id)?;
-        if &state.config != expected || state.peer.is_none() || state.status.interface.is_empty() || failed.overflowed()
-            || !failed.observed_failures().iter().any(|o| matches(o) && o.failure_reason.as_deref()==Some(reason)) { return None; }
-        let mut config = state.config.clone();
-        let group = config.groups.iter_mut().find(|g| g.enabled && g.id==group_id)?;
-        if range {
-            let address = evidence.ip.as_deref()?.parse().ok()?;
-            if !group.exit_range_check || group.exit_ranges.len() >= 256 || !approvable_source(value,address)
-                || !group.expect.iter().any(|c| Some(c) == evidence.country.as_ref()) { return None; }
-            if !group.exit_ranges.iter().any(|r|r==value) { group.exit_ranges.push(value.to_owned()); }
-        } else {
-            if value.len()!=2 || !value.bytes().all(|b|b.is_ascii_uppercase()) || evidence.country.as_deref()!=Some(value)
-                || group.expect.iter().any(|v|v.eq_ignore_ascii_case(value)) { return None; }
-            group.expect.push(value.to_owned());
+        let current = state.failures.get(&group_id)?.iter().any(|f| {
+            let o = &f.observation;
+            o.host.eq_ignore_ascii_case(&evidence.host) && o.peer_address == evidence.peer_address
+                && o.country == evidence.country && o.ip == evidence.ip && o.approval_id == evidence.approval_id
+        });
+        if &state.config != expected || state.peer.is_none() || state.interface.is_empty() || !current {
+            return None;
         }
+        let mut config = state.config.clone();
+        let group = config.groups.iter_mut().find(|g| g.enabled && g.id == group_id)?;
+        if group.allows(country) {
+            return None;
+        }
+        group.expect.push(country.to_owned());
         state.replace_config(config.clone(), &self.shared.marker);
         Some(config)
     }
 
+    /// Forget every verdict (network change, wake: §66.6).
     pub fn invalidate(&self) {
         let mut state = self.shared.state.lock().expect("controller");
         state.retire_checks();
-        if !state.internal_cidrs.is_empty() {
-            state.internal_cidrs.clear();
-            let frame = state.gate_config(&self.shared.marker);
-            state.send(&frame);
-        }
         state.send("{\"invalidate\":true}");
     }
 }
@@ -1044,35 +681,31 @@ fn accept_loop(listener: UnixListener, wake: OwnedFd, shared: Arc<Shared>) {
 
 #[derive(Deserialize)]
 struct GateMsg {
-    #[serde(rename="unknownWeb")]
-    unknown_web: Option<Vec<UnknownCount>>,
-    warm: Option<warm::WarmMsg>,
     check: Option<CheckMsg>,
-    #[serde(rename = "timedOut")]
-    timed_out: Option<CheckMsg>,
     denied: Option<Vec<Denied>>,
     up: Option<UpMsg>,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckMsg {
-    #[serde(default)]
-    host_confirmed: bool,
     group: u32,
-    host: Option<String>,
+    host: String,
     ip: IpAddr,
-    port: std::num::NonZeroU16,
     request_id: std::num::NonZeroU64,
 }
+
 #[derive(Deserialize)]
 struct UpMsg {
     ifname: String,
 }
 
-fn verdict(group: u32, request_id: u64, ok: bool, direct: bool, at: Option<u64>) -> String {
-    let mut value = serde_json::json!({"group":group, "requestId":request_id, "ok":ok, "direct":ok && direct});
-    if ok { value["evidenceAtMs"] = serde_json::json!(at); }
-    serde_json::json!({"verdict":value}).to_string()
+fn verdict(group: u32, request_id: u64, result: &str, at: Option<u64>) -> String {
+    let mut value = serde_json::json!({"group": group, "requestId": request_id, "result": result});
+    if result == "allow" {
+        value["evidenceAtMs"] = serde_json::json!(at.unwrap_or(0));
+    }
+    serde_json::json!({ "verdict": value }).to_string()
 }
 
 fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
@@ -1082,138 +715,72 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         let mut state = shared.state.lock().expect("controller");
         if state.peer_id != peer_id { return; }
         if let Some(up) = msg.up {
-            if state.status.interface != up.ifname {
-                if !state.status.interface.is_empty() {
+            if state.interface != up.ifname {
+                if !state.interface.is_empty() {
                     state.retire_checks();
                     state.send("{\"invalidate\":true}");
-                } else {
-                    state.invalidate_delivered_dns();
                 }
-                state.status.interface = up.ifname;
+                state.interface = up.ifname;
             }
         }
-        if let Some(hint) = msg.warm {
-            let scope = warm::Scope { peer_id, epoch: state.epoch, interface: state.status.interface.clone() };
-            let failed = state.failures.get(&hint.group);
-            let generation = failed.map_or(0,|f| f.generation);
-            if !failed.is_some_and(Failures::overflowed) {
-                let ControlState { config, warm, .. } = &mut *state;
-                warm.start(config, scope, generation, hint, &shared.hook, &shared.marker);
-            }
+        if let Some(reports) = msg.denied {
+            state.denied_counts(reports);
         }
-        if let Some(reports) = msg.unknown_web {state.note_unknown(reports);}
-        if let Some(reports) = msg.denied { state.denied_counts(reports); }
-        let timed_out = msg.timed_out.is_some();
-        if let Some(check) = msg.timed_out.or(msg.check) {
-            let id = check.request_id.get();
-            let key = (peer_id, id);
-            if !timed_out && state.checks.contains_key(&key) { continue; }
-            let Some(group) = state.config.group(check.group).filter(|g| g.enabled && state.config.active()).cloned() else {
-                state.send(&verdict(check.group, id, false, false, None));
-                continue;
-            };
-            let generation = state.failures.get(&group.id).map_or(0, |f| f.generation);
-            if !state.config.has_direct_method(&group) || state.failures.get(&group.id).is_some_and(Failures::overflowed) {
-                state.send(&serde_json::json!({"blockGroup":group.id}).to_string());
-                if !timed_out { state.send(&verdict(group.id, id, false, false, None)); }
-                continue;
-            }
-            let targets = state.failures.get(&group.id).unwrap_or(&Failures::default()).plan(&state.config, &group, &check);
-            if group.simple() && targets.is_empty() {
-                // Best effort (§66.24): a protected app's connection that shows
-                // no name cannot be probed; let it through and count it.
-                state.note_unverified(group.id);
-                if !timed_out { state.send(&verdict(group.id, id, true, false, None)); }
-                continue;
-            }
-            let workers: usize = state.checks.values().map(|c| c.targets.len()).sum();
-            if timed_out || state.status.interface.is_empty() || state.checks.len() >= MAX_GROUPS
-                || workers + targets.len() > MAX_GROUPS * MAX_PROBES_PER_GROUP
-            {
-                let reason = if timed_out { "出口检查超时" } else { "出口检查暂不可用" };
-                state.record(&group, check.host.as_deref(), generation, recheck::unconfirmed(&targets, reason));
-                if !timed_out { state.send(&verdict(group.id, id, false, false, None)); }
-                continue;
-            }
-            let epoch = state.epoch;
-            let iface = state.status.interface.clone();
-            let group_id = group.id;
-            let scope = warm::Scope { peer_id, epoch, interface: iface.clone() };
-            let warm = state.warm.for_check(&scope,generation,&check,check.host_confirmed,&targets);
-            state.checks.insert(key, ActiveCheck { group: group_id, epoch, generation,
-                trigger: check.host.clone(), targets: targets.clone() });
-            let worker = shared.clone();
-            if std::thread::Builder::new().name("egress-check".into()).spawn(move ||
-                run_check(&worker, group, check.host, targets, iface, key, warm)).is_err()
-            {
-                let pending = state.checks.remove(&key).expect("inserted");
-                let group = state.config.group(group_id).expect("existing group").clone();
-                state.record(&group, pending.trigger.as_deref(), generation,
-                             recheck::unconfirmed(&pending.targets, "无法启动出口检查"));
-                state.send(&verdict(group_id, id, false, false, None));
-            }
+        let Some(check) = msg.check else { continue };
+        let id = check.request_id.get();
+        let key = (peer_id, id);
+        if state.checks.contains_key(&key) { continue; }
+        let host = check.host.trim_end_matches('.').to_ascii_lowercase();
+        let usable = state.config.enabled_group(check.group).is_some_and(|g| g.covers(&host))
+            && valid_host(&host) && !state.interface.is_empty() && state.checks.len() < MAX_CHECKS;
+        if !usable {
+            state.send(&verdict(check.group, id, "block", None));
+            continue;
+        }
+        let epoch = state.epoch;
+        let interface = state.interface.clone();
+        state.checks.insert(key, ActiveCheck { group: check.group, epoch });
+        let worker = shared.clone();
+        let target = Target { host, ip: check.ip };
+        if std::thread::Builder::new().name("egress-check".into())
+            .spawn(move || run_check(&worker, check.group, vec![target], &interface, key)).is_err()
+        {
+            state.checks.remove(&key);
+            state.send(&verdict(check.group, id, "block", None));
         }
     }
     let mut state = shared.state.lock().expect("controller");
     if state.peer_id == peer_id { state.peer_lost(); }
 }
 
-fn run_check(shared: &Shared, group: Group, host: Option<String>, targets: Vec<Target>,
-             iface: String, key: (u64, u64), warm: Option<warm::Candidate>) -> bool {
-    if let (Some(candidate), [target]) = (warm, targets.as_slice()) {
-        if let Some(mut evidence) = candidate.wait() {
-            let mut state = shared.state.lock().expect("controller");
-            let scope = warm::Scope { peer_id:state.peer_id, epoch:state.epoch, interface:state.status.interface.clone() };
-            let generation = state.failures.get(&group.id).map_or(0,|f| f.generation);
-            if candidate.is_current(&scope,generation) && fresh_evidence(evidence.evidence_at_ms) {
-                evidence.observation.evidence_at_ms = Some(evidence.evidence_at_ms);
-                return finish_check(&mut state,&group,host.as_deref(),key,true,vec![(target.clone(),evidence.observation)]);
-            }
-            if !state.checks.get(&key).is_some_and(|c|c.epoch==state.epoch) {
-                state.checks.remove(&key);
-                return false;
-            }
-        }
-    }
-    let results = std::thread::scope(|scope| {
+fn run_check(shared: &Shared, group: u32, targets: Vec<Target>, interface: &str, key: (u64, u64)) -> bool {
+    let results: Vec<(Target, Observation)> = std::thread::scope(|scope| {
         let workers: Vec<_> = targets.iter().map(|target| {
-            let worker = std::thread::Builder::new().spawn_scoped(scope, || target.observe(&shared.hook, &shared.marker, &iface));
+            let worker = std::thread::Builder::new().spawn_scoped(scope, ||
+                probe(&shared.hook, &target.host, target.ip, &shared.marker, interface));
             (target, worker)
         }).collect();
         workers.into_iter().map(|(target, worker)| {
-            let obs = worker.ok().and_then(|w| w.join().ok()).unwrap_or_else(||
-                Observation { host: target.host.clone(), method: target.method.id.clone(),
-                    error: Some("出口检查未完成".into()), ..Default::default() });
+            let obs = worker.ok().and_then(|w| w.join().ok()).unwrap_or_else(|| Observation {
+                host: target.host.clone(), peer_address: Some(target.ip),
+                error: Some("出口检查未完成".into()), ..Default::default()
+            });
             (target.clone(), obs)
         }).collect()
     });
     let mut state = shared.state.lock().expect("controller");
-    let direct = !targets.is_empty() && targets.iter().all(Target::direct_flow);
-    finish_check(&mut state,&group,host.as_deref(),key,direct,results)
-}
-
-fn fresh_evidence(at: u64) -> bool {
-    crate::egress_gate::evidence_clock_ms().and_then(|now|now.checked_sub(at)).is_some_and(|age| age < 1000)
-}
-
-fn finish_check(state: &mut ControlState, group: &Group, host: Option<&str>, key: (u64,u64),
-                direct: bool, mut results: Vec<(Target,Observation)>) -> bool {
     let Some(active) = state.checks.remove(&key) else { return false };
     if active.epoch != state.epoch || (key.0 != 0 && state.peer_id != key.0) { return false; }
-    let earliest = results.iter().filter_map(|(_,o)|o.evidence_at_ms).min();
-    for (_,o) in &mut results {
-        if o.country.is_some() && !o.evidence_at_ms.is_some_and(fresh_evidence) {
-            o.error=Some("出口观测已过期，需要重新核验".into());
-        }
+    let Some(rule) = state.config.enabled_group(group).cloned() else { return false };
+    let mut answer = "block";
+    let mut at = None;
+    for (target, obs) in results {
+        at = obs.evidence_at_ms;
+        answer = state.record(&rule, target, obs);
     }
-    if group.simple() && !results.iter().any(|(_, o)| o.country.is_some()) {
-        // Best effort (§66.24): no exit could be read for this destination.
-        state.note_unverified(group.id);
-        if key.0 != 0 { state.send(&verdict(group.id, key.1, true, false, None)); }
-        return true;
+    if key.0 != 0 {
+        state.send(&verdict(group, key.1, answer, at));
     }
-    let ok = state.record(group, host, active.generation, results);
-    if key.0 != 0 { state.send(&verdict(group.id,key.1,ok,direct,earliest)); }
     true
 }
 

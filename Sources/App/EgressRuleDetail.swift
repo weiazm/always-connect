@@ -10,7 +10,6 @@ struct EgressRuleDetail: View {
     let connected: Bool
     let refresh: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
-    let pause: (UInt32) -> Void
     let remove: () -> Void
     @State private var renaming = false
     @State private var name = ""
@@ -27,7 +26,7 @@ struct EgressRuleDetail: View {
                 let decisions = (status?.decisions(config: config) ?? []).filter { $0.rule == rule.id }
                 if connected && !decisions.isEmpty {
                     Section("需要你决定") {
-                        EgressDecisionList(decisions: decisions, refresh: refresh, pause: pause)
+                        EgressDecisionList(decisions: decisions, refresh: refresh)
                     }
                 }
                 Section {
@@ -157,7 +156,6 @@ extension EgressProtection.Observation {
         let server = peerAddress.map { "（服务器 \($0)）" } ?? ""
         let place = country.map { "从 \(egressCountryLabel($0)) 出去" } ?? "没查到出口"
         let exit = ip.map { "，出口 \($0)" } ?? ""
-        let reference = evidenceKind == .thirdParty ? "（第三方查询，仅供参考）" : ""
-        return host + server + " " + place + exit + reference
+        return host + server + " " + place + exit
     }
 }

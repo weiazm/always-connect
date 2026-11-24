@@ -1671,16 +1671,6 @@ pub extern "C" fn ac_oc_kill_child(e: *const oc_engine::Engine) {
 pub extern "C" fn ac_oc_update_direct_domains(e: *const oc_engine::Engine, domains: *const c_char) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_direct_domains(c_list(domains, '\n')) }
 }
-type EgressProbe = extern "C" fn(*mut c_void, *const c_char, *mut usize) -> *mut u8;
-
-#[no_mangle]
-pub extern "C" fn ac_oc_set_egress_probe(
-    e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbe,
-) {
-    let address = ctx as usize;
-    install_egress_probe(e, move |json, length, _| probe(address as *mut c_void, json, length));
-}
-
 type EgressProbeWithPeer = extern "C" fn(*mut c_void, *const c_char, *mut usize, *mut u8, usize) -> *mut u8;
 
 #[no_mangle]
@@ -1688,17 +1678,12 @@ pub extern "C" fn ac_oc_set_egress_probe_with_peer(
     e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbeWithPeer,
 ) {
     let address = ctx as usize;
-    install_egress_probe(e, move |json, length, peer| probe(address as *mut c_void, json, length, peer.as_mut_ptr(), peer.len()));
-}
-
-fn install_egress_probe(e: *const oc_engine::Engine,
-    probe: impl Fn(*const c_char, &mut usize, &mut [u8; 64]) -> *mut u8 + Send + Sync + 'static) {
     let Some(e) = (unsafe { e.as_ref() }) else { return };
     e.set_egress_probe(std::sync::Arc::new(move |req, actual_peer| {
         let json = CString::new(serde_json::to_string(req).ok()?).ok()?;
         let mut len = 0;
         let mut peer = [0u8; 64];
-        let bytes = probe(json.as_ptr(), &mut len, &mut peer);
+        let bytes = probe(address as *mut c_void, json.as_ptr(), &mut len, peer.as_mut_ptr(), peer.len());
         *actual_peer = CStr::from_bytes_until_nul(&peer).ok()
             .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
         if bytes.is_null() { return None; }
@@ -1706,14 +1691,6 @@ fn install_egress_probe(e: *const oc_engine::Engine,
         unsafe { libc::free(bytes.cast()) };
         result
     }));
-}
-
-#[no_mangle]
-pub extern "C" fn ac_oc_unknown_web_exception(e: *const oc_engine::Engine, address: *const c_char, port: u16,
-                                              allow: bool, approval_id: *const c_char) -> bool {
-    let (Some(engine), Some(ip), Some(id)) = (unsafe {e.as_ref()}, c_str(address).and_then(|s|s.parse().ok()), c_str(approval_id))
-        else {return false};
-    engine.unknown_web_exception(ip, port, allow, &id)
 }
 
 #[no_mangle]
@@ -1729,31 +1706,12 @@ pub extern "C" fn ac_oc_recheck_egress(e: *const oc_engine::Engine, group: u32) 
 #[no_mangle]
 pub extern "C" fn ac_oc_allow_egress_country(e: *const oc_engine::Engine, expected: *const c_char,
     group: u32, started: f64, country: *const c_char, evidence: *const c_char) -> *mut c_char {
-    approve_egress(e, expected, group, started, country, false, evidence)
-}
-
-#[no_mangle]
-pub extern "C" fn ac_oc_allow_egress_range(e: *const oc_engine::Engine, expected: *const c_char,
-    group: u32, started: f64, range: *const c_char, evidence: *const c_char) -> *mut c_char {
-    approve_egress(e, expected, group, started, range, true, evidence)
-}
-
-#[no_mangle]
-pub extern "C" fn ac_oc_confirm_range_setup(e: *const oc_engine::Engine, old: *const c_char,
-    new: *const c_char, group: u32, proof: *const c_char) -> bool {
-    let (Some(engine), Some(old), Some(new), Some(proof)) = (unsafe { e.as_ref() },c_str(old),c_str(new),c_str(proof)) else {return false};
-    let (Ok(old), Ok(new)) = (serde_json::from_str(&old),serde_json::from_str(&new)) else { return false };
-    engine.confirm_range_setup(&old,&new,group,&proof)
-}
-
-fn approve_egress(e: *const oc_engine::Engine, expected: *const c_char, group: u32, started: f64,
-                  value: *const c_char, range: bool, evidence: *const c_char) -> *mut c_char {
     let apply = || {
         let engine = unsafe { e.as_ref() }?;
         let cfg = serde_json::from_str(&c_str(expected)?).ok()?;
         let observed = serde_json::from_str(&c_str(evidence)?).ok()?;
-        let result = engine.approve_egress(&cfg, group, started, &c_str(value)?, range, &observed)?;
-        serde_json::to_string(&result).ok()
+        let countries = engine.allow_egress_country(&cfg, group, started, &c_str(country)?, &observed)?;
+        serde_json::to_string(&countries).ok()
     };
     apply().map(owned).unwrap_or(std::ptr::null_mut())
 }
@@ -1776,23 +1734,6 @@ pub extern "C" fn ac_oc_egress_status(e: *const oc_engine::Engine) -> *mut c_cha
     owned(unsafe { e.as_ref() }.map(|e| e.egress_status()).unwrap_or_else(|| "{}".into()))
 }
 
-#[no_mangle]
-pub extern "C" fn ac_oc_egress_probe_host(e: *const oc_engine::Engine, host: *const c_char) -> *mut c_char {
-    let (Some(e), Some(host)) = (unsafe { e.as_ref() }, c_str(host)) else { return owned("[]".into()) };
-    owned(serde_json::to_string(&e.egress_probe_host(&host)).unwrap_or_else(|_| "[]".into()))
-}
-#[no_mangle]
-pub extern "C" fn ac_oc_egress_probe_summary(
-    e: *const oc_engine::Engine, host: *const c_char, method: *const c_char,
-) -> *mut c_char {
-    let host = c_str(host).unwrap_or_default();
-    let method = c_str(method).unwrap_or_default();
-    let summary = unsafe { e.as_ref() }.map_or_else(
-        || crate::egress_control::setup_probe::Summary::request(&host, &method),
-        |e| e.egress_probe_summary(&host, &method),
-    );
-    owned(serde_json::to_string(&summary).unwrap_or_else(|_| "{}".into()))
-}
 #[no_mangle]
 pub extern "C" fn ac_oc_update_drop_protection(e: *const oc_engine::Engine, on: bool) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_drop_protection(on) }

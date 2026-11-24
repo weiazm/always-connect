@@ -40,17 +40,16 @@ struct EgressProtection: Codable, Equatable {
         }
     }
 
+    /// What one check saw for one site at one server.
     struct Observation: Codable, Equatable, Identifiable {
         let host: String
-        let method: String
         let country: String?
         let ip: String?
         let error: String?
-        var evidence: String? = nil
         var peerAddress: String? = nil
-        var failureReason: String? = nil
+        /// Set on a wrong-country observation the user may approve.
         var approvalId: String? = nil
-        var id: String { method }
+        var id: String { host + " " + (peerAddress ?? "") }
     }
 
     struct Status: Decodable {
@@ -60,14 +59,15 @@ struct EgressProtection: Codable, Equatable {
         let records: [BlockRecord]
     }
 
+    /// A rule's state: "ok", "blocked" (some servers exit from a wrong
+    /// country; only those are blocked) or "unknown". While blocked,
+    /// `observed` lists those servers.
     struct GroupState: Decodable, Identifiable {
         let id: UInt32
         let name: String
         let state: String
         let lastCheck: Double
         let observed: [Observation]
-        var reason: String? = nil
-        var level: String? = nil
         var blockedCount: UInt64? = nil
         var unverifiedCount: UInt64? = nil
         var lastBlockedHost: String? = nil

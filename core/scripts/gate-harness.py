@@ -4,15 +4,17 @@
 server      test sites behind the test gateway: TLS on :443 (answers
             /cdn-cgi/trace with a per-name country), plain HTTP on :80,
             a raw TCP service, and UDP listeners; logs every arrival.
-controller  the gate's controller: sends the group config, answers each
-            check by probing through the tunnel with the ALPN marker.
+controller  the gate's controller: sends the protected sites, answers each
+            check by probing the connection's own server through the
+            tunnel with the ALPN marker.
 probe       one egress probe (run inside the client network namespace).
 
 Test names and countries are fixtures only (*.test, ZZ/YY).
 """
 import argparse, json, os, secrets, socket, ssl, subprocess, sys, threading, time
 
-LOC = {"protected.test": "ZZ", "blocked.test": "YY", "range.test": "ZZ"}
+# The exit country each site reports; a name without one has no trace page.
+LOC = {"protected.test": "ZZ", "blocked.test": "YY", "www.blocked.test": "YY"}
 
 
 def jlog(logfile, **kw):
@@ -55,8 +57,10 @@ def serve_tls(ip, cert, key, log):
             path, hdr = read_head(s)
             probe = hdr.get("user-agent", "") == "egress-check"
             jlog(log, kind="tls-request", sni=sni, path=path, probe=probe)
-            body = (f"ip={peer[0]}\nloc={LOC.get(sni, 'ZZ')}\n" if path == "/cdn-cgi/trace" else f"ok {sni}")
-            s.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
+            trace = path == "/cdn-cgi/trace"
+            body = (f"ip={peer[0]}\nloc={LOC[sni]}\n" if trace and sni in LOC else "no trace" if trace else f"ok {sni}")
+            status = "404 Not Found" if trace and sni not in LOC else "200 OK"
+            s.sendall(f"HTTP/1.1 {status}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
             s.close()
         except Exception as e:
             jlog(log, kind="tls-error", error=type(e).__name__)
@@ -106,12 +110,11 @@ def cmd_server(a):
         time.sleep(3600)
 
 
-# Groups (DESIGN §66.3): member -> "probe" or "follow"; expected countries.
+# Rules (DESIGN §66.25): protected sites (with subdomains) and allowed countries.
 GROUPS = {
-    1: {"names": ["protected.test"], "cidrs": [], "members": {"protected.test": "probe"}, "expect": ["ZZ"]},
-    2: {"names": ["blocked.test", "*.blocked.test"], "cidrs": [],
-        "members": {"blocked.test": "probe", "follow.blocked.test": "follow"}, "expect": ["ZZ"]},
-    3: {"names": ["range.test"], "cidrs": ["10.250.0.2/32"], "members": {"range.test": "probe"}, "expect": ["ZZ"]},
+    1: {"sites": ["protected.test"], "expect": ["ZZ"]},
+    2: {"sites": ["blocked.test"], "expect": ["ZZ"]},
+    3: {"sites": ["untraced.test"], "expect": ["ZZ"]},
 }
 
 
@@ -125,32 +128,28 @@ def cmd_controller(a):
     srv.listen(1)
     open(a.ready, "w").close()
     conn, _ = srv.accept()
-    cfg = {"probe_alpn": marker, "groups": [{"id": g, "names": v["names"], "cidrs": v["cidrs"]} for g, v in GROUPS.items()]}
+    cfg = {"probe_alpn": marker, "groups": [{"id": g, "sites": v["sites"]} for g, v in GROUPS.items()]}
     conn.sendall((json.dumps(cfg) + "\n").encode())
     lock = threading.Lock()
 
     def check(group, host, dest, request_id):
         t0 = time.time()
-        g = GROUPS[group]
-        if host in g["members"] and g["members"][host] == "probe":
-            targets = [host]
-        else:
-            targets = [m for m, mode in g["members"].items() if mode == "probe"]
-        locs = []
-        evidence_times = []
-        for h in targets:
-            try:
-                out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", h,
-                                      "--ip", dest if h == host else a.site_ip, "--alpn", marker, "--ca", a.ca],
-                                     capture_output=True, text=True, timeout=3)
-                evidence_times.append(time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000)
-                locs.append(out.stdout.strip() or None)
-            except Exception:
-                locs.append(None)
-        ok = bool(targets) and all(l in g["expect"] for l in locs)
-        jlog(a.log, kind="check", group=group, host=host, probed=targets, locs=locs, ok=ok, ms=int((time.time() - t0) * 1000))
+        loc, at = None, None
+        try:
+            out = subprocess.run(["ip", "netns", "exec", a.ns, sys.executable, "-I", __file__, "probe", "--host", host,
+                                  "--ip", dest, "--alpn", marker, "--ca", a.ca],
+                                 capture_output=True, text=True, timeout=3)
+            loc = out.stdout.strip() or None
+            at = time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000
+        except Exception:
+            pass
+        result = "unverified" if loc is None else "allow" if loc in GROUPS[group]["expect"] else "block"
+        jlog(a.log, kind="check", group=group, host=host, ip=dest, loc=loc, result=result, ms=int((time.time() - t0) * 1000))
+        verdict = {"group": group, "requestId": request_id, "result": result}
+        if result == "allow":
+            verdict["evidenceAtMs"] = at
         with lock:
-            conn.sendall((json.dumps({"verdict": {"group": group, "requestId": request_id, "ok": ok, "evidenceAtMs": min(evidence_times) if ok else None, "direct": bool(ok and host in g["members"] and g["members"][host] == "probe")}}) + "\n").encode())
+            conn.sendall((json.dumps({"verdict": verdict}) + "\n").encode())
 
     buf = b""
     while True:
@@ -166,7 +165,7 @@ def cmd_controller(a):
                 continue
             if "check" in msg:
                 c = msg["check"]
-                threading.Thread(target=check, args=(c["group"], c.get("host"), c["ip"], c["requestId"]), daemon=True).start()
+                threading.Thread(target=check, args=(c["group"], c["host"], c["ip"], c["requestId"]), daemon=True).start()
 
 
 def cmd_probe(a):
@@ -180,7 +179,10 @@ def cmd_probe(a):
         if not chunk:
             break
         data += chunk
-    body = data.split(b"\r\n\r\n", 1)[-1].decode()
+    head, _, body = data.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        return
+    body = body.decode()
     kv = dict(l.split("=", 1) for l in body.splitlines() if "=" in l)
     print(kv.get("loc", ""))
 

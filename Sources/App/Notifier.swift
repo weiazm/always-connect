@@ -119,24 +119,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
     }
 
-    func egressNotice(_ event: EgressNoticeLedger.Event) {
-        let rule = event.rule
-        let title: String
-        let body: String
-        switch event.kind {
-        case .partial:
-            title = "已拦截部分连接：\(rule.lastBlockedHost ?? rule.name)"
-            let observed = rule.observed.first { $0.evidenceKind == .direct && $0.peerAddress != nil
-                && $0.host == rule.lastBlockedHost && $0.country == rule.lastBlockedCountry }
-            let country = observed?.country.map { "最近拦截涉及 \(egressCountryName($0))。 " } ?? ""
-            body = country + (rule.blockCaption ?? "可直接检查的其他地址仍会逐条核对。")
-        case .blocked:
-            title = "有网站暂时打不开"
-            body = rule.blockCaption ?? rule.name
-        case .recovered:
-            title = "网站已恢复"
-            body = rule.displayLevel == .partial ? "\(rule.name) 已恢复可用，仍有部分连接拦截。" : rule.name
-        }
+    /// A rule started blocking servers whose exit is in a wrong country.
+    func egressNotice(_ rule: EgressProtection.GroupState) {
+        let title = "已拦截部分连接：\(rule.lastBlockedHost ?? rule.name)"
+        let country = rule.lastBlockedCountry.map { "最近拦截涉及 \(egressCountryName($0))。 " } ?? ""
+        let body = country + (rule.blockCaption ?? "其他服务器照常逐条检查。")
         post(title: title, body: body, category: Self.egressCategory, info: ["group": rule.id])
     }
 

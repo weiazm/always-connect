@@ -20,10 +20,8 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
 fn egress(enabled: bool) -> crate::egress_control::EgressConfig {
     use crate::egress_control::*;
     EgressConfig {
-        block_unidentified_web:true,
         enabled,
-        methods: vec![],
-        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, members: vec![Member { pattern: "a.example".into(), method: Some(PRESET_TRACE.into()), probe_host: None }], cidrs: vec![], expect: vec!["ZZ".into()], ..Group::default() }],
+        groups: vec![Group { id: 1, name: "Work".into(), enabled: true, sites: vec!["a.example".into()], expect: vec!["ZZ".into()] }],
     }
 }
 
@@ -128,7 +126,7 @@ fn protection_on_runs_openconnect_through_the_gate() {
     BufReader::new(s).read_line(&mut line).unwrap();
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert!(v["probe_alpn"].as_str().unwrap().starts_with("ac-probe-"));
-    assert_eq!(v["groups"][0]["names"][0], "a.example");
+    assert_eq!(v["groups"][0]["sites"][0], "a.example");
     assert!(r.engine.egress_status().contains("\"groups\""));
 }
 

@@ -46,66 +46,32 @@ impl GroupStatus {
         }
     }
 
-    pub(super) fn observe_sites(&mut self, group: &Group, observations: &[Observation], at: f64) {
-        for obs in observations {
-            if !valid_host(&obs.host) {
-                continue;
-            }
-            if let Some(site) = self.site(&obs.host) {
-                site.last_check = at;
-                site.country = obs.country.clone();
-                site.state = if decide(group, std::slice::from_ref(obs)) {
-                    "ok"
-                } else if obs.evidence.as_deref() == Some("direct") && obs.country.is_some() {
-                    "partial"
-                } else {
-                    "blocked"
-                }
-                .into();
-            }
+    pub(super) fn observe_site(&mut self, group: &Group, obs: &Observation, at: f64) {
+        if !valid_host(&obs.host) {
+            return;
         }
-    }
-
-    pub(super) fn level(&self) -> &'static str {
-        if self.reason.is_some() {
-            return "blocked";
-        }
-        match self.state.as_str() {
-            "ok" => "ok",
-            "blocked"
-                if !self.observed.is_empty()
-                    && self.observed.iter().all(|o| {
-                        o.evidence.as_deref() == Some("direct") && o.country.is_some()
-                    }) =>
-            {
-                "partial"
+        if let Some(site) = self.site(&obs.host) {
+            site.last_check = at;
+            site.country = obs.country.clone();
+            site.state = match obs.country.as_deref() {
+                Some(country) if group.allows(country) => "ok",
+                Some(_) => "blocked",
+                None => "unknown",
             }
-            "blocked" => "blocked",
-            _ => "unknown",
+            .into();
         }
     }
 }
 
 impl ControlState {
-    pub(super) fn note_unverified(&mut self, id: u32) {
-        let Some(group) = self.config.group(id).cloned() else { return };
-        let status = match self.status.groups.iter_mut().find(|g| g.id == id) {
-            Some(status) => status,
-            None => {
-                self.status.groups.push(GroupStatus { id, name: group.name.clone(), state: "ok".into(), ..Default::default() });
-                self.status.groups.last_mut().expect("pushed")
-            }
-        };
+    pub(super) fn note_unverified(&mut self, group: &Group) {
+        let status = self.status.group(group);
         status.unverified_count = status.unverified_count.saturating_add(1);
     }
 
     pub(super) fn denied_counts(&mut self, reports: Vec<Denied>) {
         for report in reports.into_iter().take(MAX_GROUPS) {
-            let Some(group) = self
-                .config
-                .group(report.group)
-                .filter(|g| self.config.active() && g.enabled)
-            else {
+            let Some(group) = self.config.enabled_group(report.group).cloned() else {
                 continue;
             };
             if report.hosts.len() > MAX_SITE_COUNTS {
@@ -116,25 +82,14 @@ impl ControlState {
                 continue;
             }
             let delta = report.count - previous.count;
-            let st = match self.status.groups.iter_mut().find(|g| g.id == group.id) {
-                Some(st) => st,
-                None => {
-                    self.status.groups.push(GroupStatus {
-                        id: group.id,
-                        name: group.name.clone(),
-                        state: "unknown".into(),
-                        ..Default::default()
-                    });
-                    self.status.groups.last_mut().unwrap()
-                }
-            };
+            let st = self.status.group(&group);
             st.blocked_count = st.blocked_count.saturating_add(delta);
             if delta > 0 {
                 st.last_blocked_host = report.last_host.clone().filter(|v| valid_host(v));
                 st.last_blocked_country = st.last_blocked_host.as_ref().and_then(|h| {
                     st.observed
                         .iter()
-                        .find(|o| o.evidence.as_deref() == Some("direct") && o.host == *h)
+                        .find(|o| o.host == *h)
                         .and_then(|o| o.country.clone())
                 });
             }

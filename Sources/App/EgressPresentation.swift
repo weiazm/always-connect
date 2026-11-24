@@ -40,65 +40,35 @@ struct EgressCountryApproval: Codable, Equatable, Identifiable {
 }
 
 extension EgressProtection {
+    /// ok; partial: some servers exit from a wrong country and only those
+    /// are blocked; unknown: not checked yet.
     enum Level: String {
-        case ok, partial, blocked, unknown
+        case ok, partial, unknown
     }
 
-    enum BlockReason: String {
-        case noDirectMethod = "no-direct-method"
-        case failedTargetOverflow = "failed-target-overflow"
-
-        var caption: String {
-            switch self {
-            case .noDirectMethod: return "无法核实网站本身的出口，已先拦住新连接"
-            case .failedTargetOverflow: return "出口不对的服务器太多，已先拦住新连接"
-            }
-        }
-    }
-
+    /// A rule that is blocking some servers right now.
     struct BlockedGroupNotice: Identifiable, Equatable {
         let id: UInt32
         let name: String
-        let reason: BlockReason
     }
 
-    enum Evidence: String, CaseIterable {
-        case direct, proxy, member, unknown
-        case thirdParty = "third-party"
-
-        var caption: String {
-            switch self {
-            case .direct: return "直接观测（同名、固定目的地址）"
-            case .proxy: return "按借用身份查到（代理观测）"
-            case .thirdParty: return "第三方查询点：仅供参考，不参与放行或拦截"
-            case .member: return "按网站名查询（组内成员）"
-            case .unknown: return "来源未记录"
-            }
-        }
-    }
-
-    /// An action from a notification may only expand the countries of the
-    /// same currently blocked direct targets.
-    struct DirectTargetObservation: Hashable, Codable {
+    /// An action may only expand the countries of the same currently
+    /// blocked servers.
+    struct WrongExit: Hashable {
         let host: String
         let address: String
-        let method: String
         let country: String
     }
 
-    static func directFailures(_ observations: [Observation], expected: [String]) -> Set<DirectTargetObservation>? {
-        let failed = observations.filter { $0.evidenceKind != .thirdParty && $0.isOutside(expected) }
+    static func wrongExits(_ observations: [Observation], expected: [String]) -> Set<WrongExit>? {
+        let failed = observations.filter { $0.isOutside(expected) }
         guard !failed.isEmpty else { return nil }
-        let direct = failed.compactMap(\.directTarget)
-        return direct.count == failed.count ? Set(direct) : nil
+        let exits = failed.compactMap(\.wrongExit)
+        return exits.count == failed.count ? Set(exits) : nil
     }
 }
 
 extension EgressProtection.Observation {
-    var evidenceKind: EgressProtection.Evidence {
-        evidence.flatMap(EgressProtection.Evidence.init(rawValue:)) ?? .unknown
-    }
-
     private var countryAndAddress: String {
         guard let country else { return "未查到" }
         return country + (ip.map { "（出口 IP \($0)）" } ?? "")
@@ -106,7 +76,7 @@ extension EgressProtection.Observation {
 
     var observationCaption: String {
         let address = peerAddress.map { "（目的地址 \($0)）" } ?? ""
-        return "\(host)\(address)：\(countryAndAddress) · \(evidenceKind.caption)"
+        return "\(host)\(address)：\(countryAndAddress)"
     }
 
     func isOutside(_ expected: [String]) -> Bool {
@@ -114,41 +84,27 @@ extension EgressProtection.Observation {
         return !expected.contains { $0.caseInsensitiveCompare(country) == .orderedSame }
     }
 
-    fileprivate var directTarget: EgressProtection.DirectTargetObservation? {
-        guard evidenceKind == .direct, let country, let address = peerAddress,
+    fileprivate var wrongExit: EgressProtection.WrongExit? {
+        guard let country, let address = peerAddress,
               IPv4Address(address) != nil || IPv6Address(address) != nil,
               country.utf8.count == 2, country.utf8.allSatisfy({ (65...90).contains($0) }) else { return nil }
-        return .init(host: host, address: address, method: method, country: country)
+        return .init(host: host, address: address, country: country)
     }
 }
 
 extension EgressProtection.GroupState {
     var displayLevel: EgressProtection.Level {
-        if blockReason != nil { return .blocked }
-        if let level, let known = EgressProtection.Level(rawValue: level) { return known }
-        // Old replies have no site-level availability statement.
-        return state == "ok" ? .ok : .unknown
-    }
-
-    var blockReason: EgressProtection.BlockReason? {
-        reason.flatMap(EgressProtection.BlockReason.init(rawValue:))
+        switch state {
+        case "ok": return .ok
+        case "blocked": return .partial
+        default: return .unknown
+        }
     }
 
     var blockCaption: String? {
-        if let reason = blockReason { return reason.caption }
-        switch displayLevel {
-        case .ok: return nil
-        case .partial:
-            let count = blockedCount ?? 0
-            return count > 0 ? "已拦下 \(count) 次连接，其他服务器照常逐条检查" : "有些服务器出口不对，已拦下；其他照常检查"
-        case .blocked:
-            let website = sites?.first(where: { $0.state == "blocked" })?.host ?? lastBlockedHost ?? name
-            if let country = lastBlockedCountry ?? observed.lazy.compactMap(\.country).first {
-                return "\(website) 暂时打不开：出口在\(egressCountryName(country))"
-            }
-            return "\(website) 暂时打不开：出口无法核实"
-        case .unknown: return blocked ? "有连接已拦截，正在等待出口状态" : nil
-        }
+        guard displayLevel == .partial else { return nil }
+        let count = blockedCount ?? 0
+        return count > 0 ? "已拦下 \(count) 次连接，其他服务器照常逐条检查" : "有些服务器出口不对，已拦下；其他照常检查"
     }
 }
 
@@ -167,10 +123,7 @@ extension EgressProtection.Status {
     }
 
     var blockingNotices: [EgressProtection.BlockedGroupNotice] {
-        groups.compactMap { group in
-            guard group.blocked, let reason = group.blockReason else { return nil }
-            return .init(id: group.id, name: group.name, reason: reason)
-        }
+        groups.filter { $0.displayLevel == .partial }.map { .init(id: $0.id, name: $0.name) }
     }
 
     var displayLevel: EgressProtection.Level { displayLevel(expectedRules: nil) }
@@ -178,7 +131,6 @@ extension EgressProtection.Status {
     func displayLevel(expectedRules: Set<UInt32>?) -> EgressProtection.Level {
         guard running else { return .unknown }
         let current = expectedRules.map { ids in groups.filter { ids.contains($0.id) } } ?? groups
-        if current.contains(where: { $0.displayLevel == .blocked }) { return .blocked }
         if current.contains(where: { $0.displayLevel == .partial }) { return .partial }
         if let expectedRules, !expectedRules.isSubset(of: current.map(\.id)) { return .unknown }
         return !current.isEmpty && current.allSatisfy { $0.displayLevel == .ok } ? .ok : .unknown
@@ -193,8 +145,6 @@ extension EgressProtection.Status {
 
     func panelCaption(checkingFor: TimeInterval, expectedRules: Set<UInt32>? = nil) -> String {
         switch displayLevel(expectedRules: expectedRules) {
-        case .blocked:
-            return groups.first { $0.displayLevel == .blocked }?.blockCaption ?? "有网站暂时打不开"
         case .partial:
             return blockedCount > 0 ? "本次已拦下 \(blockedCount) 次连接" : "部分地址已拦截"
         case .ok: return "正常"
@@ -210,75 +160,41 @@ extension EgressProtection.Status {
               let group = groups.first(where: { $0.id == approval.group }),
               let record = records.first(where: { $0.group == approval.group && $0.started == approval.started }),
               record.expected == rule.expect,
-              let target = approval.observation.directTarget,
-              record.directTargetsToTrust(current: group)?.contains(target) == true else { return false }
+              let target = approval.observation.wrongExit,
+              record.wrongExitsToTrust(current: group)?.contains(target) == true else { return false }
         return rule.covers(target.host)
     }
 
     func approvals(for id: UInt32) -> [EgressCountryApproval] {
         guard let current = groups.first(where: { $0.id == id }),
               let record = records.first(where: { $0.group == id && $0.ended == nil }),
-              let active = record.directTargetsToTrust(current: current) else { return [] }
+              let active = record.wrongExitsToTrust(current: current) else { return [] }
         var countries = Set<String>()
         return record.observed.compactMap { obs in
-            guard let target = obs.directTarget, active.contains(target), countries.insert(target.country).inserted else { return nil }
+            guard let target = obs.wrongExit, active.contains(target), countries.insert(target.country).inserted else { return nil }
             return .init(group: id, started: record.started, observation: obs)
         }.sorted { $0.country < $1.country }
     }
 }
 
+/// Notifies once per rule and connection when it starts blocking servers.
 struct EgressNoticeLedger {
-    enum Kind { case partial, blocked, recovered }
-    struct Event {
-        let kind: Kind
-        let rule: EgressProtection.GroupState
-    }
-    private var partial = Set<UInt32>()
-    private var blocked = Set<UInt32>()
-    private var recovered = Set<UInt32>()
+    private var notified = Set<UInt32>()
 
     mutating func retain(_ rules: Set<UInt32>) {
-        partial.formIntersection(rules)
-        blocked.formIntersection(rules)
-        recovered.formIntersection(rules)
+        notified.formIntersection(rules)
     }
 
-    mutating func update(_ groups: [EgressProtection.GroupState]) -> [Event] {
-        groups.compactMap { group in
-            let id = group.id
-            switch group.displayLevel {
-            case .blocked:
-                return blocked.insert(id).inserted ? .init(kind: .blocked, rule: group) : nil
-            case .ok, .partial:
-                if blocked.contains(id) && recovered.insert(id).inserted { return .init(kind: .recovered, rule: group) }
-                if group.displayLevel == .partial && (group.blockedCount ?? 0) > 0
-                    && !blocked.contains(id) && partial.insert(id).inserted {
-                    return .init(kind: .partial, rule: group)
-                }
-                return nil
-            case .unknown:
-                return nil
-            }
-        }
+    mutating func update(_ groups: [EgressProtection.GroupState]) -> [EgressProtection.GroupState] {
+        groups.filter { $0.displayLevel == .partial && ($0.blockedCount ?? 0) > 0 && notified.insert($0.id).inserted }
     }
 }
 
 extension EgressProtection.BlockRecord {
-    func directFailures() -> Set<EgressProtection.DirectTargetObservation>? {
-        EgressProtection.directFailures(observed, expected: expected)
-    }
-
-    func directTargetsToTrust(current: EgressProtection.GroupState) -> Set<EgressProtection.DirectTargetObservation>? {
-        guard ended == nil, current.id == group, current.blocked, current.reason == nil,
-              let failures = directFailures(),
-              failures == EgressProtection.directFailures(current.observed, expected: expected) else { return nil }
+    func wrongExitsToTrust(current: EgressProtection.GroupState) -> Set<EgressProtection.WrongExit>? {
+        guard ended == nil, current.id == group, current.blocked,
+              let failures = EgressProtection.wrongExits(observed, expected: expected),
+              failures == EgressProtection.wrongExits(current.observed, expected: expected) else { return nil }
         return failures
-    }
-
-    var evidenceSummary: String {
-        let counts = Dictionary(grouping: observed, by: \.evidenceKind).mapValues(\.count)
-        return EgressProtection.Evidence.allCases.compactMap { evidence in
-            counts[evidence].map { "\(evidence.rawValue)=\($0)" }
-        }.joined(separator: "，")
     }
 }

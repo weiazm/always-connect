@@ -201,7 +201,6 @@ struct EgressProtectionPage: View {
             let count = liveStatus?.blockedCount ?? 0
             return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 条出口不对的连接" : "有些连接出口不对，已拦下",
                          lineColor: .orange)
-        case .blocked: return .init(tint: .red, line: "有连接被拦住了，需要你决定", lineColor: .red)
         case .unknown: return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · 有连接时核实出口")
         }
     }
@@ -275,7 +274,7 @@ struct EgressProtectionPage: View {
                 .help(group.enabled ? "暂停这个保护" : "恢复保护")
             }
             if !decisions.isEmpty {
-                EgressDecisionList(decisions: decisions, refresh: refresh, pause: pause)
+                EgressDecisionList(decisions: decisions, refresh: refresh)
             }
         }
         .padding(.vertical, 3)
@@ -323,7 +322,7 @@ struct EgressProtectionPage: View {
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
-                                 edit: { edit in changeRule(id, edit: edit) }, pause: pause,
+                                 edit: { edit in changeRule(id, edit: edit) },
                                  remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
             }
         }
@@ -337,8 +336,6 @@ struct EgressProtectionPage: View {
     }
 
     // MARK: - Changes
-
-    private func pause(_ id: UInt32) { changeRule(id) { $0.enabled = false } }
 
     private func addSites(_ sites: [String], countries: [String], done: @escaping (Bool) -> Void) {
         var group = EgressProtection.newGroup(in: stored, name: sites.count > 1 ? "\(sites[0]) 等 \(sites.count) 个" : sites[0])

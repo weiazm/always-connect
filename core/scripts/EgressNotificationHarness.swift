@@ -108,15 +108,12 @@ struct EgressNotificationHarness {
         print("PASS \(message)")
     }
 
-    static func observation(evidence: String = "direct", address: String = "2001:db8:9::7") -> EgressProtection.Observation {
-        .init(host: "tested.example", method: "trace", country: "YY", ip: "198.51.100.7",
-              error: nil, evidence: evidence, peerAddress: address)
+    static func observation(address: String = "2001:db8:9::7") -> EgressProtection.Observation {
+        .init(host: "tested.example", country: "YY", ip: "198.51.100.7", error: nil, peerAddress: address)
     }
 
-    static func group(_ level: String, reason: String? = nil,
-                      observed: [EgressProtection.Observation] = [observation()]) -> EgressProtection.GroupState {
-        .init(id: UInt32.max, name: "Fixture", state: level == "ok" ? "ok" : "blocked", lastCheck: 1235,
-              observed: observed, reason: reason, level: level, blockedCount: 3,
+    static func group(_ state: String, observed: [EgressProtection.Observation] = [observation()]) -> EgressProtection.GroupState {
+        .init(id: UInt32.max, name: "Fixture", state: state, lastCheck: 1235, observed: observed, blockedCount: 3,
               lastBlockedHost: "tested.example", lastBlockedCountry: "YY")
     }
 
@@ -142,19 +139,20 @@ struct EgressNotificationHarness {
 
     static func main() {
         var ledger = EgressNoticeLedger()
-        let partial = group("partial")
+        let partial = group("blocked")
         let unknown = group("unknown")
-        let red = group("blocked", reason: "no-direct-method")
         let ok = group("ok")
+        check(ledger.update([unknown]).isEmpty && ledger.update([ok]).isEmpty, "nothing blocked, nothing to announce")
         let outgoing = ledger.update([partial])
-        check(outgoing.count == 1 && ledger.update([partial]).isEmpty, "partial notification only fires once per rule/session")
+        check(outgoing.count == 1 && ledger.update([partial]).isEmpty, "the notification fires once per rule and session")
         notifier.egressNotice(outgoing[0])
         check(center.requests.count == 1, "one notification was delivered to the stand-in")
         let banner = center.requests[0]
         let category = center.categories.first { $0.identifier == banner.content.categoryIdentifier }
         check(category?.actions.map(\.title) == ["查看"] && center.delegate === notifier, "banner only offers View")
-        check(banner.content.title.contains("tested.example") && banner.content.body.contains("已拦下 3 次连接"),
-              "banner describes actual gated connections")
+        check(banner.content.title.contains("tested.example") && banner.content.body.contains("已拦下 3 次连接")
+              && banner.content.body.contains(egressCountryName("YY")),
+              "banner describes actual blocked connections")
         respond("trust-egress", to: banner)
         check(SettingsWindow.shared.opened.isEmpty, "an action from an older version cannot open or write a rule")
         respond(Notifier.reviewEgressAction, to: banner)
@@ -163,19 +161,6 @@ struct EgressNotificationHarness {
         var presented: UNNotificationPresentationOptions = []
         notifier.userNotificationCenter(center, willPresent: .init(request: banner)) { presented = $0 }
         check(presented == [.banner, .sound], "foreground banner presentation still works")
-
-        check(ledger.update([unknown]).isEmpty, "unknown status cannot announce recovery")
-        let blocked = ledger.update([red])
-        check(blocked.count == 1 && blocked[0].kind == .blocked && ledger.update([red]).isEmpty,
-              "red escalation notifies only once")
-        notifier.egressNotice(blocked[0])
-        check(center.requests.last!.content.body.contains("无法核实网站本身的出口"), "red alert names the reason")
-        check(ledger.update([unknown]).isEmpty, "red to unknown is not a recovery")
-        let recovery = ledger.update([ok])
-        check(recovery.count == 1 && recovery[0].kind == .recovered && ledger.update([ok]).isEmpty,
-              "known recovery notifies only once")
-        notifier.egressNotice(recovery[0])
-        check(center.requests.last!.content.title == "网站已恢复", "recovery describes restored availability")
         var nextSession = EgressNoticeLedger()
         check(nextSession.update([partial]).count == 1, "a new logical session starts fresh")
 
@@ -184,7 +169,9 @@ struct EgressNotificationHarness {
               && unknownCheck.panelCaption(checkingFor: 1.0) == "正在核对出口",
               "the panel suppresses short checks")
         check(status(ok).panelCaption(checkingFor: 2) == "正常" && status(partial).displayLevel == .partial
-              && status(red).displayLevel == .blocked, "availability levels stay distinct")
+              && status(partial).panelCaption(checkingFor: 0) == "本次已拦下 3 次连接"
+              && status(partial).blockingNotices.map(\.id) == [partial.id] && status(ok).blockingNotices.isEmpty,
+              "availability levels stay distinct")
         check(status(ok).panelCaption(checkingFor: 0, expectedRules: [ok.id, 10]) == "尚未核实出口",
               "a rule missing from a snapshot prevents a normal status")
 
@@ -192,7 +179,7 @@ struct EgressNotificationHarness {
             enabled: true, sites: ["tested.example"], expect: ["ZZ"])])
         let known = status(partial)
         guard let approval = known.approvals(for: partial.id).first else { exit(1) }
-        check(known.permits(approval, in: local) && approval.country == "YY", "matching current direct evidence can start confirmation")
+        check(known.permits(approval, in: local) && approval.country == "YY", "the current wrong exit can start confirmation")
         let unchanged = EgressProtection.Group(id: 8, name: "An independently edited rule")
         var latest = local
         latest.groups.append(unchanged)
@@ -205,18 +192,17 @@ struct EgressNotificationHarness {
               && approval.applying(["ZZ", "YY"], then: local, now: altered, sameSession: true) == nil
               && approval.applying(["ZZ", "YY"], then: local, now: local, sameSession: false) == nil,
               "failure, a competing edit and a new session all leave preferences unchanged")
-        for changed in [group("partial", observed: [observation(address: "198.51.100.8")]),
-                        group("partial", observed: [observation(evidence: "proxy")]),
-                        group("partial", observed: [observation(evidence: "member")]),
-                        group("partial", observed: [observation(evidence: "third-party")]),
-                        group("partial", observed: [observation(evidence: "unknown")]), red, ok] {
+        let unread = EgressProtection.Observation(host: "tested.example", country: nil, ip: nil, error: "no answer",
+                                                  peerAddress: "2001:db8:9::7")
+        for changed in [group("blocked", observed: [observation(address: "198.51.100.8")]),
+                        group("blocked", observed: [observation(), unread]), unknown, ok] {
             check(!status(changed).permits(approval, in: local) && status(changed).approvals(for: partial.id).isEmpty,
-                  "stale, unconfirmed or whole-rule evidence cannot be approved")
+                  "stale or unread observations cannot be approved")
         }
         let historical = try! JSONDecoder().decode(EgressProtection.Observation.self, from: Data(
-            #"{"host":"old.example","method":"trace","country":"YY"}"#.utf8))
-        check(historical.evidenceKind == .unknown && EgressProtection.directFailures([historical], expected: ["ZZ"]) == nil,
-              "legacy observations decode without authorizing trust")
+            #"{"host":"old.example","method":"trace","evidence":"member","country":"YY"}"#.utf8))
+        check(EgressProtection.wrongExits([historical], expected: ["ZZ"]) == nil,
+              "an observation without its server address cannot authorize trust")
         notifier.notifyGatewayCertificateFailure()
         check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
         let legacy = try! JSONDecoder().decode(EgressProtection.Group.self, from: Data(

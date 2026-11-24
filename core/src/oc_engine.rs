@@ -158,8 +158,6 @@ enum Event {
     DropProtection(bool),
     AllowNetworks(Vec<String>),
     DnsAnswer(dns_forwarder::Observation, Sender<bool>),
-    DnsDelivered(delivered_dns::Record),
-    DnsCompatibilityLoss(delivered_dns::Loss),
     /// A scheduled retry: spawn again unless a manual stop landed first
     /// or the user already asked for it (the epoch moved on).
     Respawn(u64),
@@ -391,13 +389,6 @@ struct Child {
 #[derive(Clone, PartialEq, Eq)]
 struct TunnelLease { name: String, index: u32, generation: u64, confirmed_at: Instant }
 
-#[derive(PartialEq, Eq)]
-struct SetupProbeTunnel {
-    lease: TunnelLease,
-    dns: Vec<String>,
-    dns_epoch: Option<u64>,
-    gate: Option<(String, u64)>,
-}
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
 const SPLIT_CAPACITY_ERROR: &str = "近一小时访问的网站过多，按网站分流暂时全部走 VPN；约一小时内自动恢复，无需重新连接";
 enum SplitSync { Complete, PendingAdditions, Blocked }
@@ -411,7 +402,6 @@ fn interface_index(name: &str) -> Option<u32> {
 // Presentation detail only. The connect hook still owns the connected state.
 const TUNNEL_NEGOTIATED: &str = "tunnel negotiation accepted";
 mod cstp_dns;
-mod delivered_dns;
 
 struct Core {
     /// A retry is scheduled and no attempt is running.
@@ -419,7 +409,7 @@ struct Core {
     /// Bumped by RetryNow so the retired backoff timers do nothing.
     respawn_epoch: u64,
     config: Config,
-    protected_routes: Option<Arc<crate::egress_control::ProtectedRoutes>>,
+    protected_sites: Option<Arc<crate::egress_gate::ProtectedSites>>,
     driver: SessionDriver,
     child: Option<Child>,
     generation: u64,
@@ -467,7 +457,6 @@ struct Core {
     tunnel_dns: Vec<String>,
     cstp_dns: cstp_dns::CstpDns,
     tunnel_if: Option<String>,
-    setup_receipts: std::collections::VecDeque<(SetupProbeTunnel, crate::egress_control::setup_probe::SetupReceipt)>,
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
     split_needs_sync: bool,
@@ -514,15 +503,15 @@ impl Engine {
         guard.own_engine_started(&holder);
         let (tx, rx) = mpsc::channel();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
-        let protected_routes = egress_active(&config)
-            .then(|| Arc::new(config.egress.as_ref().expect("active").protected_routes()));
+        let protected_sites = egress_active(&config)
+            .then(|| Arc::new(config.egress.as_ref().expect("active").protected_sites()));
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 respawn_waiting: false,
                 respawn_epoch: 0,
                 driver: SessionDriver::new(seed),
                 config,
-                protected_routes,
+                protected_sites,
                 child: None,
                 generation: 0,
                 stop_requested: false,
@@ -566,7 +555,6 @@ impl Engine {
                 tunnel_dns: Vec::new(),
                 cstp_dns: Default::default(),
                 tunnel_if: None,
-                setup_receipts: Default::default(),
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
                 split_needs_sync: false,
@@ -647,30 +635,18 @@ impl Engine {
         job.is_some_and(|run| run())
     }
 
-    pub fn unknown_web_exception(&self, address: std::net::IpAddr, port: u16, allow: bool, approval_id: &str) -> bool {
-        let c = self.shared.core.lock().expect("engine");
-        if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none() {
-            return false;
-        }
-        self.shared.egress.lock().expect("egress").as_ref().is_some_and(|ctl|
-            ctl.unknown_exception(address, port, allow, approval_id))
-    }
-
-    pub fn approve_egress(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
-                                value: &str, range: bool, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
+    /// The user allowed a wrong exit country for a rule; returns the
+    /// rule's new countries.
+    pub fn allow_egress_country(&self, expected: &crate::egress_control::EgressConfig, group: u32, started: f64,
+                                country: &str, evidence: &crate::egress_control::Observation) -> Option<Vec<String>> {
         let mut c = self.shared.core.lock().ok()?;
         if c.stop_requested || c.tunnel_retrying || !c.child_alive() || c.tunnel_if.is_none()
             || c.recovery_suspended() || c.config.egress.as_ref() != Some(expected) { return None; }
         let controller = self.shared.egress.lock().ok()?;
-        let cfg = controller.as_ref()?.approve(expected, group, started, value, range, evidence)?;
-        let updated = cfg.group(group)?;
-        let result = if range { updated.exit_ranges.clone() } else { updated.expect.clone() };
+        let cfg = controller.as_ref()?.allow_country(expected, group, started, country, evidence)?;
+        let countries = cfg.group(group)?.expect.clone();
         c.config.egress = Some(cfg);
-        if let Some(f) = &c.forwarder {
-            f.set_parsed_rules(c.split_rules());
-            if let Some(ctl) = controller.as_ref() { ctl.set_dns_epoch(Some(f.epoch())); }
-        }
-        Some(result)
+        Some(countries)
     }
 
     /// JSON status for the App; `{"running":false}` when not in use.
@@ -678,87 +654,6 @@ impl Engine {
         let ctl = self.shared.egress.lock().expect("egress");
         ctl.as_ref().map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
     }
-    /// Set-up probing also works on the ordinary tunnel before protection
-    /// is enabled. Never run a probe against the physical interface.
-    pub fn egress_probe_host(&self, host: &str) -> Vec<crate::egress_control::Observation> {
-        let marker = self.shared.egress.lock().expect("egress").as_ref().map(|ctl| ctl.marker());
-        let (cfg, iface) = {
-            let c = self.shared.core.lock().expect("engine");
-            if c.stop_requested || c.recovery_suspended() || c.tunnel_retrying || !c.child_alive() {
-                return Vec::new();
-            }
-            (c.config.egress.clone().unwrap_or_default(), c.tunnel_if.clone())
-        };
-        let (Some(iface), Some(hook)) = (iface, self.shared.egress_probe.lock().expect("probe").clone())
-        else { return Vec::new() };
-        if cfg.active() && marker.is_none() { return Vec::new(); }
-        let marker = marker.unwrap_or_default();
-        crate::egress_control::probe_methods(&cfg, host, &hook, &marker, &iface)
-    }
-
-    pub(crate) fn egress_probe_summary(&self, host: &str, method: &str) -> crate::egress_control::setup_probe::Summary {
-        use crate::egress_control::setup_probe::Summary;
-        let mut summary = Summary::request(host, method);
-        let (method, tunnel) = {
-            let c = self.shared.core.lock().expect("engine");
-            (summary.method(c.config.egress.as_ref()), self.setup_probe_tunnel(&c))
-        };
-        let hook = self.shared.egress_probe.lock().expect("probe").clone();
-        let (Some(method), Some(tunnel), Some(hook)) = (method, tunnel, hook) else { return summary; };
-        let query = |request: &[u8], deadline| dns_forwarder::query_for_setup_probe(
-            request, &tunnel.dns, &tunnel.lease.name, tunnel.lease.index, deadline,
-        );
-        let still_current = || {
-            let c = self.shared.core.lock().expect("engine");
-            let same_method = Summary::request(host, &method.id).method(c.config.egress.as_ref()).as_ref() == Some(&method);
-            same_method && self.setup_probe_tunnel(&c).as_ref() == Some(&tunnel)
-        };
-        let marker = tunnel.gate.as_ref().map_or("", |(marker, _)| marker.as_str());
-        let mut summary = summary.probe(&method, &hook, marker, &tunnel.lease.name, query, still_current);
-        let mut c = self.shared.core.lock().expect("engine");
-        if self.setup_probe_tunnel(&c).as_ref() == Some(&tunnel) {
-            if let Some(receipt) = summary.issue_receipt(&method) {
-                if c.setup_receipts.len() >= 8 { c.setup_receipts.pop_front(); }
-                c.setup_receipts.push_back((tunnel,receipt));
-            }
-        }
-        summary
-    }
-
-    pub fn confirm_range_setup(&self, previous: &crate::egress_control::EgressConfig,
-                               proposed: &crate::egress_control::EgressConfig, group: u32, proof: &str) -> bool {
-        let mut c = self.shared.core.lock().expect("engine");
-        let Some(tunnel) = self.setup_probe_tunnel(&c) else { return false };
-        if c.config.egress.as_ref().cloned().unwrap_or_default() != *previous { return false; }
-        let Some(index) = c.setup_receipts.iter().position(|(session,receipt)|
-            session == &tunnel && receipt.is_current(proof) && receipt.approves(previous,proposed,group)) else { return false };
-        c.setup_receipts.remove(index);
-        true
-    }
-
-    fn setup_probe_tunnel(&self, c: &Core) -> Option<SetupProbeTunnel> {
-        let lease = c.tunnel_lease.as_ref()?;
-        if c.driver.state != SessionStatus::Connected || !c.hook_fired || !c.child_alive()
-            || c.stop_requested || c.finished || c.recovery_suspended() || c.tunnel_retrying
-            || (c.config.drop_protection && c.pf_needs_load)
-            || c.tunnel_if.as_ref() != Some(&lease.name) || c.generation != lease.generation
-            || interface_index(&lease.name) != Some(lease.index)
-            || self.shared.guard.was_superseded(&self.shared.holder)
-        {
-            return None;
-        }
-        let gate = self.shared.egress.lock().expect("egress").as_ref().and_then(|ctl| ctl.setup_probe_context());
-        if c.config.egress.as_ref().is_some_and(|config| config.active()) && gate.is_none() {
-            return None;
-        }
-        Some(SetupProbeTunnel {
-            lease: lease.clone(),
-            dns: c.tunnel_dns.clone(),
-            dns_epoch: c.forwarder.as_ref().map(|forwarder| forwarder.epoch()),
-            gate,
-        })
-    }
-
     pub fn update_direct_domains(&self, d: Vec<String>) {
         self.send(Event::DirectDomains(d));
     }
@@ -909,15 +804,12 @@ impl Core {
                 out.push(n.clone());
             }
         }
-        if let Some(protected) = &self.protected_routes {
-            out.retain(|range| !protected.overlaps(range));
-        }
         out
     }
 
     fn split_rules(&self) -> dns_forwarder::SplitRules {
         dns_forwarder::SplitRules::new(self.config.direct_domains.as_deref().unwrap_or_default())
-            .with_protection(self.protected_routes.clone())
+            .with_protection(self.protected_sites.clone())
     }
 
     fn support(&self) -> PathBuf {
@@ -1022,7 +914,6 @@ impl Shared {
                     c.reset_direct_retries();
                     if let Some(f) = &c.forwarder {
                         f.set_parsed_rules(c.split_rules());
-                        self.sync_dns_scope(&c);
                     }
                     let rules = c.split_rules();
                     c.split_policy.revalidate(&rules);
@@ -1036,21 +927,16 @@ impl Shared {
                         ctl.update(cfg.clone());
                     }
                     c.config.egress = Some(cfg);
-                    let was_active = c.protected_routes.is_some();
-                    c.protected_routes = egress_active(&c.config)
-                        .then(|| Arc::new(c.config.egress.as_ref().expect("active").protected_routes()));
-                    if was_active || c.protected_routes.is_some() {
+                    let was_active = c.protected_sites.is_some();
+                    c.protected_sites = egress_active(&c.config)
+                        .then(|| Arc::new(c.config.egress.as_ref().expect("active").protected_sites()));
+                    if was_active || c.protected_sites.is_some() {
+                        // Protected sites stay in the VPN and lose their ECH configs (§66.25).
                         if let Some(f) = &c.forwarder { f.set_parsed_rules(c.split_rules()); }
-                        self.sync_dns_scope(&c);
                         let rules = c.split_rules();
                         c.split_policy.revalidate(&rules);
                         c.reset_direct_retries();
                         self.sync_split_routes(&mut c);
-                        self.route_networks_direct(&mut c);
-                        if let Some((tun, gateways)) = c.last_pf.clone() {
-                            let allow = c.last_allow_direct_egress;
-                            self.load_pf(&mut c, Some(tun), gateways, allow);
-                        }
                     }
                 }
                 Event::AllowNetworks(n) => {
@@ -1061,26 +947,6 @@ impl Shared {
                     if let Some((tun, gws)) = c.last_pf.clone() {
                         let allow = c.last_allow_direct_egress;
                         self.load_pf(&mut c, Some(tun), gws, allow);
-                    }
-                }
-                Event::DnsDelivered(delivery) => {
-                    let answer = &delivery.dns;
-                    if delivery.current() && c.hook_fired && !c.stop_requested && !c.tunnel_retrying
-                        && !c.recovery_suspended() && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch))
-                    {
-                        if let (Some(interface), Some(routes), Some(ctl)) = (c.tunnel_if.as_deref(),
-                            c.protected_routes.as_deref(), self.egress.lock().expect("egress").as_ref())
-                        {
-                            ctl.delivered_dns(answer, interface, routes);
-                        }
-                    }
-                }
-                Event::DnsCompatibilityLoss(loss) => {
-                    let epoch = loss.resume();
-                    if c.forwarder.as_ref().is_some_and(|f| f.is_current(epoch)) {
-                        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
-                            ctl.dns_delivery_loss(epoch);
-                        }
                     }
                 }
                 Event::DnsAnswer(answer, reply) => {
@@ -1353,28 +1219,9 @@ impl Shared {
             // re-add a bypass after its rule or session was removed.
             rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
         });
-        let egress_dns = c.protected_routes.as_ref().map(|_| {
-            let weak = Arc::downgrade(self);
-            let lookup: dns_forwarder::EgressDnsHook = Box::new(move |epoch, name, candidates| {
-                let Some(engine) = weak.upgrade() else { return Vec::new() };
-                // This optional hint must never wait for the engine, which can be joining DNS workers.
-                let Ok(c) = engine.core.try_lock() else { return Vec::new() };
-                if c.stop_requested || c.tunnel_retrying || c.recovery_suspended()
-                    || c.forwarder.as_ref().is_none_or(|f| f.epoch() != epoch) { return Vec::new(); }
-                let Some(interface) = c.tunnel_if.as_deref() else { return Vec::new() };
-                let Some(group) = c.protected_routes.as_ref().and_then(|routes|
-                    crate::egress_gate::Classifier::group_for_name(routes.as_ref(), name)) else { return Vec::new() };
-                let Ok(controller) = engine.egress.try_lock() else { return Vec::new() };
-                controller.as_ref().map_or_else(Vec::new, |controller|
-                    controller.wrong_dns_addresses(group, name, candidates, interface))
-            });
-            lookup
-        });
-        let on_delivered = Some(delivered_dns::hook(self.tx.lock().unwrap().clone()));
-        let forwarder = Forwarder::with_dns_hooks(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
-            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook), egress_dns, on_delivered);
-        if c.protected_routes.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
-        forwarder.observe_deliveries(false);
+        let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
+            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
+        if c.protected_sites.is_some() { forwarder.set_parsed_rules(c.split_rules()); }
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {
@@ -1508,17 +1355,6 @@ impl Shared {
         SplitSync::Complete
     }
 
-    fn sync_dns_scope(&self, c: &Core) {
-        let active = egress_active(&c.config) && c.config.egress.as_ref().is_some_and(|cfg| cfg.block_unidentified_web)
-            && c.tunnel_if.is_some() && !c.stop_requested && !c.tunnel_retrying && !c.recovery_suspended();
-        if let Some(forwarder) = &c.forwarder {
-            forwarder.observe_deliveries(active);
-        }
-        if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
-            ctl.set_dns_epoch(c.forwarder.as_ref().filter(|_| active).map(Forwarder::epoch));
-        }
-    }
-
     fn update_forwarder(&self, c: &Core) {
         if let Some(f) = &c.forwarder {
             let tunnel_if = c.tunnel_if.clone().filter(|_| !c.recovery_suspended());
@@ -1528,7 +1364,6 @@ impl Shared {
                 physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
                 tunnel_if,
             },index);
-            self.sync_dns_scope(c);
         }
     }
 
@@ -1537,7 +1372,6 @@ impl Shared {
             return;
         }
         c.config.drop_protection = on;
-        self.sync_dns_scope(c);
         if on {
             if let Some((tun, gws)) = c.last_pf.clone() {
                 if !c.stop_requested {
@@ -1718,7 +1552,6 @@ impl Shared {
         c.routed_networks.clear();
         c.network_routes_error=None;
         if let Some(f) = c.forwarder.take() {
-            self.sync_dns_scope(c);
             f.stop();
         }
         if !self.routes.remove_all() {
@@ -2180,10 +2013,6 @@ impl Shared {
                         }
                     }
                     gateway = Some(peer);
-                }
-                if let Some(ctl) = self.egress.lock().expect("egress").as_ref() {
-                    let includes = pairs.iter().find(|(k, _)| *k == "intweb").map_or("",|(_,v)| *v);
-                    ctl.session_internal_routes(includes);
                 }
                 c.hook_fired = true;
                 if let Some(servers) = c.cstp_dns.accepted() {

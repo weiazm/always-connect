@@ -1,15 +1,16 @@
 #!/bin/bash
-# Egress gate harness (DESIGN.md §66.13): real openconnect in --script-tun
-# mode against the local test gateway (ocserv-test.sh), with the gate
-# program in between. The client side lives in its own network namespace,
-# so its traffic can only leave through the gate; the test sites sit on a
-# dummy interface on the gateway side. Proves, with hard-coded addresses
-# (no DNS at all):
+# Egress gate harness (DESIGN.md §66.13, §66.25): real openconnect in
+# --script-tun mode against the local test gateway (ocserv-test.sh), with the
+# gate program in between. The client side lives in its own network
+# namespace, so its traffic can only leave through the gate; the test sites
+# sit on a dummy interface on the gateway side. Proves, with hard-coded
+# addresses (no DNS at all):
 #   - an unprotected site passes without a check;
 #   - a protected site is checked first, then passes (probe before request);
-#   - a group whose egress country is wrong is refused with a reset and no
-#     request reaches the site, including its "follow the group" member;
-#   - plain HTTP is decided by Host; a protected address range by address;
+#   - a protected site (or subdomain) whose exit country is wrong is refused
+#     with a reset and no request reaches the site;
+#   - plain HTTP is decided by Host; a connection without a name passes;
+#   - a protected site whose exit cannot be read passes (best effort);
 #   - UDP 443 (QUIC) never leaves, other UDP does;
 #   - concurrent connections share one check;
 #   - with the controller gone, protected connections are refused.
@@ -65,7 +66,7 @@ openssl req -newkey rsa:2048 -nodes -subj "/CN=protected.test" \
 # Full leaf extensions: Python 3.13+ verifies strictly (VERIFY_X509_STRICT)
 # and rejects a leaf without an authority key identifier.
 cat > "$W/site.ext" <<'EXT'
-subjectAltName=DNS:protected.test,DNS:blocked.test,DNS:follow.blocked.test,DNS:free.test,DNS:range.test
+subjectAltName=DNS:protected.test,DNS:blocked.test,DNS:www.blocked.test,DNS:free.test,DNS:untraced.test
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
@@ -122,8 +123,8 @@ if [ "$out" = "ok protected.test" ] && python3 -c "import sys; sys.exit(0 if 0 <
   pass "protected site is checked first, then passes"
 else fail "protected site: '$out' probe=$probe_t request=$req_t"; fi
 
-# 3. Wrong egress country: refused fast, nothing reaches the site.
-for name in blocked.test follow.blocked.test; do
+# 3. Wrong exit country: refused fast, nothing reaches the site.
+for name in blocked.test www.blocked.test; do
   start=$(date +%s.%N)
   if nsx "${CURL[@]}" --resolve $name:443:$SITE https://$name/ >/dev/null 2>&1; then
     fail "$name was let through"
@@ -137,12 +138,11 @@ for name in blocked.test follow.blocked.test; do
 done
 hs=$(count '"kind": "handshake", "sni": "blocked.test"' "$W/site.log")
 probes=$(count '"sni": "blocked.test", "path": "/cdn-cgi/trace", "probe": true' "$W/site.log")
-fhs=$(count '"kind": "handshake", "sni": "follow.blocked.test"' "$W/site.log")
-if [ "$hs" = "$probes" ] && [ "$fhs" = 0 ]; then
-  pass "only marked probes completed a TLS handshake with the blocked group ($probes)"
-else fail "blocked handshakes=$hs probes=$probes follow=$fhs"; fi
+if [ "$hs" = "$probes" ]; then
+  pass "only marked probes completed a TLS handshake with the blocked site ($probes)"
+else fail "blocked handshakes=$hs probes=$probes"; fi
 
-# 4. Plain HTTP by Host; a protected range by address.
+# 4. Plain HTTP by Host; no name, or no readable exit: best effort, passes.
 out=$(nsx curl -sS --max-time 8 --resolve free.test:80:$SITE http://free.test/ 2>&1 || true)
 [ "$out" = "ok free.test" ] && pass "plain HTTP to an unprotected host passes" || fail "http free: '$out'"
 if nsx curl -sS --max-time 8 --resolve blocked.test:80:$SITE http://blocked.test/ >/dev/null 2>&1; then
@@ -150,10 +150,15 @@ if nsx curl -sS --max-time 8 --resolve blocked.test:80:$SITE http://blocked.test
 elif [ "$(count '"host": "blocked.test"' "$W/site.log")" = 0 ]; then
   pass "plain HTTP to a blocked host is refused by Host"
 else fail "plain HTTP request reached the site"; fi
+checks=$(count '"kind": "check"' "$W/controller.log")
 out=$(nsx python3 -I -c "import socket;s=socket.create_connection(('$RANGE',7000),5);s.sendall(b'ping');print(s.recv(16).decode())" 2>&1 || true)
-if [ "$out" = "pong" ] && [ "$(count '"group": 3' "$W/controller.log")" -ge 1 ]; then
-  pass "a protected address range is checked, then passes"
-else fail "range: '$out'"; fi
+if [ "$out" = "pong" ] && [ "$(count '"kind": "check"' "$W/controller.log")" = "$checks" ]; then
+  pass "a connection that shows no name passes without a check"
+else fail "nameless: '$out'"; fi
+out=$(nsx "${CURL[@]}" --resolve untraced.test:443:$SITE https://untraced.test/ 2>&1 || true)
+if [ "$out" = "ok untraced.test" ] && [ "$(count '"result": "unverified"' "$W/controller.log")" -ge 1 ]; then
+  pass "a protected site whose exit cannot be read passes"
+else fail "untraced: '$out'"; fi
 
 # 5. QUIC never leaves; other UDP does.
 nsx python3 -I -c "

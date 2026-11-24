@@ -348,12 +348,10 @@ struct PanelView: View {
     /// state on the left, a chevron to the 出口保护 page on the right
     /// (user, 2026-11-24: the centred row looked broken).
     private func egressRow(_ line: String) -> some View {
-        let blocked = !manager.egressNotices.isEmpty
-        let tint: Color = blocked ? .red : {
+        let tint: Color = {
             switch manager.egressLevel {
             case .ok: return .green
             case .partial: return .orange
-            case .blocked: return .red
             case .unknown: return .secondary
             }
         }()
@@ -367,7 +365,7 @@ struct PanelView: View {
                     Text(line)
                         .font(.caption)
                         .foregroundStyle(tint)
-                        .lineLimit(blocked ? 3 : 2)
+                        .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 6)

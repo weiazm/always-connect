@@ -357,7 +357,7 @@ struct ConnectionsPage: View {
     private func blockedDestination(_ row: Row) -> Bool {
         guard row.via == "vpn", let owner = protectedConfig.rule(covering: row.host),
               let state = protectionStatus?.groups.first(where: { $0.id == owner.id }) else { return false }
-        return state.observed.contains { $0.evidenceKind == .direct && $0.host == row.host
+        return state.observed.contains { $0.host == row.host
             && $0.peerAddress == row.remote && $0.country != nil && $0.isOutside(owner.expect) }
     }
 

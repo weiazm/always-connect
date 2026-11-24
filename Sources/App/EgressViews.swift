@@ -37,10 +37,7 @@ struct EgressRuleBadge: Equatable {
         case .partial:
             let count = state.blockedCount ?? 0
             return .init(text: count > 0 ? "拦下 \(count) 次" : "部分拦截", tone: .warning, problem: state.blockCaption)
-        case .blocked: return .init(text: "已拦住", tone: .bad, problem: state.blockCaption)
-        case .unknown:
-            return state.blocked ? .init(text: "已拦住", tone: .warning, problem: state.blockCaption)
-                : .init(text: "核实中", tone: .active, problem: nil)
+        case .unknown: return .init(text: "核实中", tone: .active, problem: nil)
         }
     }
 }
@@ -185,40 +182,22 @@ struct EgressCountryChips: View {
     }
 }
 
-/// The "blocked first, ask the user" step made visible: every pending
-/// question the background service can prove, with its answer buttons.
-enum EgressDecision: Identifiable {
-    case country(EgressCountryApproval, rule: String)
-    case unverified(UInt32, rule: String, caption: String)
-
-    var id: String {
-        switch self {
-        case .country(let approval, _): return "c:" + approval.id
-        case .unverified(let id, _, _): return "u:\(id)"
-        }
-    }
-
-    var rule: UInt32 {
-        switch self {
-        case .country(let approval, _): return approval.group
-        case .unverified(let id, _, _): return id
-        }
-    }
+/// The "blocked first, ask the user" step made visible: a wrong exit
+/// country the background service can prove, with its answer buttons.
+struct EgressDecision: Identifiable {
+    let approval: EgressCountryApproval
+    let ruleName: String
+    var id: String { approval.id }
+    var rule: UInt32 { approval.group }
 }
 
 extension EgressProtection.Status {
     func decisions(config: EgressProtection) -> [EgressDecision] {
         guard running else { return [] }
         return config.groups.filter(\.enabled).flatMap { rule -> [EgressDecision] in
-            let countries = approvals(for: rule.id).filter { approval in
+            approvals(for: rule.id).filter { approval in
                 records.first { $0.group == rule.id && $0.started == approval.started }?.expected == rule.expect
-            }.map { EgressDecision.country($0, rule: rule.name) }
-            if !countries.isEmpty { return countries }
-            guard let state = groups.first(where: { $0.id == rule.id }), state.displayLevel == .blocked else { return [] }
-            // Name the website that is actually blocked, not the whole rule (user report, 2026-11-24).
-            let site = state.sites?.first(where: { $0.state == "blocked" })?.host ?? state.lastBlockedHost ?? rule.name
-            let others = site == rule.name ? "" : "；\(rule.name) 的其他网站照常逐条检查"
-            return [.unverified(rule.id, rule: site, caption: "查不到它从哪里出去，按规则先拦住了" + others)]
+            }.map { EgressDecision(approval: $0, ruleName: rule.name) }
         }
     }
 }
@@ -228,7 +207,6 @@ struct EgressDecisionList: View {
     let decisions: [EgressDecision]
     let refresh: () -> Void
     var open: ((UInt32) -> Void)? = nil
-    let pause: (UInt32) -> Void
     @State private var pending: Pending?
     @State private var busy = false
     @State private var message: String?
@@ -270,24 +248,17 @@ struct EgressDecisionList: View {
         } message: { choice in Text(choice.caption) }
     }
 
-    @ViewBuilder private func row(_ decision: EgressDecision) -> some View {
-        switch decision {
-        case .country(let approval, let rule):
-            EgressCallout(icon: "exclamationmark.shield.fill", tint: .orange,
-                          text: "\(rule) 的出口变成了 \(egressCountryLabel(approval.country))，已先拦住",
-                          caption: "服务器 \(approval.observation.peerAddress ?? approval.observation.host)"
-                              + (approval.observation.ip.map { " · 出口 \($0)" } ?? "")) {
-                if let open { Button("详情") { open(approval.group) } }
-                Button("允许" + egressCountryName(approval.country)) { pending = .country(approval) }
-            }
-            .disabled(busy || !manager.showsConnected)
-        case .unverified(let id, let rule, let caption):
-            EgressCallout(icon: "xmark.shield.fill", tint: .red, text: "\(rule) 暂时打不开", caption: caption) {
-                Button("暂停保护") { pause(id) }
-                Button(busy ? "正在检查…" : "重新检查") { recheck(id) }
-            }
-            .disabled(busy || !manager.showsConnected)
+    private func row(_ decision: EgressDecision) -> some View {
+        let approval = decision.approval
+        return EgressCallout(icon: "exclamationmark.shield.fill", tint: .orange,
+                             text: "\(decision.ruleName) 的出口变成了 \(egressCountryLabel(approval.country))，已先拦住",
+                             caption: "服务器 \(approval.observation.peerAddress ?? approval.observation.host)"
+                                 + (approval.observation.ip.map { " · 出口 \($0)" } ?? "")) {
+            if let open { Button("详情") { open(approval.group) } }
+            Button(busy ? "正在检查…" : "重新检查") { recheck(approval.group) }
+            Button("允许" + egressCountryName(approval.country)) { pending = .country(approval) }
         }
+        .disabled(busy || !manager.showsConnected)
     }
 
     private func recheck(_ id: UInt32) {
@@ -318,7 +289,6 @@ extension EgressProtection.Level {
         switch self {
         case .ok, .unknown: return .secondary
         case .partial: return .orange
-        case .blocked: return .red
         }
     }
 }
