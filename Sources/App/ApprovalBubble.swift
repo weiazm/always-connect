@@ -93,7 +93,7 @@ struct ApprovalBubble: View {
     /// while the phone is asked, blue while connecting, green when done.
     static func iconColor(_ stage: ApprovalPromptTracker.Stage) -> Color {
         switch stage {
-        case .waiting: return .orange
+        case .waiting, .expired: return .orange
         case .gatewayReply, .configuring, .establishing: return .blue
         case .connected: return .green
         }
@@ -244,6 +244,9 @@ struct ApprovalCardIcon: View {
             case .connected:
                 Image(systemName: "checkmark")
                     .font(.system(size: 14, weight: .heavy))
+            case .expired:
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 14, weight: .semibold))
             }
         }
         .foregroundStyle(tint)

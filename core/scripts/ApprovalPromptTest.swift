@@ -131,6 +131,31 @@ struct ApprovalPromptTest {
 
         check(T.Card.clock(-3) == "0:00" && T.Card.clock(3600) == "60:00", "clock")
 
+        // An expired request says so and counts down to the next one (2026-11-24).
+        check(T.ownLoginSignal("手机上的批准已超时，30 秒后重新发起批准") == .expired(30)
+              && T.ownLoginSignal("手机上的批准已超时，5 分钟后重新发起批准") == .expired(300)
+              && T.ownLoginSignal("手机上的批准已超时") == .expired(-1), "expiry details parse")
+        var expiry = T()
+        _ = expiry.handle(.approval, now: at(0))
+        _ = expiry.handle(.gatewayReply, now: at(100))
+        if case .update(let late) = expiry.handle(.expired(120), now: at(101)) {
+            check(late.title == "手机上的批准已超时" && late.subtitle(now: at(101)) == "2:00 后重新发起"
+                  && late.subtitle(now: at(220)) == "0:01 后重新发起"
+                  && late.subtitle(now: at(222)) == "正在重新发起…", "expiry replaces the gateway reply and counts down")
+        } else { check(false, "expiry updates the card") }
+        check(expiry.handle(.expired(120), now: at(110)) == .none, "the same expiry pushed again changes nothing")
+        check(expiry.handle(.ownLogin, now: at(111)) == .none, "a status readback keeps the expiry card")
+        check(expiry.handle(.newAttempt, now: at(221)) == .hide, "the next attempt retires the expiry card")
+        if case .show(let second) = expiry.handle(.approval, now: at(222)) {
+            check(second.request == 2 && second.subtitle(now: at(222)).hasPrefix("第 2 次请求"), "the next push counts as request 2")
+        } else { check(false, "next push shows") }
+        _ = expiry.handle(.expired(60), now: at(322))
+        check(expiry.card?.subtitle(now: at(322)) == "第 2 次 · 1:00 后重新发起", "later expiries name the count")
+        var hiddenExpiry = T()
+        _ = hiddenExpiry.handle(.approval, now: at(0))
+        hiddenExpiry.hide()
+        if case .show = hiddenExpiry.handle(.expired(30), now: at(100)) {} else { check(false, "expiry ends a hidden wait and shows") }
+
         print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
         exit(failures == 0 ? 0 : 1)
     }

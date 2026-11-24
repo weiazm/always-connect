@@ -85,6 +85,8 @@ final class ApprovalPrompt {
     private static func signal(_ state: HelperClient.State, own: Bool, progress: ApprovalPromptTracker.Signal,
                                failed: Bool) -> ApprovalPromptTracker.Signal {
         if failed { return .ended }
+        // Either engine, between an expired request and the next one.
+        if case .expired = progress, state != .connected, state != .disconnected { return progress }
         switch state {
         case .awaitingApproval: return own && progress == .configuring ? .configuring : .approval
         case .authenticating:
