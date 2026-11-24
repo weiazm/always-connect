@@ -82,10 +82,10 @@ struct ConnectionsPage: View {
         var before: [DirectSite]
     }
 
-    /// The app picker opens with the clicked row's program ticked (§66.24).
+    /// The add sheet opens with the clicked row's website filled in (§66.25).
     private struct EgressAddition: Identifiable {
         let id = UUID()
-        var process: String?
+        var site: String?
     }
 
     private struct EgressAction: Identifiable {
@@ -119,7 +119,7 @@ struct ConnectionsPage: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if showEgressTip && filter == .vpn {
-                Text("点行尾的「操作」→「保护这个程序的出口…」。")
+                Text("点行尾的「操作」→「保护这个网站的出口…」。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Table(shown, selection: $selected, sortOrder: $sortOrder) {
@@ -240,13 +240,12 @@ struct ConnectionsPage: View {
             if !Task.isCancelled && egressNotice?.id == notice.id { egressNotice = nil }
         }
         .sheet(item: $egressAddition) { addition in
-            EgressAppPicker(process: addition.process,
-                            countries: protectedConfig.groups.last(where: \.byApp)?.expect ?? []) { apps, countries, done in
-                guard let change = EgressRuleChange.addingApps(apps, countries: countries, to: nil, config:
+            EgressSiteSheet(sites: addition.site.map { [$0] } ?? [],
+                            countries: protectedConfig.groups.last(where: \.simple)?.expect ?? [], preview: preview) { sites, countries, done in
+                guard let change = EgressRuleChange.addingSites(sites, countries: countries, config:
                         ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) else { done(false); return }
                 let added = change.after.groups.first { group in !change.before.groups.contains { $0.id == group.id } }
-                let action = EgressAction(change: change, text: "已开始保护 " + apps.map(EgressApps.displayName).joined(separator: "、"),
-                                          rule: added?.id)
+                let action = EgressAction(change: change, text: "已开始保护 " + sites.joined(separator: "、"), rule: added?.id)
                 done(true)
                 if change.needsReconnect(connected: manager.showsConnected) { egressPending = action } else { applyEgress(action) }
             }
@@ -285,11 +284,13 @@ struct ConnectionsPage: View {
         let bypass = DirectSites.covering(sites, host: row.host, address: row.remote)
         let directChoices = manager.ownConnection && row.via == "vpn" && bypass == nil
             ? DirectSites.choices(host: row.host, address: row.remote) : []
-        // Exit protection is by app (§66.24): any program on the VPN can be added.
-        let protectable = row.via == "vpn" && !manager.usesCisco && manager.protectsDrops
+        // Exit protection is by site (§66.25): a VPN row with a name can be added.
+        let site = row.host.flatMap { DirectSites.clean(DirectSites.site(of: $0)) }
+        let protectable = row.via == "vpn" && !manager.usesCisco && manager.protectsDrops && site != nil
         let owner = protectedConfig.groups.first { group in
-            group.byApp && group.apps.contains { ($0 as NSString).lastPathComponent == row.process
-                || EgressApps.displayName($0) == row.process }
+            group.enabled && group.sites.contains { protected in
+                row.host.map { $0 == protected || $0.hasSuffix("." + protected) } ?? false
+            }
         }
         return Group {
             if row.via == "direct", let bypass, manager.ownConnection {
@@ -300,7 +301,7 @@ struct ConnectionsPage: View {
                         if let owner {
                             Button("在出口保护里查看「\(owner.name)」") { settingsWindow.show(tab: "egress", egressRule: owner.id) }
                         } else {
-                            Button("保护这个程序的出口…") { egressAddition = .init(process: row.process) }
+                            Button("保护这个网站的出口…") { egressAddition = .init(site: site) }
                         }
                     }
                     if !directChoices.isEmpty {

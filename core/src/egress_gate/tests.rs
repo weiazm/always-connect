@@ -1571,3 +1571,42 @@ fn a_protected_apps_connection_is_held_and_checked_by_what_it_shows() {
     connect_and_send(&mut g, 47002, RANGE_IP, b"opaque-protocol-bytes", now);
     assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 1, host: None, host_confirmed: false, .. }]));
 }
+
+#[test]
+fn a_site_rule_checks_any_programs_connection_that_shows_a_protected_name() {
+    let mut g = gate();
+    g.set_unknown_web(UnknownWebPolicy::new(true, &[], &[]));
+    g.set_rule_sites(HashMap::from([(2, vec!["Guarded.Example.".to_string()])]), &HashSet::new());
+    let now = Instant::now();
+    let (step, _) = connect_and_send(&mut g, 48000, PUBLIC, &hello(Some("api.guarded.example"), &[], false, 0), now);
+    assert_eq!(step, Step::Consumed);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 2, host: Some(h), host_confirmed: true, .. }] if h == "api.guarded.example"));
+    // A real name behind the ECH (GREASE) extension is still that site.
+    connect_and_send(&mut g, 48001, PUBLIC, &hello(Some("guarded.example"), &[], true, 0), now);
+    assert!(matches!(drain(&mut g).as_slice(), [Out::Check { group: 2, host_confirmed: false, .. }]));
+    // Everything else passes: other names, a cover name, no name, look-alikes.
+    for (port, payload) in [(48002, hello(Some("other.example"), &[], false, 0)), (48003, hello(Some("cloudflare-ech.com"), &[], true, 0)),
+                            (48004, hello(None, &[], false, 0)), (48005, hello(Some("notguarded.example"), &[], false, 0)),
+                            (48006, b"opaque".to_vec())] {
+        assert_eq!(connect_and_send(&mut g, port, PUBLIC, &payload, now).0, Step::Forward);
+    }
+    assert!(drain(&mut g).is_empty());
+    assert!(g.take_unknown_web().is_none(), "nothing is blocked as unidentified");
+    assert_eq!(g.outbound(&udp4(MAC, 48010, PUBLIC, 443, b"QUIC"), now), Step::Consumed, "QUIC falls back to TCP");
+    assert_eq!(g.outbound(&udp4(MAC, 48011, PUBLIC, 53, b"dns"), now), Step::Forward);
+}
+
+#[test]
+fn an_app_rule_with_sites_checks_only_those_and_what_it_hides() {
+    let mut g = app_gate();
+    g.set_rule_sites(HashMap::from([(1, vec!["guarded.example".to_string()])]), &HashSet::from([1]));
+    let now = Instant::now();
+    // The app's other services (e.g. a remote tool) pass unchecked.
+    assert_eq!(connect_and_send(&mut g, 47000, PUBLIC, &hello(Some("tools.example"), &[], false, 0), now).0, Step::Forward);
+    assert!(drain(&mut g).is_empty());
+    connect_and_send(&mut g, 47001, PUBLIC, &hello(Some("chat.guarded.example"), &[], false, 0), now);
+    assert_eq!(checks(&drain(&mut g)), vec![(1, Some("chat.guarded.example".into()))]);
+    // A hidden name from the protected app may be one of its sites: checked.
+    connect_and_send(&mut g, 47002, PUBLIC, &hello(Some("cloudflare-ech.com"), &[], true, 0), now);
+    assert_eq!(checks(&drain(&mut g)).len(), 1);
+}

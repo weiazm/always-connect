@@ -64,11 +64,20 @@ pub struct Group {
     /// Protected apps (§66.24): bundle paths or executable names. A group
     /// with apps is checked by connection owner, not by name.
     pub apps: Vec<String>,
+    /// The sites this rule protects, with subdomains (§66.25). Without
+    /// apps the rule covers every program's connections to them.
+    pub sites: Vec<String>,
 }
 
 impl Group {
     pub fn by_app(&self) -> bool {
         self.apps.iter().any(|app| !app.trim().is_empty())
+    }
+
+    /// A rule of the simple kind (§66.24, §66.25): apps and/or sites,
+    /// checked at the connection's own destination; no website members.
+    pub fn simple(&self) -> bool {
+        self.by_app() || self.sites.iter().any(|site| !site.trim().is_empty())
     }
 }
 
@@ -134,9 +143,18 @@ pub struct GateGroup {
     cidrs: Vec<String>,
     #[serde(default)]
     apps: Vec<String>,
+    #[serde(default)]
+    sites: Vec<String>,
 }
 
 impl GateGroup {
+    /// The gate's protected sites per rule, and which rules also name apps.
+    pub fn rule_sites(groups: &[GateGroup]) -> (std::collections::HashMap<u32, Vec<String>>, std::collections::HashSet<u32>) {
+        let sites = groups.iter().filter(|g| !g.sites.is_empty()).map(|g| (g.id, g.sites.clone())).collect();
+        let apps = groups.iter().filter(|g| !g.apps.is_empty()).map(|g| g.id).collect();
+        (sites, apps)
+    }
+
     /// The gate's app rules; empty unless some group protects apps.
     pub fn app_rules(groups: &[GateGroup]) -> Vec<crate::egress_gate::owners::AppRule> {
         groups.iter().filter(|g| !g.apps.is_empty())
@@ -246,11 +264,18 @@ impl EgressConfig {
 
     pub fn protected_routes(&self) -> ProtectedRoutes {
         // App groups protect by owner: no names or addresses to route or rewrite.
-        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled && !g.by_app()).map(|g| GateGroup {
+        ProtectedRoutes::new(&self.groups.iter().filter(|g| g.enabled && (!g.by_app() || !g.sites.is_empty())).map(|g| GateGroup {
             id: g.id,
-            names: g.members.iter().map(|m| m.pattern.trim().to_string()).collect(),
+            // A site rule's names still go through the VPN and lose their ECH
+            // configs in local DNS, so the gate can read them (§66.25).
+            names: if g.simple() {
+                g.sites.iter().flat_map(|s| { let s = s.trim().trim_start_matches("*.").to_ascii_lowercase(); [s.clone(), format!("*.{s}")] }).collect()
+            } else {
+                g.members.iter().map(|m| m.pattern.trim().to_string()).collect()
+            },
             cidrs: g.cidrs.clone(),
             apps: Vec::new(),
+            sites: Vec::new(),
         }).collect::<Vec<_>>())
     }
 
@@ -282,8 +307,8 @@ impl EgressConfig {
         self.groups
             .iter()
             .filter(|g| g.enabled)
-            .map(|g| if g.by_app() {
-                serde_json::json!({ "id": g.id, "names": [], "cidrs": [], "apps": g.apps })
+            .map(|g| if g.simple() {
+                serde_json::json!({ "id": g.id, "names": [], "cidrs": [], "apps": g.apps, "sites": g.sites })
             } else {
                 serde_json::json!({ "id": g.id, "names": g.members.iter().map(|m| m.pattern.trim().to_ascii_lowercase()).collect::<Vec<_>>(), "cidrs": g.cidrs })
             })
@@ -291,7 +316,7 @@ impl EgressConfig {
     }
 
     fn has_direct_method(&self, group: &Group) -> bool {
-        if group.by_app() {
+        if group.simple() {
             return self.method(PRESET_TRACE).is_some_and(|m| m.is_direct());
         }
         group.members.iter().filter_map(|m| self.method(m.method.as_deref()?)).any(|m| m.is_direct())
@@ -1094,7 +1119,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
                 continue;
             }
             let targets = state.failures.get(&group.id).unwrap_or(&Failures::default()).plan(&state.config, &group, &check);
-            if group.by_app() && targets.is_empty() {
+            if group.simple() && targets.is_empty() {
                 // Best effort (§66.24): a protected app's connection that shows
                 // no name cannot be probed; let it through and count it.
                 state.note_unverified(group.id);
@@ -1181,7 +1206,7 @@ fn finish_check(state: &mut ControlState, group: &Group, host: Option<&str>, key
             o.error=Some("出口观测已过期，需要重新核验".into());
         }
     }
-    if group.by_app() && !results.iter().any(|(_, o)| o.country.is_some()) {
+    if group.simple() && !results.iter().any(|(_, o)| o.country.is_some()) {
         // Best effort (§66.24): no exit could be read for this destination.
         state.note_unverified(group.id);
         if key.0 != 0 { state.send(&verdict(group.id, key.1, true, false, None)); }

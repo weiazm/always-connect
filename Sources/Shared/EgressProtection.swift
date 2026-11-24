@@ -35,7 +35,7 @@ struct EgressProtection: Codable, Equatable {
     func permitsActivation(comparedTo previous: Self) -> Bool {
         guard enabled else { return true }
         return groups.allSatisfy { group in
-            !group.enabled || group.byApp || !directMembers(in: group).isEmpty
+            !group.enabled || group.simple || !directMembers(in: group).isEmpty
                 || (previous.enabled && previous.groups.contains { $0.id == group.id && $0.enabled })
         }
     }
@@ -53,8 +53,13 @@ struct EgressProtection: Codable, Equatable {
         /// or executable names ("x-cli"). A group with apps is checked by
         /// connection owner; website members are no longer used.
         var apps: [String] = []
+        /// The sites this rule protects, with subdomains (DESIGN §66.25).
+        /// Without apps the rule covers every program's connections to them.
+        var sites: [String] = []
 
         var byApp: Bool { apps.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
+        /// Apps and/or sites; the retired kind has website members instead.
+        var simple: Bool { byApp || sites.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty } }
     }
 
     struct Member: Codable, Equatable, Identifiable {
@@ -219,5 +224,6 @@ extension EgressProtection.Group {
         exitRangeCheck = try values.decodeIfPresent(Bool.self, forKey: .exitRangeCheck) ?? false
         exitRanges = try values.decodeIfPresent([String].self, forKey: .exitRanges) ?? []
         apps = try values.decodeIfPresent([String].self, forKey: .apps) ?? []
+        sites = try values.decodeIfPresent([String].self, forKey: .sites) ?? []
     }
 }

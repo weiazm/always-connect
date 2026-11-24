@@ -837,6 +837,15 @@ fn an_app_group_probes_the_connection_itself_and_never_by_member_names() {
     assert!(Failures::default().plan(&cfg, &group, &target_check(3, "198.51.100.9", None)).is_empty(),
             "no name: nothing to probe, the controller lets it through (best effort)");
     assert!(crate::egress_gate::Classifier::group_for_name(&cfg.protected_routes(), "chat.example.com").is_none(), "app groups route and rewrite no names");
+    let mut sites = cfg.clone();
+    sites.groups[0].apps.clear();
+    sites.groups[0].sites = vec!["guarded.example".into()];
+    assert!(sites.groups[0].simple() && sites.has_direct_method(&sites.groups[0]));
+    let routes = sites.protected_routes();
+    assert!(crate::egress_gate::Classifier::group_for_name(&routes, "api.guarded.example") == Some(1)
+            && crate::egress_gate::Classifier::group_for_name(&routes, "guarded.example") == Some(1),
+            "a site rule's names keep the VPN route and lose their ECH configs");
+    assert_eq!(sites.gate_groups()[0]["sites"], serde_json::json!(["guarded.example"]));
     let gate = cfg.gate_groups();
     assert_eq!(gate[0]["apps"], serde_json::json!(["/Applications/Example.app", "example-cli"]));
 }

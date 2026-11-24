@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// One protection rule (DESIGN §66.24): the apps it covers, where they may
-/// leave from, and what was blocked (UI-DESIGN「出口保护页」).
+/// One protection rule (DESIGN §66.25): the sites it covers, where they
+/// may leave from, and what was blocked (UI-DESIGN「出口保护页」).
 struct EgressRuleDetail: View {
     @Environment(\.dismiss) private var dismiss
     let rule: EgressProtection.Group
@@ -9,13 +9,11 @@ struct EgressRuleDetail: View {
     let status: EgressProtection.Status?
     let connected: Bool
     let refresh: () -> Void
-    let addApp: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
     let pause: (UInt32) -> Void
     let remove: () -> Void
     @State private var renaming = false
     @State private var name = ""
-    @State private var removing: String?
     @State private var showDelete = false
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
@@ -33,13 +31,15 @@ struct EgressRuleDetail: View {
                     }
                 }
                 Section {
-                    ForEach(rule.apps, id: \.self) { app in appRow(app) }
-                    Button(action: addApp) { Label("添加 App…", systemImage: "plus.circle.fill") }
-                        .buttonStyle(.borderless)
+                    EgressSitesEditor(sites: Binding(get: { rule.sites }, set: { sites in
+                        // A rule needs at least one site; delete the rule instead.
+                        guard !sites.isEmpty else { return }
+                        edit { $0.sites = sites }
+                    }))
                 } header: {
-                    Text("App")
+                    Text("要保护的网站")
                 } footer: {
-                    Text("App 里的辅助程序一起算。它们以外的程序不受这条保护影响。")
+                    Text("任何程序访问这里的网站（含子域名）时检查出口，别的连接不受影响。至少留一个。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -86,21 +86,15 @@ struct EgressRuleDetail: View {
                 if !value.isEmpty && value != rule.name { edit { $0.name = value } }
             }
         } message: { Text("只是给自己看的名字，不影响保护。") }
-        .confirmationDialog("不再保护 \(removing.map(EgressApps.displayName) ?? "")？", isPresented: Binding(
-            get: { removing != nil }, set: { if !$0 { removing = nil } }
-        ), titleVisibility: .visible, presenting: removing) { app in
-            Button("移除", role: .destructive) { edit { $0.apps.removeAll { $0 == app } } }
-            Button("取消", role: .cancel) {}
-        } message: { _ in Text("它的连接以后不再核对出口。") }
         .alert("删除「\(rule.name)」的出口保护？", isPresented: $showDelete) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive, action: remove)
-        } message: { Text("这些 App 以后不再核对出口。只想临时停一下，可以用右上角的开关暂停。") }
+        } message: { Text("以后不再核对出口。只想临时停一下，可以用右上角的开关暂停。") }
     }
 
     private var header: some View {
         HStack(alignment: .center, spacing: 14) {
-            Image(nsImage: EgressApps.icon(rule.apps.first ?? "")).resizable().frame(width: 44, height: 44)
+            EgressSiteAvatar(name: rule.sites.first ?? rule.name, size: 44)
                 .opacity(rule.enabled ? 1 : 0.45)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -121,7 +115,7 @@ struct EgressRuleDetail: View {
             }
             .toggleStyle(.always)
             .fixedSize()
-            .disabled(!rule.enabled && (rule.apps.isEmpty || rule.expect.isEmpty))
+            .disabled(!rule.enabled && (!rule.simple || rule.expect.isEmpty))
         }
     }
 
@@ -135,21 +129,6 @@ struct EgressRuleDetail: View {
             return countries + " · \(time) 核实过"
         }
         return countries
-    }
-
-    private func appRow(_ app: String) -> some View {
-        HStack(spacing: 10) {
-            Image(nsImage: EgressApps.icon(app)).resizable().frame(width: 20, height: 20)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(EgressApps.displayName(app)).lineLimit(1)
-                Text(app.hasPrefix("/") ? app : "命令行程序（按名字匹配）")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            }
-            Spacer(minLength: 8)
-            Button { removing = app } label: { Image(systemName: "minus.circle").foregroundStyle(.secondary) }
-                .buttonStyle(.borderless).help("不再保护这个 App")
-                .disabled(rule.apps.count <= 1)
-        }
     }
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {

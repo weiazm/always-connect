@@ -32,10 +32,10 @@ struct EgressProtectionPage: View {
     @State private var confirmDropProtection = false
 
     enum Sheet: Identifiable {
-        case add(UInt32?), details(UInt32), unknownWeb
+        case addSites, details(UInt32), unknownWeb
         var id: String {
             switch self {
-            case .add(let id): return "add-\(id ?? 0)"
+            case .addSites: return "add-sites"
             case .details(let id): return "details-\(id)"
             case .unknownWeb: return "unknown-web"
             }
@@ -54,10 +54,10 @@ struct EgressProtectionPage: View {
     /// Only app rules are shown and edited (§66.24); website rules are retired.
     private var config: EgressProtection {
         var result = stored.rulesForEditing
-        result.groups.removeAll { !$0.byApp }
+        result.groups.removeAll { !$0.simple }
         return result
     }
-    private var legacyRules: [EgressProtection.Group] { stored.groups.filter { !$0.byApp } }
+    private var legacyRules: [EgressProtection.Group] { stored.groups.filter { !$0.simple } }
     private var connected: Bool { preview?.connected ?? manager.showsConnected }
     private var available: Bool { preview?.available ?? (!manager.usesCisco && manager.protectsDrops) }
     private var active: [EgressProtection.Group] { config.groups.filter(\.enabled) }
@@ -70,8 +70,8 @@ struct EgressProtectionPage: View {
                 statusBar
                 if !legacyRules.isEmpty {
                     EgressCallout(icon: "arrow.triangle.2.circlepath", tint: .accentColor,
-                                  text: "出口保护改成了按 App 保护",
-                                  caption: "以前按网站设的 \(legacyRules.count) 个保护\(stored.isActive ? "还在生效" : "已不再使用")；添加 App 后会自动替换。") {
+                                  text: "出口保护改成了按域名保护",
+                                  caption: "以前按网站设的 \(legacyRules.count) 个保护\(stored.isActive ? "还在生效" : "已不再使用")；添加网站后会自动替换。") {
                         Button("现在移除") { change { _ in } }
                     }
                 }
@@ -90,7 +90,7 @@ struct EgressProtectionPage: View {
                     }
                 }
             } footer: {
-                Text("选好的 App 经 VPN 的每条新连接先确认从哪个国家出去，不对就拦下再问你；别的程序完全不受影响。查不到出口的连接先放行并记数。选中 App 的连接约多等半秒，也不用 QUIC。")
+                Text("访问受保护网站的每条新连接先确认从哪个国家出去，不对就拦下再问你；别的连接不受影响。查不出出口的先放行并记数。经 VPN 的新连接约多等半秒，也不用 QUIC。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {
@@ -142,7 +142,7 @@ struct EgressProtectionPage: View {
                 imported.blockUnidentifiedWeb = nil
                 for index in imported.groups.indices { imported.groups[index].exitRangeCheck = false }
                 var offline = imported.rulesForEditing
-                offline.groups.removeAll { !$0.byApp }
+                offline.groups.removeAll { !$0.simple }
                 change { $0 = offline }
                 if message == nil {
                     notice = nil
@@ -179,7 +179,7 @@ struct EgressProtectionPage: View {
                 Button("打开断线保护") { confirmDropProtection = true }
             }
             moreMenu
-            Button { sheet = .add(nil) } label: { Label("添加 App", systemImage: "plus") }
+            Button { sheet = .addSites } label: { Label("添加网站", systemImage: "plus") }
                 .buttonStyle(.borderedProminent)
                 .disabled(!available || busy)
         }
@@ -205,32 +205,32 @@ struct EgressProtectionPage: View {
     }
 
     private var statusLook: StatusLook {
-        let sites = Set(active.flatMap(\.apps)).count
+        let sites = Set(active.flatMap(\.sites)).count
         if preview == nil && manager.usesCisco {
             return .init(tint: .gray, line: "要先在「分流」页打开「按网站分流」才能用", lineColor: .secondary)
         }
         if !available { return .init(tint: .gray, line: "要先打开断线保护才能用", lineColor: .secondary) }
-        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个 App", lineColor: .secondary) }
+        if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加要保护的网站", lineColor: .secondary) }
         if active.isEmpty { return .init(tint: .gray, line: "已全部暂停", lineColor: .secondary) }
-        guard connected else { return .init(tint: .accentColor, line: "\(sites) 个 App 受保护 · VPN 连上后开始检查") }
+        guard connected else { return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · VPN 连上后开始检查") }
         switch liveStatus?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown {
-        case .ok: return .init(tint: .green, line: "一切正常 · 正在保护 \(sites) 个 App")
+        case .ok: return .init(tint: .green, line: "一切正常 · 正在保护 \(sites) 个网站")
         case .partial:
             let count = liveStatus?.blockedCount ?? 0
             return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 条出口不对的连接" : "有些连接出口不对，已拦下",
                          lineColor: .orange)
         case .blocked: return .init(tint: .red, line: "有连接被拦住了，需要你决定", lineColor: .red)
-        case .unknown: return .init(tint: .accentColor, line: "\(sites) 个 App 受保护 · 等它们连网时核实出口")
+        case .unknown: return .init(tint: .accentColor, line: "\(sites) 个网站受保护 · 有连接时核实出口")
         }
     }
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "app.badge.checkmark").font(.system(size: 34)).foregroundStyle(.secondary)
-            Text("还没有受保护的 App").font(.headline)
-            Text("选好 App 和允许的国家。它经 VPN 的每条连接都会先确认出口，\n不对就拦下再问你；别的程序不受影响。")
+            Image(systemName: "globe.asia.australia.fill").font(.system(size: 34)).foregroundStyle(.secondary)
+            Text("还没有受保护的网站").font(.headline)
+            Text("填上要保护的网站和允许的国家。访问这些网站的连接会先确认出口，\n不对就拦下再问你；别的连接不受影响。")
                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button("添加 App…") { sheet = .add(nil) }
+            Button("添加网站…") { sheet = .addSites }
                 .buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
@@ -245,7 +245,7 @@ struct EgressProtectionPage: View {
 
     private var tableHeader: some View {
         HStack(spacing: 8) {
-            Text("App").frame(maxWidth: .infinity, alignment: .leading)
+            Text("网站").frame(maxWidth: .infinity, alignment: .leading)
             Text("只从这里出去").frame(width: Self.countryWidth, alignment: .leading)
             Text("状态").frame(width: Self.stateWidth, alignment: .leading)
             Text("保护").frame(width: Self.switchWidth)
@@ -256,22 +256,21 @@ struct EgressProtectionPage: View {
     private func ruleRow(_ group: EgressProtection.Group, decisions: [EgressDecision]) -> some View {
         let state = liveStatus?.groups.first { $0.id == group.id }
         let badge = EgressRuleBadge.of(group, config: config, state: state, connected: connected)
-        let canEnable = (group.byApp || !config.directMembers(in: group).isEmpty) && !group.expect.isEmpty
+        let canEnable = (group.simple || !config.directMembers(in: group).isEmpty) && !group.expect.isEmpty
         let problem = group.enabled && decisions.isEmpty ? badge.problem : nil
         let unverified = connected ? state?.unverifiedCount ?? 0 : 0
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Button { sheet = .details(group.id) } label: {
                     HStack(spacing: 10) {
-                        Image(nsImage: EgressApps.icon(group.apps.first ?? "")).resizable().frame(width: 26, height: 26)
+                        EgressSiteAvatar(name: group.sites.first ?? group.name, size: 26)
                             .opacity(group.enabled ? 1 : 0.45)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(group.name).fontWeight(.medium).lineLimit(1)
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
                             } else {
-                                Text(group.appNames.joined(separator: "、")
-                                     + (unverified > 0 ? " · \(unverified) 条查不到出口，已放行" : ""))
+                                Text(Self.rowCaption(group, unverified: unverified))
                                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                             }
                         }
@@ -291,13 +290,20 @@ struct EgressProtectionPage: View {
                 }))
                 .labelsHidden().toggleStyle(.always).fixedSize()
                 .frame(width: Self.switchWidth)
-                .help(group.enabled ? "暂停保护这个 App" : "恢复保护")
+                .help(group.enabled ? "暂停这个保护" : "恢复保护")
             }
             if !decisions.isEmpty {
                 EgressDecisionList(decisions: decisions, refresh: refresh, pause: pause)
             }
         }
         .padding(.vertical, 3)
+    }
+
+    private static func rowCaption(_ group: EgressProtection.Group, unverified: UInt64) -> String {
+        var parts: [String] = []
+        if !group.sites.isEmpty { parts.append(group.sites.joined(separator: "、")) }
+        if unverified > 0 { parts.append("\(unverified) 条查不到出口，已放行") }
+        return parts.joined(separator: " · ")
     }
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
@@ -329,15 +335,13 @@ struct EgressProtectionPage: View {
 
     @ViewBuilder private func sheetView(_ page: Sheet) -> some View {
         switch page {
-        case .add(let id):
-            EgressAppPicker(rule: config.groups.first { $0.id == id },
-                            countries: config.groups.last?.expect ?? []) { apps, countries, done in
-                addApps(apps, countries: countries, to: id, done: done)
+        case .addSites:
+            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { sites, countries, done in
+                addSites(sites, countries: countries, done: done)
             }
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
-                                 addApp: { sheet = .add(id) },
                                  edit: { edit in changeRule(id, edit: edit) }, pause: pause,
                                  remove: { sheet = nil; change { $0.groups.removeAll { $0.id == id } } })
             }
@@ -362,17 +366,10 @@ struct EgressProtectionPage: View {
 
     private func pause(_ id: UInt32) { changeRule(id) { $0.enabled = false } }
 
-    private func addApps(_ apps: [String], countries: [String], to id: UInt32?, done: @escaping (Bool) -> Void) {
-        let names = apps.map(EgressApps.displayName)
-        if let id {
-            changeRule(id, edit: { rule in
-                for app in apps where !rule.apps.contains(app) { rule.apps.append(app) }
-            }, completion: done)
-            return
-        }
-        var group = EgressProtection.newGroup(in: stored, name: names.count > 1 ? "\(names[0]) 等 \(names.count) 个" : names[0])
+    private func addSites(_ sites: [String], countries: [String], done: @escaping (Bool) -> Void) {
+        var group = EgressProtection.newGroup(in: stored, name: sites.count > 1 ? "\(sites[0]) 等 \(sites.count) 个" : sites[0])
         group.enabled = true
-        group.apps = apps
+        group.sites = sites
         group.expect = countries
         change({ $0.groups.append(group) }, completion: { ok in
             if ok { message = nil }
@@ -391,7 +388,7 @@ struct EgressProtectionPage: View {
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
         // Website rules are retired (§66.24): any save keeps only app rules.
         let change = EgressRuleChange(config: previous) { config in
-            config.groups.removeAll { !$0.byApp }
+            config.groups.removeAll { !$0.simple }
             edit(&config)
         }
         guard change.after.permitsActivation(comparedTo: previous) else {

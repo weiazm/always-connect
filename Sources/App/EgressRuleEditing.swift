@@ -63,24 +63,18 @@ struct EgressRuleChange: Identifiable, Equatable {
 }
 
 extension EgressRuleChange {
-    /// Protect apps (§66.24): a new rule with these countries, or more apps
-    /// for an existing rule. Retired website rules are dropped on the way.
-    static func addingApps(_ apps: [String], countries: [String], to id: UInt32?, config: EgressProtection) -> Self? {
-        guard !apps.isEmpty, id != nil || !countries.isEmpty else { return nil }
-        let names = apps.map(EgressApps.displayName)
-        var added = EgressProtection.newGroup(in: config, name: names.count > 1 ? "\(names[0]) 等 \(names.count) 个" : names[0])
+    /// Protect sites (§66.25): a new rule with these countries. Retired
+    /// website-member rules are dropped on the way.
+    static func addingSites(_ sites: [String], countries: [String], config: EgressProtection) -> Self? {
+        guard !sites.isEmpty, !countries.isEmpty else { return nil }
+        var added = EgressProtection.newGroup(in: config, name: sites.count > 1 ? "\(sites[0]) 等 \(sites.count) 个" : sites[0])
         added.enabled = true
-        added.apps = apps
+        added.sites = sites
         added.expect = countries
-        let change = Self(config: config) { result in
-            result.groups.removeAll { !$0.byApp }
-            if let id, let index = result.groups.firstIndex(where: { $0.id == id }) {
-                for app in apps where !result.groups[index].apps.contains(app) { result.groups[index].apps.append(app) }
-            } else if id == nil {
-                result.groups.append(added)
-            }
+        return Self(config: config) { result in
+            result.groups.removeAll { !$0.simple }
+            result.groups.append(added)
         }
-        return change.after == change.before ? nil : change
     }
 }
 

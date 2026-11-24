@@ -364,6 +364,8 @@ fn main() {
     };
     let mut gate = Gate::new(gcfg, Box::new(groups));
     gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&cfg.groups))));
+    let (sites, app_rules) = GateGroup::rule_sites(&cfg.groups);
+    gate.set_rule_sites(sites, &app_rules);
     log(&format!("up on {ifname}"));
     if let Some(c) = &mut control {
         let _ = c.stream.write_all((serde_json::json!({ "up": { "ifname": ifname } }).to_string() + "\n").as_bytes());
@@ -400,6 +402,8 @@ fn main() {
                                 log("new configuration");
                                 gate.set_unknown_web(m.unknown_web.policy(&groups));
                                 gate.set_owners(Box::new(ProcessOwners::new(GateGroup::app_rules(&groups))));
+                                let (sites, app_rules) = GateGroup::rule_sites(&groups);
+                                gate.set_rule_sites(sites, &app_rules);
                                 gate.reconfigure(alpn.into_bytes(), Box::new(ProtectedRoutes::new(&groups)));
                             }
                             if m.invalidate == Some(true) {

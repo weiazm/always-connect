@@ -47,6 +47,10 @@ const MAX_WARMS_PER_WINDOW: usize = 8;
 const WARM_WINDOW: Duration = Duration::from_secs(1);
 const WARM_NAME_LIFETIME: Duration = Duration::from_secs(60);
 
+/// A held connection of any program, to be matched against site rules by
+/// the name it shows (rule ids are never 0).
+const ANY_PROGRAM: GroupId = 0;
+
 /// Outer names that real ECH deployments use to hide the site.
 const ECH_COVER_NAMES: &[&str] = &["cloudflare-ech.com"];
 
@@ -365,6 +369,11 @@ pub struct Gate {
     /// held and checked; every other connection passes untouched.
     owners: Box<dyn owners::FlowOwners>,
     app_flows: HashMap<FlowKey, GroupId>,
+    /// Per rule: the sites it protects, with subdomains (§66.25). A rule
+    /// without apps applies to every program; with apps, only to theirs.
+    rule_sites: HashMap<GroupId, Vec<String>>,
+    /// Rules with sites and no apps, in order.
+    site_rules: Vec<GroupId>,
 }
 
 impl Gate {
@@ -388,6 +397,8 @@ impl Gate {
             clock: evidence_clock_ms,
             owners: Box::new(owners::NoOwners),
             app_flows: HashMap::new(),
+            rule_sites: HashMap::new(),
+            site_rules: Vec::new(),
         }
     }
 
@@ -398,8 +409,33 @@ impl Gate {
         self.app_flows.clear();
     }
 
+    /// The sites each rule protects (§66.25). `app_rules` are the rules
+    /// that also name apps; the others cover every program.
+    pub fn set_rule_sites(&mut self, sites: HashMap<GroupId, Vec<String>>, app_rules: &HashSet<GroupId>) {
+        self.rule_sites = sites.into_iter()
+            .map(|(group, sites)| (group, sites.iter().map(|s| norm(s).trim_start_matches("*.").to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()))
+            .filter(|(_, sites)| !sites.is_empty())
+            .collect();
+        let mut site_rules: Vec<_> = self.rule_sites.keys().copied().filter(|group| !app_rules.contains(group)).collect();
+        site_rules.sort_unstable();
+        self.site_rules = site_rules;
+        self.app_flows.clear();
+    }
+
+    fn site_matches(sites: &[String], host: &str) -> bool {
+        let host = norm(host);
+        sites.iter().any(|site| host == *site || host.strip_suffix(site.as_str()).is_some_and(|rest| rest.ends_with('.')))
+    }
+
+    /// A name the connection really shows: not a known ECH cover name.
+    fn visible_name(name: &str, ech: bool) -> bool {
+        is_site_name(name) && !(ech && ECH_COVER_NAMES.contains(&norm(name).as_str()))
+    }
+
+    /// Rules by app or by site (§66.24, §66.25): only their connections are
+    /// held; everything else passes at its first packet.
     fn app_mode(&self) -> bool {
-        self.owners.active()
+        self.owners.active() || !self.site_rules.is_empty()
     }
 
     /// Actions produced since the last drain, in order.
@@ -704,7 +740,12 @@ impl Gate {
             .collect();
         for k in stale {
             if let Some(&group) = self.app_flows.get(&k) {
-                self.wait_for_check(k, group, None, false, now);
+                if group == ANY_PROGRAM {
+                    self.app_flows.remove(&k);
+                    self.release(k);
+                } else {
+                    self.wait_for_check(k, group, None, false, now);
+                }
                 continue;
             }
             let _ = self.decide_by_address(k, now, false, UnknownWebReason::Unidentified, None);
@@ -724,7 +765,9 @@ impl Gate {
                 f.last_seen = now;
                 return if matches!(f.state, State::Blocked) { Step::Consumed } else { Step::Forward };
             }
-            let protected = dport == 443 && self.owners.group_for(17, sport, now).is_some();
+            // A site rule covers every program, and QUIC hides which site a
+            // datagram is for: all QUIC falls back to TCP, as before (§66.5).
+            let protected = dport == 443 && (!self.site_rules.is_empty() || self.owners.group_for(17, sport, now).is_some());
             self.insert(key, if protected { State::Blocked } else { State::Pass }, now);
             return if protected { Step::Consumed } else { Step::Forward };
         }
@@ -870,10 +913,16 @@ impl Gate {
     #[allow(clippy::too_many_arguments)]
     fn outbound_new_app_tcp(&mut self, pkt: &[u8], key: FlowKey, seg: ClientSeg, syn: bool, data_start: u32,
                             empty: bool, now: Instant) -> Step {
-        let Some(group) = self.owners.group_for(6, key.sport, now) else {
+        let owned = if self.owners.active() { self.owners.group_for(6, key.sport, now) } else { None };
+        let Some(group) = owned.or_else(|| (!self.site_rules.is_empty()).then_some(ANY_PROGRAM)) else {
             self.insert(key, State::Pass, now);
             return Step::Forward;
         };
+        if group == ANY_PROGRAM && !syn && !empty {
+            // Mid-stream with no name to read: best effort, let it pass.
+            self.insert(key, State::Pass, now);
+            return Step::Forward;
+        }
         if syn {
             if !self.insert(key, State::Fresh { next: data_start }, now) {
                 self.reset(key, seg);
@@ -902,23 +951,40 @@ impl Gate {
     /// A protected app's held connection: check it with whatever name its
     /// first bytes show. The name may be an ECH cover name; the check is
     /// about this destination address either way.
-    fn after_hold_app(&mut self, key: FlowKey, group: GroupId, now: Instant) -> Step {
+    fn after_hold_app(&mut self, key: FlowKey, group: GroupId, now: Instant, first: bool) -> Step {
         let (verdict, full) = {
             let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };
             (sniff(&h.stream), h.bytes >= self.cfg.max_held_bytes)
         };
-        let (host, confirmed) = match verdict {
+        let (host, ech) = match verdict {
             Sniff::Incomplete if !full => return Step::Consumed,
-            Sniff::Tls { sni: Some(name), ech, .. } => {
-                let confirmed = !ech && is_site_name(&name);
-                (Some(name), confirmed)
-            }
-            Sniff::Http(Some(name)) => {
-                let confirmed = is_site_name(&name);
-                (Some(name), confirmed)
-            }
+            Sniff::Tls { sni: Some(name), ech, .. } => (Some(name), ech),
+            Sniff::Http(Some(name)) => (Some(name), false),
             _ => (None, false),
         };
+        let visible = host.as_deref().filter(|name| Self::visible_name(name, ech));
+        let target = if group == ANY_PROGRAM {
+            // A site rule: only a connection that shows a protected name.
+            visible.and_then(|name| self.site_rules.iter().copied()
+                .find(|rule| self.rule_sites.get(rule).is_some_and(|sites| Self::site_matches(sites, name))))
+        } else {
+            // An app rule: with sites, a shown name outside them passes; a
+            // hidden one is checked, it may be one of them.
+            match (self.rule_sites.get(&group), visible) {
+                (Some(sites), Some(name)) if !Self::site_matches(sites, name) => None,
+                _ => Some(group),
+            }
+        };
+        let Some(group) = target else {
+            self.app_flows.remove(&key);
+            if first {
+                self.set_state(key, State::Pass);
+                return Step::Forward;
+            }
+            self.release(key);
+            return Step::Consumed;
+        };
+        let confirmed = !ech && host.as_deref().is_some_and(is_site_name);
         self.wait_for_check(key, group, host, confirmed, now);
         Step::Consumed
     }
@@ -926,7 +992,7 @@ impl Gate {
     /// Try to classify a holding connection from what it has sent so far.
     fn after_hold(&mut self, key: FlowKey, now: Instant, first: bool) -> Step {
         if let Some(&group) = self.app_flows.get(&key) {
-            return self.after_hold_app(key, group, now);
+            return self.after_hold_app(key, group, now, first);
         }
         let (verdict, full) = {
             let Some(Flow { state: State::Holding(h), .. }) = self.flows.get(&key) else { return Step::Consumed };

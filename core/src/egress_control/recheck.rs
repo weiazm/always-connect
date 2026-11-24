@@ -141,7 +141,7 @@ impl Failures {
     }
 
     pub fn plan(&self, cfg: &EgressConfig, group: &Group, check: &CheckMsg) -> Vec<Target> {
-        if group.by_app() {
+        if group.simple() {
             // A protected app's connection is probed at its own destination,
             // with the name it showed (a cover name still reaches the same edge).
             let (Some(host), Some(method)) = (check.host.as_ref(), cfg.method(super::PRESET_TRACE)) else { return Vec::new() };
