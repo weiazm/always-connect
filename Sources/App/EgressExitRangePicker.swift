@@ -1,8 +1,11 @@
 import SwiftUI
 
+/// Which observed exits to allow. The recommended range is ticked; single
+/// addresses are one disclosure away. Only observed exits are offered.
 struct EgressExitRangePicker: View {
     let offers: [EgressExitRangeOffer]
     @Binding var selection: EgressExitRangeSelection?
+    var showsToggle = true
 
     private var offer: EgressExitRangeOffer? {
         offers.first { $0.proof == selection?.proof }
@@ -10,42 +13,61 @@ struct EgressExitRangePicker: View {
 
     var body: some View {
         if !offers.isEmpty {
-            Toggle("同时核对出口网段", isOn: Binding(
-                get: { selection != nil },
-                set: { on in
-                    if on, let first = offers.first { select(first) }
-                    else { selection = nil }
-                }))
-            if let offer {
-                if offers.count > 1 {
-                    Picker("使用此网站的观测", selection: Binding(
-                        get: { offer.proof },
-                        set: { value in if let next = offers.first(where: { $0.proof == value }) { select(next) } }
-                    )) {
-                        ForEach(offers) { Text($0.host).tag($0.proof) }
-                    }
-                }
-                Text("直接观测的出口 IP：" + offer.suggestions.addresses.map(\.address).joined(separator: "、"))
-                    .font(.caption).foregroundStyle(.secondary)
-                ForEach(offer.suggestions.recommended, id: \.self) { cidr in
-                    Toggle((cidr.hasSuffix("/128") ? "只允许 " : "允许网段 ") + cidr, isOn: rangeBinding(cidr))
-                }
-                DisclosureGroup("其他范围") {
-                    ForEach(offer.suggestions.addresses) { exit in
-                        if exit.isIPv6 {
-                            Toggle("允许网段 \(exit.subnet)", isOn: rangeBinding(exit.subnet))
-                        } else {
-                            Toggle("只允许 \(exit.address)", isOn: rangeBinding(exit.single))
+            VStack(alignment: .leading, spacing: 6) {
+                if showsToggle {
+                    Toggle(isOn: Binding(
+                        get: { selection != nil },
+                        set: { on in
+                            if on, let first = offers.first { select(first) }
+                            else { selection = nil }
+                        })) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("还要核对出口地址（更严）")
+                            Text("国家对了还不够，出口地址也得是下面勾的；换了就先拦住再问你。")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    .toggleStyle(.checkbox)
                 }
-                if offer.suggestions.addresses.contains(where: \.isIPv6) {
-                    Text("IPv6 出口网段校验尚未在真实 VPN 上实测。")
-                        .font(.caption).foregroundStyle(.secondary)
+                if let offer {
+                    if offers.count > 1 {
+                        Picker("按哪个网站查到的出口", selection: Binding(
+                            get: { offer.proof },
+                            set: { value in if let next = offers.first(where: { $0.proof == value }) { select(next) } }
+                        )) {
+                            ForEach(offers) { Text($0.host).tag($0.proof) }
+                        }
+                        .fixedSize()
+                    }
+                    let current = offer.suggestions.addresses.map(\.address).joined(separator: "、")
+                    ForEach(offer.suggestions.recommended, id: \.self) { cidr in
+                        Toggle(isOn: rangeBinding(cidr)) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(cidr.hasSuffix("/128") ? "只放行 \(cidr)" : "放行 \(cidr)")
+                                Text("推荐 · 包含现在的出口 \(current)").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                    DisclosureGroup("改成只放行单个地址") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(offer.suggestions.addresses) { exit in
+                                if exit.isIPv6 {
+                                    Toggle("放行 \(exit.subnet)", isOn: rangeBinding(exit.subnet)).toggleStyle(.checkbox)
+                                } else {
+                                    Toggle("只放行 \(exit.address)", isOn: rangeBinding(exit.single)).toggleStyle(.checkbox)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if offer.suggestions.addresses.contains(where: \.isIPv6) {
+                        Text("IPv6 出口地址的核对还没在真实 VPN 上实测过。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                Text("只有你确认的地址或网段才会加入允许列表。")
-                    .font(.caption).foregroundStyle(.secondary)
             }
+            .padding(.leading, showsToggle ? 0 : 2)
         }
     }
 

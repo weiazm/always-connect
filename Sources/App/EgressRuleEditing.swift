@@ -230,6 +230,25 @@ extension EgressProtection.SetupProbe {
         return first.country
     }
 
+    /// One line for the add sheet's list: where it leaves from, plainly.
+    var shortCaption: String {
+        switch status {
+        case "ok":
+            let counts = countriesByCount
+            guard !counts.isEmpty else { return "这次没查到出口" }
+            let failed = max(0, probedAddressCount - counts.reduce(0) { $0 + $1.count })
+            if counts.count == 1 && failed == 0 {
+                return "\(probedAddressCount) 个服务器都从 \(egressFlag(counts[0].country)) \(egressCountryName(counts[0].country)) 出去"
+            }
+            let parts = counts.map { "\($0.count) 个从 \(egressFlag($0.country)) \(egressCountryName($0.country))" }
+            return parts.joined(separator: "，") + (failed > 0 ? "，\(failed) 个查不到" : "")
+        case "unsupported":
+            return "不能直接检查，跟着一起保护"
+        default:
+            return error ?? "这次没查到出口"
+        }
+    }
+
     var caption: String {
         switch status {
         case "ok":

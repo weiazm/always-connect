@@ -23,6 +23,9 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
+            EgressProtectionPage()
+                .tabItem { Label("出口保护", systemImage: "checkmark.shield") }
+                .tag("egress")
             ConnectionSettingsPage(preview: connectionPreview)
                 .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
                 .tag("connections")
@@ -692,20 +695,6 @@ struct SplitPage: View {
     @State private var localNetworks: [String] = []
 
     var body: some View {
-        ScrollViewReader { proxy in
-            splitForm
-                .onAppear { focusEgress(using: proxy) }
-                .onChange(of: window.egressCardRequested) { _ in focusEgress(using: proxy) }
-        }
-    }
-
-    private func focusEgress(using proxy: ScrollViewProxy) {
-        guard window.egressCardRequested else { return }
-        window.egressCardRequested = false
-        DispatchQueue.main.async { proxy.scrollTo("egress-protection", anchor: .top) }
-    }
-
-    private var splitForm: some View {
         Form {
             Section {
                 Toggle(isOn: Binding(
@@ -814,8 +803,6 @@ struct SplitPage: View {
                     ? "改动立即生效，不用重新连接。写法示例：鼠标停在输入框旁的问号上；点问号打开全部清单名。"
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
-
-            EgressProtectionSection().id("egress-protection")
 
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {

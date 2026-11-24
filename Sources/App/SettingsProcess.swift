@@ -47,7 +47,7 @@ final class SettingsLink {
             transport?.send(["type": "show", "tab": tab ?? "", "egressRule": egressRule.map(String.init) ?? ""])
             return
         }
-        if let tab { UserDefaults.standard.set(["egress", "unknown-egress"].contains(tab) ? "split" : tab, forKey: "settingsTab") }
+        if let tab { UserDefaults.standard.set(tab == "unknown-egress" ? "egress" : tab, forKey: "settingsTab") }
         guard let executable = Bundle.main.executableURL else { return }
         let p = Process()
         p.executableURL = executable

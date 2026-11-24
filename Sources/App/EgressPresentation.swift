@@ -5,6 +5,21 @@ func egressCountryName(_ code: String) -> String {
     Locale(identifier: "zh_Hans").localizedString(forRegionCode: code) ?? code
 }
 
+func egressFlag(_ code: String) -> String {
+    let letters = code.uppercased().unicodeScalars
+    guard letters.count == 2, letters.allSatisfy({ (65...90).contains($0.value) }) else { return "" }
+    return String(String.UnicodeScalarView(letters.compactMap { UnicodeScalar(127_397 + $0.value) }))
+}
+
+func egressCountryLabel(_ code: String) -> String {
+    let flag = egressFlag(code)
+    return (flag.isEmpty ? "" : flag + " ") + egressCountryName(code)
+}
+
+func egressCountriesLabel(_ codes: [String]) -> String {
+    codes.isEmpty ? "还没选国家" : codes.map(egressCountryLabel).joined(separator: "、")
+}
+
 struct EgressCountryApproval: Codable, Equatable, Identifiable {
     let group: UInt32
     let started: Double
@@ -46,8 +61,8 @@ extension EgressProtection {
 
         var caption: String {
             switch self {
-            case .noDirectMethod: return "无法核实网站本身的出口，已拦截这组新连接"
-            case .failedTargetOverflow: return "失败地址过多，已拦截这组新连接"
+            case .noDirectMethod: return "无法核实网站本身的出口，已先拦住新连接"
+            case .failedTargetOverflow: return "出口不对的服务器太多，已先拦住新连接"
             }
         }
     }
@@ -93,8 +108,8 @@ extension EgressProtection {
 extension EgressProtection.Observation {
     var exitRangeFailureCaption: String? {
         switch failureReason {
-        case "exit-range-mismatch": return "出口换到了未允许的网段，已拦截相关新连接"
-        case "exit-ip-unavailable": return "未能核实出口 IP，已拦截相关新连接"
+        case "exit-range-mismatch": return "出口地址不在允许范围，已先拦住新连接"
+        case "exit-ip-unavailable": return "查不到出口地址，已先拦住新连接"
         default: return nil
         }
     }
@@ -146,9 +161,12 @@ extension EgressProtection.GroupState {
         case .ok: return nil
         case .partial:
             let count = blockedCount ?? 0
-            return count > 0 ? "已拦下 \(count) 次连接，其他地址仍逐条核对" : "部分地址已拦截，其他地址仍逐条核对"
+            return count > 0 ? "已拦下 \(count) 次连接，其他服务器照常逐条检查" : "有些服务器出口不对，已拦下；其他照常检查"
         case .blocked:
             let website = sites?.first(where: { $0.state == "blocked" })?.host ?? lastBlockedHost ?? name
+            if let country = lastBlockedCountry ?? observed.lazy.compactMap(\.country).first {
+                return "\(website) 暂时打不开：出口在\(egressCountryName(country))"
+            }
             return "\(website) 暂时打不开：出口无法核实"
         case .unknown: return blocked ? "有连接已拦截，正在等待出口状态" : nil
         }

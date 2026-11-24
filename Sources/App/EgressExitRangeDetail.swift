@@ -1,9 +1,13 @@
 import SwiftUI
 
+/// The stricter check inside 「允许的出口」: besides the country, only
+/// the exit addresses the user confirmed. Turning it on first looks up
+/// the current exit, so the user only ever confirms what was observed.
+/// A changed exit is asked about in 「需要你决定」 (EgressDecisionList).
 struct EgressExitRangeDetail: View {
     @ObservedObject private var manager = HelperClient.shared
     let rule: EgressProtection.Group
-    let status: EgressProtection.Status?
+    let connected: Bool
     let refresh: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
 
@@ -12,96 +16,57 @@ struct EgressExitRangeDetail: View {
     @State private var sampleConfiguration: EgressProtection?
     @State private var request = UUID()
     @State private var busy = false
-    @State private var pending: Decision?
+    @State private var confirmStop = false
     @State private var message: String?
 
-    private enum Decision {
-        case enable(EgressExitRangeSetup)
-        case allow(EgressExitRangeApproval)
-        case disable
-
-        var title: String {
-            switch self {
-            case .enable: return "开启出口网段核对？"
-            case .allow: return "允许此出口范围？"
-            case .disable: return "停止核对出口网段？"
-            }
-        }
-
-        var caption: String {
-            switch self {
-            case .enable(let setup):
-                let ranges = setup.proposed.groups.first { $0.id == setup.group }?.exitRanges ?? []
-                return "后续连接须同时满足允许的国家和这些出口范围：" + ranges.joined(separator: "、") + "。"
-            case .allow(let approval):
-                return "允许出口范围 \(approval.cidr)。同一规则里仍会核对国家和每条新连接的实际出口。"
-            case .disable:
-                return "关闭后，这条规则仍核对国家。同一国家的新出口地址将不再因为网段变化被拦截。"
-            }
-        }
-
-        var button: String {
-            switch self {
-            case .enable: return "确认开启"
-            case .allow(let approval): return "允许 \(approval.cidr)"
-            case .disable: return "停止核对"
-            }
-        }
-    }
-
     var body: some View {
-        Section("允许的出口网段") {
-            if rule.exitRangeCheck {
-                Text("新连接必须同时符合允许的国家和出口网段。")
-                    .font(.caption).foregroundStyle(.secondary)
-                ForEach(rule.exitRanges, id: \.self) { Text($0) }
-                if rule.exitRanges.contains(where: { $0.contains(":") }) {
-                    Text("IPv6 出口网段校验尚未在真实 VPN 上实测。")
+        if rule.exitRangeCheck {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("核对出口地址")
+                    Text("国家对了还不够，出口地址也得在这些范围里：")
                         .font(.caption).foregroundStyle(.secondary)
-                }
-                Button("停止核对出口网段", role: .destructive) { pending = .disable }.disabled(busy)
-                ForEach(status?.exitChanges(for: rule) ?? []) { change in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("出口换了新地址 \(change.exit.address)，已拦截相关新连接。")
-                            .foregroundStyle(.orange)
-                        Text(change.observation.observationCaption)
-                            .font(.caption).foregroundStyle(.secondary)
-                        HStack {
-                            Button("只允许 \(change.exit.address)") { pending = .allow(change.approval(for: change.exit.single)) }
-                            Button("允许网段 \(change.exit.subnet)") { pending = .allow(change.approval(for: change.exit.subnet)) }
-                        }
-                        if change.exit.isIPv6 {
-                            Text("IPv6 出口网段校验尚未在真实 VPN 上实测。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
+                    Text(rule.exitRanges.joined(separator: "、")).font(.callout.monospacedDigit())
+                    if rule.exitRanges.contains(where: { $0.contains(":") }) {
+                        Text("IPv6 出口地址的核对还没在真实 VPN 上实测过。").font(.caption).foregroundStyle(.secondary)
                     }
-                    .disabled(busy || !manager.showsConnected)
                 }
-            } else {
-                Text("当前只核对国家。开启后，未允许的出口网段会拦截相关新连接。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Button(busy ? "正在核对…" : "检查出口并查看网段建议") { check() }
-                    .disabled(busy || !manager.showsConnected || !rule.enabled)
-                if !manager.showsConnected || !rule.enabled {
-                    Text("请连接自建 VPN 并开启这条网站规则后再检查。")
-                        .font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 12)
+                Button("停止核对…") { confirmStop = true }
+            }
+            .confirmationDialog("只核对国家？", isPresented: $confirmStop, titleVisibility: .visible) {
+                Button("停止核对出口地址", role: .destructive) {
+                    edit { if $0 == rule { $0.exitRangeCheck = false } }
                 }
-                EgressExitRangePicker(offers: offers, selection: $selection)
+                Button("取消", role: .cancel) {}
+            } message: { Text("之后同一国家换了新出口地址，也不会再拦。") }
+        } else {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("核对出口地址")
+                    Text(offers.isEmpty ? "现在只看国家。更严一点：先查一次现在的出口地址，由你确认放行范围。"
+                         : "勾选要放行的出口，之后出口换到别处就先拦住再问你。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                if offers.isEmpty {
+                    Button(busy ? "正在查…" : "查现在的出口") { check() }
+                        .disabled(busy || !connected || !rule.enabled)
+                        .help(!connected || !rule.enabled ? "连上 VPN 并打开这个保护后才能查" : "")
+                }
+            }
+            if !offers.isEmpty {
+                EgressExitRangePicker(offers: offers, selection: $selection, showsToggle: false)
                     .disabled(busy)
-                if !offers.isEmpty {
-                    Button("开启出口网段核对") { confirmSetup() }
+                HStack {
+                    Spacer()
+                    Button("取消") { offers = []; selection = nil; request = UUID() }
+                    Button("开始核对") { confirmSetup() }
                         .disabled(busy || selection?.verified(in: offers) != true)
                 }
             }
             if let message { Text(message).font(.caption).foregroundStyle(.secondary) }
         }
-        .onDisappear { request = UUID() }
-        .confirmationDialog(pending?.title ?? "确认出口网段", isPresented: Binding(
-            get: { pending != nil }, set: { if !$0 { pending = nil } }
-        ), titleVisibility: .visible, presenting: pending) { change in
-            Button(change.button) { apply(change) }
-            Button(rule.exitRangeCheck ? "继续拦截" : "取消", role: .cancel) {}
-        } message: { change in Text(change.caption) }
     }
 
     private func check() {
@@ -125,13 +90,17 @@ struct EgressExitRangeDetail: View {
             guard manager.showsConnected, manager.connectedSince == session,
                   (ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) == config else {
                 busy = false
-                message = "VPN 或规则已变化，请重新检查。"
+                message = "VPN 或设置刚变过，请再查一次。"
                 return
             }
             guard members.indices.contains(index) else {
                 busy = false
                 offers = collected
-                if collected.isEmpty { message = "没有来自已允许国家的直接出口 IP。请检查这条规则的检测方式。" }
+                if let first = collected.first {
+                    selection = .init(proof: first.proof, ranges: Set(first.suggestions.recommended))
+                } else {
+                    message = "这次没查到允许国家里的出口地址。请稍后再查。"
+                }
                 return
             }
             let member = members[index]
@@ -152,31 +121,13 @@ struct EgressExitRangeDetail: View {
         guard manager.showsConnected, let sampleConfiguration, let selection,
               let setup = EgressExitRangeSetup(proposed: sampleConfiguration, previous: sampleConfiguration,
                                               group: rule.id, selection: selection, offers: offers) else { return }
-        pending = .enable(setup)
-    }
-
-    private func apply(_ decision: Decision) {
-        pending = nil
-        switch decision {
-        case .enable(let setup):
-            busy = true
-            manager.confirmExitRangeSetup(setup) { ok in
-                busy = false
-                offers = []
-                selection = nil
-                message = ok ? "已开启出口网段核对。" : "未能确认开启。原设置已保留，请重新检查后再试。"
-                refresh()
-            }
-        case .allow(let approval):
-            busy = true
-            manager.allowEgressRange(approval) { ok in
-                busy = false
-                message = ok ? "已允许 \(approval.cidr)。下方显示当前拦截状态。"
-                    : "未能确认该出口范围。原设置已保留，请重新检查。"
-                refresh()
-            }
-        case .disable:
-            edit { if $0 == rule { $0.exitRangeCheck = false } }
+        busy = true
+        manager.confirmExitRangeSetup(setup) { ok in
+            busy = false
+            offers = []
+            self.selection = nil
+            message = ok ? nil : "没能确认。原设置没动，请再查一次。"
+            refresh()
         }
     }
 }

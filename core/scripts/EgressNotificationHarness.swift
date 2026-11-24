@@ -344,7 +344,7 @@ struct EgressNotificationHarness {
               && roundTrip.observation.approvalId == "fixture-approval"
               && !status.permits(incident.approval(for: "192.0.0.0/8"), in: enabled)
               && status.approvals(for: rule.id).isEmpty
-              && status.panelCaption(checkingFor: 0).contains("出口换到了未允许的网段"),
+              && status.panelCaption(checkingFor: 0).contains("出口地址不在允许范围"),
               "current range evidence retains its approval ID and is independent of the first record and country approval")
         var borrowed = miss
         borrowed.evidence = "proxy"
@@ -362,7 +362,7 @@ struct EgressNotificationHarness {
               && snapshot(withoutApprovalID).exitChanges(for: current).isEmpty
               && !snapshot(miss, reason: "failed-target-overflow").permits(approval, in: enabled)
               && snapshot(unavailable).exitChanges(for: current).isEmpty
-              && snapshot(unavailable).panelCaption(checkingFor: 0).contains("未能核实出口 IP"),
+              && snapshot(unavailable).panelCaption(checkingFor: 0).contains("查不到出口地址"),
               "borrowed, changed, locked and missing-IP evidence cannot authorize a range")
         let accepted = [ip.single, incident.exit.subnet]
         check(approval.applying(accepted, then: enabled, now: enabled, sameSession: true)?.groups[0].exitRanges == accepted
