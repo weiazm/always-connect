@@ -50,20 +50,26 @@ pub fn pf_original_destination() -> io::Result<OriginalDestination> {
     if raw < 0 { return Err(io::Error::last_os_error()); }
     let pf = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
     Ok(Arc::new(move |proto, peer: SocketAddrV4, local: SocketAddrV4| {
-        let mut look = NatLook {
-            saddr: [0; 16], daddr: [0; 16], rsaddr: [0; 16], rdaddr: [0; 16],
-            sxport: [0; 4], dxport: [0; 4], rsxport: [0; 4], rdxport: [0; 4],
-            af: libc::AF_INET as u8,
-            proto: if proto == Proto::Tcp { libc::IPPROTO_TCP } else { libc::IPPROTO_UDP } as u8,
-            proto_variant: 0, direction: PF_OUT,
-        };
-        look.saddr[..4].copy_from_slice(&peer.ip().octets());
-        look.daddr[..4].copy_from_slice(&local.ip().octets());
-        look.sxport[..2].copy_from_slice(&peer.port().to_be_bytes());
-        look.dxport[..2].copy_from_slice(&local.port().to_be_bytes());
-        if unsafe { libc::ioctl(pf.as_raw_fd(), DIOCNATLOOK, &mut look as *mut NatLook) } != 0 { return None; }
-        let ip = Ipv4Addr::new(look.rdaddr[0], look.rdaddr[1], look.rdaddr[2], look.rdaddr[3]);
-        Some(SocketAddrV4::new(ip, u16::from_be_bytes([look.rdxport[0], look.rdxport[1]])))
+        // xnu keys UDP states by their external filter mode as well (kept in
+        // proto_variant: 0, then APD 1, AD 2, EI 3); TCP ignores it. Measured
+        // on the CI Mac: with 0 alone every UDP lookup missed.
+        let variants: &[u8] = if proto == Proto::Tcp { &[0] } else { &[1, 0, 2, 3] };
+        variants.iter().find_map(|&variant| {
+            let mut look = NatLook {
+                saddr: [0; 16], daddr: [0; 16], rsaddr: [0; 16], rdaddr: [0; 16],
+                sxport: [0; 4], dxport: [0; 4], rsxport: [0; 4], rdxport: [0; 4],
+                af: libc::AF_INET as u8,
+                proto: if proto == Proto::Tcp { libc::IPPROTO_TCP } else { libc::IPPROTO_UDP } as u8,
+                proto_variant: variant, direction: PF_OUT,
+            };
+            look.saddr[..4].copy_from_slice(&peer.ip().octets());
+            look.daddr[..4].copy_from_slice(&local.ip().octets());
+            look.sxport[..2].copy_from_slice(&peer.port().to_be_bytes());
+            look.dxport[..2].copy_from_slice(&local.port().to_be_bytes());
+            if unsafe { libc::ioctl(pf.as_raw_fd(), DIOCNATLOOK, &mut look as *mut NatLook) } != 0 { return None; }
+            let ip = Ipv4Addr::new(look.rdaddr[0], look.rdaddr[1], look.rdaddr[2], look.rdaddr[3]);
+            Some(SocketAddrV4::new(ip, u16::from_be_bytes([look.rdxport[0], look.rdxport[1]])))
+        })
     }))
 }
 
