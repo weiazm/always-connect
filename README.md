@@ -85,8 +85,8 @@
     <th>通用设置</th>
   </tr>
   <tr>
-    <td><img src="docs/images/settings-split.png" width="400" alt="分流设置：按网站分流总开关，下面切换分流直连、分流代理、局域网"></td>
-    <td><img src="docs/images/settings-general.png" width="400" alt="通用设置：自动连接、断线保护、通知、快捷键、版本、关于、卸载"></td>
+    <td><img src="docs/images/settings-split.png" width="400" alt="分流设置：六个图标标签、按网站分流总开关、分流直连 / 分流代理 / 局域网"></td>
+    <td><img src="docs/images/settings-general.png" width="400" alt="通用设置：自动连接、断线保护、通知、快捷键和版本"></td>
   </tr>
   <tr>
     <th>第一次打开：三步向导</th>

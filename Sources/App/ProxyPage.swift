@@ -7,7 +7,7 @@ struct ProxyPage: View {
     var previewSplitOn = true
 
     var body: some View {
-        Form { ProxySections(previewRoutes: previewRoutes, previewSplitOn: previewSplitOn) }
+        Form { ProxySections(splitOn: previewSplitOn, previewRoutes: previewRoutes) }
             .formStyle(.grouped)
     }
 }
@@ -17,23 +17,24 @@ struct ProxyPage: View {
 /// box in the split list's syntax; the first proxy whose rules match a
 /// site takes it, before 分流直连. Sections of the 分流 page.
 struct ProxySections: View {
-    @ObservedObject private var manager = HelperClient.shared
     @ObservedObject private var health = ProxyHealth.shared
     @State private var routes: [ProxyRoute]
     @State private var paused: Bool
     @State private var editing: ProxyRoute?
     @State private var note: String?
     private let preview: Bool
-    private var splitOn: Bool
+    private let splitOn: Bool
+    private let onSave: (AppSettings) -> Void
     /// Read once (it hashes two binaries): an older service ignores proxies.
     @State private var serviceTooOld: Bool
 
-    init(previewRoutes: [ProxyRoute]? = nil, previewSplitOn: Bool = true) {
-        let settings = ProfileStore.loadAppSettings()
+    init(splitOn: Bool, previewRoutes: [ProxyRoute]? = nil, onSave: @escaping (AppSettings) -> Void = { _ in }) {
+        let settings = previewRoutes == nil ? ProfileStore.loadAppSettings() : AppSettings()
         _routes = State(initialValue: previewRoutes ?? settings.proxyRoutes ?? [])
         preview = previewRoutes != nil
         _paused = State(initialValue: previewRoutes == nil && !settings.proxiesOn)
-        splitOn = previewRoutes != nil ? previewSplitOn : settings.splitOn
+        self.splitOn = splitOn
+        self.onSave = onSave
         _serviceTooOld = State(initialValue: previewRoutes == nil && HelperInstaller.installedHelperOutdated)
     }
 
@@ -159,8 +160,7 @@ struct ProxySections: View {
                     if on && !preview { health.check([routes[i]], force: true) }
                 }))
                 .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
+                .fixedSize()
                 .accessibilityLabel("启用 \(route.name)")
             Menu {
                 Button("编辑…") { editing = route }
@@ -197,6 +197,7 @@ struct ProxySections: View {
         var stored = ProfileStore.loadAppSettings()
         stored.proxyRoutes = routes
         ProfileStore.saveAppSettings(stored)
+        onSave(stored)
         if !HelperClient.shared.usesCisco {
             HelperClient.shared.pushDirectDomains { taken in
                 note = taken == nil ? "已保存；后台服务没有回应，更新后台服务后生效。" : nil
