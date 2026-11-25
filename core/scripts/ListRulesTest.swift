@@ -24,6 +24,27 @@ struct ListRulesTest {
         check("network and single address", ListRule.parse("10.1.0.0/16") == .network("10.1.0.0/16")
               && ListRule.parse("192.168.1.5") == .network("192.168.1.5/32"))
         check("junk explained", ListRule.problem("not a rule") != nil && ListRule.problem("") == nil)
+        // One syntax for the split list and exit protection (§66.30).
+        check("domain: is the plain form", ListRule.parse("domain:Example.com") == .domain("example.com")
+              && ListRule.parse("domain:example.com")?.text == "example.com")
+        check("full, keyword and regexp", ListRule.parse("full:WWW.example.com") == .full("www.example.com")
+              && ListRule.parse("keyword:Example") == .keyword("example")
+              && ListRule.parse(#"regexp:^a\d+\.Example\.com$"#) == .regexp(#"^a\d+\.Example\.com$"#))
+        check("a regexp the background service cannot compile is refused",
+              ListRule.parse("regexp:(") == nil && ListRule.problem("regexp:(") == "正则表达式写得不对")
+        check("a pasted Clash line is converted, its policy dropped",
+              ListRule.parse("GEOSITE,github,PROXY")?.text == "geosite:github"
+              && ListRule.parse("DOMAIN-SUFFIX,Example.com")?.text == "example.com"
+              && ListRule.parse("DOMAIN,a.example.com,X")?.text == "full:a.example.com"
+              && ListRule.parse("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve")?.text == "10.0.0.0/8"
+              && ListRule.parse("GEOIP,CN")?.text == "geoip:cn"
+              && ListRule.parse("PROCESS-NAME,example") == nil)
+        check("a malformed network is not read as a domain", ListRule.parse("192.0.2.0/33") == nil
+              && ListRule.parse("full:192.0.2.1") == nil && ListRule.parse("IP-CIDR,192.0.2.0/33") == nil)
+        check("an attribute nothing carries is refused", ListRule.parse("geosite:github@nosuchattr") == nil)
+        check("full/keyword/regexp go to the forwarder as written",
+              ListRule.full("a.example.com").expanded == ["full:a.example.com"]
+              && ListRule.keyword("example").expanded == ["keyword:example"])
 
         let gh = ListRule.geosite("github", attribute: nil).expanded
         check("geosite:github brings its related names", gh.contains("domain:github.com") && gh.contains("domain:ghcr.io"))
@@ -39,7 +60,7 @@ struct ListRulesTest {
 
         // The split page's examples (SplitPage.examples) must all be valid
         // and the attribute example must select something.
-        for example in ["example.com", "10.0.0.5", "192.168.50.0/24", "geosite:apple", "geosite:microsoft",
+        for example in ["example.com", "full:www.example.com", "keyword:example", "10.0.0.5", "192.168.50.0/24", "geosite:apple", "geosite:microsoft",
                         "geosite:github", "geosite:apple@cn"] {
             check("example \(example) is valid", ListRule.parse(example) != nil)
         }
@@ -56,9 +77,11 @@ struct ListRulesTest {
                                 DirectSite(name: "10.9.0.0/16", domains: ["10.9.0.0/16"]),
                                 DirectSite(name: "geosite:github", domains: ["geosite:github"])]
         settings.autoLAN = false
-        check("the forwarder gets names and lists, not networks",
-              settings.directDomains.contains("example.com") && settings.directDomains.contains("domain:ghcr.io")
-              && !settings.directDomains.contains("10.9.0.0/16"))
+        // One newline-joined text from the Rust core (§66.30).
+        let direct = settings.directRuleText.split(separator: "\n").map(String.init)
+        check("the forwarder gets names and lists, not networks, without repeats",
+              direct.contains("example.com") && direct.contains("domain:ghcr.io") && !direct.contains("10.9.0.0/16")
+              && direct.count == Set(direct).count)
         check("the allowlist gets the list's networks", settings.effectiveAllowNetworks == ["10.9.0.0/16"])
         settings.autoLAN = nil
         let local = LocalNetwork.current()
@@ -73,10 +96,15 @@ struct ListRulesTest {
               && DirectSites.site(of: "example.com") == "example.com")
         let menu = DirectSites.choices(host: "a.b.example.com", address: "93.184.215.14")
         check("menu: whole site first, each level, the name, then the address",
-              menu.map(\.rule) == ["example.com", "b.example.com", "a.b.example.com", "93.184.215.14/32"]
+              menu.map(\.rule) == ["example.com", "b.example.com", "full:a.b.example.com", "93.184.215.14/32"]
               && menu.first?.label.contains("整个网站") == true && menu[2].label.contains("只这一个"))
         check("menu for a bare site has no duplicate",
               DirectSites.choices(host: "example.com", address: "93.184.215.14").map(\.rule) == ["example.com", "93.184.215.14/32"])
+        check("a full: line covers only that name",
+              DirectSites.covering([DirectSite(name: "full:a.example.com", domains: ["full:a.example.com"])],
+                                   host: "a.example.com", address: "203.0.113.1") == "full:a.example.com"
+              && DirectSites.covering([DirectSite(name: "full:a.example.com", domains: ["full:a.example.com"])],
+                                      host: "b.a.example.com", address: "203.0.113.1") == nil)
         check("menu without a name offers only the address",
               DirectSites.choices(host: nil, address: "203.0.113.10").map(\.rule) == ["203.0.113.10/32"])
         check("every menu line is a valid list line", menu.allSatisfy { ListRule.parse($0.rule) != nil })

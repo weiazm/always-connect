@@ -221,9 +221,9 @@ def dtls(relay_port, fixture_port, d):
     return ok
 
 
-def access(relay_port, fixture_port, d, name):
+def access(relay_port, fixture_port, d, name, gateway="gateway", trusted=True):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(d / "gateway.pem", d / "gateway.key")
+    ctx.load_cert_chain(d / (gateway + ".pem"), d / (gateway + ".key"))
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(d / "ca.pem")
     listener = socket.socket()
@@ -232,6 +232,7 @@ def access(relay_port, fixture_port, d, name):
     listener.listen()
     listener.settimeout(8)
 
+    received = threading.Event()
     def serve():
         try:
             conn, _ = listener.accept()
@@ -239,7 +240,11 @@ def access(relay_port, fixture_port, d, name):
                 conn.settimeout(8)
                 request = b""
                 while b"\r\n\r\n" not in request:
-                    request += conn.recv(4096)
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    received.set()
+                    request += chunk
                 conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
                 time.sleep(0.3)
         except Exception:
@@ -257,7 +262,10 @@ def access(relay_port, fixture_port, d, name):
         answered = False
     thread.join(timeout=3)
     listener.close()
-    if name == "relay-client":
+    if not trusted:
+        good = not answered and not received.is_set()
+        label = gateway + " is rejected without forwarding application bytes"
+    elif name == "relay-client":
         good, label = answered, "relay passes the Helper's own certificate through (control)"
     else:
         good = not answered
@@ -321,6 +329,10 @@ def main():
         ok = dtls(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]))
     elif mode == "access":
         ok = access(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
+    elif mode == "trust":
+        ok = True
+        for cert, trusted in [("gateway", True), ("wrong-name", False), ("untrusted", False), ("gateway", True)]:
+            ok = access(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), "relay-client", cert, trusted) and ok
     elif mode == "presents":
         ok = presents(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
     else:

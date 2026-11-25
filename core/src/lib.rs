@@ -13,14 +13,18 @@ pub mod diagnostics;
 pub mod direct_routes;
 pub mod dns_forwarder;
 pub mod dns_routes;
+pub mod egress_control;
+pub mod egress_gate;
 pub mod ffi;
 pub mod kill_switch;
 pub mod leak_probe;
+pub mod login_cache;
 pub mod network_guard;
 pub mod network_check;
 pub mod oc_engine;
 pub mod offline;
 pub mod pf;
+pub mod pf_verify;
 pub mod relay;
 pub mod relay_log;
 pub mod route_watch;
@@ -29,6 +33,8 @@ pub mod session;
 pub mod split_policy;
 pub mod state_machine;
 pub mod traffic;
+pub mod geodata;
+pub mod geosite;
 pub mod update_check;
 
 #[cfg(feature = "openconnect")]

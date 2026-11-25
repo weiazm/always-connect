@@ -9,6 +9,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=$REPO/.local-build/AlwaysConnectHelper
 pass(){ echo "PASS $1"; }; fail(){ echo "FAIL $1"; FAILS=$((FAILS+1)); }; FAILS=0
+"$REPO/scripts/egress-notification-test.sh" && pass egress-notification || fail egress-notification
 "$REPO/scripts/on-demand-test.sh" && pass on-demand || fail on-demand
 # 1 smoke
 rm -rf /tmp/ac-engine-test && mkdir -p /tmp/ac-engine-test
@@ -31,13 +32,13 @@ O=/tmp/ac-engine-test/out.txt
 grep -q 'testpass' $O && fail "password leaked into output" || pass "no-password-in-output"
 # 2b established tunnel: hook -> connected, drop -> reconnecting, cookie reuse
 rm -rf /tmp/ac-drop && mkdir -p /tmp/ac-drop
-OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1); E=$?
+OUT=$(printf 'pw\n' | "$REPO/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1); E=$?
 [ $E -eq 3 ] && echo "$OUT" | grep -q "^STATE connected tunnel up" \
   && echo "$OUT" | grep -q "^STATE reconnecting dropped, retrying" \
   && echo "$OUT" | grep -q "^STATE reconnecting spawning openconnect (attempt 2, credential cookie)" \
   && grep -q fakecookie42 /tmp/ac-drop/session.json && pass drop-episode || { fail drop-episode; echo "$OUT" | grep -E "^(STATE|TERMINAL)"; }
 # 2b an internal reconnect is reported as reconnecting, then connected (§28.1)
-rm -rf /tmp/ac-irc; OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1)
+rm -rf /tmp/ac-irc; OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$REPO/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1)
 echo "$OUT" | awk '/^STATE reconnecting 隧道断了，正在重连/ { waiting=1; next }
   waiting && /^STATE connected tunnel up/ { recovered=1; exit }
   END { exit !recovered }' \
@@ -70,6 +71,9 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/reset-network-test.sh" && pass reset-network-plan || fail reset-network-plan
 "$REPO/scripts/recovery-shortcut-test.sh" && pass recovery-shortcut || fail recovery-shortcut
 "$REPO/scripts/gateway-resolution-test.sh" && pass gateway-resolution || fail gateway-resolution
+"$REPO/scripts/login-gateway-test.sh" && pass login-gateway || fail login-gateway
+"$REPO/scripts/egress-peer-probe-test.sh" && pass egress-peer-probe || fail egress-peer-probe
+python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sample || fail connectivity-sample
 "$REPO/scripts/private-descriptors-test.sh" && pass private-descriptors || fail private-descriptors
 # 4b vpnc-script route plan (stubbed route/ifconfig/scutil, routes ON)
 "$REPO/core/scripts/vpnc-route-plan-test.sh" $S > /tmp/ac-route-plan.log 2>&1 && pass vpnc-route-plan || { fail vpnc-route-plan; grep -v '^AC-SCRIPT' /tmp/ac-route-plan.log; }
@@ -90,6 +94,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 # 4d5 approval card: when it shows, updates, finishes, hides (§29)
 "$REPO/scripts/approval-prompt-test.sh" > /tmp/ac-approval-prompt.log 2>&1 && pass approval-prompt || { fail approval-prompt; grep FAIL /tmp/ac-approval-prompt.log || true; }
 "$REPO/scripts/list-rules-test.sh" > /tmp/ac-list-rules.log 2>&1 && pass list-rules || { fail list-rules; grep FAIL /tmp/ac-list-rules.log || true; }
+"$REPO/scripts/geo-update-test.sh" > /tmp/ac-geo-update.log 2>&1 && pass geo-update || { fail geo-update; grep FAIL /tmp/ac-geo-update.log || true; }
 "$REPO/scripts/neighbors-test.sh" > /tmp/ac-neighbors.log 2>&1 && pass neighbors || { fail neighbors; grep FAIL /tmp/ac-neighbors.log || true; }
 "$REPO/scripts/connections-test.sh" > /tmp/ac-connections.log 2>&1 && pass connections || { fail connections; grep FAIL /tmp/ac-connections.log || true; }
 "$REPO/scripts/connections-ui-test.sh" && pass connections-ui || fail connections-ui
@@ -116,6 +121,9 @@ RES=$REPO/.local-build/AlwaysConnect.app/Contents/Resources
 NOK=1
 for f in THIRD_PARTY_NOTICES.md RESPONSIBLE-USE.md LICENSE.txt third_party/rust-crates.txt third_party/licenses/LGPL-2.1.txt \
          third_party/licenses/v2fly-domain-list-community.txt; do [ -s "$RES/$f" ] || { echo "  missing $f"; NOK=0; }; done
+[ -x "$RES/openconnect/bin/alwaysconnect-gate" ] &&
+  codesign --verify --strict "$RES/openconnect/bin/alwaysconnect-gate" &&
+  pass egress-gate-bundle || fail egress-gate-bundle
 if [ -x "$RES/openconnect/bin/openconnect" ]; then
   for f in SOURCES README-LGPL.txt licenses/LGPL-2.1.txt licenses/LGPL-3.0.txt licenses/GPL-2.0.txt licenses/GPL-3.0.txt; do
     [ -s "$RES/openconnect/$f" ] || { echo "  missing openconnect/$f"; NOK=0; }; done

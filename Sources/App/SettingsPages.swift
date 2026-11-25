@@ -23,6 +23,9 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
+            EgressProtectionPage()
+                .tabItem { Label("出口保护", systemImage: "checkmark.shield") }
+                .tag("egress")
             ConnectionSettingsPage(preview: connectionPreview)
                 .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
                 .tag("connections")
@@ -84,6 +87,7 @@ struct GeneralPage: View {
     @State private var loginItemOn = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
     @State private var recording = false
+    @State private var egressDisabledWithDrop = false
 
     var body: some View {
         Form {
@@ -98,8 +102,12 @@ struct GeneralPage: View {
                 Toggle("断线保护", isOn: Binding(
                     get: { settings.isDropProtectionOn },
                     set: { on in
-                        settings.dropProtection = on
-                        ProfileStore.saveAppSettings(settings)
+                        var latest = ProfileStore.loadAppSettings()
+                        latest.dropProtection = on
+                        egressDisabledWithDrop = !on && latest.egressProtection?.enabled == true
+                        if !on { latest.egressProtection?.enabled = false }
+                        settings = latest
+                        ProfileStore.saveAppSettings(settings, updatingEgress: !on)
                         HelperClient.shared.dropProtectionChanged()
                     }))
             } header: {
@@ -109,7 +117,8 @@ struct GeneralPage: View {
                          ? (HelperClient.shared.usesCisco
                             ? "断线保护开：VPN 断开时暂停上网，直到重新连上或你手动断开，公司流量不会走本地网络。"
                             : "断线保护开：VPN 断开时暂停上网（名单里的网站照常），直到重新连上或你手动断开，公司流量不会走本地网络。")
-                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。")
+                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。"
+                           + (egressDisabledWithDrop ? "出口保护已关闭。自建连接需要重新连接一次才能生效。" : ""))
             }
 
             Section("启动与通知") {
@@ -545,7 +554,7 @@ struct CredentialForm: View {
                 }
                 if showsStatus {
                     LabeledContent("当前状态") {
-                        Text(manager.stateLine).foregroundStyle(.secondary)
+                        Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary)
                     }
                 }
             }
@@ -676,6 +685,7 @@ enum DirectList {
 
 struct SplitPage: View {
     @ObservedObject private var manager = HelperClient.shared
+    @ObservedObject private var window = SettingsWindow.shared
     @State private var settings = ProfileStore.loadAppSettings()
     @State private var sites = DirectSites.sites(ProfileStore.loadAppSettings())
     @State private var certificates: [CertificateRelay.ClientIdentity] = []
@@ -794,6 +804,8 @@ struct SplitPage: View {
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
 
+            SiteListsSection()
+
             if manager.usesCisco {
                 Section("Cisco 的局域网访问") {
                     LocalLanStatus()
@@ -816,6 +828,8 @@ struct SplitPage: View {
     /// shows no region or streaming examples. geoip:cn still parses.
     static let examples: [(rule: String, meaning: String)] = [
         ("example.com", "这个网站和它所有子域名"),
+        ("full:www.example.com", "只这一个域名"),
+        ("keyword:example", "域名里含这个词"),
         ("10.0.0.5", "单个地址"),
         ("192.168.50.0/24", "一个网段"),
         ("geosite:apple", "苹果相关域名（系统更新、App Store 等）"),
@@ -831,7 +845,8 @@ struct SplitPage: View {
     private func icon(_ site: DirectSite) -> String {
         guard site.domains.count == 1, let rule = ListRule.parse(site.domains[0]) else { return "globe" }
         switch rule {
-        case .domain: return "globe"
+        case .domain, .full: return "globe"
+        case .keyword, .regexp: return "text.magnifyingglass"
         case .geosite: return "list.bullet.rectangle"
         case .geoip: return "flag"
         case .network: return "point.3.connected.trianglepath.dotted"
@@ -937,6 +952,57 @@ struct SplitPage: View {
 
 }
 
+/// The site lists' version and updates (DESIGN.md §66.30), shared by the
+/// split list and exit protection.
+struct SiteListsSection: View {
+    @ObservedObject private var updater = GeoUpdater.shared
+    @State private var autoUpdate = ProfileStore.loadAppSettings().isSiteListsAutoUpdateOn
+    @State private var result: String?
+
+    var body: some View {
+        Section {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(updater.version == nil ? "还没下载" : "现用 \(updater.versionText)")
+                    if updater.checking {
+                        Text(updater.version == nil ? "正在下载…" : "正在检查…").font(.caption).foregroundStyle(.secondary)
+                    } else if let error = updater.lastError {
+                        Text((updater.version == nil ? "还没下载成功：" : "上次更新没成功：") + error
+                             + (error == GeoUpdater.unreachable ? "（VPN 连上后会自动再试）" : ""))
+                            .font(.caption).foregroundStyle(.orange)
+                    } else if let result {
+                        Text(result).font(.caption).foregroundStyle(.secondary)
+                    } else if let when = updater.lastSuccess {
+                        Text("上次检查 \(when.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button(updater.version == nil ? "立即下载" : "立即更新") {
+                    let before = updater.version
+                    result = nil
+                    updater.check { error in
+                        guard error == nil else { return }
+                        result = updater.version == before ? "已经是最新" : "已更新，规则已按新清单生效"
+                    }
+                }
+                .disabled(updater.checking)
+            }
+            Toggle("每天自动更新", isOn: $autoUpdate)
+                .onChange(of: autoUpdate) { on in
+                    var settings = ProfileStore.loadAppSettings()
+                    settings.siteListsAutoUpdate = on
+                    ProfileStore.saveAppSettings(settings)
+                }
+        } header: {
+            Text("网站清单（geosite）")
+        } footer: {
+            Footnote("分流名单和出口保护里的 geosite: 都按这份清单展开。清单来自 v2fly/domain-list-community，第一次启动时自动下载、存在本机；开着自动更新时每天看一次有没有新版，内容变了才下载，校验通过才换上。")
+        }
+        .onAppear { updater.reload() }
+    }
+}
+
 /// The hover card on the split page: the rules in one column, what they
 /// mean in the other (§26.16, §26.18).
 struct RuleExamples: View {
@@ -951,7 +1017,7 @@ struct RuleExamples: View {
                     }
                 }
             }
-            Text("geosite 后面填清单名，来自开源的 v2fly/domain-list-community（App 自带 2026-11-05 版）。\n点这个问号打开全部清单名：github.com/v2fly/domain-list-community")
+            Text("geosite 后面填清单名，来自开源的 v2fly/domain-list-community（现用 \(GeoUpdater.shared.versionText)）。出口保护用同一种写法。\n点这个问号打开全部清单名：github.com/v2fly/domain-list-community")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1012,9 +1078,9 @@ struct DiagnosticsPage: View {
             .onChange(of: HelperClient.shared.state) { _ in checkNeighbors() }
 
             Section("当前连接") {
-                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(.secondary) }
+                LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary) }
                 LabeledContent("连接时长") {
-                    if let since = manager.connectedSince {
+                    if manager.showsConnected, let since = manager.connectedSince {
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
                             Text(durationText(Date().timeIntervalSince(since))).monospacedDigit()
                         }
@@ -1040,7 +1106,7 @@ struct DiagnosticsPage: View {
                         }
                         .buttonStyle(.borderless)
                         .help("刷新本次 VPN 流量")
-                        .disabled(statsRunning || manager.state != .connected)
+                        .disabled(statsRunning || !manager.showsConnected)
                     }
                 }
             }
@@ -1102,7 +1168,7 @@ struct DiagnosticsPage: View {
                     Text("泄漏自检")
                     Spacer()
                     Button("运行") { runLeakCheck() }
-                        .disabled(manager.state != .connected)
+                        .disabled(!manager.showsConnected)
                 }
                 if let leakMessage {
                     Text(leakMessage).foregroundStyle(.red)
@@ -1144,7 +1210,7 @@ struct DiagnosticsPage: View {
         }
         .formStyle(.grouped)
         .onAppear(perform: refreshStats)
-        .onChange(of: manager.state) { _ in
+        .onChange(of: manager.showsConnected) { _ in
             refreshStats()
             leakItems = nil
             leakMessage = nil
@@ -1164,7 +1230,7 @@ struct DiagnosticsPage: View {
         statsRequest = request
         stats = nil
         statsMessage = nil
-        statsRunning = manager.state == .connected
+        statsRunning = manager.showsConnected
         guard statsRunning else { return }
         HelperClient.shared.fetchStats { result in
             guard statsRequest == request else { return }

@@ -21,6 +21,7 @@ import Security
 ///   in (§36.3).
 enum ClientRequirement {
     static let appIdentifier = "com.alwaysconnect.app"
+    static let egressGatePath = "/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate"
 
     /// The requirement for clients of this running process.
     static let forThisProcess: String? = {
@@ -44,6 +45,24 @@ enum ClientRequirement {
         let team = dict[kSecCodeInfoTeamIdentifier as String] as? String
         let leaf = (dict[kSecCodeInfoCertificates as String] as? [SecCertificate])?.first
         return make(team: team, leafDER: leaf.map { SecCertificateCopyData($0) as Data })
+    }
+
+    /// The gate is a separate executable and must carry our exact leaf certificate.
+    static func verifiesEgressGate() -> Bool {
+        var running: SecCode?
+        var helper: SecStaticCode?
+        var gate: SecStaticCode?
+        var information: CFDictionary?
+        guard SecCodeCopySelf([], &running) == errSecSuccess, let running,
+              SecCodeCopyStaticCode(running, [], &helper) == errSecSuccess, let helper,
+              SecCodeCopySigningInformation(helper, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let values = information as? [String: Any],
+              let leaf = (values[kSecCodeInfoCertificates as String] as? [SecCertificate])?.first,
+              SecStaticCodeCreateWithPath(URL(fileURLWithPath: egressGatePath) as CFURL, [], &gate) == errSecSuccess,
+              let gate else { return false }
+        let digest = Insecure.SHA1.hash(data: SecCertificateCopyData(leaf) as Data)
+            .map { String(format: "%02x", $0) }.joined()
+        return staticCode(gate, satisfies: "certificate leaf = H\"\(digest)\"")
     }
 
     static func make(team: String?, leafDER: Data?) -> String? {

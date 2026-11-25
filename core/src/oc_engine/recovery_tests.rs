@@ -23,13 +23,11 @@ impl Fixture {
         Self::with_physical_facts(false)
     }
     fn with_physical_facts(stable: bool) -> Self {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ac-flaps-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
         let cli = dir.join("openconnect");
@@ -275,6 +273,7 @@ fn paused_engine_does_not_reconfirm_a_stopping_childs_interface() {
             name: name.into(),
             index: interface_index(name).unwrap(),
             generation: c.generation,
+            confirmed_at: Instant::now(),
         });
         let paused = shared.reconfirm_tunnel(&mut c);
         c.tunnel_if = None;
@@ -572,7 +571,7 @@ fn queued_respawn_waits_for_exit_event_after_process_is_reaped() {
             alive: Arc::new(AtomicBool::new(false)),
         });
     }
-    f.engine.shared.send(Event::Respawn);
+    f.engine.shared.send(Event::Respawn(0));
     f.barrier();
     let attempts = {
         let mut c = f.engine.shared.core.lock().unwrap();
@@ -612,7 +611,7 @@ fn restoration_after_reaping_still_fences_output_until_exited_is_consumed() {
         stdout: true,
         bytes: b"AC_HOOK connect tun=utun99 gateway=198.51.100.7\n".to_vec(),
     });
-    f.engine.shared.send(Event::Respawn);
+    f.engine.shared.send(Event::Respawn(0));
     f.barrier();
     let (waiting, hooked, attempts) = {
         let mut c = f.engine.shared.core.lock().unwrap();

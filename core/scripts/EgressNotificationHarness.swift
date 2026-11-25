@@ -1,0 +1,220 @@
+import Foundation
+
+// The App talks to these stand-ins only in scripts/egress-notification-test.sh.
+// No notification is delivered to the desktop and no VPN client is started.
+protocol UNUserNotificationCenterDelegate: AnyObject {}
+
+final class UNUserNotificationCenter {
+    static let shared = UNUserNotificationCenter()
+    static func current() -> UNUserNotificationCenter { shared }
+
+    weak var delegate: UNUserNotificationCenterDelegate?
+    private(set) var categories: [UNNotificationCategory] = []
+    private(set) var requests: [UNNotificationRequest] = []
+
+    func setNotificationCategories(_ categories: [UNNotificationCategory]) {
+        self.categories = categories
+    }
+
+    func requestAuthorization(options: Set<NotificationOption>, completionHandler: (Bool, Error?) -> Void) {
+        completionHandler(true, nil)
+    }
+
+    func add(_ request: UNNotificationRequest, withCompletionHandler: ((Error?) -> Void)?) {
+        requests.append(request)
+        withCompletionHandler?(nil)
+    }
+}
+
+enum NotificationOption { case alert, sound, banner, foreground }
+let UNNotificationDefaultActionIdentifier = "default"
+
+final class SettingsWindow {
+    static let shared = SettingsWindow()
+    private(set) var opened: [(String?, UInt32?)] = []
+
+    func show(tab: String?, egressRule: UInt32? = nil) { opened.append((tab, egressRule)) }
+}
+typealias UNNotificationPresentationOptions = Set<NotificationOption>
+
+struct UNNotificationAction {
+    let identifier: String
+    let title: String
+    let options: [NotificationOption]
+}
+
+struct UNNotificationCategory {
+    let identifier: String
+    let actions: [UNNotificationAction]
+    let intentIdentifiers: [String]
+    let options: [NotificationOption]
+}
+
+final class UNMutableNotificationContent {
+    var title = ""
+    var body = ""
+    var categoryIdentifier = ""
+    var userInfo: [AnyHashable: Any] = [:]
+}
+
+struct UNTimeIntervalNotificationTrigger {
+    let timeInterval: TimeInterval
+    let repeats: Bool
+}
+
+struct UNNotificationRequest {
+    let identifier: String
+    let content: UNMutableNotificationContent
+    let trigger: UNTimeIntervalNotificationTrigger
+}
+
+struct UNNotification { let request: UNNotificationRequest }
+
+struct UNNotificationResponse {
+    let actionIdentifier: String
+    let notification: UNNotification
+}
+
+enum ProfileStore {
+    static func loadAppSettings() -> AppSettings { AppSettings() }
+    struct AppSettings { let notificationAggregation = true }
+}
+
+final class ApprovalPrompt {
+    static let shared = ApprovalPrompt()
+    let takesOverApprovalNotice = false
+}
+
+final class HelperClient {
+    static let shared = HelperClient()
+    enum State { case connected, reconnecting, awaitingApproval }
+    private(set) var trusted: [(group: UInt32, started: Double)] = []
+    private(set) var disconnects = 0
+
+    func trustEgress(group: UInt32, started: Double) { trusted.append((group, started)) }
+    func disconnect() { disconnects += 1 }
+}
+
+@main
+struct EgressNotificationHarness {
+    static let center = UNUserNotificationCenter.current()
+    static let notifier = Notifier.shared
+
+    static func check(_ condition: Bool, _ message: String) {
+        guard condition else {
+            fputs("FAIL \(message)\n", stderr)
+            exit(1)
+        }
+        print("PASS \(message)")
+    }
+
+    static func observation(address: String = "2001:db8:9::7") -> EgressProtection.Observation {
+        .init(host: "tested.example", country: "YY", ip: "198.51.100.7", error: nil, peerAddress: address)
+    }
+
+    static func group(_ state: String, observed: [EgressProtection.Observation] = [observation()]) -> EgressProtection.GroupState {
+        .init(id: UInt32.max, name: "Fixture", state: state, lastCheck: 1235, observed: observed, blockedCount: 3,
+              lastBlockedHost: "tested.example", lastBlockedCountry: "YY")
+    }
+
+    static func status(_ group: EgressProtection.GroupState, checking: [UInt32] = []) -> EgressProtection.Status {
+        let record = EgressProtection.BlockRecord(started: 1234.125, ended: nil, group: group.id, name: group.name,
+            host: "tested.example", observed: [observation()], expected: ["ZZ"])
+        return .init(running: true, checking: checking, groups: [group], records: [record])
+    }
+
+    static func respond(_ identifier: String, to request: UNNotificationRequest) {
+        let response = UNNotificationResponse(actionIdentifier: identifier, notification: .init(request: request))
+        var completed = false
+        notifier.userNotificationCenter(center, didReceive: response) { completed = true }
+        check(completed, "\(identifier) completes the system callback")
+        var drained = false
+        DispatchQueue.main.async { drained = true }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while !drained && Date() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+        check(drained, "the action had a turn on the main queue")
+    }
+
+    static func main() {
+        var ledger = EgressNoticeLedger()
+        let partial = group("blocked")
+        let unknown = group("unknown")
+        let ok = group("ok")
+        check(ledger.update([unknown]).isEmpty && ledger.update([ok]).isEmpty, "nothing blocked, nothing to announce")
+        let outgoing = ledger.update([partial])
+        check(outgoing.count == 1 && ledger.update([partial]).isEmpty, "the notification fires once per rule and session")
+        notifier.egressNotice(outgoing[0])
+        check(center.requests.count == 1, "one notification was delivered to the stand-in")
+        let banner = center.requests[0]
+        let category = center.categories.first { $0.identifier == banner.content.categoryIdentifier }
+        check(category?.actions.map(\.title) == ["查看"] && center.delegate === notifier, "banner only offers View")
+        check(banner.content.title.contains("tested.example") && banner.content.body.contains("已拦下 3 次连接")
+              && banner.content.body.contains(egressCountryName("YY")),
+              "banner describes actual blocked connections")
+        respond("trust-egress", to: banner)
+        check(SettingsWindow.shared.opened.isEmpty, "an action from an older version cannot open or write a rule")
+        respond(Notifier.reviewEgressAction, to: banner)
+        check(SettingsWindow.shared.opened.count == 1 && SettingsWindow.shared.opened[0].0 == "egress"
+              && SettingsWindow.shared.opened[0].1 == partial.id, "View opens the specific protected rule")
+        var presented: UNNotificationPresentationOptions = []
+        notifier.userNotificationCenter(center, willPresent: .init(request: banner)) { presented = $0 }
+        check(presented == [.banner, .sound], "foreground banner presentation still works")
+        var nextSession = EgressNoticeLedger()
+        check(nextSession.update([partial]).count == 1, "a new logical session starts fresh")
+
+        let unknownCheck = status(unknown, checking: [partial.id])
+        check(unknownCheck.panelCaption(checkingFor: 0.99) == "尚未核实出口"
+              && unknownCheck.panelCaption(checkingFor: 1.0) == "正在核对出口",
+              "the panel suppresses short checks")
+        check(status(ok).panelCaption(checkingFor: 2) == "正常" && status(partial).displayLevel == .partial
+              && status(partial).panelCaption(checkingFor: 0) == "本次已拦下 3 次连接"
+              && status(partial).blockingNotices.map(\.id) == [partial.id] && status(ok).blockingNotices.isEmpty,
+              "availability levels stay distinct")
+        check(status(ok).panelCaption(checkingFor: 0, expectedRules: [ok.id, 10]) == "尚未核实出口",
+              "a rule missing from a snapshot prevents a normal status")
+
+        let local = EgressProtection(enabled: true, groups: [.init(id: partial.id, name: partial.name,
+            enabled: true, sites: ["tested.example"], expect: ["ZZ"])])
+        let known = status(partial)
+        guard let approval = known.approvals(for: partial.id).first else { exit(1) }
+        check(known.permits(approval, in: local) && approval.country == "YY", "the current wrong exit can start confirmation")
+        let unchanged = EgressProtection.Group(id: 8, name: "An independently edited rule")
+        var latest = local
+        latest.groups.append(unchanged)
+        let saved = approval.applying(["ZZ", "YY"], then: local, now: latest, sameSession: true)
+        check(saved?.groups[0].expect == ["ZZ", "YY"] && saved?.groups[1] == unchanged,
+              "successful receipt changes only this rule's allowed country")
+        var altered = local
+        altered.groups[0].name = "Edited after the confirmation"
+        check(approval.applying(nil, then: local, now: local, sameSession: true) == nil
+              && approval.applying(["ZZ", "YY"], then: local, now: altered, sameSession: true) == nil
+              && approval.applying(["ZZ", "YY"], then: local, now: local, sameSession: false) == nil,
+              "failure, a competing edit and a new session all leave preferences unchanged")
+        let unread = EgressProtection.Observation(host: "tested.example", country: nil, ip: nil, error: "no answer",
+                                                  peerAddress: "2001:db8:9::7")
+        for changed in [group("blocked", observed: [observation(address: "198.51.100.8")]),
+                        group("blocked", observed: [unread]), unknown, ok] {
+            check(!status(changed).permits(approval, in: local) && status(changed).approvals(for: partial.id).isEmpty,
+                  "stale or unread observations cannot be approved")
+        }
+        var rangeRule = local
+        rangeRule.groups[0].sites = ["192.0.2.0/24"]
+        let mixed = status(group("blocked", observed: [observation(), unread]))
+        check(mixed.permits(approval, in: rangeRule) && mixed.approvals(for: partial.id).count == 1,
+              "an address rule can approve a known wrong exit without approving unreadable ones")
+        check(group("blocked", observed: [unread]).blockCaption?.contains("查不到出口") == true,
+              "strictly blocked unknown exits describe why they were blocked")
+        let historical = try! JSONDecoder().decode(EgressProtection.Observation.self, from: Data(
+            #"{"host":"old.example","method":"trace","evidence":"member","country":"YY"}"#.utf8))
+        check(EgressProtection.wrongExits([historical], expected: ["ZZ"]) == nil,
+              "an observation without its server address cannot authorize trust")
+        notifier.notifyGatewayCertificateFailure()
+        check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
+        let legacy = try! JSONDecoder().decode(EgressProtection.Group.self, from: Data(
+            #"{"id":3,"name":"Old","enabled":true,"members":[{"pattern":"site.example","method":"trace"},{"pattern":"*.site.example"},{"pattern":"geosite:list"}],"cidrs":[],"expect":["ZZ"]}"#.utf8))
+        check(legacy.sites == ["site.example"] && legacy.expect == ["ZZ"] && legacy.enabled && legacy.unverified == .whenWrong,
+              "a rule saved with website members becomes the sites it named")
+    }
+}

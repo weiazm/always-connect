@@ -20,8 +20,8 @@ swiftc -O -parse-as-library -module-name SessionHarness "${SOURCES[@]}" \
 [ -x "$WORK/harness" ] || { echo "FAIL build"; exit 1; }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cisco-disconnect protection-off own-disconnect own-then-cisco
-    own-protection-off own-protection-toggle
+[ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cold-protected-login cached-protected-login bounded-gateway-lookup cisco-disconnect protection-off own-disconnect own-then-cisco
+    own-protection-off own-protection-toggle egress-drop-dependency
     grace-expiry grace-cancelled quit-no-relaunch restart-same-boot restart-other-boot legacy-pf-state
     own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal
     takeover-adopted takeover-replace protection-off-adopted held-allow-update
@@ -30,21 +30,7 @@ SCENARIOS=("$@")
 # they run in parallel (SESSION_JOBS at a time); reports print in order.
 scenario() {
     local s=$1 T="$WORK/$1"; mkdir -p "$T"
-    cat > "$T/pfctl" <<'STUB'
-#!/bin/bash
-D=$(dirname "$0")
-printf "%s\n" "$*" >> "$D/pfctl.log"
-# The rule text of each load, for checks on what a set lets through.
-if [ "$3" = "-f" ]; then
-    [ "$4" = "-" ] || exit 1
-    { echo "=== load"; cat; } >> "$D/pf-rules.log"
-fi
-if [ "$*" = "-E" ]; then
-    n=$(( $(cat "$D/token" 2>/dev/null || echo 0) + 1 )); echo $n > "$D/token"
-    echo "Token : 1000$n" >&2
-fi
-exit 0
-STUB
+    cp "$ROOT/core/scripts/fake-pfctl.sh" "$T/pfctl"
     cp "$ROOT/core/scripts/fake-openconnect.sh" "$T/openconnect"
     chmod +x "$T/pfctl" "$T/openconnect"
     {

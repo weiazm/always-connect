@@ -29,14 +29,19 @@ struct DropHistoryTest {
         check(r1?.outcome == .recovered && r1?.retries == 2 && r1?.approvals == 1 && r1?.engine == "cisco",
               "recovered: retries 2, approvals 1 (got \(String(describing: r1)))")
         check(r1?.durationSeconds == 37, "duration from drop to recovery")
-        check(r1?.summary == "断了 37 秒，重新登录 2 次后恢复；其中 1 次等你在手机上批准", "summary: \(r1?.summary ?? "")")
+        guard var manyAttempts = r1 else { check(false, "missing completed episode"); exit(1) }
+        manyAttempts.retries = 29
+        manyAttempts.approvals = 2
+        check(manyAttempts.summary.contains("连接重试 29 轮后恢复，等待登录确认 2 次"),
+              "transport attempts and approval waits remain distinct")
+        check(r1?.summary == "断了 37 秒，连接重试 2 轮后恢复，等待登录确认 1 次", "summary: \(r1?.summary ?? "")")
         check(r1?.outcomeLabel == "已恢复" && r1?.engineLabel == "经 Cisco", "labels")
         check(tracker.episode == nil, "episode closed")
 
         // 2 came back by itself
         _ = tracker.handle(.reconnecting, previous: .connected, engine: "own", retries: 0, now: at(100))
         let r2 = tracker.handle(.connected, previous: .reconnecting, engine: "own", retries: 0, now: at(102))
-        check(r2?.retries == 0 && r2?.summary == "断了 2 秒，连接自己续上了（没有重新登录）", "self-recovered: \(r2?.summary ?? "")")
+        check(r2?.retries == 0 && r2?.summary == "断了 2 秒，连接自己续上了", "self-recovered: \(r2?.summary ?? "")")
 
         // 3 failed, then the terminal reason refines it
         _ = tracker.handle(.reconnecting, previous: .connected, engine: "own", retries: 0, now: at(200))
@@ -45,8 +50,8 @@ struct DropHistoryTest {
         check(r3?.outcome == .failed && r3?.retries == 4, "disconnected mid-drop = failed")
         let r3b = r3!.applyingTerminal(2)
         check(r3b.failureReason == "账号或密码被拒绝"
-              && r3b.summary == "断了 5 分钟，重新登录 4 次后停止重试：账号或密码被拒绝", "rejected: \(r3b.summary)")
-        check(r3b.panelSummary == "断了 5 分钟，重新登录 4 次，没恢复", "panel: \(r3b.panelSummary)")
+              && r3b.summary == "断了 5 分钟，连接重试 4 轮后停止重试：账号或密码被拒绝", "rejected: \(r3b.summary)")
+        check(r3b.panelSummary == "断了 5 分钟，连接重试 4 轮，没恢复", "panel: \(r3b.panelSummary)")
         check(r3!.applyingTerminal(3).failureReason == "重试次数用完", "attempts exhausted")
         check(r3!.applyingTerminal(5).failureReason == "手机上的登录确认没有通过" && r3!.applyingTerminal(5).outcome == .failed,
               "phone confirmation failed (§43)")
@@ -58,7 +63,7 @@ struct DropHistoryTest {
         let r4 = tracker.handle(.disconnected, previous: .reconnecting, engine: "cisco", retries: 1, now: at(675))
         check(r4?.outcome == .stoppedByUser && r4!.applyingTerminal(1).outcome == .stoppedByUser,
               "user stop stays the user's")
-        check(r4?.summary == "断了 1 分 15 秒，重新登录 1 次时你断开了 VPN", "stopped: \(r4?.summary ?? "")")
+        check(r4?.summary == "断了 1 分 15 秒，连接重试 1 轮时你断开了 VPN", "stopped: \(r4?.summary ?? "")")
 
         // 5 quit mid-drop; then the late disconnected push records nothing
         _ = tracker.handle(.reconnecting, previous: .connected, engine: "own", retries: 0, now: at(700))
@@ -113,7 +118,10 @@ struct DropHistoryTest {
         check(night.sleepSince == at(11_000) && night.sleepDropCount == 3 && night.durationSeconds == 4
               && night.droppedAt == at(12_000) && night.latestDropAt == at(14_000) && night.recoveredAt == at(14_002),
               "three sleep drops fold into one: count, down time, span")
-        check(night.summary == "电脑睡眠时断了 3 次，合计 4 秒，每次都自己续上了（没有重新登录）", "sleep summary: \(night.summary)")
+        var olderSleep = night
+        olderSleep.retries = nil
+        check(olderSleep.summary.contains("没有重试详情"), "unknown sleep history does not claim zero retries")
+        check(night.summary == "电脑睡眠时断了 3 次，合计 4 秒，每次都自己续上了", "sleep summary: \(night.summary)")
         check(night.panelSummary == "睡眠中断了 3 次（合计 4 秒），都已恢复", "sleep panel: \(night.panelSummary)")
         // A drop found just after the lid opens is still the sleep's; later ones are not.
         sleeper.noteWake(now: at(15_000))
@@ -121,20 +129,20 @@ struct DropHistoryTest {
         check(history.count == 2 && history.last!.sleepDropCount == 4 && history.last!.retries == 2
               && history.last!.approvals == 1 && history.last!.durationSeconds == 64,
               "drop within the wake grace folds in with its re-logins and approval")
-        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共重新登录 2 次，都已恢复；其中 1 次等你在手机上批准",
+        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共连接重试 2 轮，都已恢复，等待登录确认 1 次",
               "sleep summary with re-logins: \(history.last!.summary)")
         drop(15_200, 15_201)
         check(history.count == 3 && history.last!.sleepSince == nil, "after the grace: an ordinary record")
         // The next night is a new sleep record; one that ends badly says so.
         sleeper.noteSleep(now: at(20_000))
         drop(20_100, 20_105)
-        check(history.count == 4 && history.last!.summary == "电脑睡眠时断了 5 秒，连接自己续上了（没有重新登录）",
+        check(history.count == 4 && history.last!.summary == "电脑睡眠时断了 5 秒，连接自己续上了",
               "single sleep drop: \(history.last!.summary)")
         drop(20_200, 20_500, retries: 3, failed: true)
         let bad = history.last!.applyingTerminal(3)
-        check(history.count == 4 && bad.summary == "电脑睡眠时断了 2 次，合计 5 分 5 秒，共重新登录 3 次，最后一次停止重试：重试次数用完",
+        check(history.count == 4 && bad.summary == "电脑睡眠时断了 2 次，合计 5 分 5 秒，共连接重试 3 轮，最后一次停止重试：重试次数用完",
               "failed sleep record: \(bad.summary)")
-        check(bad.panelSummary == "睡眠中断了 2 次（合计 5 分 5 秒），重新登录 3 次，没恢复", "failed sleep panel: \(bad.panelSummary)")
+        check(bad.panelSummary == "睡眠中断了 2 次（合计 5 分 5 秒），连接重试 3 轮，没恢复", "failed sleep panel: \(bad.panelSummary)")
         let sleepData = try! JSONEncoder().encode(history)
         check((try? JSONDecoder().decode([DropRecord].self, from: sleepData)) == history, "sleep records round trip")
 

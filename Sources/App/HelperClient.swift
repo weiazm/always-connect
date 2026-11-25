@@ -37,6 +37,28 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// The own connection stopped itself after its self-check found no
     /// usable network (§26.11); shown on the panel until the next connect.
     @Published private(set) var autoStopNotice: String?
+    @Published private(set) var gatewayTrustFailed = false
+    @Published private(set) var rejectedLoginHeld = false
+    private var relayIncident: UInt64 = 0
+    private var revalidatedRelayPin: String?
+    private var pendingRecovery: UInt64?
+    private var awaitingCiscoStart = false
+    var showsConnected: Bool { state == .connected && !gatewayTrustFailed }
+    var certificateProtectionText: String {
+        if !protectsDrops { return "断线保护已关闭。请联系 VPN 管理员。" }
+        if rejectedLoginHeld { return "网络已拦截。可点「恢复网络」回到直连。" }
+        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+    }
+    @Published private(set) var loginProtectionNotice: String?
+    @Published private(set) var loginGatewayReadiness: LoginGatewayReadiness = .idle
+    private let loginPreparation = LoginGatewayPreparation()
+    private var loginPreparationRequest: UInt64 = 0
+    private var loginPreparationForConnection: UInt64?
+    private var loginPreparationTarget: GatewayAddress?
+    private var loginPreparationProfileName: String?
+    private var loginIntentActive = false
+    private var pendingProtectedStart: UInt64?
+    private var endingApp = false
     private let connectionCheck = ConnectionCheck()
     @Published private(set) var helperAvailable = false
     /// When the current connection was established (nil when not connected).
@@ -68,6 +90,17 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Kill switch not in force (Cisco engine): shown in red on the
     /// panel. Nil when pf is applied or nothing needs it.
     @Published private(set) var pfWarning: String?
+    @Published private(set) var egressLine: String?
+    @Published private(set) var egressLevel: EgressProtection.Level = .unknown
+    @Published private(set) var egressNotices: [EgressProtection.BlockedGroupNotice] = []
+    @Published private(set) var egressRecheckRule: UInt32?
+    private var egressTimer: Timer?
+    private var egressPollPending = false
+    private var egressCheckSeen: Date?
+    private var egressNotifications = EgressNoticeLedger()
+    private var egressSession = UUID()
+    private var egressActiveRules = Set<UInt32>()
+    private var egressSavePending = false
 
     /// Drop episodes → DropRecords (DESIGN.md §21.22).
     private var dropTracker = DropEpisodeTracker()
@@ -88,9 +121,20 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             || KeychainStore.exists(server: ProfileStore.loadProfile().server, username: username)
     }
 
-    /// One-line status text (UI-DESIGN.md §三), shared by the panel,
-    /// the Credentials page, and Diagnostics.
+    /// Localized details shared by the panel and the menu tooltip.
+    var ownLoginProgressText: String? {
+        guard !usesCisco, state == .authenticating || state == .awaitingApproval else { return nil }
+        switch ApprovalPromptTracker.ownLoginSignal(detail) {
+        case .gatewayReply: return "网关已回应，等待连接结果"
+        case .configuring: return "隧道协商完成，正在配置 VPN 网络"
+        default: return nil
+        }
+    }
+
+    /// One-line status shared by the panel, Credentials and Diagnostics.
     var stateLine: String {
+        if gatewayTrustFailed { return StatusLook.certificateHeadline }
+        if let progress = ownLoginProgressText { return progress }
         switch state {
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }
@@ -104,11 +148,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         case .connected: return "已连接 · \(ProfileStore.loadProfile().server)"
         case .reconnecting:
             if detail == "等待网络恢复" { return detail }
-            let retries = dropRetryCount > 0 ? "（第 \(dropRetryCount) 次）" : ""
+            let progress = dropRetryCount > 0 ? "连接重试 \(dropRetryCount) 轮" : "正在重连"
             if !protectsDrops {
-                return "已断开，正在重连（断线保护已关，流量走本地网络）" + retries
+                return "断线保护已关，流量走本地网络 · " + progress
             }
-            return "已断开，网络已拦截，正在重连" + retries
+            return "网络已拦截 · " + progress
         }
     }
 
@@ -157,6 +201,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         onDemand.holdLaunch()
         onDemand.waiting = { [weak self] in self?.onDemandDisconnect.waiting == true }
         onDemand.connect = { [weak self] in _ = self?.startStoredConnection() }
+        onDemand.connectAtLaunch = { [weak self] in _ = self?.startStoredConnection(allowLookup: true) }
         onDemand.stopUser = { [weak self] in self?.disconnect() }
         onDemand.recheck = { [weak self] in self?.onDemandDisconnect.recheck() }
         onDemand.debounce = { [weak self] delay, done in
@@ -275,6 +320,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         profile.server = target
         ProfileStore.saveProfile(profile)
         protection.invalidate(.serverChanged)
+        resetGatewayPreparation()
+        if !loginIntentActive { prepareGatewayWhileDirect() }
+        if pendingProtectedStart != nil && loginIntentActive && state == .disconnected {
+            pendingProtectedStart = nil
+            loginProtectionNotice = "服务器已切换，本次登录已取消。请先恢复直连。"
+            return
+        }
         guard state != .disconnected || networkHeld else { return }
         if let cisco {
             cisco.disconnect { [weak self] in
@@ -346,8 +398,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         // A Cisco engine still winding down after the switch to the own
         // connection must not speak for the session any more.
-        cisco.onState = { [weak self] state, detail in
+        cisco.onStatus = { [weak self] state, detail, rejected in
             guard let self, self.usesCisco else { return }
+            self.updateCiscoTrust(rejected: rejected, state: state)
             if state == .reconnecting {
                 self.dropRetryCount = cisco.episodeRetries
             }
@@ -359,9 +412,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             self?.applyTerminalToDrop(reason)
             Notifier.shared.notifyTerminal(reasonCode: reason)
         }
-        cisco.onKillSwitch = { [weak self] mode, tun, gateways in
-            guard self?.usesCisco == true else { return }
-            self?.setKillSwitch(mode, tunnelIf: tun, gatewayIps: gateways)
+        cisco.onProtectionRequest = { [weak self] mode, tun, gateways, completion in
+            guard let self, self.usesCisco else { completion(false); return }
+            self.setKillSwitch(mode, tunnelIf: tun, gatewayIps: gateways, completion: completion)
         }
     }
 
@@ -374,41 +427,41 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Cisco engine → Helper pf (DESIGN.md §二十一). A missing or old
     /// Helper means no kill switch: say so on the panel, never hide it.
-    private func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String]) {
-        guard let ticket = protection.request(mode) else { return }
+    private func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String],
+                               completion: @escaping (Bool) -> Void = { _ in }) {
+        guard let ticket = protection.request(mode) else { completion(false); return }
+        rejectedLoginHeld = false
+        var finished = false
+        func finish(_ ok: Bool) {
+            guard !finished else { return }
+            finished = true
+            completion(ok)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard !finished else { return }
+            if self.protection.isCurrent(ticket) { self.pfWarning = "后台服务未响应，拦截尚未确认" }
+            finish(false)
+        }
         ensureConnection { proxy in
-            var finished = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if !finished && self.protection.isCurrent(ticket) {
-                    finished = true
-                    self.pfWarning = "后台服务未响应：断线封网未生效"
-                }
-            }
+            let matches = HelperInstaller.installedHelperMatchesBundle
             let apply = {
-                guard self.protection.claim(ticket) else {
-                    finished = true
-                    return
-                }
-                let mode = ProfileStore.loadAppSettings().isDropProtectionOn
-                    && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
-                proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+                guard !finished, self.protection.claim(ticket) else { finish(false); return }
+                let enabled = ProfileStore.loadAppSettings().isDropProtectionOn
+                let requested = enabled && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
+                proxy.setKillSwitch(requested, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
                     DispatchQueue.main.async {
-                        // A reply may update only the latest session's intent.
-                        guard self.protection.isCurrent(ticket) else { return }
-                        finished = true
+                        guard !finished, self.protection.isCurrent(ticket) else { finish(false); return }
                         self.markHelperReachable()
                         self.pfWarning = ok || !self.usesCisco ? nil : message
+                        self.rejectedLoginHeld = ok && matches && enabled && requested == 2 && self.usesCisco
+                        // A legacy session can retain its previous kill switch. A new
+                        // protected login requires a matching service and verified rule set.
+                        finish(ok && (!enabled || (matches && requested == mode)))
                     }
                 }
             }
-            if HelperInstaller.installedHelperMatchesBundle {
-                // This service serializes disconnect and protection on one queue.
-                // No status reply is needed to submit protection after a lost reply.
-                apply()
-            } else {
-                // Older/unknown service: its protection uses a different queue.
-                proxy.getStatus { _, _ in DispatchQueue.main.async(execute: apply) }
-            }
+            if matches { apply() }
+            else { proxy.getStatus { _, _ in DispatchQueue.main.async(execute: apply) } }
         }
     }
 
@@ -418,19 +471,20 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// manual disconnect. AwaitingApproval keeps the switch on: the
     /// user is mid-flow, not disconnected.
     var switchIsOn: Bool {
-        state != .disconnected || networkHeld
+        state != .disconnected || networkHeld || loginProtectionNotice != nil || gatewayTrustFailed
     }
 
-    func connect(server: String, group: String, username: String, password: String, onAccepted: (() -> Void)? = nil) {
+    private func connect(server: String, group: String, username: String, password: String, session: UInt64, onAccepted: (() -> Void)? = nil) {
         guard onDemand.permitsConnection() else { return }
-        protection.startSession(usesCisco: usesCisco)
+        guard protection.isSessionCurrent(session) else { return }
         autoStopNotice = nil
         ensureConnection { proxy in
-            guard self.onDemand.permitsConnection() else { return }
+            guard self.protection.isSessionCurrent(session), self.onDemand.permitsConnection() else { return }
             proxy.connect(
                 server: server, group: group, username: username, password: password
             ) { [weak self] accepted in
                 DispatchQueue.main.async {
+                    guard self?.protection.isSessionCurrent(session) == true else { return }
                     if !accepted {
                         self?.lastError = "Helper 未接受连接请求"
                     } else {
@@ -551,6 +605,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Panel: the forced restore went through (or the service is back).
     func forcedRestoreDone() {
+        resetGatewayPreparation()
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
+        loginIntentActive = false
+        loginProtectionNotice = nil
         helperUnresponsive = false
         resettingNetwork = false
         awaitingRestartRecovery = false
@@ -568,6 +627,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         onLocalStopped: (() -> Void)? = nil,
         isCurrent: @escaping () -> Bool = { true }
     ) {
+        pendingProtectedStart = nil
+        loginIntentActive = false
+        resetGatewayPreparation()
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
+        loginProtectionNotice = nil
         let protectionSession = protection.invalidate(.disconnect)
         dropTracker.noteUserStop()
         if let cisco {
@@ -641,8 +706,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// back, and the panel and a notification say so. The user is never
     /// left to rescue the network by hand.
     private func startConnectionCheck() {
+        guard ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
         connectionCheck.start { [weak self] in
-            guard let self, self.state == .connected, !self.usesCisco else { return }
+            guard let self, self.state == .connected, !self.usesCisco,
+                  !self.gatewayTrustFailed,
+                  ProfileStore.loadAppSettings().egressProtection?.isActive != true else { return }
             self.autoStopNotice = "自建连接连上后 30 秒都上不了网，已自动断开并恢复直连。"
                 + "可以先在设置里改用「经 Cisco」连接。"
             self.disconnect()
@@ -668,8 +736,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Detaches the current relay (and cancels one being prepared); the
     /// caller stops it once the Helper has let go of the tunnel.
-    private func takeRelay() -> CertificateRelay? {
+    private func takeRelay(clearTrustNotice: Bool = true) -> CertificateRelay? {
         relayGeneration += 1
+        relayIncident = 0
+        revalidatedRelayPin = nil
+        pendingRecovery = nil
+        if clearTrustNotice { gatewayTrustFailed = false }
+        rejectedLoginHeld = false
         let current = relay
         relay = nil
         return current
@@ -681,12 +754,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard own != ownConnection else { return }
         if switchIsOn { disconnect() }
         protection.invalidate(.modeChanged)
+        resetGatewayPreparation()
         var settings = ProfileStore.loadAppSettings()
         settings.connectionMode = own ? "own" : "cisco"
         ProfileStore.saveAppSettings(settings)
         ownConnection = own
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
         pfWarning = nil
         splitActivity = nil
+        prepareGatewayWhileDirect()
     }
 
     /// 按网站分流 (DESIGN.md §26.12): one switch for the user; on = the
@@ -835,29 +912,36 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// open panel: list entries looked up and addresses sent direct.
     @Published private(set) var splitActivity: (entries: [String], addresses: Int)?
     @Published private(set) var splitWarning: String?
+    @Published private(set) var dnsNotice: String?
 
     func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; return }
+        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
+        let sessionStarted = connectedSince
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if !finished { finished = true; self.splitWarning = nil }
+                guard !finished, self.connectedSince == sessionStarted else { return }
+                finished = true
+                self.splitWarning = nil
+                self.dnsNotice = nil
             }
             if HelperInstaller.installedHelperMatchesBundle {
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
-                        guard !finished else { return }; finished = true
+                        guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
+                        finished = true
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
-                            var splitRunning: Bool; var splitWarning: String?; var pfError: String?
+                            var splitRunning: Bool; var splitWarning: String?; var pfError: String?; var dnsNotice: String?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        self.dnsNotice = status?.dnsNotice
                         self.splitWarning = status?.splitWarning
                         if let status { self.pfWarning = status.pfError }
                     }
@@ -866,8 +950,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             proxy.getSplitActivity { entries, addresses, running in
                 DispatchQueue.main.async {
-                    guard !finished else { return }
+                    guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                     finished = true
+                    self.dnsNotice = nil
                     self.splitActivity = running ? (entries, addresses) : nil
                     self.splitWarning = nil
                 }
@@ -881,11 +966,27 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Own connection: tell the background service (§26.19).
     func dropProtectionChanged() {
         if AppRole.isSettings { SettingsLink.shared.send("dropProtectionChanged"); return }
+        resetGatewayPreparation()
+        updateEgressMonitoring()
+        if !ProfileStore.loadAppSettings().isDropProtectionOn {
+            if pendingProtectedStart != nil { disconnect() }
+            rejectedLoginHeld = false
+            loginProtectionNotice = nil
+            if state == .disconnected { loginIntentActive = false }
+        } else if loginIntentActive || state != .disconnected {
+            // A previously unprotected login cannot keep running on an unverified path.
+            // Applying the common login barrier precedes either engine's next authentication.
+            if usesCisco || state != .connected {
+                _ = connectWithStoredCredentials()
+                return
+            }
+        }
         if usesCisco {
             cisco?.rearm()
             if !ProfileStore.loadAppSettings().isDropProtectionOn {
                 setKillSwitch(0, tunnelIf: "", gatewayIps: [])
             }
+            prepareGatewayWhileDirect()
         } else {
             pushDropProtection { [weak self] in self?.refreshAfterDropSetting() }
         }
@@ -898,12 +999,18 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func prepareForNetworkReset() {
         resettingNetwork = true
-        if switchIsOn || networkHeld { disconnect() }
+        resetGatewayPreparation()
+        if loginIntentActive || switchIsOn || networkHeld { disconnect() }
     }
 
     func networkResetFinished() {
         resettingNetwork = false
+        gatewayTrustFailed = false
+        rejectedLoginHeld = false
+        loginIntentActive = false
+        loginProtectionNotice = nil
         refreshStatus()
+        refreshHeld()
     }
 
     /// Quit = VPN off and the plain direct network (DESIGN.md §21.5):
@@ -914,6 +1021,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// wind down what the App runs, and drop our XPC connection so the
     /// Helper, with nothing left to do, exits on its own.
     func shutdownForQuit(completion: @escaping () -> Void) {
+        endingApp = true
+        protection.invalidate(.manualStop)
+        resetGatewayPreparation()
         if let record = dropTracker.finishForQuit() {
             appendDrop(record)
         }
@@ -983,25 +1093,146 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             SettingsLink.shared.send("connect")
             return true
         }
-        onDemand.requestConnection(manual: manual) { [weak self] in _ = self?.startStoredConnection() }
+        onDemand.requestConnection(manual: manual) { [weak self] in _ = self?.startStoredConnection(allowLookup: manual) }
         return hasCredentials
     }
 
     @discardableResult
-    private func startStoredConnection() -> Bool {
+    private func startStoredConnection(allowLookup: Bool = false) -> Bool {
+        // Include service checks and leave time inside the three-second budget to load PF.
+        let deadline = DispatchTime.now() + .milliseconds(2500)
+        guard !endingApp, !resettingNetwork else { return false }
         if AppRole.isSettings {
             guard hasCredentials else { return false }
             SettingsLink.shared.send("connect")
             return true
         }
+        if let pending = pendingProtectedStart, loginIntentActive, protection.isSessionCurrent(pending) {
+            return true
+        }
         let profile = ProfileStore.loadProfile()
         guard hasCredentials, let username = ProfileStore.loadUsername() else { return false }
+        let allowPreparation = allowLookup && !loginIntentActive && state == .disconnected && !networkHeld && !gatewayTrustFailed
         splitWarning = nil
-        protection.startSession(usesCisco: usesCisco)
+        loginIntentActive = true
+        let native = usesCisco
+        awaitingCiscoStart = native
+        let session = protection.startSession(usesCisco: native)
+        let server = CiscoProfiles.resolve(profile.server)
+        let target = GatewayAddress(server)
+        guard protectsDrops else {
+            resetGatewayPreparation()
+            loginProtectionNotice = nil
+            return continueStoredConnection(profile, username: username, server: server,
+                                            addresses: nil, session: session)
+        }
+        guard HelperInstaller.installedHelperMatchesBundle else {
+            resetGatewayPreparation()
+            loginProtectionNotice = "请更新后台服务。网络拦截尚未确认，已停止登录。"
+            return false
+        }
+        pendingProtectedStart = session
+        loginProtectionNotice = "正在确认登录前的网络保护"
+        let status = target.map { loginPreparation.status(for: $0) }
+        var candidate = ""
+        var rejected = false
+        if status == .ready || status == .certificateRejected || !allowPreparation {
+            let result = loginPreparation.takeResultForIntent(target)
+            candidate = result.address ?? ""
+            rejected = result.certificateRejected
+        }
+        if rejected { showGatewayRejection() }
+
+        func current() -> Bool {
+            pendingProtectedStart == session && loginIntentActive && !endingApp && !resettingNetwork
+                && protection.isSessionCurrent(session) && usesCisco == native && protectsDrops
+                && ProfileStore.loadProfile().server == profile.server
+        }
+        func protected(_ result: (Bool, [String], String)?, failure: LoginGatewayReadiness?) {
+            guard current() else { return }
+            pendingProtectedStart = nil
+            resetGatewayPreparation()
+            guard let (ok, peers, notice) = result else {
+                loginProtectionNotice = "后台服务没有及时确认网络拦截，已停止登录。"
+                refreshHeld()
+                return
+            }
+            guard ok else {
+                loginProtectionNotice = notice
+                if [ProtectedLoginNotice.noTrustedAddress, ProtectedLoginNotice.preparationTimedOut,
+                    ProtectedLoginNotice.preparationUnavailable].contains(notice) {
+                    networkHeld = true
+                    switch failure {
+                    case .certificateRejected:
+                        showGatewayRejection()
+                        rejectedLoginHeld = true
+                    case .timedOut:
+                        loginProtectionNotice = ProtectedLoginNotice.preparationTimedOut
+                    case .unavailable:
+                        loginProtectionNotice = "没有取得可用的 VPN 服务器地址。网络已拦截，请恢复直连后重试。"
+                    case .dnsFailed:
+                        loginProtectionNotice = "无法解析 VPN 服务器的名称。网络已拦截，请恢复直连后重试。"
+                    case .networkUnknown:
+                        loginProtectionNotice = ProtectedLoginNotice.preparationUnavailable
+                    default: break
+                    }
+                }
+                refreshHeld()
+                return
+            }
+            networkHeld = true
+            loginProtectionNotice = "网络已拦截，正在连接 VPN"
+            _ = continueStoredConnection(profile, username: username, server: server, addresses: peers, session: session)
+        }
+
+        typealias Opening = (ticket: UInt64, ok: Bool, peers: [String], notice: String)
+        egressRPC({ proxy, done in
+            proxy.requestProtectedLogin(server, cisco: native, candidate: candidate, rejected: rejected,
+                                        allowPreparation: allowPreparation, deadline: deadline.uptimeNanoseconds) {
+                done((ticket: $0, ok: $1, peers: $2, notice: $3))
+            }
+        }) { [weak self] (opening: Opening?) in
+            guard let self, current() else { return }
+            guard let opening else { protected(nil, failure: nil); return }
+            guard opening.ticket != 0 else {
+                protected((opening.ok, opening.peers, opening.notice), failure: rejected ? .certificateRejected : nil)
+                return
+            }
+            var submitted = false
+            func finish(_ readiness: LoginGatewayReadiness) {
+                guard current(), !submitted else { return }
+                submitted = true
+                let prep = self.loginPreparation.takeResultForIntent(target)
+                let failedTrust = prep.certificateRejected || readiness == .certificateRejected
+                if failedTrust { self.showGatewayRejection() }
+                let withinBudget = DispatchTime.now() < deadline
+                let peer = withinBudget && !failedTrust && readiness == .candidate ? prep.address ?? "" : ""
+                let failure: LoginGatewayReadiness
+                if failedTrust { failure = .certificateRejected }
+                else if !withinBudget { failure = .timedOut }
+                else { failure = readiness }
+                self.loginProtectionNotice = "正在确认登录前的网络拦截"
+                self.egressRPC({ proxy, done in
+                    proxy.finishProtectedLogin(opening.ticket, candidate: peer) { done(($0, $1, $2)) }
+                }) { protected($0, failure: failure) }
+            }
+            guard DispatchTime.now() < deadline else { finish(.timedOut); return }
+            self.loginProtectionNotice = ProtectedLoginNotice.preparingGateway
+            DispatchQueue.main.asyncAfter(deadline: deadline) { finish(.timedOut) }
+            self.prepareGatewayForConnection(deadline: deadline, expectedTarget: target,
+                                             joinOnly: status == .preparing, completion: finish)
+        }
+        return true
+    }
+
+    private func continueStoredConnection(_ profile: Profile, username: String, server: String,
+                                          addresses: [String]?, session: UInt64) -> Bool {
+        guard protection.isSessionCurrent(session), onDemand.permitsConnection() else { return false }
         if let cisco {
             // The engine reads the password itself, once, when it logs in.
             // Allowlist first, so the kill switch's first load has it.
             updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+            awaitingCiscoStart = false
             cisco.connect()
             return true
         }
@@ -1010,9 +1241,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         // Keychain stays keyed by the entry name the user typed; only
         // the Helper gets the resolved address (DESIGN.md §20.6).
-        let server = CiscoProfiles.resolve(profile.server)
-        prepareRelay(server: server) { [weak self] error in
-            guard let self else { return }
+        prepareRelay(server: server, authorisedAddresses: addresses) { [weak self] error in
+            guard let self, self.protection.isSessionCurrent(session) else { return }
             if let error {
                 self.lastError = error
                 self.detail = error
@@ -1027,13 +1257,31 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // takes it over at once and must pass the LAN (§30.1).
                 self.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
             }
-            self.connect(server: server, group: profile.group,
-                         username: username, password: password) {
-                // The Helper starts with the built-in LAN allowlist; push
-                // the user's list as soon as the engine exists (the
-                // connect reply means it does). Best effort: a stale
-                // list is corrected on the next connect or Settings save.
-                HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+            let begin = {
+                guard self.protection.isSessionCurrent(session) else { return }
+                self.connect(server: server, group: profile.group,
+                             username: username, password: password, session: session) {
+                    // The connect reply means the engine exists and can take the LAN list.
+                    HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+                }
+            }
+            let settings = ProfileStore.loadAppSettings()
+            let egress = settings.egressProtection ?? EgressProtection()
+            if egress.isActive && settings.isDropProtectionOn && !self.usesCisco {
+                let generation = self.relayGeneration
+                self.sendEgress(egress) { ok in
+                    guard self.relayGeneration == generation, !self.usesCisco else { return }
+                    if ok { begin() }
+                    else {
+                        self.lastError = "后台服务未接受出口保护设置。请更新后台服务后再连接。"
+                        self.detail = self.lastError ?? ""
+                    }
+                }
+            } else if !self.usesCisco, settings.isDropProtectionOn, settings.egressProtection != nil {
+                self.sendEgress(egress) { _ in }
+                begin()
+            } else {
+                begin()
             }
         }
         return true
@@ -1074,8 +1322,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Helper to go through it; with no certificate in use, tell it to
     /// go straight to the gateway. Completion on main: nil = ready to
     /// connect, else what to show the user.
-    private func prepareRelay(server: String, completion: @escaping (String?) -> Void) {
-        takeRelay()?.stop()
+    private func prepareRelay(server: String, authorisedAddresses: [String]? = nil, completion: @escaping (String?) -> Void) {
+        takeRelay(clearTrustNotice: false)?.stop()
         retiringRelay?.stop()
         retiringRelay = nil
         let generation = relayGeneration
@@ -1100,6 +1348,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     return
                 }
                 DispatchQueue.main.async {
+                    guard self.relayGeneration == generation else { return }
+                    if self.gatewayTrustFailed { self.revalidatedRelayPin = "" }
                     self.sendPrepareRelay(gatewayIp: "", serverPin: "") { _ in finish(nil) }
                 }
                 return
@@ -1117,17 +1367,22 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             DispatchQueue.main.async {
                 guard generation == self.relayGeneration else { return }
-                self.resolveGatewayIPv4(address.host) { addresses in
+                let prepare: ([String]?) -> Void = { addresses in
                     DispatchQueue.global(qos: .userInitiated).async {
                         let prepared: CertificateRelay.Prepared
                         do {
-                            prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: memory.addresses, resolved: addresses)
+                            prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: authorisedAddresses ?? memory.addresses, resolved: addresses)
                         } catch {
                             finish(error.localizedDescription)
                             return
                         }
                         GatewayMemory.save(address.host, last: prepared.gatewayIp,
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onGatewayTrustChanged = { [weak self] trusted in
+                            DispatchQueue.main.async {
+                                self?.observeRelayTrust(trusted, pin: prepared.serverPin, generation: generation)
+                            }
+                        }
                         relay.onGatewayUnreachable = { [weak self] silent in
                             DispatchQueue.main.async { self?.gatewayUnreachable(silent, host: address.host, generation: generation) }
                         }
@@ -1158,6 +1413,68 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         }
                     }
                 }
+                if let authorisedAddresses { prepare(authorisedAddresses) }
+                else { self.resolveGatewayIPv4(address.host, completion: prepare) }
+            }
+        }
+    }
+
+    private func showGatewayRejection() {
+        guard !gatewayTrustFailed else { return }
+        gatewayTrustFailed = true
+        Notifier.shared.notifyGatewayCertificateFailure()
+    }
+
+    private func updateCiscoTrust(rejected: Bool, state: State) {
+        if rejected {
+            showGatewayRejection()
+            loginProtectionNotice = nil
+        } else if state == .connected && gatewayTrustFailed && !awaitingCiscoStart {
+            // Cisco sends this clean state only after confirming the current native session.
+            gatewayTrustFailed = false
+            rejectedLoginHeld = false
+        }
+    }
+
+    private func observeRelayTrust(_ trusted: Bool, pin: String, generation: Int) {
+        guard generation == relayGeneration, !usesCisco else { return }
+        if trusted {
+            guard gatewayTrustFailed else { return }
+            revalidatedRelayPin = pin
+            confirmRelayRecovery()
+            return
+        }
+        relayIncident &+= 1
+        let incident = relayIncident
+        revalidatedRelayPin = nil
+        pendingRecovery = nil
+        showGatewayRejection()
+        rejectedLoginHeld = false
+        loginProtectionNotice = nil
+        egressRPC({ $0.recordGatewayRejection(pin, incident: incident, withReply: $1) }) { held in
+            guard generation == self.relayGeneration, self.relayIncident == incident, self.gatewayTrustFailed else { return }
+            self.rejectedLoginHeld = held == true && self.protectsDrops
+            self.confirmRelayRecovery()
+        }
+    }
+
+    private func confirmRelayRecovery() {
+        let incident = relayIncident
+        guard state == .connected, gatewayTrustFailed, !usesCisco,
+              let pin = revalidatedRelayPin, pendingRecovery != incident else { return }
+        let generation = relayGeneration
+        pendingRecovery = incident
+        egressRPC({ $0.hasVerifiedRelayTunnel(pin, incident: incident, withReply: $1) }) { verified in
+            guard generation == self.relayGeneration, incident == self.relayIncident else { return }
+            self.pendingRecovery = nil
+            guard verified == true, self.state == .connected, self.revalidatedRelayPin == pin else { return }
+            self.gatewayTrustFailed = false
+            self.rejectedLoginHeld = false
+            self.revalidatedRelayPin = nil
+            self.connectedSince = Date()
+            if !self.sessionProven {
+                self.sessionProven = true
+                self.startConnectionCheck()
             }
         }
     }
@@ -1264,6 +1581,147 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         fetchNetworkHeld { [weak self] held in
             guard let self, self.state == .disconnected else { return }
             self.networkHeld = held ?? false
+            if held == true { self.resetGatewayPreparation() }
+            if held == false { self.prepareGatewayWhileDirect() }
+        }
+    }
+
+    private var mayPrepareLoginGateway: Bool {
+        protectsDrops && !AppRole.isSettings && !endingApp && !resettingNetwork && !loginIntentActive
+            && state == .disconnected && !networkHeld && !gatewayTrustFailed && loginProtectionNotice == nil
+    }
+
+    private func resetGatewayPreparation(cancelTransport: Bool = true) {
+        loginPreparationRequest &+= 1
+        loginPreparationForConnection = nil
+        if cancelTransport { loginPreparation.cancel() }
+        loginPreparationTarget = nil
+        loginPreparationProfileName = nil
+        if loginGatewayReadiness != .idle { loginGatewayReadiness = .idle }
+    }
+
+    func expireGatewayPreparation() {
+        guard loginGatewayReadiness == .candidate, let target = loginPreparationTarget,
+              loginPreparation.status(for: target) != .ready else { return }
+        loginGatewayReadiness = .idle
+    }
+
+    /// Called by the shared connection entry after it has checked the cache,
+    /// confirmed direct networking, and fixed the absolute protection deadline.
+    func prepareGatewayForConnection(deadline: DispatchTime, expectedTarget: GatewayAddress? = nil, joinOnly: Bool = false,
+                                     completion: @escaping (LoginGatewayReadiness) -> Void) {
+        guard loginPreparationForConnection == nil, !endingApp, !resettingNetwork else { return }
+        guard loginIntentActive, state == .disconnected, protectsDrops, !networkHeld else {
+            completion(.networkUnknown)
+            return
+        }
+        guard DispatchTime.now() < deadline else {
+            resetGatewayPreparation()
+            completion(.timedOut)
+            return
+        }
+        let name = ProfileStore.loadProfile().server
+        guard let target = GatewayAddress(CiscoProfiles.resolve(name)) else {
+            completion(.unavailable)
+            return
+        }
+        guard expectedTarget == nil || target == expectedTarget else {
+            completion(.networkUnknown)
+            return
+        }
+        if loginPreparationProfileName != name || loginPreparationTarget != target {
+            resetGatewayPreparation()
+        }
+        let native = usesCisco
+        loginPreparationRequest &+= 1
+        let request = loginPreparationRequest
+        loginPreparationForConnection = request
+        loginPreparationTarget = target
+        loginPreparationProfileName = name
+        let finish = { [weak self] in
+            guard let self, self.loginPreparationForConnection == request,
+                  self.loginIntentActive, self.usesCisco == native,
+                  ProfileStore.loadProfile().server == name else { return }
+            self.loginPreparationForConnection = nil
+            let result: LoginGatewayReadiness
+            if DispatchTime.now() >= deadline {
+                result = .timedOut
+            } else if self.networkHeld {
+                result = .networkUnknown
+            } else {
+                result = LoginGatewayReadiness(preparation: self.loginPreparation.status(for: target))
+            }
+            self.loginGatewayReadiness = result
+            completion(result)
+        }
+        loginPreparation.confirmDirect()
+        let status = loginPreparation.prepareWhileDirect(target, ipv4Only: !native, deadline: deadline,
+                                                        joinOnly: joinOnly, completion: finish)
+        if status == .preparing { loginGatewayReadiness = .preparing }
+        else { finish() }
+    }
+
+    func prepareGatewayWhileDirect(retry: Bool = false) {
+        guard mayPrepareLoginGateway else { return }
+        let name = ProfileStore.loadProfile().server
+        let server = CiscoProfiles.resolve(name)
+        guard let target = GatewayAddress(server) else {
+            resetGatewayPreparation()
+            loginGatewayReadiness = .unavailable
+            return
+        }
+        if let previous = loginPreparationProfileName, previous != name || loginPreparationTarget != target {
+            resetGatewayPreparation()
+        }
+        guard !loginGatewayReadiness.isBusy else { return }
+        let native = usesCisco
+        loginPreparationRequest &+= 1
+        let request = loginPreparationRequest
+        loginPreparationTarget = target
+        loginPreparationProfileName = name
+        loginGatewayReadiness = .checking
+        fetchTrustedLoginGateway(server, cisco: native) { [weak self] cached in
+            guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+            let candidate = self.loginPreparation.status(for: target)
+            if let readiness = LoginGatewayReadiness.afterCacheCheck(cached, candidate: candidate) {
+                self.loginGatewayReadiness = readiness
+            } else if !retry && [.unavailable, .certificateRejected, .dnsFailed, .timedOut].contains(candidate) {
+                self.loginGatewayReadiness = LoginGatewayReadiness(preparation: candidate)
+            } else {
+                self.prepareUncachedGateway(target, request: request, name: name, native: native)
+            }
+        }
+    }
+
+    private func isGatewayPreparationCurrent(_ request: UInt64, name: String, native: Bool) -> Bool {
+        request == loginPreparationRequest && mayPrepareLoginGateway && usesCisco == native
+            && ProfileStore.loadProfile().server == name
+    }
+
+    private func prepareUncachedGateway(_ target: GatewayAddress, request: UInt64, name: String, native: Bool) {
+        fetchNetworkHeld { [weak self] held in
+            guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+            guard held == false else {
+                if held == true { self.networkHeld = true }
+                self.loginGatewayReadiness = .networkUnknown
+                return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let direct = ac_login_direct_route()
+                DispatchQueue.main.async {
+                    guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+                    guard direct else {
+                        self.loginGatewayReadiness = .networkUnknown
+                        return
+                    }
+                    self.loginPreparation.confirmDirect()
+                    let status = self.loginPreparation.prepareWhileDirect(target, ipv4Only: !native) { [weak self] in
+                        guard let self, self.isGatewayPreparationCurrent(request, name: name, native: native) else { return }
+                        self.loginGatewayReadiness = LoginGatewayReadiness(preparation: self.loginPreparation.status(for: target))
+                    }
+                    self.loginGatewayReadiness = LoginGatewayReadiness(preparation: status)
+                }
+            }
         }
     }
 
@@ -1370,9 +1828,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // the drop (it read as 断了 2 秒，没恢复, §30.4).
             return
         }
+        let rejectedWithHold = detail == "VPN 网关证书校验失败，网络已拦截"
+        if !usesCisco && relay == nil && (detail == StatusLook.certificateHeadline || rejectedWithHold) {
+            showGatewayRejection()
+            rejectedLoginHeld = rejectedWithHold && protectsDrops
+            revalidatedRelayPin = ""
+            loginProtectionNotice = nil
+        }
         state = parsed
+        if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
+        if parsed != old { updateEgressMonitoring() }
+        if parsed == .connected && old != .connected && !AppRole.isSettings {
+            // The network is usable now: a site-list check that found none
+            // (launch while connecting) runs again (§66.30).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { GeoUpdater.shared.checkIfDue(networkReady: true) }
+        }
         self.detail = detail
-        if parsed != .connected { splitWarning = nil }
+        if parsed != .connected { splitWarning = nil; dnsNotice = nil }
         if parsed != old, !usesCisco {
             // Next to the relay's login trace (§30.9): what the App showed
             // and when, readable without administrator rights.
@@ -1395,13 +1867,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             recordAwaitingTerminal = parsed == .disconnected ? id.map { ($0, record.retries ?? 0) } : nil
         }
         if parsed == .connected {
+            confirmRelayRecovery()
+            loginProtectionNotice = nil
             if old != .connected {
                 connectedSince = Date()
                 // Only a session that has not worked yet (§26.11): one
                 // that comes back after a drop, a wake or a service
                 // restart was proven before, and 30 quiet seconds there
                 // must not turn the VPN off (§30.4).
-                if !usesCisco, !sessionProven {
+                if !usesCisco, !sessionProven, !gatewayTrustFailed {
                     sessionProven = true
                     startConnectionCheck()
                 }
@@ -1415,11 +1889,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             fetchNetworkHeld { [weak self] held in
                 guard let self, self.state == .disconnected else { return }
                 self.networkHeld = held ?? false
+                if held == true && self.loginGatewayReadiness != .idle { self.resetGatewayPreparation() }
+                if held == false && self.loginGatewayReadiness == .idle { self.prepareGatewayWhileDirect() }
             }
         } else {
             networkHeld = false
         }
-        Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops)
+        if !gatewayTrustFailed {
+            Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops)
+        }
         updateHoldReminder()
         // Session info (DESIGN.md §十九): the retry count is live
         // during a drop episode; the terminal reason is fetched once
@@ -1545,6 +2023,234 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
+    private func egressRPC<Value>(_ call: @escaping (AlwaysConnectHelperProtocol, @escaping (Value) -> Void) -> Void,
+                                  completion: @escaping (Value?) -> Void) {
+        guard !HelperInstaller.installedHelperOutdated, HelperInstaller.installedHelperMatchesBundle else {
+            completion(nil)
+            return
+        }
+        var pending = true
+        func finish(_ result: Value?) {
+            guard pending else { return }
+            pending = false
+            completion(result)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil) }
+        ensureConnection { proxy in
+            call(proxy) { result in DispatchQueue.main.async { finish(result) } }
+        }
+    }
+
+    private func sendEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
+        guard let json = config.backgroundServiceJSON, json.utf8.count <= 524_288 else {
+            completion(false)
+            return
+        }
+        egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
+    }
+
+    /// New site lists are in place (GeoUpdater, §66.30): the split list
+    /// and exit protection are expanded again and sent, when they name one.
+    func siteListsChanged() {
+        if AppRole.isSettings {
+            SettingsLink.shared.send("siteListsChanged") { _ in }
+            return
+        }
+        let settings = ProfileStore.loadAppSettings()
+        let usesLists = { (lines: [String]) in lines.contains { $0.lowercased().hasPrefix("geosite:") } }
+        if settings.splitOn, usesLists(DirectSites.sites(settings).flatMap(\.domains)) {
+            pushDirectDomains()
+        }
+        if let egress = settings.egressProtection, egress.isActive, !usesCisco, settings.isDropProtectionOn,
+           usesLists(egress.groups.filter(\.enabled).flatMap(\.sites)) {
+            sendEgress(egress) { _ in }
+        }
+    }
+
+    func saveEgress(_ config: EgressProtection, replacing previous: EgressProtection? = nil,
+                    completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            let update = EgressConfigUpdate(config: config, previous: previous)
+            guard let data = try? JSONEncoder().encode(update) else { completion(false); return }
+            SettingsLink.shared.send("saveEgress", String(decoding: data, as: UTF8.self)) {
+                completion($0 == "1")
+            }
+            return
+        }
+        let settings = ProfileStore.loadAppSettings()
+        let stored = settings.egressProtection ?? EgressProtection()
+        guard !egressSavePending, previous == nil || previous == stored,
+              config.permitsActivation(comparedTo: stored),
+              !config.enabled || (!usesCisco && settings.isDropProtectionOn) else { completion(false); return }
+        egressSavePending = true
+        sendEgress(config) { ok in
+            self.egressSavePending = false
+            if ok {
+                var latest = ProfileStore.loadAppSettings()
+                if config.enabled && (!latest.isDropProtectionOn || self.usesCisco) {
+                    completion(false)
+                    return
+                }
+                latest.egressProtection = config
+                ProfileStore.saveAppSettings(latest, updatingEgress: true)
+                self.updateEgressMonitoring()
+            }
+            completion(ok)
+        }
+    }
+
+    func fetchEgressJSON(_ completion: @escaping (String?) -> Void) {
+        if AppRole.isSettings { SettingsLink.shared.send("egressStatus", done: completion); return }
+        guard !usesCisco else { completion(nil); return }
+        egressRPC({ $0.getEgressStatus(withReply: $1) }, completion: completion)
+    }
+
+    func connectForEgressSetup() {
+        if AppRole.isSettings { SettingsLink.shared.send("connect"); return }
+        _ = connectWithStoredCredentials(manual: true)
+    }
+
+    func allowEgressCountry(_ approval: EgressCountryApproval, completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            guard let json = try? JSONEncoder().encode(approval) else { completion(false); return }
+            SettingsLink.shared.send("allowEgressCountry", String(decoding: json, as: UTF8.self)) { completion($0 == "1") }
+            return
+        }
+        fetchEgressJSON { json in
+            guard let json,
+                  let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
+                  self.showsConnected, !self.egressSavePending,
+                  let evidence = try? JSONEncoder().encode(approval.observation) else { completion(false); return }
+            let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+            guard status.permits(approval, in: stored) else { completion(false); return }
+            let session = self.egressSession
+            self.egressSavePending = true
+            self.egressRPC({ proxy, done in
+                proxy.allowEgressCountry(approval.country, group: approval.group, started: approval.started,
+                                         evidence: String(decoding: evidence, as: UTF8.self)) { ok, countries in
+                    done(ok ? countries : [])
+                }
+            }) { (countries: [String]?) in
+                self.egressSavePending = false
+                var latest = ProfileStore.loadAppSettings()
+                guard latest.isDropProtectionOn, let config = latest.egressProtection,
+                      let updated = approval.applying(countries, then: stored, now: config,
+                          sameSession: self.egressSession == session) else { completion(false); return }
+                latest.egressProtection = updated
+                ProfileStore.saveAppSettings(latest, updatingEgress: true)
+                self.refreshEgress()
+                completion(true)
+            }
+        }
+    }
+
+    /// The approval bubble's 「现在重新发起」: the next login attempt now
+    /// instead of after the backoff. Either engine ignores it unless a
+    /// retry is waiting, so it never starts a second login.
+    func retryLoginNow(completion: @escaping (Bool) -> Void = { _ in }) {
+        if let cisco {
+            cisco.retryNow()
+            completion(true)
+            return
+        }
+        guard !HelperInstaller.installedHelperOutdated, HelperInstaller.installedHelperMatchesBundle else {
+            completion(false)
+            return
+        }
+        var pending = true
+        func finish(_ taken: Bool) {
+            guard pending else { return }
+            pending = false
+            completion(taken)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }
+        ensureConnection { proxy in
+            proxy.retryLoginNow { taken in DispatchQueue.main.async { finish(taken) } }
+        }
+    }
+
+    func recheckEgressRule(_ id: UInt32, completion: @escaping (Bool) -> Void) {
+        if AppRole.isSettings {
+            SettingsLink.shared.send("recheckEgressRule", String(id)) { completion($0 == "1") }
+            return
+        }
+        guard !usesCisco, showsConnected else { completion(false); return }
+        egressRPC({ $0.recheckEgressFailures(id, withReply: $1) }) { didCheck in
+            self.refreshEgress()
+            completion(didCheck == true)
+        }
+    }
+
+    func disableEgressGroup(_ id: UInt32, completion: @escaping (Bool) -> Void) {
+        let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        var config = stored.rulesForEditing
+        guard config.disableGroup(id) else {
+            completion(false)
+            return
+        }
+        config.updateEnabledFromRules()
+        saveEgress(config, replacing: stored, completion: completion)
+    }
+
+    private func updateEgressMonitoring() {
+        guard !AppRole.isSettings else { return }
+        let settings = ProfileStore.loadAppSettings()
+        let groups = settings.egressProtection?.groups ?? []
+        egressNotifications.retain(Set(groups.map(\.id)))
+        egressActiveRules = Set(groups.filter(\.enabled).map(\.id))
+        let enabled = !usesCisco && settings.isDropProtectionOn && settings.egressProtection?.isActive == true
+        guard enabled, state == .connected else {
+            egressTimer?.invalidate()
+            egressTimer = nil
+            if egressLine != nil { egressLine = nil }
+            if egressLevel != .unknown { egressLevel = .unknown }
+            if !egressNotices.isEmpty { egressNotices = [] }
+            if egressRecheckRule != nil { egressRecheckRule = nil }
+            egressCheckSeen = nil
+            if state == .disconnected {
+                egressNotifications = EgressNoticeLedger()
+                egressSession = UUID()
+            }
+            return
+        }
+        if egressTimer == nil {
+            let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in self?.refreshEgress() }
+            timer.tolerance = 1
+            RunLoop.main.add(timer, forMode: .common)
+            egressTimer = timer
+        }
+        refreshEgress()
+    }
+
+    func refreshEgress() {
+        guard egressTimer != nil, !egressPollPending else { return }
+        egressPollPending = true
+        let session = egressSession
+        fetchEgressJSON { json in
+            self.egressPollPending = false
+            guard self.egressTimer != nil, self.egressSession == session else { return }
+            let status = json.flatMap { EgressProtection.Status.monitoring(Data($0.utf8)) }
+            let notices = status?.blockingNotices ?? []
+            let now = Date()
+            if status?.checking.isEmpty == false {
+                if self.egressCheckSeen == nil { self.egressCheckSeen = now }
+            } else { self.egressCheckSeen = nil }
+            let line = status?.panelCaption(checkingFor: self.egressCheckSeen.map { now.timeIntervalSince($0) } ?? 0,
+                                            expectedRules: self.egressActiveRules)
+                ?? "尚未取得保护状态"
+            let level = status?.displayLevel(expectedRules: self.egressActiveRules) ?? .unknown
+            let recheckRule = notices.first?.id
+            if self.egressLine != line { self.egressLine = line }
+            if self.egressLevel != level { self.egressLevel = level }
+            if self.egressNotices != notices { self.egressNotices = notices }
+            if self.egressRecheckRule != recheckRule { self.egressRecheckRule = recheckRule }
+            guard let status, status.running else { return }
+            for rule in self.egressNotifications.update(status.groups.filter { self.egressActiveRules.contains($0.id) }) {
+                Notifier.shared.egressNotice(rule)
+            }
+        }
+    }
+
     func runLeakCheck(completion: @escaping ([LeakCheckItem]?) -> Void) {
         let done: ([LeakCheckItem]?) -> Void = { [weak self] result in
             self?.endReadOnlyConnection()
@@ -1581,16 +2287,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let settings = ProfileStore.loadAppSettings()
         // Without Cisco on this Mac the own connection runs either way;
         // only the switch decides whether the list applies.
-        let domains = settings.splitOn ? settings.directDomains : []
+        let text = settings.splitOn ? settings.directRuleText : ""
+        // A background service built before §66.30 only knows the list form.
+        let legacy = HelperInstaller.installedHelperOutdated
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 if !finished { finished = true; completion?(nil) }
             }
-            proxy.setDirectDomains(domains) { ok in
+            let reply: (Bool) -> Void = { ok in
                 DispatchQueue.main.async {
                     if !finished { finished = true; completion?(ok) }
                 }
+            }
+            if legacy {
+                proxy.setDirectDomains(text.split(separator: "\n").map(String.init), withReply: reply)
+            } else {
+                proxy.setDirectRuleText(text, withReply: reply)
             }
         }
     }
@@ -1644,6 +2357,17 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 DispatchQueue.main.async {
                     if !finished { finished = true; completion(applied) }
                 }
+            }
+        }
+    }
+
+    /// Read-only panel query. An unavailable or outdated service gives an unknown result.
+    func fetchTrustedLoginGateway(_ server: String, cisco: Bool, completion: @escaping (Bool?) -> Void) {
+        egressRPC({ $0.getLoginGatewayReadiness(server, cisco: cisco, withReply: $1) }) { state in
+            switch state {
+            case 1: completion(true)
+            case 0: completion(false)
+            default: completion(nil)
             }
         }
     }
@@ -1783,6 +2507,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             "helperUpdatePending": helperUpdatePending, "drops": dropHistory.count,
             "lastDropId": lastDrop?.id.uuidString ?? "", "lastDropSignature": Self.dropSignature(lastDrop),
         ]
+        json["gatewayTrustFailed"] = gatewayTrustFailed
+        if let loginProtectionNotice { json["loginProtectionNotice"] = loginProtectionNotice }
+        json["rejectedLoginHeld"] = rejectedLoginHeld
         if let lastError { json["lastError"] = lastError }
         if let autoStopNotice { json["autoStopNotice"] = autoStopNotice }
         if let pfWarning { json["pfWarning"] = pfWarning }
@@ -1807,6 +2534,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         splitSwitchPending = json["splitSwitchPending"] as? Bool ?? false
         helperUpdatePending = json["helperUpdatePending"] as? Bool ?? false
         splitWarning = json["splitWarning"] as? String
+        gatewayTrustFailed = json["gatewayTrustFailed"] as? Bool ?? false
+        loginProtectionNotice = json["loginProtectionNotice"] as? String
+        rejectedLoginHeld = json["rejectedLoginHeld"] as? Bool ?? false
         lastError = json["lastError"] as? String
         autoStopNotice = json["autoStopNotice"] as? String
         pfWarning = json["pfWarning"] as? String
@@ -1853,6 +2583,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // The panel's "后台服务未运行" row already says it;
                 // no second red line.
                 self.helperAvailable = false
+                self.rejectedLoginHeld = false
                 self.onDemandDisconnect.transportLost(
                     active: self.state != .disconnected, resetting: self.resettingNetwork, invalidated: false)
             }
@@ -1863,6 +2594,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 self.connection = nil
                 if !AppRole.isSettings {
                     self.helperAvailable = false
+                    self.rejectedLoginHeld = false
                     self.onDemandDisconnect.transportLost(
                         active: self.state != .disconnected, resetting: self.resettingNetwork, invalidated: true)
                 }
@@ -1906,3 +2638,6 @@ enum GatewayMemory {
 private func ac_gateway_system_bootstrap(_ held: Int32) -> Bool
 @_silgen_name("ac_gateway_literal")
 private func ac_gateway_literal(_ host: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+
+@_silgen_name("ac_login_direct_route") private func ac_login_direct_route() -> Bool

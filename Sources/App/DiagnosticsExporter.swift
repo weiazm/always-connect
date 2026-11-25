@@ -19,8 +19,12 @@ enum DiagnosticsExporter {
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             manager.ciscoTimelineForDiagnostics { timeline in
-                try? diagnosticsText(manager: manager, profile: profile, ciscoTimeline: timeline)
-                    .write(to: url, atomically: true, encoding: .utf8)
+                manager.fetchEgressJSON { json in
+                    let egress = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
+                    try? diagnosticsText(manager: manager, profile: profile, ciscoTimeline: timeline,
+                                         blocks: egress?.records ?? [])
+                        .write(to: url, atomically: true, encoding: .utf8)
+                }
             }
         }
     }
@@ -32,7 +36,7 @@ enum DiagnosticsExporter {
     }
 
     private static func diagnosticsText(
-        manager: HelperClient, profile: Profile, ciscoTimeline: String
+        manager: HelperClient, profile: Profile, ciscoTimeline: String, blocks: [EgressProtection.BlockRecord]
     ) -> String {
         let version = DiagnosticsRedaction.classify(
             .version, Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
@@ -75,12 +79,22 @@ enum DiagnosticsExporter {
                 DiagnosticsRedaction.classify(.isSleepRecord, String(drop.isSleepRecord)),
                 DiagnosticsRedaction.classify(.sleepDropCount, String(drop.sleepDropCount)),
             ].filter { !$0.isEmpty }.joined(separator: "，")
-            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，重试 \(retries) 次，等待批准 \(approvals) 次；原因：\(reason)")
+            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，连接重试 \(retries) 轮，等待登录确认 \(approvals) 次；原因：\(reason)")
             if !metadata.isEmpty { lines[lines.count - 1] += "；\(metadata)" }
         }
         lines.append("")
         lines.append("Cisco 引擎时间线：")
         lines.append(DiagnosticsRedaction.classify(.timeline, ciscoTimeline))
+        if !blocks.isEmpty {
+            lines.append("")
+            lines.append("出口保护拦截记录（已隐去组名、网站、地址和国家）：")
+            for block in blocks.prefix(10) where block.started.isFinite && block.started > 0 {
+                let time = timeFormatter.string(from: Date(timeIntervalSince1970: block.started))
+                let end = block.ended.flatMap { $0.isFinite && $0 >= block.started
+                    ? timeFormatter.string(from: Date(timeIntervalSince1970: $0)) : nil }
+                lines.append("- \(time) → \(end ?? "尚未恢复")，\(block.observed.count) 台服务器出口不对")
+            }
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 }

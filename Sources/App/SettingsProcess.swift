@@ -42,16 +42,17 @@ final class SettingsLink {
 
     /// Opens Settings on `tab`: starts the settings process, or brings the
     /// running one forward.
-    func show(tab: String?) {
+    func show(tab: String?, egressRule: UInt32? = nil) {
         if let process, process.isRunning {
-            transport?.send(["type": "show", "tab": tab ?? ""])
+            transport?.send(["type": "show", "tab": tab ?? "", "egressRule": egressRule.map(String.init) ?? ""])
             return
         }
         if let tab { UserDefaults.standard.set(tab, forKey: "settingsTab") }
         guard let executable = Bundle.main.executableURL else { return }
         let p = Process()
         p.executableURL = executable
-        p.arguments = ["--settings"]
+        p.arguments = ["--settings"] + (egressRule.map { ["--egress-rule", String($0)] } ?? [])
+            + (tab == "egress" ? ["--focus-egress"] : [])
         guard let pair = PrivateDescriptors.pair(kind: 1) else { return }
         let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
         p.standardInput = child
@@ -126,8 +127,30 @@ final class SettingsLink {
         case "approvalCard": ApprovalPrompt.shared.settingsChanged()
         case "quit": AppQuit.request()  // the uninstaller, from Settings (not from this block, §37)
         case "installUpdate": UpdateChecker.shared.installAvailable()  // §35.4
+        case "siteListsChanged": client.siteListsChanged()
         case "pushDirectDomains":
             client.pushDirectDomains { [weak self] ok in self?.reply(id, ok.map { $0 ? "1" : "0" }) }
+            return
+        case "saveEgress":
+            guard let update = try? JSONDecoder().decode(EgressConfigUpdate.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.saveEgress(update.config, replacing: update.previous) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
+        case "egressStatus":
+            client.fetchEgressJSON { [weak self] json in self?.reply(id, json) }
+            return
+        case "allowEgressCountry":
+            guard let approval = try? JSONDecoder().decode(EgressCountryApproval.self, from: Data(argument.utf8)) else {
+                reply(id, "0")
+                return
+            }
+            client.allowEgressCountry(approval) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
+            return
+        case "recheckEgressRule":
+            guard let group = UInt32(argument) else { reply(id, "0"); return }
+            client.recheckEgressRule(group) { [weak self] ok in self?.reply(id, ok ? "1" : "0") }
             return
         case "updateAllowNetworks":
             let networks = argument.split(separator: "\n").map(String.init)
@@ -166,7 +189,7 @@ final class SettingsLink {
                 done(info["result"])
             case "show":
                 let tab = info["tab"] ?? ""
-                SettingsWindow.shared.show(tab: tab.isEmpty ? nil : tab)
+                SettingsWindow.shared.show(tab: tab.isEmpty ? nil : tab, egressRule: info["egressRule"].flatMap(UInt32.init))
             default: break
             }
         }, ended: { exit(0) })

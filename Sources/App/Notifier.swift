@@ -21,6 +21,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private var authRequested = false
     static let heldCategory = "network-held"
     static let restoreAction = "restore-direct"
+    static let egressCategory = "egress-rule"
+    static let reviewEgressAction = "review-egress"
 
     private override init() { super.init() }
 
@@ -86,9 +88,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center.delegate = self
         let restore = UNNotificationAction(identifier: Self.restoreAction, title: "恢复直连",
                                            options: [])
+        let review = UNNotificationAction(identifier: Self.reviewEgressAction, title: "查看", options: [.foreground])
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Self.heldCategory, actions: [restore],
                                    intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: Self.egressCategory, actions: [review], intentIdentifiers: [], options: []),
         ])
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
@@ -111,6 +115,18 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
              body: "连上后 30 秒都上不了网，已断开 VPN、恢复直连。可在设置里改用「经 Cisco」连接。")
     }
 
+    func notifyGatewayCertificateFailure() {
+        post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
+    }
+
+    /// A rule started blocking connections.
+    func egressNotice(_ rule: EgressProtection.GroupState) {
+        let title = "已拦截部分连接：\(rule.lastBlockedHost ?? rule.name)"
+        let country = rule.lastBlockedCountry.map { "最近拦截涉及 \(egressCountryName($0))。 " } ?? ""
+        let body = country + (rule.blockCaption ?? "其他服务器照常逐条检查。")
+        post(title: title, body: body, category: Self.egressCategory, info: ["group": rule.id])
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -118,6 +134,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         if response.actionIdentifier == Self.restoreAction {
             DispatchQueue.main.async { HelperClient.shared.disconnect() }
+        } else if [Self.reviewEgressAction, UNNotificationDefaultActionIdentifier].contains(response.actionIdentifier) {
+            let content = response.notification.request.content
+            if content.categoryIdentifier == Self.egressCategory,
+               let group = content.userInfo["group"] as? NSNumber {
+                DispatchQueue.main.async { SettingsWindow.shared.show(tab: "egress", egressRule: group.uint32Value) }
+            }
         }
         completionHandler()
     }
@@ -130,13 +152,16 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .sound])
     }
 
-    private func post(title: String, body: String, held: Bool = false) {
+    private func post(title: String, body: String, held: Bool = false, category: String? = nil,
+                      info: [AnyHashable: Any] = [:]) {
         let center = UNUserNotificationCenter.current()
         requestAuthorization()
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         if held { content.categoryIdentifier = Self.heldCategory }
+        if let category { content.categoryIdentifier = category }
+        content.userInfo = info
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,
             content: content,

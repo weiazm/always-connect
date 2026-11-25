@@ -66,14 +66,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.isVisible = true
         statusItem?.button?.target = self
         statusItem?.button?.action = #selector(togglePanel(_:))
-        updateStatusIcon(state: HelperClient.shared.state, held: false)
+        updateStatusIcon()
         HelperClient.shared.$state
-            .combineLatest(HelperClient.shared.$networkHeld, HelperClient.shared.$onDemandPaused)
+            .combineLatest(HelperClient.shared.$networkHeld, HelperClient.shared.$onDemandPaused, HelperClient.shared.$gatewayTrustFailed)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state, held, _ in
-                self?.updateStatusIcon(state: state, held: held)
+            .sink { [weak self] state, _, _, rejected in
+                self?.updateStatusIcon()
                 // Connecting leaves freed buffers behind (§45.5).
-                if state == .connected { MemoryRelief.soon(after: 10) }
+                if state == .connected && !rejected { MemoryRelief.soon(after: 10) }
             }
             .store(in: &cancellables)
         // Attach to the Helper first: a session it kept running while
@@ -90,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             UpdateChecker.shared.checkIfDue()
         }
+        // Site lists (§66.30): at once, so a fresh install has them as soon
+        // as the network lets it out (user, 2026-11-25: "可以先下载").
+        GeoUpdater.shared.checkIfDue()
         // Auto-connect on launch when credentials are stored — after
         // updating a background service older than this App (one
         // password prompt, §30.5), so the update never lands on a live
@@ -265,13 +268,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// awaiting approval, red hollow = disconnected with kill switch
     /// on (reconnecting, or disconnected with the network still held),
     /// gray ring = manual disconnect.
-    private func updateStatusIcon(state: HelperClient.State, held: Bool) {
+    private func updateStatusIcon() {
         guard let button = statusItem?.button else { return }
         // Globe + state badge (GlobeIcon); drawn with label
         // colours, so it follows the light/dark menu bar by itself.
-        button.image = GlobeIcon.image(GlobeIcon.badge(for: state, held: held))
-        button.contentTintColor = nil
-        button.toolTip = "AlwaysConnect：\(HelperClient.shared.stateLine)"
+        StatusLook.updateMenuButton(button, client: HelperClient.shared)
     }
 
 }

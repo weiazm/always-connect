@@ -214,6 +214,7 @@ pub struct Controller {
     pub generation: u64,
     pub pending_auto: bool,
     pub pending_resume: bool,
+    pub pending_launch_connect: bool,
     pub launch_ready: bool,
     pub last_facts: Option<Value>,
     pub collected_facts: Option<Value>,
@@ -233,6 +234,7 @@ impl Default for Controller {
             generation: 0,
             pending_auto: false,
             pending_resume: false,
+            pending_launch_connect: false,
             launch_ready: true,
             last_facts: None,
             collected_facts: None,
@@ -276,6 +278,7 @@ impl Controller {
         self.policy = effect.state;
         if self.policy.paused {
             self.pending_resume = false;
+            self.pending_launch_connect = false;
             self.rule_name = self
                 .rules
                 .iter()
@@ -302,7 +305,9 @@ impl Controller {
             && !self.policy.paused
             && (self.pending_auto || self.pending_resume)
         {
-            out.push(json!({"kind":if self.pending_auto {"start_auto"} else {"start"}}));
+            out.push(json!({"kind":if self.pending_auto {"start_auto"} else {"start"},
+                            "at_launch": self.pending_launch_connect}));
+            self.pending_launch_connect = false;
             self.pending_auto = false;
             self.pending_resume = false;
         }
@@ -353,6 +358,7 @@ impl Controller {
         }
     }
     fn manual(&mut self, context: &Value, out: &mut Vec<Value>) {
+        self.pending_launch_connect = false;
         self.invalidate(out);
         self.evaluating = false;
         self.pending_auto = false;
@@ -445,6 +451,7 @@ impl Controller {
             "launch_finished" => {
                 self.launch_ready = true;
                 self.pending_resume |= flag(event, "automatic");
+                self.pending_launch_connect = flag(event, "automatic") && !self.policy.paused;
                 if !self.ready && !self.evaluating {
                     self.evaluate("startup", context, out);
                 }
@@ -452,6 +459,7 @@ impl Controller {
             }
             "disconnect_settled" => self.flush(context, out),
             "cancel_resume" => {
+                self.pending_launch_connect = false;
                 self.pending_resume = false;
                 self.pending_auto = false;
             }

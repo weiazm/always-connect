@@ -21,7 +21,7 @@ pub(super) enum Operation {
     Disconnect,
     Credentials,
     GuiWait,
-    GatewayResolution,
+    Protection,
     Pause,
     Resume,
     Tick,
@@ -40,7 +40,7 @@ impl Operation {
             Self::Disconnect => "disconnect",
             Self::Credentials => "credentials",
             Self::GuiWait => "gui-wait",
-            Self::GatewayResolution => "gateway-resolution",
+            Self::Protection => "protection",
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Tick => "tick",
@@ -99,10 +99,14 @@ enum ErrorClass {
     NoResponse,
     LoginRejected,
     LoginFailed,
+    CertificateRejected,
     Other,
 }
 impl ErrorClass {
     fn parse(line: &str) -> Option<Self> {
+        if is_certificate_rejection(line) {
+            return Some(Self::CertificateRejected);
+        }
         if line.contains("Login error") {
             return Some(Self::LoginRejected);
         }
@@ -125,6 +129,23 @@ impl ErrorClass {
             },
         )
     }
+}
+
+pub(super) fn is_certificate_rejection(line: &str) -> bool {
+    let message = line.trim();
+    if message.trim_end_matches('!').eq_ignore_ascii_case("Untrusted VPN Server Blocked") {
+        return true;
+    }
+    let Some((_, error)) = message.split_once(">> error:") else { return false };
+    let error = error.to_ascii_lowercase();
+    [
+        "certificate validation fail",
+        "certificate verification fail",
+        "certificate is invalid",
+        "certificate is not trusted",
+        "certificate has expired",
+        "untrusted vpn server",
+    ].iter().any(|reason| error.contains(reason))
 }
 
 #[derive(Clone, Copy)]
@@ -317,8 +338,10 @@ impl Trace<'_> {
         if let Some((_, state)) = line.split_once(">> state: ") {
             self.state.set(Some(CiscoState::parse(state.trim())));
         }
-        if let Some(error) = ErrorClass::parse(line) {
-            self.error.set(Some(error));
+        if self.error.get() != Some(ErrorClass::CertificateRejected) {
+            if let Some(error) = ErrorClass::parse(line) {
+                self.error.set(Some(error));
+            }
         }
         if previous != (self.state.get(), self.error.get()) {
             self.note(Phase::Observation, Outcome::Completed);
@@ -350,6 +373,7 @@ pub(super) fn diagnostic_detail(text: &str) -> &'static str {
         Some(ErrorClass::NoResponse) => "未收到应答或连接超时",
         Some(ErrorClass::LoginRejected) => "登录被拒绝",
         Some(ErrorClass::LoginFailed) => "登录失败",
+        Some(ErrorClass::CertificateRejected) => "VPN 证书校验失败",
         _ => "其他详情已省略",
     }
 }
@@ -374,6 +398,7 @@ const OPERATIONS: &[&str] = &[
     "credentials",
     "gui-wait",
     "gateway-resolution",
+    "protection",
     "pause",
     "resume",
     "tick",
@@ -405,6 +430,7 @@ const ERRORS: &[&str] = &[
     "NoResponse",
     "LoginRejected",
     "LoginFailed",
+    "CertificateRejected",
     "Other",
 ];
 fn fixed(value: &str, allowed: &'static [&'static str]) -> Option<&'static str> {
@@ -501,6 +527,34 @@ pub(super) fn sanitize_export(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_rejection_takes_priority_and_exports_only_the_class() {
+        for line in [
+            ">> error: Certificate validation failure.",
+            ">> error: The server's certificate is not trusted.",
+            ">> error: The certificate has expired.",
+            "Untrusted VPN Server Blocked!",
+        ] {
+            assert!(is_certificate_rejection(line));
+        }
+        assert!(!is_certificate_rejection(">> notice: Certificate expires soon."));
+        assert!(!is_certificate_rejection("VPN> connect certificate.example"));
+        assert!(!is_certificate_rejection(">> error: Login error."));
+
+        let recorder = Recorder::new();
+        let trace = recorder.begin(Operation::Connect, 1);
+        trace.cli_line(">> error: Certificate validation failure. CANARY");
+        trace.cli_line(">> Login error.");
+        trace.cli_line(">> state: Connected");
+        drop(trace);
+        let export = sanitize_export(&recorder.text());
+        assert!(!export.contains("CANARY"));
+        assert!(!export.contains("LoginRejected"));
+        assert!(export.contains("CertificateRejected"));
+        assert_eq!(diagnostic_detail("Certificate validation failure."), "VPN 证书校验失败");
+    }
+
     #[test]
     fn export_rebuilds_real_rows_and_rejects_unknown_text() {
         let recorder = Recorder::new();

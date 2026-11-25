@@ -61,6 +61,14 @@ jobs:
           AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
           AC_TEST_USER: testuser
         run: sudo -E core/scripts/cli-behavior-test.sh
+      - name: Egress gate harness (openconnect --script-tun through the gate, DESIGN §66.13)
+        timeout-minutes: 6
+        env:
+          AC_TEST_URL: https://127.0.0.1:4443
+          AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
+        run: |
+          (cd core && cargo build --release --bin alwaysconnect-gate)
+          sudo --preserve-env=AC_TEST_URL,AC_TEST_CA core/scripts/gate-harness.sh core/target/release/alwaysconnect-gate
       - name: Stop test gateway
         if: always()
         run: sudo core/scripts/ocserv-test.sh stop
@@ -83,6 +91,12 @@ jobs:
           build CODE_SIGNING_ALLOWED=NO
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
+      - name: Protected login gateway preparation (loopback TLS)
+        run: scripts/login-gateway-test.sh
+      - name: Egress probe over a numeric peer with a DNS-name certificate
+        run: scripts/egress-peer-probe-test.sh
+      - name: DNS and fixed-address connectivity sampler (fixtures)
+        run: python3 core/scripts/connectivity-sample-test.py
       - name: Emergency recovery route plan (stubbed, no network changes)
         run: |
           scripts/reset-network-test.sh
@@ -193,7 +207,7 @@ jobs:
           test -n "$HELPER"
           rm -rf /tmp/ac-drop && mkdir -p /tmp/ac-drop
           set +e
-          OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1)
+          OUT=$(printf 'pw\n' | "$PWD/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1)
           RUN_EXIT=$?
           set -e
           echo "$OUT" | grep -E '^(STATE|TERMINAL)' || true
@@ -204,7 +218,7 @@ jobs:
           grep -q fakecookie42 /tmp/ac-drop/session.json
           # An internal reconnect (network change, DESIGN.md §28.1) is
           # reported as reconnecting, then connected again.
-          OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
+          OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$PWD/core/scripts/with-mock-pf.sh" "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
           echo "$OUT" | grep -E '^STATE' || true
           echo "$OUT" | grep -q '^STATE reconnecting 隧道断了，正在重连'
           # Status notices may appear between reconnecting and tunnel-up.
@@ -381,8 +395,15 @@ jobs:
       - name: Split list rules (domains, geosite, geoip, networks; bundled data)
         # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
         run: scripts/list-rules-test.sh
+      - name: Site-list updates (synthetic releases on a local feed)
+        # Sources/App/GeoUpdater.swift (DESIGN.md §66.30): hash, catalogue and
+        # lists-in-use checks, no download for an unchanged release. The real
+        # GitHub release download is Mac proof.
+        run: scripts/geo-update-test.sh
       - name: On-demand policy and connection orchestration
         run: scripts/on-demand-test.sh
+      - name: Egress notification actions and recovery (mock settings and delivery)
+        run: scripts/egress-notification-test.sh
 
   # Real openconnect against the mock gateway; needs the Xcode-built
   # background service, so it builds it too.

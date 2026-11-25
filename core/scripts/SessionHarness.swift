@@ -45,8 +45,23 @@ struct SessionHarness {
     }
 
     static func arm(_ s: HelperSession, _ mode: Int) -> Bool {
+        if mode == 1 {
+            let firewall = NetworkGuard.shared
+            firewall.supersedeOwnHolders()
+            guard firewall.installLogin(holder: NetworkGuard.ciscoHolder, physical: "en0",
+                                        gateways: ["198.51.100.7"], port: 443, cisco: true, verify: true) == nil else { return false }
+            let accepted: Bool? = sync { reply in s.setKillSwitch(2, tunnelIf: "", gatewayIps: []) { ok, _ in reply(ok) } }
+            guard accepted == true else { return false }
+        }
+        // The firewall is a stub; the production interface-existence check is real.
+        // A host with no utun can validate rejection and release of its strict hold.
+        let tunnel = (0..<256).map { "utun" + String($0) }.first { if_nametoindex($0) != 0 }
         let r: (Bool, String)? = sync { reply in
-            s.setKillSwitch(mode, tunnelIf: "utun99", gatewayIps: ["198.51.100.7"]) { reply(($0, $1)) }
+            s.setKillSwitch(mode, tunnelIf: tunnel ?? "utun99", gatewayIps: ["198.51.100.7"]) { reply(($0, $1)) }
+        }
+        if mode == 1 && tunnel == nil {
+            check(r?.0 == false && NetworkGuard.shared.isHolding, "missing tunnel keeps the strict Cisco hold")
+            return r?.0 == false && NetworkGuard.shared.isHolding
         }
         return r?.0 ?? false
     }
@@ -132,13 +147,136 @@ struct SessionHarness {
             session.harnessOwner(attached: true, appPath: app)
         }
         switch scenario {
+        case "bounded-gateway-lookup":
+            let server = "vpn.example.test"
+            let peer = "198.51.100.7"
+            let firewall = NetworkGuard.shared
+            func open(_ budget: Int = 2500, cisco: Bool = false) -> (UInt64, Bool)? {
+                let cutoff = DispatchTime.now() + .milliseconds(budget)
+                return sync { reply in
+                    session.requestProtectedLogin(server, cisco: cisco, candidate: "", rejected: false,
+                                                  allowPreparation: true, deadline: cutoff.uptimeNanoseconds) {
+                        ticket, ok, _, _ in reply((ticket, ok))
+                    }
+                }
+            }
+            func finish(_ ticket: UInt64, _ candidate: String) -> Bool? {
+                sync { reply in session.finishProtectedLogin(ticket, candidate: candidate) { ok, _, _ in reply(ok) } }
+            }
+            // The fake pfctl reads the anchor from this private file.
+            try! Data().write(to: root.appendingPathComponent("current.rules"))
+            for cisco in [false, true] {
+                let ticket = open(cisco: cisco)?.0 ?? 0
+                check(ticket != 0 && !firewall.isHolding && firewall.hasPendingLoginDeadline,
+                      "empty cache grants a bounded lookup for the selected engine")
+                check(finish(ticket, peer) == true && firewall.held?.inputs.gatewayIps == [peer],
+                      "only a current result can open the verified carrier")
+                check(disconnect(session) && !firewall.isHolding, "explicit release clears the session")
+            }
+            let failed = open()?.0 ?? 0
+            check(failed != 0 && finish(failed, "") == false && firewall.held?.inputs.gatewayIps.isEmpty == true,
+                  "failed TLS leaves an empty-gateway hold")
+            check(open()?.0 == 0 && firewall.isHolding, "an existing hold never grants a new lookup")
+            check(disconnect(session), "released the failure hold")
+            let started = DispatchTime.now()
+            let abandoned = open()?.0 ?? 0
+            let ruleFile = root.appendingPathComponent("current.rules")
+            let installed = waitFor(3) {
+                (try? String(contentsOf: ruleFile, encoding: .utf8))?.contains("block drop out quick all") == true
+            }
+            let elapsed = (DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+            check(installed && elapsed <= 3000, "stub received the blocking rule within three seconds (\(elapsed) ms)")
+            check(abandoned != 0 && waitFor(3) { firewall.loginDeadlineStatus(abandoned) == .timedOutBlocked },
+                  "the service blocks even if the App never returns a TLS result")
+            check(finish(abandoned, peer) == false && firewall.held?.inputs.gatewayIps.isEmpty == true,
+                  "late success cannot widen the timed-out hold")
+            check(disconnect(session), "released the expired hold")
+            let cancelled = open()?.0 ?? 0
+            check(cancelled != 0 && disconnect(session) && finish(cancelled, peer) == false && !firewall.isHolding,
+                  "manual release rejects the previous ticket")
+            let disabled = open(cisco: true)?.0 ?? 0
+            let off: Bool? = sync { session.setDropProtection(false, withReply: $0) }
+            check(disabled != 0 && off == true && finish(disabled, peer) == false && !firewall.isHolding,
+                  "turning off protection cancels an uninstalled Cisco deadline")
+            try! Data("block drop out quick all\n".utf8).write(to: ruleFile)
+            let unknown = open()
+            check(unknown?.0 == 0 && unknown?.1 == false && firewall.isHolding,
+                  "unaccounted anchor content refuses direct preparation")
+            check(disconnect(session), "unconfirmed direct path released manually")
+            let target = GatewayAddress(server)!
+            let support = CLIOrchestrator.defaultSupportDir
+            try! FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: support.path)
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: peer), "fixture peer saved")
+            let cached = open()
+            check(cached?.0 == 0 && cached?.1 == true && firewall.isHolding && !firewall.hasPendingLoginDeadline,
+                  "a cached connection applies protection immediately without a lookup window")
+            check(disconnect(session), "cached session released")
+            let file = support.appendingPathComponent("login-gateway-cache.json")
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+            let unreadable: Int? = sync { session.getLoginGatewayReadiness(server, cisco: false, withReply: $0) }
+            let refused = open()
+            check(unreadable == -1 && refused?.0 == 0 && refused?.1 == false && firewall.isHolding,
+                  "an unsafe cache reports unknown and never authorizes a direct lookup")
+            check(disconnect(session), "unreadable cache hold released")
+        case "cached-protected-login":
+            let server = "vpn.example.test"
+            let support = CLIOrchestrator.defaultSupportDir
+            try! FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            try! FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: support.path)
+            let target = GatewayAddress(server)!
+            func hasPeer(_ server: String, cisco: Bool = false) -> Bool? {
+                sync { session.hasTrustedLoginGateway(server, cisco: cisco, withReply: $0) }
+            }
+            let before = pfLog()
+            check(hasPeer(server) == false, "empty cache gives no ready indication")
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: "2001:db8::7"),
+                  "recorded a synthetic IPv6 peer")
+            check(hasPeer(server) == false && hasPeer(server, cisco: true) == true,
+                  "readiness uses the selected engine's address families")
+            check(LoginGatewayCache.rememberConnected(in: support, target: target, peer: "198.51.100.7"),
+                  "recorded a synthetic IPv4 peer")
+            check(hasPeer(server) == true && hasPeer(server + ":8443") == false &&
+                  hasPeer("other.example.test") == false, "readiness is bound to the selected host and port")
+            check(pfLog() == before && status(session) == 0, "readiness neither writes firewall rules nor starts login")
+            let peers: [String]? = sync { reply in
+                session.beginProtectedLogin(server, cisco: false, candidate: "") { ok, addresses, _ in
+                    reply(ok ? addresses : [])
+                }
+            }
+            check(peers == ["198.51.100.7"] && NetworkGuard.shared.held?.inputs.gatewayIps == peers,
+                  "immediate connection with no candidate installs the strict rule for the saved peer")
+            check(connect(session) == true && waitFor(12) { status(session) == SessionDriverClient.State.connected.rawValue },
+                  "cached peer reaches the mock tunnel through the normal login entry")
+            check(disconnect(session), "manual disconnect replied")
+        case "cold-protected-login":
+            let server = "https://198.51.100.7:8443"
+            func prepare(_ candidate: String) -> Bool? {
+                sync { reply in session.beginProtectedLogin(server, cisco: false, candidate: candidate) { ok, _, _ in reply(ok) } }
+            }
+            check(prepare("") == false, "a numeric target alone never authorizes a carrier")
+            let held = NetworkGuard.shared.held?.inputs
+            check(held?.loginPort == 8443 && held?.gatewayIps.isEmpty == true, "empty-address policy stays installed (port \(held?.loginPort ?? 0), addresses \(held?.gatewayIps.count ?? -1))")
+            check(connect(session) == false, "failed preparation cannot be followed by an unprotected login")
+            check(prepare("198.51.100.7") == true, "a previously verified candidate may be used")
+            check(disconnect(session) && !NetworkGuard.shared.isHolding, "manual disconnect releases the pre-login hold")
+        case "egress-drop-dependency":
+            let group = EgressProtection.Group(id: 1, name: "Fixture", enabled: true,
+                sites: ["site.example"], expect: ["ZZ"])
+            let config = EgressProtection(enabled: true, groups: [group])
+            let json = String(decoding: try! JSONEncoder().encode(config), as: UTF8.self)
+            func apply() -> Bool? { sync { reply in session.setEgressProtection(json, withReply: reply) } }
+            func setDrop(_ on: Bool) -> Bool? { sync { reply in session.setDropProtection(on, withReply: reply) } }
+            check(apply() == true, "group accepted with drop protection enabled")
+            check(setDrop(false) == true, "service accepts switch-off")
+            check(apply() == false, "egress cannot be enabled without drop protection")
+            check(setDrop(true) == true && apply() == true, "group accepted after restoring drop protection")
         case "cisco-disconnect":
-            check(arm(session, 1), "kill switch armed (connected)")
-            check(loads() == 1, "connected set loaded")
+            check(arm(session, 1), "Cisco hold armed")
+            check(loads() == (NetworkGuard.shared.held?.inputs.tunnelIf.isEmpty == false ? 2 : 1), "strict hold precedes any connected Cisco rules")
             check(disconnect(session), "disconnect replied")
             assertReleased("cisco-disconnect")
         case "protection-off":
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             check(arm(session, 0), "kill switch set off")
             assertReleased("protection-off")
         case "own-then-cisco":
@@ -151,7 +289,7 @@ struct SessionHarness {
             }
             check(stopped, "own engine stopped")
             assertReleased("own disconnect")
-            check(arm(session, 1), "Cisco kill switch armed (connected)")
+            check(arm(session, 1), "Cisco Cisco hold armed")
             check(disconnect(session), "Cisco disconnect replied")
             assertReleased("own-then-cisco")
         case "own-disconnect":
@@ -224,7 +362,7 @@ struct SessionHarness {
         case "grace-expiry":
             // App crashed while holding: relaunch tried, hold ends after
             // the grace period, reason kept for the App.
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             session.harnessOwner(attached: false)
             check(relaunches() == 1, "App relaunch attempted once")
             check(NetworkGuard.shared.isHolding, "still holding within the grace period")
@@ -232,7 +370,7 @@ struct SessionHarness {
             check(lastRelease() == NetworkGuard.Reason.appGone, "release reason recorded: app-gone (\(lastRelease()))")
             assertReleased("grace-expiry")
         case "grace-cancelled":
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             session.harnessOwner(attached: false)
             usleep(500_000)
             session.harnessOwner(attached: true, appPath: app)
@@ -243,7 +381,7 @@ struct SessionHarness {
             assertReleased("grace-cancelled")
         case "quit-no-relaunch":
             // A quit releases first: the App leaving is not a crash.
-            check(arm(session, 1), "kill switch armed (connected)")
+            check(arm(session, 1), "Cisco hold armed")
             check(disconnect(session), "quit's disconnect replied")
             session.harnessOwner(attached: false)
             check(relaunches() == 0, "no relaunch after a quit")

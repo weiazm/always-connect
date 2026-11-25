@@ -60,6 +60,25 @@ enum VpncScript {
     # (DESIGN.md §26.3): it is written BEFORE each change, so a session
     # killed at any point leaves a record that `restore` can undo.
     log() { echo "AC-SCRIPT [$1] $2" >&2; }
+    # Only explicit includes from this negotiated session can identify an internal
+    # destination. Excludes, the default route and the user's direct list do not.
+    internal_web_routes() {
+      local prefix count n addr bits routes=""
+      for prefix in CISCO_SPLIT_INC CISCO_IPV6_SPLIT_INC; do
+        count=$(/usr/bin/printenv "$prefix" 2>/dev/null) || continue
+        case "$count" in ''|*[!0-9]*|????*) continue ;; esac
+        n=0
+        while [ "$n" -lt "$count" ] && [ "$n" -lt 64 ]; do
+          addr=$(/usr/bin/printenv "${prefix}_${n}_ADDR" 2>/dev/null)
+          bits=$(/usr/bin/printenv "${prefix}_${n}_MASKLEN" 2>/dev/null)
+          case "$addr" in ''|*[!0-9a-fA-F:.]*) ;; *)
+            case "$bits" in ''|*[!0-9]*|????*) ;; *) routes="${routes:+$routes,}$addr/$bits" ;; esac ;;
+          esac
+          n=$((n+1))
+        done
+      done
+      printf '%s' "$routes"
+    }
     hook() { echo "AC_HOOK $*"; }
     STATE="$ALWAYSCONNECT_ROUTE_STATE_PATH"
     # Through the certificate relay openconnect connects to 127.0.0.1;
@@ -263,6 +282,8 @@ enum VpncScript {
           if [ -z "$dns_csv" ]; then dns_csv="$d"; else dns_csv="$dns_csv,$d"; fi
         done
         line="connect tun=$TUNDEV gateway=$VPNGATEWAY"
+        intweb=$(internal_web_routes)
+        if [ -n "$intweb" ]; then line="$line intweb=$intweb"; fi
         if [ -n "$dns_csv" ]; then line="$line dns=$dns_csv"; fi
         # Private networks the company's gateway itself excludes from the
         # VPN (DESIGN.md §28.5): home LAN gear behind the router (a

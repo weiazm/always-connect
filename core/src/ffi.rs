@@ -696,7 +696,7 @@ mod tests {
         );
         assert!(!out.is_null());
         let text = unsafe { CStr::from_ptr(out).to_str().unwrap().to_owned() };
-        assert!(text.ends_with("pass out quick on en0 all\n"));
+        assert!(text.ends_with("pass out quick on en0 all no state\n"));
         ac_string_free(out);
         // Bad input yields null, never a crash.
         assert!(ac_pf_generate(
@@ -1162,11 +1162,9 @@ pub struct AcCiscoHooks {
     pub ctx: *mut c_void,
     pub state: extern "C" fn(*mut c_void, c_int, *const c_char),
     pub terminal: extern "C" fn(*mut c_void, c_int),
-    pub kill_switch: extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char),
+    pub kill_switch: extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, u64),
     /// Fills three malloc'd strings (entry, username, password); false = none.
     pub credentials: extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char, *mut *mut c_char) -> bool,
-    /// Comma-separated hosts (malloc'd) or null.
-    pub profile_hosts: extern "C" fn(*mut c_void) -> *mut c_char,
     pub network_available: extern "C" fn(*mut c_void) -> bool,
     pub before_login: extern "C" fn(*mut c_void),
     pub owned: extern "C" fn(*mut c_void, bool),
@@ -1208,14 +1206,14 @@ pub extern "C" fn ac_cisco_new(cli: *const c_char, approval_minimum_ms: u32, mon
     let (Some(cli), Some(h)) = (c_str(cli), unsafe { hooks.as_ref() }) else { return std::ptr::null_mut() };
     let ctx = std::sync::Arc::new(Ctx(h.ctx, h.release));
     let (state, terminal, kill_switch, credentials) = (h.state, h.terminal, h.kill_switch, h.credentials);
-    let (profile_hosts, before_login, owned, log, disconnected) = (h.profile_hosts, h.before_login, h.owned, h.log, h.disconnected);
+    let (before_login, owned, log, disconnected) = (h.before_login, h.owned, h.log, h.disconnected);
     let c = || std::sync::Arc::clone(&ctx);
     let hooks = cisco::Hooks {
         state: { let x = c(); Box::new(move |s, d| state(x.0, s, cstring(d).as_ptr())) },
         terminal: { let x = c(); Box::new(move |code| terminal(x.0, code)) },
         kill_switch: {
             let x = c();
-            Box::new(move |mode, tun, gws| kill_switch(x.0, mode, cstring(tun).as_ptr(), cstring(&gws.join(",")).as_ptr()))
+            Box::new(move |mode, tun, gws, request| kill_switch(x.0, mode, cstring(tun).as_ptr(), cstring(&gws.join(",")).as_ptr(), request))
         },
         credentials: {
             let x = c();
@@ -1227,14 +1225,6 @@ pub extern "C" fn ac_cisco_new(cli: *const c_char, approval_minimum_ms: u32, mon
                     (true, Some(entry), Some(username), Some(password)) => Some(cisco::Credentials { entry, username, password }),
                     _ => None,
                 }
-            })
-        },
-        profile_hosts: {
-            let x = c();
-            Box::new(move || {
-                take_malloced(profile_hosts(x.0))
-                    .map(|s| s.split(',').filter(|h| !h.is_empty()).map(str::to_string).collect())
-                    .unwrap_or_default()
             })
         },
         network_available: { let x = c(); let available = h.network_available; Box::new(move || available(x.0)) },
@@ -1265,10 +1255,25 @@ pub extern "C" fn ac_cisco_connect(e: *const cisco::Engine) {
 pub extern "C" fn ac_cisco_disconnect(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.disconnect() }
 }
+
+#[no_mangle]
+pub extern "C" fn ac_cisco_protection_pending(e: *const cisco::Engine, request: u64) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|e| e.protection_pending(request))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_cisco_protection_reply(e: *const cisco::Engine, request: u64, applied: bool) {
+    if let Some(e) = unsafe { e.as_ref() } { e.protection_reply(request, applied); }
+}
 /// Delivers an OS network-change event; availability and debounce stay in Rust.
 #[no_mangle]
 pub extern "C" fn ac_cisco_network_changed(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.network_changed(); }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_cisco_retry_now(e: *const cisco::Engine) {
+    if let Some(e) = unsafe { e.as_ref() } { e.retry_now() }
 }
 
 #[no_mangle]
@@ -1372,6 +1377,49 @@ pub extern "C" fn ac_guard_init(support_dir: *const c_char, boot: *const c_char,
 #[no_mangle]
 pub extern "C" fn ac_guard_new_own_holder() -> *mut c_char {
     guard().map(|g| owned(g.new_own_holder())).unwrap_or(std::ptr::null_mut())
+}
+
+/// Synchronous protected login using the cached or prepared gateway list.
+#[no_mangle]
+pub extern "C" fn ac_guard_login(holder: *const c_char, physical: *const c_char,
+    gateways: *const c_char, port: u16, cisco: bool, verify: bool) -> *mut c_char {
+    let (Some(guard), Some(holder)) = (guard(), c_str(holder)) else { return owned("后台服务尚未就绪".into()); };
+    let inputs = network_guard::Inputs::login(&c_str(physical).unwrap_or_default(), c_list(gateways, ','), port, cisco);
+    let result = guard.install_login(&holder, &inputs).and_then(|()| if verify { guard.verify_login(&holder) } else { Ok(()) });
+    result.err().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_arm_login_deadline(holder: *const c_char, physical: *const c_char,
+    port: u16, cisco: bool, deadline: u64) -> u64 {
+    let (Some(guard), Some(holder), Some(physical)) = (guard(), c_str(holder), c_str(physical)) else { return 0; };
+    guard.arm_login_deadline(&holder, &physical, port, cisco, deadline)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_finish_login_deadline(token: u64, gateways: *const c_char) -> *mut c_char {
+    let Some(guard) = guard() else { return owned("后台服务尚未就绪".into()); };
+    guard.finish_login_deadline(token, c_list(gateways, ',')).err().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_login_deadline_status(token: u64) -> i32 {
+    guard().map_or(network_guard::LoginDeadlineStatus::Stale, |g| g.login_deadline_status(token)) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_login_deadline_error(token: u64) -> *mut c_char {
+    guard().and_then(|g| g.login_deadline_error(token)).map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_has_pending_login_deadline() -> bool {
+    guard().is_some_and(|g| g.has_pending_login_deadline())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_guard_cancel_login_deadline(token: u64) {
+    if let Some(guard) = guard() { guard.cancel_login_deadline(token); }
 }
 
 /// `inputs` is the Inputs JSON. Null = applied (or stale holder); else
@@ -1508,9 +1556,9 @@ pub extern "C" fn ac_ks_set(mode: c_int, tunnel_if: *const c_char, gateways: *co
 }
 
 #[no_mangle]
-pub extern "C" fn ac_ks_update_allow_networks(networks: *const c_char) {
+pub extern "C" fn ac_ks_refresh_allow_networks() {
     if let Some(ks) = kill_switch() {
-        ks.update_allow_networks(&c_list(networks, ','));
+        ks.refresh_allow_networks();
     }
 }
 
@@ -1569,7 +1617,10 @@ pub extern "C" fn ac_oc_new(config: *const c_char, hooks: *const AcEngineHooks) 
             std::ptr::write_volatile(b, 0);
         }
     }
-    let Ok(config) = parsed else { return std::ptr::null_mut() };
+    let Ok(mut config) = parsed else { return std::ptr::null_mut() };
+    if let Some(text) = config.direct_domains_text.take() {
+        config.direct_domains = Some(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect());
+    }
     let ctx = std::sync::Arc::new(Ctx(h.ctx, h.release));
     let c = || std::sync::Arc::clone(&ctx);
     let (state, terminal, physical_network, local_dns, system_roots, stopped) =
@@ -1623,6 +1674,94 @@ pub extern "C" fn ac_oc_kill_child(e: *const oc_engine::Engine) {
 pub extern "C" fn ac_oc_update_direct_domains(e: *const oc_engine::Engine, domains: *const c_char) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_direct_domains(c_list(domains, '\n')) }
 }
+type EgressProbeWithPeer = extern "C" fn(*mut c_void, *const c_char, *mut usize, *mut u8, usize) -> *mut u8;
+
+#[no_mangle]
+pub extern "C" fn ac_oc_set_egress_probe_with_peer(
+    e: *const oc_engine::Engine, ctx: *mut c_void, probe: EgressProbeWithPeer,
+) {
+    let address = ctx as usize;
+    let Some(e) = (unsafe { e.as_ref() }) else { return };
+    e.set_egress_probe(std::sync::Arc::new(move |req, actual_peer| {
+        let json = CString::new(serde_json::to_string(req).ok()?).ok()?;
+        let mut len = 0;
+        let mut peer = [0u8; 64];
+        let bytes = probe(address as *mut c_void, json.as_ptr(), &mut len, peer.as_mut_ptr(), peer.len());
+        *actual_peer = CStr::from_bytes_until_nul(&peer).ok()
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+        if bytes.is_null() { return None; }
+        let result = (len <= 65_536).then(|| unsafe { std::slice::from_raw_parts(bytes, len).to_vec() });
+        unsafe { libc::free(bytes.cast()) };
+        result
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_retry_now(e: *const oc_engine::Engine) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|engine| engine.retry_now())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_recheck_egress(e: *const oc_engine::Engine, group: u32) -> bool {
+    unsafe { e.as_ref() }.is_some_and(|engine| engine.recheck_egress(group))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_allow_egress_country(e: *const oc_engine::Engine, expected: *const c_char,
+    group: u32, started: f64, country: *const c_char, evidence: *const c_char) -> *mut c_char {
+    let apply = || {
+        let engine = unsafe { e.as_ref() }?;
+        let cfg = serde_json::from_str(&c_str(expected)?).ok()?;
+        let observed = serde_json::from_str(&c_str(evidence)?).ok()?;
+        let countries = engine.allow_egress_country(&cfg, group, started, &c_str(country)?, &observed)?;
+        serde_json::to_string(&countries).ok()
+    };
+    apply().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_update_egress(e: *const oc_engine::Engine, json: *const c_char) {
+    let (Some(e), Some(json)) = (unsafe { e.as_ref() }, c_str(json)) else { return };
+    if let Ok(cfg) = serde_json::from_str(&json) { e.update_egress(cfg); }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_egress_config_valid(json: *const c_char) -> bool {
+    c_str(json).filter(|s| s.len() <= 524_288)
+        .and_then(|s| serde_json::from_str::<crate::egress_control::EgressConfig>(&s).ok())
+        .is_some_and(|cfg| cfg.valid())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_list_rule_valid(rule: *const c_char) -> bool {
+    c_str(rule).is_some_and(|rule| crate::egress_control::valid_rule(&rule, false))
+}
+
+#[no_mangle]
+pub extern "C" fn ac_egress_match_targets(config: *const c_char, targets: *const c_char) -> *mut c_char {
+    #[derive(serde::Deserialize)]
+    struct Target {
+        host: Option<String>,
+        address: String,
+    }
+    let match_all = || {
+        let cfg: crate::egress_control::EgressConfig = serde_json::from_str(&c_str(config)?).ok()?;
+        let targets: Vec<Target> = serde_json::from_str(&c_str(targets)?).ok()?;
+        let sites = cfg.protected_sites();
+        let matched: Vec<_> = targets.into_iter().map(|target| {
+            sites.group_for(target.host.as_deref().unwrap_or(""))
+                .or_else(|| sites.group_for_ip(target.address.parse().ok()?))
+        }).collect();
+        serde_json::to_string(&matched).ok()
+    };
+    match_all().map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_egress_status(e: *const oc_engine::Engine) -> *mut c_char {
+    owned(unsafe { e.as_ref() }.map(|e| e.egress_status()).unwrap_or_else(|| "{}".into()))
+}
+
 #[no_mangle]
 pub extern "C" fn ac_oc_update_drop_protection(e: *const oc_engine::Engine, on: bool) {
     if let Some(e) = unsafe { e.as_ref() } { e.update_drop_protection(on) }
@@ -1643,6 +1782,11 @@ pub extern "C" fn ac_oc_info(e: *const oc_engine::Engine) -> *mut c_char {
         .map(owned)
         .unwrap_or(std::ptr::null_mut())
 }
+#[no_mangle]
+pub extern "C" fn ac_oc_split_status(e: *const oc_engine::Engine) -> *mut c_char {
+    unsafe { e.as_ref() }.map(|e| owned(e.split_status_json())).unwrap_or(std::ptr::null_mut())
+}
+
 #[no_mangle]
 pub extern "C" fn ac_oc_connections_json(e: *const oc_engine::Engine, fallback_gateways: *const c_char) -> *mut c_char {
     let fallback = c_list(fallback_gateways, ',');
@@ -1908,4 +2052,27 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
 #[no_mangle]
 pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {
     crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_login_direct_route() -> bool {
+    crate::connections::default_route_interface().is_some_and(|name| name.starts_with("en"))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_oc_certificate_rejected(engine: *const oc_engine::Engine) -> bool {
+    ac_oc_record_gateway_rejection(engine, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engine, incident: u64) -> bool {
+    unsafe { engine.as_ref() }.is_some_and(|e| e.record_gateway_rejection(incident))
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
+    unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
 }

@@ -22,6 +22,10 @@ struct PanelView: View {
     @State private var servers = ProfileStore.loadServers()
     @State private var selectedServer = ProfileStore.loadProfile().server
     @State private var protectionOn = ProfileStore.loadAppSettings().isDropProtectionOn
+    @State private var egressDisabledWithDrop = false
+    @State private var egressActionError: String?
+    @State private var egressStopConfirmation: UInt32?
+    @State private var egressRechecking = false
     @State private var showConfirmQuit = false
     /// The split switch flipped while connected: reconnect first (§26.12).
     @State private var confirmSplit: Bool?
@@ -40,25 +44,19 @@ struct PanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            let look = StatusLook.of(manager.state, held: manager.networkHeld,
-                                     hasCredentials: manager.hasCredentials, onDemand: manager.onDemandPaused)
-            HStack(spacing: 12) {
-                Image(nsImage: GlobeIcon.image(
-                    GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))
-                    .frame(width: 40, height: 40)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(look.headline)
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(Color(nsColor: look.color))
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                Spacer()
+            PanelStatusHeader(client: manager, subtitle: subtitle)
+            if !manager.gatewayTrustFailed, manager.state != .disconnected, let notice = manager.loginProtectionNotice {
+                Label(notice, systemImage: "lock.shield").font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if manager.showsConnected, let notice = manager.dnsNotice {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             primaryButton
-            if manager.state == .connected {
+            if manager.showsConnected {
                 speedCard
             }
             quickSettings
@@ -155,7 +153,7 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-            if let warning = manager.splitWarning, manager.state == .connected {
+            if let warning = manager.splitWarning, manager.showsConnected {
                 Text(warning)
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -268,8 +266,10 @@ struct PanelView: View {
         .frame(width: 320)
         .toggleStyle(.always)
         .onAppear {
+            manager.prepareGatewayWhileDirect()
             speed.start()
             manager.refreshSplitActivity()
+            manager.refreshEgress()
             let active = manager.state != .disconnected
             let cisco = manager.usesCisco
             let split = manager.ownConnection
@@ -279,7 +279,10 @@ struct PanelView: View {
                 DispatchQueue.main.async { neighbors = found }
             }
         }
-        .onReceive(activityTimer) { _ in manager.refreshSplitActivity() }
+        .onReceive(activityTimer) { _ in
+            manager.refreshSplitActivity()
+            manager.expireGatewayPreparation()
+        }
         .onDisappear { speed.stop() }
     }
 
@@ -323,7 +326,8 @@ struct PanelView: View {
 
     /// One row of the settings card: icon, name, a line under it, and
     /// whatever sits on the right.
-    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?) -> some View {
+    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?, captionLines: Int = 1,
+                          captionColor: Color = .secondary) -> some View {
         HStack(spacing: 10) {
             Image(systemName: symbol)
                 .foregroundStyle(.secondary)
@@ -333,11 +337,47 @@ struct PanelView: View {
                 if let caption {
                     Text(caption)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .foregroundStyle(captionColor)
+                        .lineLimit(captionLines)
                 }
             }
         }
+    }
+
+    /// 出口保护 in the panel, laid out like the other rows: icon, title and
+    /// state on the left, a chevron to the 出口保护 page on the right
+    /// (user, 2026-11-24: the centred row looked broken).
+    private func egressRow(_ line: String) -> some View {
+        let tint: Color = {
+            switch manager.egressLevel {
+            case .ok: return .green
+            case .partial: return .orange
+            case .unknown: return .secondary
+            }
+        }()
+        return Button { onOpenSettings("egress") } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("出口保护")
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(tint)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.vertical, 8)
+        .help("打开出口保护")
     }
 
     /// 按网站分流 in the panel (§26.12): the switch, and in one line what
@@ -371,7 +411,7 @@ struct PanelView: View {
         if manager.splitSwitchPending { return "正在切换，稍候会重新连接…" }
         guard manager.ownConnection else { return "关：全部走 VPN（经 Cisco）" }
         if siteCount == 0 { return "名单还是空的，点「名单」添加" }
-        guard manager.state == .connected, let activity = manager.splitActivity else {
+        guard manager.showsConnected, let activity = manager.splitActivity else {
             return "名单里 \(siteCount) 条不走 VPN"
         }
         if activity.entries.isEmpty { return "还没打开名单里的网站" }
@@ -449,6 +489,54 @@ struct PanelView: View {
             .padding(.vertical, 9)
             Divider()
             splitRow
+            if !manager.gatewayTrustFailed, let line = manager.egressLine {
+                Divider()
+                egressRow(line)
+                if !manager.egressNotices.isEmpty || manager.egressRecheckRule != nil {
+                    HStack(spacing: 12) {
+                        if let id = manager.egressRecheckRule {
+                            Button(egressRechecking ? "正在重新检查…" : "重新检查") {
+                                egressRechecking = true
+                                manager.recheckEgressRule(id) { ok in
+                                    egressRechecking = false
+                                    egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
+                                }
+                            }.disabled(egressRechecking)
+                        }
+                        if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
+                            Button("暂停保护", role: .destructive) { askToDisableEgressGroup(notice.id) }
+                        } else if !manager.egressNotices.isEmpty {
+                            Menu("暂停保护") {
+                                ForEach(manager.egressNotices) { notice in
+                                    Button(notice.name, role: .destructive) { askToDisableEgressGroup(notice.id) }
+                                }
+                            }
+                            .fixedSize()
+                        }
+                        Spacer()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .padding(.leading, 28)
+                    .padding(.bottom, 8)
+                }
+                if let id = egressStopConfirmation {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
+                        HStack {
+                            Button("取消") { egressStopConfirmation = nil }
+                            Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 28).padding(.bottom, 8)
+                }
+                if let egressActionError {
+                    Text(egressActionError).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 28).padding(.bottom, 8)
+                }
+            }
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
             // the local network instead of pausing it.
             Divider()
@@ -458,30 +546,52 @@ struct PanelView: View {
                     protectionOn = on
                     var settings = ProfileStore.loadAppSettings()
                     settings.dropProtection = on
-                    ProfileStore.saveAppSettings(settings)
+                    egressDisabledWithDrop = !on && settings.egressProtection?.enabled == true
+                    if !on { settings.egressProtection?.enabled = false }
+                    ProfileStore.saveAppSettings(settings, updatingEgress: !on)
                     manager.dropProtectionChanged()
                 })) {
                 rowLabel(protectionOn ? "lock.shield" : "lock.open", "断线保护",
                          protectionOn ? "掉线时暂停上网，不漏走直连" : "关：掉线时改走本地网络")
             }
             .padding(.vertical, 8)
+            if egressDisabledWithDrop {
+                Text("出口保护已关闭。自建连接需要重新连接一次才能生效。")
+                    .font(.caption).foregroundStyle(.secondary).padding(.bottom, 8)
+            }
         }
         .font(.callout)
         .padding(.horizontal, 12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
     }
 
+    private func disableEgressGroup(_ id: UInt32) {
+        manager.disableEgressGroup(id) { ok in
+            egressActionError = ok ? nil : "这组未停用。请在分流设置重试。"
+        }
+    }
+
+    private func askToDisableEgressGroup(_ id: UInt32) {
+        let config = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
+        let change = EgressRuleChange(config: config) { $0.disableGroup(id) }
+        if change.needsReconnect(connected: manager.showsConnected) { egressStopConfirmation = id }
+        else { disableEgressGroup(id) }
+    }
+
     /// The engine's own words under the headline (retry count, last
     /// notice); for a plain disconnect, what "未连接" means.
     private var subtitle: String {
+        if manager.state == .disconnected, let notice = manager.loginProtectionNotice { return notice }
         if !manager.hasCredentials {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }
+        if manager.state == .disconnected, !manager.networkHeld, manager.protectsDrops,
+           let preparation = manager.loginGatewayReadiness.caption { return preparation }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
-        if manager.state == .connected {
+        if manager.showsConnected {
             // Which server and for how long (§45.4), not the engine's words.
             let server = servers.first { $0.target == selectedServer }?.name ?? selectedServer
             guard let since = manager.connectedSince else { return server }
@@ -502,21 +612,8 @@ struct PanelView: View {
 
     /// One button, labelled with what it does next.
     @ViewBuilder private var primaryButton: some View {
-        let red = manager.state == .reconnecting || manager.networkHeld
-        if !manager.hasCredentials {
-            Button(ProfileStore.loadProfile().servers.isEmpty ? "填写服务器与账号" : "填写账号与密码") {
-                onOpenSettings("credentials")
-            }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
-        } else if manager.state == .disconnected, !manager.networkHeld {
-            Button { showConfirmDisconnect = false; onStart() } label: {
-                Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-        } else if red {
+        let red = manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+        if red {
             // Never trapped behind drop protection: one click, no
             // confirm, back to the direct network.
             Button { showConfirmDisconnect = false; onStop() } label: {
@@ -525,9 +622,29 @@ struct PanelView: View {
             .buttonStyle(.borderedProminent)
             .tint(.red)
             .controlSize(.large)
+        } else if !manager.hasCredentials {
+            Button(ProfileStore.loadProfile().servers.isEmpty ? "填写服务器与账号" : "填写账号与密码") {
+                onOpenSettings("credentials")
+            }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+        } else if manager.state == .disconnected, let notice = manager.loginProtectionNotice {
+            let preparing = notice == ProtectedLoginNotice.preparingGateway
+            Button(preparing ? "取消连接" : "取消连接并恢复直连") {
+                showConfirmDisconnect = false
+                onStop()
+            }
+                .buttonStyle(.borderedProminent).controlSize(.large)
+        } else if manager.state == .disconnected, !manager.networkHeld {
+            Button { showConfirmDisconnect = false; onStart() } label: {
+                Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         } else {
             Button { showConfirmDisconnect = true } label: {
-                Text(manager.state == .connected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
+                Text(manager.showsConnected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
@@ -612,6 +729,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         // restart and corrects availability.
         manager.refreshStatus()
         UpdateChecker.shared.checkIfDue()
+        GeoUpdater.shared.checkIfDue()
         let view = PanelView(
             manager: manager,
             profile: ProfileStore.loadProfile(),

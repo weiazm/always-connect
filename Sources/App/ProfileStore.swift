@@ -204,7 +204,9 @@ enum ProfileStore {
         saveAppSettings(settings)
     }
 
-    static func saveAppSettings(_ settings: AppSettings) {
+    static func saveAppSettings(_ settings: AppSettings, updatingEgress: Bool = false) {
+        var settings = settings
+        if !updatingEgress { settings.egressProtection = loadAppSettings().egressProtection }
         if let data = try? JSONEncoder().encode(settings) {
             defaults?.set(data, forKey: appSettingsKey)
         }
@@ -290,7 +292,12 @@ struct AppSettings: Codable, Equatable {
     /// Nil preserves defaults when decoding settings written by older versions.
     var onDemandEnabled: Bool?
     var onDemandRules: [OnDemandRule]?
+    var egressProtection: EgressProtection?
+    /// Keep the site lists (geosite:) current from their publisher
+    /// (DESIGN.md §66.30). Nil = on.
+    var siteListsAutoUpdate: Bool?
 
+    var isSiteListsAutoUpdateOn: Bool { siteListsAutoUpdate ?? true }
     var isDropProtectionOn: Bool { dropProtection ?? true }
     var isApprovalCardOn: Bool { approvalCard ?? true }
     var usesOwnConnection: Bool { connectionMode == "own" }

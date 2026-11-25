@@ -18,6 +18,7 @@
 # Usage: scripts/build-local.sh            build everything
 #        scripts/build-local.sh --tests    build, then run the CI-equivalent
 #                                          Helper / vpnc-script / harness checks
+#        scripts/build-local.sh --release  remove debug symbols before signing
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -77,7 +78,7 @@ cp "$SRC/App/AlwaysConnectHelper.plist" \
 mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/scripts/dev-helper.sh" "$APP/Contents/Resources/dev-helper.sh"
 # The split list's site lists and geoip data (scripts/make-geo-data.py).
-cp "$SRC"/App/GeoData/*.txt "$APP/Contents/Resources/"
+cp "$SRC"/App/GeoData/geoip-cn.txt "$APP/Contents/Resources/"  # site lists are downloaded (§66.30)
 # App icon (scripts/make-app-icon.swift draws it from the menu-bar globe).
 cp "$SRC/App/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Emergency network reset, usable without the App (DESIGN.md §24.6).
@@ -109,6 +110,17 @@ IDENTITY=${SIGN_IDENTITY:--}
 if ! "$ROOT/scripts/bundle-openconnect.sh" "$APP/Contents/Resources/openconnect" "$IDENTITY" >/tmp/ac-bundle-oc.log 2>&1; then
     echo "warning: openconnect not bundled (see /tmp/ac-bundle-oc.log)" >&2
 fi
+GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
+mkdir -p "$(dirname "$GATE")"
+install -m 755 "$ROOT/core/target/release/alwaysconnect-gate" "$GATE"
+if [ "${1:-}" = "--release" ]; then
+    # The Mach-O debug map can keep absolute paths to Rust object files
+    # even after rustc remaps the paths in panic messages (DESIGN.md §36.6).
+    /usr/bin/strip -S "$APP/Contents/MacOS/AlwaysConnect" \
+        "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper" "$GATE"
+fi
+codesign --force --sign "$IDENTITY" --timestamp=none "$GATE"
+codesign --verify --strict "$GATE"
 codesign --force --options runtime --sign "$IDENTITY" \
     --identifier com.alwaysconnect.app.helper \
     "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper"

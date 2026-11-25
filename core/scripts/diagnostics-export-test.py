@@ -48,6 +48,7 @@ final class HelperClient {
         recoveredAt: Date(timeIntervalSince1970: 60), outcome: .failed, retries: 2,
         approvals: 1, engine: "ENGINE_CANARY_8", failureReason: "HISTORY_CANARY_8 USER_CANARY_7 203.0.113.73 backup-canary.example")]
     func ciscoTimelineForDiagnostics(_ done: @escaping (String) -> Void) { done("") }
+    func fetchEgressJSON(_ done: @escaping (String?) -> Void) { done(nil) }
 }
 enum CiscoProfiles {
     static func resolve(_ value: String) -> String { "" }
@@ -64,6 +65,7 @@ enum CiscoProfiles {
         let engine = CiscoEngine()
         engine.credentialsProvider = { .init(entry: profile.server, username: "USER_CANARY_7", password: "synthetic-only") }
         var got = false
+        engine.onProtectionRequest = { _, _, _, done in done(true) }
         engine.onState = { state, detail in
             client.state = state
             client.detail = detail
@@ -78,7 +80,9 @@ enum CiscoProfiles {
         let tokens = ["gateway-canary.example", "GROUP_CANARY_7", "USER_CANARY_7", "203.0.113.73",
             "RAW_CANARY_7", "backup-canary.example", "SERVER_NAME_CANARY_8", "CISCO_NAME_CANARY_8",
             "RULE_TYPE_CANARY_8", "RULE_TARGET_CANARY_8.example", "STATE_DESCRIPTION_CANARY_8",
-            "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8"]
+            "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8",
+            "EGRESS_GROUP_CANARY", "egress-canary.example", "198.51.100.77", "2001:db8:9::7",
+            "EGRESS_ERROR_CANARY", "ZZ", "YY"]
         let leaks = tokens.filter { exported.contains($0) || malformed.contains($0) }
         // Verify's two-hour sleep fixture: equal spans do not imply equal downtime.
         let start = Date(timeIntervalSince1970: 0)
@@ -122,7 +126,8 @@ enum CiscoProfiles {
         print("production CLI -> production state callback -> unchanged diagnosticsText")
         print("fake error delivered=\(got); local stop completed=\(done); full bundle leaks=\(leaks)")
         let useful = exported.contains("Cisco 引擎时间线：") && exported.contains("request-connect")
-            && exported.contains("重试 2 次") && exported.contains("认证中")
+            && exported.contains("连接重试 2 轮，等待登录确认 1 次") && exported.contains("认证中")
+            && exported.contains("出口保护拦截记录") && exported.contains("2 台服务器出口不对")
         exit(got && done && useful && leaks.isEmpty && distinguishable && subsecond && bounded && historySafe ? 0 : 1)
     }
 }
@@ -143,7 +148,15 @@ def main():
         # Same-file extension can call the private method without rewriting it.
         source += '''\nextension DiagnosticsExporter {
     static func fixtureText(_ manager: HelperClient, _ profile: Profile, _ timeline: String) -> String {
-        diagnosticsText(manager: manager, profile: profile, ciscoTimeline: timeline)
+        let observations = [
+            EgressProtection.Observation(host: "egress-canary.example", country: "ZZ",
+                                         ip: "198.51.100.77", error: nil, peerAddress: "2001:db8:9::7"),
+            EgressProtection.Observation(host: "egress-canary.example", country: "ZZ",
+                                         ip: nil, error: "EGRESS_ERROR_CANARY"),
+        ]
+        let block = EgressProtection.BlockRecord(started: 1, ended: 10, group: 1, name: "EGRESS_GROUP_CANARY",
+                                                 host: "egress-canary.example", observed: observations, expected: ["YY"])
+        return diagnosticsText(manager: manager, profile: profile, ciscoTimeline: timeline, blocks: [block])
     }
 }\n'''
         exporter = work / "DiagnosticsExporter.swift"
@@ -162,6 +175,8 @@ esac
         executable = work / "test"
         subprocess.run(["swiftc", "-O", "-parse-as-library",
             str(root / "Sources/Shared/PhysicalConnectivity.swift"),
+            str(root / "Sources/Shared/EgressProtection.swift"),
+            str(root / "Sources/App/EgressPresentation.swift"),
             str(root / "Sources/App/CiscoEngine.swift"), str(root / "Sources/App/DropHistory.swift"),
             str(root / "Sources/App/DiagnosticsRedaction.swift"), str(exporter), str(swift),
             str(root / "core/target/release/libalwaysconnect_core.a"), "-o", str(executable)], check=True)

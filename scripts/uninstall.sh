@@ -12,7 +12,8 @@
 #     unloaded and kept unloaded
 #   3 system files: the LaunchDaemon, the background service, the bundled
 #     openconnect copy, /Library/Application Support/AlwaysConnect
-#     (held state, session cookie, relay key, journals), its logs
+#     (held state, session cookie, relay key, verified gateway cache,
+#     and journals), its logs
 #   4 the user's files: logs, caches, the Desktop reset copy; settings
 #     (both preference domains) unless --keep-settings; the keychain
 #     password unless --keep-password (from the App, the App has already
@@ -190,6 +191,7 @@ sys launchctl bootout "system/$LABEL"
 # ---- 3 system files
 remove "$R/Library/LaunchDaemons/$LABEL.plist"
 remove "$R/Library/PrivilegedHelperTools/$LABEL"
+# Includes the signed tunnel gate and its root-private controller socket.
 remove "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
 remove "$R/Library/Application Support/AlwaysConnect"
 remove "$R/Library/Logs/AlwaysConnect"
@@ -198,7 +200,7 @@ remove "$R/Library/Logs/AlwaysConnect"
 if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
     L="$USER_HOME/Library"
     remove "$L/Logs/AlwaysConnect"
-    remove "$L/Application Support/AlwaysConnect"
+    remove "$L/Application Support/AlwaysConnect"  # incl. downloaded site lists (§66.30)
     remove "$L/Caches/$BUNDLE_ID"
     remove "$L/HTTPStorages/$BUNDLE_ID"
     remove "$L/HTTPStorages/$BUNDLE_ID.binarycookies"

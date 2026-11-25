@@ -6,7 +6,7 @@ import SwiftUI
 // renders compile it with ApprovalPromptTracker.swift alone.
 
 enum ApprovalBubbleMetrics {
-    static let width: CGFloat = 290
+    static let width: CGFloat = 320
     static let bodyHeight: CGFloat = 50
     static let arrowHeight: CGFloat = 7
     /// Room for the shadow inside the borderless window.
@@ -57,11 +57,12 @@ struct ApprovalCardView: View {
     @ObservedObject var model: ApprovalCardModel
     var onHide: () -> Void
     var onOpen: () -> Void
+    var onRetry: () -> Void = {}
 
     var body: some View {
         Group {
             if let card = model.card {
-                ApprovalBubble(card: card, arrowX: model.arrowX, onHide: onHide, onOpen: onOpen)
+                ApprovalBubble(card: card, arrowX: model.arrowX, onHide: onHide, onOpen: onOpen, onRetry: onRetry)
             } else {
                 Color.clear.frame(width: ApprovalBubbleMetrics.width,
                                   height: ApprovalBubbleMetrics.bodyHeight + ApprovalBubbleMetrics.arrowHeight)
@@ -83,6 +84,8 @@ struct ApprovalBubble: View {
     var arrowX: CGFloat?
     var onHide: () -> Void = {}
     var onOpen: () -> Void = {}
+    /// 「现在重发」 on an expired request (2026-11-24).
+    var onRetry: () -> Void = {}
     /// Fixed clock for offscreen renders; nil = live.
     var now: Date?
     /// Offscreen renders: draw the glow at its brightest.
@@ -93,8 +96,8 @@ struct ApprovalBubble: View {
     /// while the phone is asked, blue while connecting, green when done.
     static func iconColor(_ stage: ApprovalPromptTracker.Stage) -> Color {
         switch stage {
-        case .waiting: return .orange
-        case .establishing: return .blue
+        case .waiting, .expired: return .orange
+        case .gatewayReply, .configuring, .establishing: return .blue
         case .connected: return .green
         }
     }
@@ -124,6 +127,19 @@ struct ApprovalBubble: View {
                 .lineLimit(1)
             }
             Spacer(minLength: 6)
+            if card.stage == .expired {
+                Button(action: onRetry) {
+                    Text("现在重发")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(ink)
+                        .padding(.horizontal, 9)
+                        .frame(height: 22)
+                        .background(Capsule().fill(ink.opacity(0.12)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("不等倒计时，马上向手机发起下一次登录请求")
+            }
             if card.stage != .connected {
                 Button(action: onHide) {
                     Image(systemName: "xmark")
@@ -238,12 +254,15 @@ struct ApprovalCardIcon: View {
             case .waiting:
                 Image(systemName: "iphone.radiowaves.left.and.right")
                     .font(.system(size: 14, weight: .semibold))
-            case .establishing:
+            case .gatewayReply, .configuring, .establishing:
                 Image(systemName: "ellipsis")
                     .font(.system(size: 14, weight: .heavy))
             case .connected:
                 Image(systemName: "checkmark")
                     .font(.system(size: 14, weight: .heavy))
+            case .expired:
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 14, weight: .semibold))
             }
         }
         .foregroundStyle(tint)

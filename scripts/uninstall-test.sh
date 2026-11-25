@@ -30,7 +30,7 @@ setup() {
     S="$R/Library/Application Support/AlwaysConnect"
     mkdir -p "$R/Library/LaunchDaemons" "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin" \
         "$S/relay" "$R/Library/Logs/AlwaysConnect" \
-        "$H/Library/Logs/AlwaysConnect" "$H/Library/Application Support/AlwaysConnect" \
+        "$H/Library/Logs/AlwaysConnect" "$H/Library/Application Support/AlwaysConnect/GeoData" \
         "$H/Library/Caches/com.alwaysconnect.app" "$H/Library/Preferences" "$H/Desktop" \
         "$H/Library/Saved Application State/com.alwaysconnect.app.savedState" \
         "$R/opt/cisco/secureclient/bin" "$R/Applications/Cisco"
@@ -38,10 +38,13 @@ setup() {
         "$R/Library/LaunchDaemons/com.cisco.secureclient.vpnagentd.plist" \
         "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect" \
+        "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate" "$S/egress.sock" \
+        "$S/login-gateway-cache.json" "$S/.login-gateway-cache.interrupted" \
         "$S/direct-routes.pending.crash" "$S/direct-routes.retire-crash" "$S/guard.json" "$S/route-state" "$S/session.json" "$S/relay/client.key" \
         "$R/Library/Logs/AlwaysConnect/helper.log" \
         "$H/Library/Logs/AlwaysConnect/relay.log" "$H/Library/Logs/AlwaysConnect/update.log" \
         "$H/Library/Application Support/AlwaysConnect/alwaysconnect-vpnc.sh" \
+        "$H/Library/Application Support/AlwaysConnect/GeoData/geosite.txt" "$H/Library/Application Support/AlwaysConnect/GeoData/version" \
         "$H/Library/Preferences/com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.render.plist" \
@@ -63,6 +66,8 @@ system_and_user_files_gone() {
     gone "$R/Library/LaunchDaemons/com.alwaysconnect.app.helper.plist"
     gone "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper"
     gone "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
+    gone "$S/login-gateway-cache.json"
+    gone "$S/.login-gateway-cache.interrupted"
     gone "$R/Library/Application Support/AlwaysConnect"
     gone "$R/Library/Logs/AlwaysConnect"
     gone "$H/Library/Logs/AlwaysConnect"
@@ -156,6 +161,7 @@ echo "== 5 dry-run changes nothing"
 setup
 bash "$UNINSTALL" --dry-run >/dev/null 2>&1
 kept "$R/Library/Application Support/AlwaysConnect"
+kept "$S/login-gateway-cache.json"
 kept "$R/Applications/AlwaysConnect.app"
 kept "$H/Library/Preferences/com.alwaysconnect.app.plist"
 rm -rf "$R"

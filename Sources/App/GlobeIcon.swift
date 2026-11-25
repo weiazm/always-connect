@@ -11,7 +11,8 @@ import AppKit
 enum GlobeIcon {
     enum Badge { case none, lock, busy, alert }
 
-    static func badge(for state: HelperClient.State, held: Bool) -> Badge {
+    static func badge(for state: HelperClient.State, held: Bool, certificateRejected: Bool = false) -> Badge {
+        if certificateRejected { return .alert }
         switch state {
         case .connected: return .lock
         case .connecting, .authenticating, .awaitingApproval: return .busy
