@@ -159,8 +159,7 @@ struct ProxySections: View {
                     if on && !preview { health.check([routes[i]], force: true) }
                 }))
                 .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
+                .fixedSize()
                 .accessibilityLabel("启用 \(route.name)")
             Menu {
                 Button("编辑…") { editing = route }

@@ -13,27 +13,44 @@ struct SettingsView: View {
     @AppStorage("splitSection") private var splitSection = "direct"
     var connectionPreview: [ConnectionRow]? = nil
 
+    /// The pages in order (UI-DESIGN.md 设置, layout A, 2026-11-25).
+    static let pages: [(tag: String, title: String, symbol: String)] = [
+        ("general", "通用", "gearshape"),
+        ("credentials", "账号", "person.crop.circle"),
+        ("split", "分流", "arrow.triangle.branch"),
+        ("egress", "出口保护", "checkmark.shield"),
+        ("connections", "连接", "point.3.filled.connected.trianglepath.dotted"),
+        ("diagnostics", "诊断", "stethoscope"),
+    ]
+
     var body: some View {
         // 分流代理 is a part of 分流 (§69.9): "proxy" opens it there.
-        TabView(selection: Binding(get: { tab == "proxy" ? "split" : tab }, set: { tab = $0 })) {
-            GeneralPage()
-                .tabItem { Label("通用", systemImage: "gearshape") }
-                .tag("general")
-            CredentialsPage()
-                .tabItem { Label("账号", systemImage: "person.crop.circle") }
-                .tag("credentials")
-            SplitPage()
-                .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
-                .tag("split")
-            EgressProtectionPage()
-                .tabItem { Label("出口保护", systemImage: "checkmark.shield") }
-                .tag("egress")
-            ConnectionSettingsPage(preview: connectionPreview)
-                .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
-                .tag("connections")
-            DiagnosticsPage()
-                .tabItem { Label("诊断", systemImage: "stethoscope") }
-                .tag("diagnostics")
+        let current = tab == "proxy" ? "split" : (Self.pages.contains { $0.tag == tab } ? tab : "general")
+        VStack(spacing: 0) {
+            // Icon above name, like System Settings' toolbars (the user's
+            // chosen design); the system TabView draws a text-only pill.
+            HStack(spacing: 4) {
+                ForEach(Self.pages, id: \.tag) { page in
+                    SettingsTabButton(title: page.title, symbol: page.symbol, selected: page.tag == current) {
+                        tab = page.tag
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(Color.primary.opacity(0.04))
+            Divider()
+            Group {
+                switch current {
+                case "credentials": CredentialsPage()
+                case "split": SplitPage()
+                case "egress": EgressProtectionPage()
+                case "connections": ConnectionSettingsPage(preview: connectionPreview)
+                case "diagnostics": DiagnosticsPage()
+                default: GeneralPage()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: SettingsWindow.minimumSize.width, maxWidth: .infinity,
                minHeight: SettingsWindow.minimumSize.height, maxHeight: .infinity)
@@ -46,6 +63,35 @@ struct SettingsView: View {
         guard tab == "proxy" else { return }
         splitSection = "proxy"
         tab = "split"
+    }
+}
+
+/// One page in the settings window's tab row: icon over name, the
+/// selected one tinted with a soft background.
+struct SettingsTabButton: View {
+    var title: String
+    var symbol: String
+    var selected: Bool
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: symbol).font(.system(size: 17))
+                    .frame(height: 20)
+                Text(title).font(.system(size: 11))
+            }
+            .frame(width: 66, height: 50)
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .background(RoundedRectangle(cornerRadius: 7)
+                .fill(Color.primary.opacity(selected ? 0.08 : (hovering ? 0.04 : 0))))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -693,7 +739,15 @@ enum DirectList {
     }
 }
 
+/// Fixed data instead of the live state (offscreen screenshots).
+struct SplitPagePreview {
+    var ownConnection = true
+    var sites: [DirectSite] = []
+    var routes: [ProxyRoute] = []
+}
+
 struct SplitPage: View {
+    var preview: SplitPagePreview? = nil
     @ObservedObject private var manager = HelperClient.shared
     @ObservedObject private var window = SettingsWindow.shared
     @State private var settings = ProfileStore.loadAppSettings()
@@ -706,23 +760,38 @@ struct SplitPage: View {
     /// Which part is shown: 分流直连, 分流代理 or 局域网 (§69.9).
     @AppStorage("splitSection") private var section = "direct"
 
+    private var own: Bool { preview?.ownConnection ?? manager.ownConnection }
+    private var proxyCount: Int { preview.map { $0.routes.count } ?? (settings.proxyRoutes ?? []).count }
+
     var body: some View {
         Form {
+            // The master switch as one card (layout A): what on and off mean,
+            // in the card itself.
             Section {
-                Toggle(isOn: Binding(
-                    get: { manager.ownConnection },
-                    set: { on in
-                        if manager.switchIsOn { confirmSwitch = on } else { manager.setSplit(on: on) }
-                    })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("按网站分流")
-                        Text(manager.ownConnection ? "「分流直连」的网站走本地网络，「分流代理」的网站经你的代理，其余走 VPN"
-                                                   : "关闭：全部经 Cisco 走 VPN")
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 20))
+                        .foregroundStyle(own ? Color.accentColor : Color.secondary)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("按网站分流").font(.headline)
+                        Text(own ? "开：AlwaysConnect 自己连 VPN，「分流直连」的网站走本地网络，「分流代理」的网站经你的代理，其余走 VPN。"
+                                 : "关：经 Cisco 连接，全部按公司的规则走；分流直连、分流代理不起作用。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    Spacer(minLength: 12)
+                    AlwaysSwitchTrack(isOn: Binding(
+                        get: { own },
+                        set: { on in
+                            guard preview == nil else { return }
+                            if manager.switchIsOn { confirmSwitch = on } else { manager.setSplit(on: on) }
+                        }))
+                        .disabled(manager.splitSwitchPending)
+                        .accessibilityLabel("按网站分流")
                 }
-                .disabled(manager.splitSwitchPending)
+                .padding(.vertical, 4)
                 if let on = confirmSwitch {
                     HStack {
                         Text(on ? "要用证书重新连接一次，手机需要再批准。" : "要改回经 Cisco 重新连接一次。")
@@ -735,17 +804,17 @@ struct SplitPage: View {
                         }
                     }
                 }
-                if manager.ownConnection {
+                if own {
                     certificateRow
                 }
             } footer: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Footnote(manager.ownConnection
-                             ? "开启后由 AlwaysConnect 自己连公司 VPN（不经 Cisco），登录时出示钥匙串里公司发的证书，私钥不离开钥匙串。VPN 掉线时分流直连的网站照常能打开，其余暂停上网。"
-                             : "开启后由 AlwaysConnect 自己连公司 VPN，分流直连、分流代理才起作用。关闭时经 Cisco 连接，分流按公司的规则。")
-                    if manager.ownConnection, let problem = ownConnectionProblem {
-                        Text(problem).font(.caption).foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
+                if own {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Footnote("登录时出示钥匙串里公司发的证书，私钥不离开钥匙串。VPN 掉线时分流直连的网站照常能打开，其余暂停上网。")
+                        if preview == nil, let problem = ownConnectionProblem {
+                            Text(problem).font(.caption).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
             }
@@ -753,19 +822,20 @@ struct SplitPage: View {
             Section {
                 Picker("", selection: $section) {
                     Text("分流直连 · \(sites.count) 条").tag("direct")
-                    Text("分流代理 · \((settings.proxyRoutes ?? []).count) 个").tag("proxy")
+                    Text("分流代理 · \(proxyCount) 个").tag("proxy")
                     Text("局域网").tag("lan")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(maxWidth: .infinity)
+                .listRowBackground(Color.clear)
             } footer: {
                 Footnote("同一网站命中多处时：出口保护 > 分流代理 > 分流直连 > 其余走 VPN。")
             }
 
             switch section {
             case "proxy":
-                ProxySections()
+                ProxySections(previewRoutes: preview?.routes, previewSplitOn: own)
             case "lan":
                 Section {
                 Toggle(isOn: Binding(
@@ -847,7 +917,7 @@ struct SplitPage: View {
             } header: {
                 Text("不走 VPN 的网站")
             } footer: {
-                Footnote(siteNote ?? (manager.ownConnection
+                Footnote(siteNote ?? (own
                     ? "改动立即生效，不用重新连接。写法示例：鼠标停在输入框旁的问号上；点问号打开全部清单名。"
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
@@ -858,6 +928,7 @@ struct SplitPage: View {
         }
         .formStyle(.grouped)
         .onAppear {
+            if let preview { sites = preview.sites; return }
             certificates = CertificateRelay.loginCandidates()
             localNetworks = LocalNetwork.current()
             // The 连接 page may have changed the list meanwhile (§四十四).
@@ -959,6 +1030,7 @@ struct SplitPage: View {
     /// What the certificate row says: the automatic pick, the manual
     /// one, or that none is used.
     private var certificateSummary: String {
+        if preview != nil { return "自动：示例证书（到期 2027-06-30）" }
         switch settings.clientCertificate {
         case nil:
             guard let pick = certificates.first else { return "自动（未找到）" }
