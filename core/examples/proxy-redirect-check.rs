@@ -26,6 +26,9 @@ mod macos {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    static STAGE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+    fn stage(name: &'static str) { *STAGE.lock().unwrap() = name; println!("-- {name}"); }
+
     fn echo_site() -> io::Result<SocketAddr> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
@@ -98,11 +101,21 @@ mod macos {
 
     pub fn run() -> Result<(), String> {
         if unsafe { libc::geteuid() } != 0 { return Err("run as root".into()); }
+        // A stuck step must not hold the runner: dump every thread's stack
+        // (sample, with this debug build's symbols) and fail.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(45));
+            eprintln!("proxy-redirect-check: stuck at {}", STAGE.lock().unwrap());
+            let pid = std::process::id().to_string();
+            eprintln!("{}", command("/usr/bin/sample", &[&pid, "1", "-mayDie"]));
+            std::process::exit(1);
+        });
         let work = std::env::temp_dir().join(format!("ac-proxy-check-{}", std::process::id()));
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         let guard = Guard::new(Settings { support_dir: work.clone(), boot: Some("check".into()), grace: Duration::from_secs(120), pfctl: Some("/sbin/pfctl".into()) });
         let routes = DirectRoutes::new(work.join("proxy-routes"), "check".into(), false);
         let result = check(&guard, &routes);
+        stage("cleanup");
         // Always taken out, also after a failure.
         let pf = guard.proxy_redirect(None);
         let route = routes.remove_all();
@@ -132,6 +145,7 @@ mod macos {
         guard.proxy_redirect(Some(listener.port())).map_err(|e| format!("pf load: {e}"))?;
         println!("{}", command("/sbin/pfctl", &["-a", alwaysconnect_core::pf::PROXY_ANCHOR, "-s", "nat"]).trim());
 
+        stage("socks5 exchange");
         let socks_ip = routing.answer("www.socks.example").ok_or("no answer")?;
         exchange(socks_ip, 443)?;
         let seen = asked.recv_timeout(Duration::from_secs(5)).map_err(|_| "socks proxy not asked")?;
@@ -155,9 +169,12 @@ mod macos {
         }
 
         // No listener: the redirect stays, connections are refused.
+        stage("stop listener");
         listener.stop();
+        stage("reload redirect");
         guard.proxy_redirect(None).map_err(|e| e.to_string())?;
         guard.proxy_redirect(Some(listener.port())).map_err(|e| e.to_string())?;
+        stage("connect without listener");
         let started = Instant::now();
         match TcpStream::connect_timeout(&SocketAddr::from((socks_ip, 443)), Duration::from_secs(5)) {
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => println!("stopped listener: refused after {:?}", started.elapsed()),

@@ -358,6 +358,7 @@ jobs:
         working-directory: core
         run: cargo test
       - name: Proxied sites through real pf (route, rdr, original address; DESIGN §69)
+        timeout-minutes: 5
         # Root on the runner: the loopback route, the pf redirect and the
         # listener carry connections to proxied names through local SOCKS5
         # and HTTP CONNECT proxies; UDP and a stopped listener are refused;
