@@ -80,6 +80,9 @@ pub struct Config {
     pub debug_child_output: bool,
     pub relay: Option<RelayConfig>,
     pub direct_domains: Option<Vec<String>>,
+    /// The same list as one newline-joined text (§66.30: the App expands
+    /// it in Rust and neither process holds it as separate strings).
+    pub direct_domains_text: Option<String>,
     pub drop_protection: bool,
     /// The session harness's scratch root is in use (TestSeam).
     pub test_active: bool,

@@ -17,7 +17,7 @@
 //! A file that does not decode, or decodes to far fewer lists than the
 //! project has, is refused: the App then keeps what it had.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashMap;
 
 /// The project has well over a thousand lists; a file with fewer than
 /// this is a truncated or foreign download, not a smaller catalogue.
@@ -86,11 +86,14 @@ fn text(bytes: &[u8]) -> Result<&str, ()> {
     std::str::from_utf8(bytes).map_err(|_| ())
 }
 
-/// One Domain message as a text line; None for a kind this format lacks.
-fn rule(bytes: &[u8]) -> Result<Option<String>, ()> {
+/// Appends one Domain message to `out` as a text line ("d:x @a @b"),
+/// without allocating per rule (§66.30: the conversion runs in the App and
+/// 100 000 small strings left the allocator ~10 MB larger). Returns
+/// whether a line was written (false for a kind this format lacks).
+fn write_rule<'a>(bytes: &'a [u8], out: &mut String, attributes: &mut Vec<&'a str>) -> Result<bool, ()> {
     let mut kind = 0u64;
     let mut value = "";
-    let mut attributes = Vec::new();
+    attributes.clear();
     let mut reader = Reader::new(bytes);
     while let Some((field, item)) = reader.next()? {
         match (field, item) {
@@ -100,7 +103,7 @@ fn rule(bytes: &[u8]) -> Result<Option<String>, ()> {
                 let mut attribute = Reader::new(b);
                 while let Some((field, item)) = attribute.next()? {
                     if let (1, Field::Bytes(key)) = (field, item) {
-                        attributes.push(text(key)?.to_ascii_lowercase());
+                        attributes.push(text(key)?);
                     }
                 }
             }
@@ -113,43 +116,65 @@ fn rule(bytes: &[u8]) -> Result<Option<String>, ()> {
         1 => "r:",
         2 => "d:",
         3 => "f:",
-        _ => return Ok(None),
+        _ => return Ok(false),
     };
-    let value = if kind == 1 { value.to_owned() } else { value.to_ascii_lowercase() };
     // A line break inside a value would start a new line in the text.
     if value.is_empty() || value.contains(['\n', '\r', ' ']) {
-        return Ok(None);
+        return Ok(false);
+    }
+    out.push_str(prefix);
+    if kind == 1 {
+        out.push_str(value);
+    } else {
+        out.extend(value.chars().map(|c| c.to_ascii_lowercase()));
     }
     attributes.retain(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_graphic()));
-    attributes.sort();
-    attributes.dedup();
-    let mut line = format!("{prefix}{value}");
-    for attribute in attributes {
-        line.push_str(" @");
-        line.push_str(&attribute);
+    let lower = |a: &&str| a.to_ascii_lowercase();
+    attributes.sort_by_cached_key(lower);
+    attributes.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    for attribute in attributes.iter() {
+        out.push_str(" @");
+        out.extend(attribute.chars().map(|c| c.to_ascii_lowercase()));
     }
-    Ok(Some(line))
+    Ok(true)
 }
 
-/// `dlc.dat` (routercommon.GeoSiteList) to the bundled text format.
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// `dlc.dat` (routercommon.GeoSiteList) to the bundled text format: lists
+/// sorted by name, each list's lines in file order without repeats.
 pub fn from_dlc(data: &[u8]) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(data.len());
+    convert(data, |_, list| {
+        out.push_str(list);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The same conversion, handing each list's text ("[name]\n" and its
+/// lines) to `sink` as soon as it is complete, so the caller can write it
+/// out without holding the whole text (§66.30). Refuses a damaged file or
+/// one far short of the project's catalogue before `sink` sees anything
+/// that matters: the caller writes to a temporary file and keeps it only
+/// on Ok.
+pub fn convert(data: &[u8], mut sink: impl FnMut(&str, &str) -> std::io::Result<()>) -> Result<(), &'static str> {
     let damaged = |_| "清单文件损坏";
-    let mut lists: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Pass 1: each list's name and where its message is (about 1500).
+    let mut sites: Vec<(String, &[u8])> = Vec::new();
     let mut reader = Reader::new(data);
     while let Some((field, item)) = reader.next().map_err(damaged)? {
         let (1, Field::Bytes(entry)) = (field, item) else { continue };
         let mut name = None;
-        let mut rules = Vec::new();
         let mut site = Reader::new(entry);
         while let Some((field, item)) = site.next().map_err(damaged)? {
-            match (field, item) {
-                (1, Field::Bytes(b)) => name = Some(text(b).map_err(damaged)?.to_ascii_lowercase()),
-                (2, Field::Bytes(b)) => {
-                    if let Some(line) = rule(b).map_err(damaged)? {
-                        rules.push(line);
-                    }
-                }
-                _ => {}
+            if let (1, Field::Bytes(b)) = (field, item) {
+                name = Some(text(b).map_err(damaged)?.to_ascii_lowercase());
             }
         }
         let Some(name) = name.filter(|n| {
@@ -157,26 +182,70 @@ pub fn from_dlc(data: &[u8]) -> Result<String, &'static str> {
         }) else {
             continue;
         };
-        lists.entry(name).or_default().extend(rules);
+        sites.push((name, entry));
     }
-    let total: usize = lists.values().map(Vec::len).sum();
-    if lists.len() < MIN_LISTS || total < MIN_RULES {
+    sites.sort_by(|a, b| a.0.cmp(&b.0));  // stable: same-named lists keep file order
+    let lists = sites.iter().enumerate().filter(|(i, s)| *i == 0 || sites[i - 1].0 != s.0).count();
+    if lists < MIN_LISTS {
         return Err("清单数量不对");
     }
-    let mut out = String::with_capacity(total * 24);
-    for (name, rules) in &lists {
+    // Pass 2: one list at a time into a reused buffer; repeats found by
+    // hash in one reused table, confirmed against what was written.
+    let mut out = String::new();
+    let mut attributes = Vec::new();
+    let mut seen: HashMap<u64, (usize, usize)> = HashMap::new();
+    let mut clashes: Vec<(u64, usize, usize)> = Vec::new();
+    let mut total = 0usize;
+    let mut index = 0;
+    while index < sites.len() {
+        let name = sites[index].0.as_str();
+        out.clear();
         out.push('[');
         out.push_str(name);
         out.push_str("]\n");
-        let mut seen = HashSet::new();
-        for line in rules {
-            if seen.insert(line.as_str()) {
-                out.push_str(line);
-                out.push('\n');
+        seen.clear();
+        clashes.clear();
+        while index < sites.len() && sites[index].0 == name {
+            let mut site = Reader::new(sites[index].1);
+            while let Some((field, item)) = site.next().map_err(damaged)? {
+                let (2, Field::Bytes(b)) = (field, item) else { continue };
+                let start = out.len();
+                if !write_rule(b, &mut out, &mut attributes).map_err(damaged)? {
+                    continue;
+                }
+                total += 1;
+                let end = out.len();
+                let bytes = out.as_bytes();
+                let line = &bytes[start..end];
+                let key = hash(line);
+                let repeat = match seen.get(&key) {
+                    None => {
+                        seen.insert(key, (start, end));
+                        false
+                    }
+                    Some(&(s, e)) if &bytes[s..e] == line => true,
+                    Some(_) => {
+                        let known = clashes.iter().any(|&(k, s, e)| k == key && &bytes[s..e] == line);
+                        if !known {
+                            clashes.push((key, start, end));
+                        }
+                        known
+                    }
+                };
+                if repeat {
+                    out.truncate(start);
+                } else {
+                    out.push('\n');
+                }
             }
+            index += 1;
         }
+        sink(name, &out).map_err(|_| "清单写不进去")?;
     }
-    Ok(out)
+    if total < MIN_RULES {
+        return Err("清单数量不对");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,8 +1,10 @@
 import CryptoKit
 import Foundation
 
-@_silgen_name("ac_geosite_from_dlc")
-private func ac_geosite_from_dlc(_ data: UnsafePointer<UInt8>?, _ len: Int) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_geodata_install")
+private func ac_geodata_install(_ dat: UnsafePointer<UInt8>?, _ len: Int, _ tag: UnsafePointer<CChar>,
+                                _ hash: UnsafePointer<CChar>, _ dir: UnsafePointer<CChar>,
+                                _ used: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_string_free")
 private func geo_string_free(_ value: UnsafeMutablePointer<CChar>?)
 
@@ -222,38 +224,26 @@ final class GeoUpdater: ObservableObject {
         return tag
     }
 
-    /// Checks the download and puts the converted text in place. Returns
-    /// why not (nothing changed then), and whether a list the rules use
-    /// is different from before.
+    /// Checks the download's hash, then the Rust core converts it, checks
+    /// the lists the rules use and writes the text and the version file in
+    /// place (§66.30). Returns why not (nothing changed then), and whether
+    /// a list the rules use is different from before.
     static func install(dat: Data?, hash: String?, tag: String) -> (error: String?, changed: Bool) {
         guard let dat, let hash else { return ("清单没有下载完", false) }
         let actual = SHA256.hash(data: dat).map { String(format: "%02x", $0) }.joined()
         guard hash == actual else { return ("清单校验不通过", false) }
-        let pointer = dat.withUnsafeBytes { raw in
-            ac_geosite_from_dlc(raw.bindMemory(to: UInt8.self).baseAddress, raw.count)
+        let used = Set(usedLists()).sorted().joined(separator: "\n")
+        let reply = dat.withUnsafeBytes { raw in
+            ac_geodata_install(raw.bindMemory(to: UInt8.self).baseAddress, raw.count, tag, hash,
+                               GeoData.updateDirectory.path, used)
         }
-        guard let pointer else { return ("清单内容不完整", false) }
-        defer { geo_string_free(pointer) }
-        let text = Data(bytes: pointer, count: strlen(pointer))
-        let old = GeoData.available ? (try? Data(contentsOf: target, options: .alwaysMapped)) : nil
-        var changed = old == nil
-        for name in Set(usedLists()) {
-            guard let range = GeoData.range(of: name, in: text) else {
-                return ("新清单里没有 geosite:\(name)，先不更新", false)
-            }
-            if let old, old.isEmpty == false {
-                let before = GeoData.range(of: name, in: old).map { old[$0] }
-                if before != text[range] { changed = true }
-            }
-        }
-        do {
-            try FileManager.default.createDirectory(at: GeoData.updateDirectory, withIntermediateDirectories: true)
-            try text.write(to: target, options: .atomic)
-        } catch {
+        guard let reply else { return ("清单写不进去", false) }
+        defer { geo_string_free(reply) }
+        struct Outcome: Decodable { let error: String?; let changed: Bool }
+        guard let outcome = try? JSONDecoder().decode(Outcome.self, from: Data(String(cString: reply).utf8)) else {
             return ("清单写不进去", false)
         }
-        guard writeStamp(Stamp(tag: tag, hash: hash)) else { return ("清单写不进去", false) }
-        return (nil, changed)
+        return (outcome.error, outcome.changed)
     }
 
     var versionText: String {

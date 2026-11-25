@@ -2,6 +2,8 @@ import Foundation
 
 @_silgen_name("ac_egress_match_targets")
 private func ac_egress_match_targets(_ config: UnsafePointer<CChar>, _ targets: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_geodata_expand_egress")
+private func ac_geodata_expand_egress(_ config: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_string_free")
 private func egress_string_free(_ value: UnsafeMutablePointer<CChar>?)
 
@@ -85,20 +87,20 @@ extension EgressProtection {
         enabled = groups.contains(where: \.enabled)
     }
 
+    /// The settings as the background service takes them, as JSON: each
+    /// enabled rule's matches expanded by the Rust core (§66.30), so the
+    /// App never holds the expanded entries as separate strings.
+    var backgroundServiceJSON: String? {
+        GeoData.prepare()
+        guard let data = try? JSONEncoder().encode(withoutExpandedMatches),
+              let out = ac_geodata_expand_egress(String(decoding: data, as: UTF8.self)) else { return nil }
+        defer { egress_string_free(out) }
+        return String(cString: out)
+    }
+
+    /// The same, decoded (tests and checks only).
     var forBackgroundService: Self {
-        var result = withoutExpandedMatches
-        guard enabled else { return result }
-        var expanded: [String: [String]] = [:]
-        for index in result.groups.indices where result.groups[index].enabled {
-            var seen = Set<String>()
-            result.groups[index].matches = result.groups[index].sites.flatMap { site in
-                if let cached = expanded[site] { return cached }
-                let items = ListRule.parse(site).map { $0.isNetwork ? ["ipcidr:" + $0.text] : $0.expanded } ?? []
-                expanded[site] = items
-                return items
-            }.filter { seen.insert($0).inserted }
-        }
-        return result
+        backgroundServiceJSON.flatMap { try? JSONDecoder().decode(Self.self, from: Data($0.utf8)) } ?? withoutExpandedMatches
     }
 
     struct Target: Codable, Hashable {
@@ -109,9 +111,9 @@ extension EgressProtection {
     /// Compile the same matcher as the gate, once for an on-screen batch.
     func rules(covering targets: [Target]) -> [Target: UInt32] {
         guard isActive, !targets.isEmpty,
-              let config = try? JSONEncoder().encode(forBackgroundService),
+              let config = backgroundServiceJSON,
               let input = try? JSONEncoder().encode(targets),
-              let result = ac_egress_match_targets(String(decoding: config, as: UTF8.self),
+              let result = ac_egress_match_targets(config,
                                                    String(decoding: input, as: UTF8.self)) else { return [:] }
         defer { egress_string_free(result) }
         guard let matches = try? JSONDecoder().decode([UInt32?].self, from: Data(String(cString: result).utf8))

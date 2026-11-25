@@ -225,7 +225,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// Set by prepareRelay, used by the next connect (DESIGN.md §二十三).
     private var relay: RelaySettings?
     /// Names that go out the local network (DESIGN.md §26.5), from the App.
-    private var directDomains: [String] = []
+    /// The split list as the App expanded it, newline-joined (§66.30).
+    private var directRuleText = ""
     /// The App's direct networks (its list and the local network), kept
     /// for the next engine: one that starts takes over a held set at
     /// once and must pass the LAN from its first second (§30.1).
@@ -466,7 +467,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         )
         config.relay = relay
         // Own connection: the domain split's forwarder runs (§26.5).
-        if relay != nil { config.directDomains = directDomains }
+        if relay != nil { config.directDomainsText = directRuleText }
         if relay != nil { config.egress = egress }
         config.dropProtection = dropProtection
         if !TestSeam.isActive || login != nil {
@@ -576,8 +577,19 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         queue.async {
             // Rules as the App expanded them (§26.13); SplitRules ignores
             // what it does not understand.
-            self.directDomains = domains.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-            self.engine?.updateDirectDomains(self.directDomains)
+            self.directRuleText = domains.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            self.engine?.updateDirectRules(self.directRuleText)
+            reply(true)
+        }
+    }
+
+    func setDirectRuleText(_ text: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            // Rules as the App's Rust core expanded them; SplitRules ignores
+            // what it does not understand (§26.13, §66.30).
+            self.directRuleText = text
+            self.engine?.updateDirectRules(text)
             reply(true)
         }
     }

@@ -46,7 +46,7 @@ enum ListRule: Equatable {
             let attribute = parts.count == 2 ? parts[1] : nil
             if GeoData.available {
                 guard GeoData.hasList(list) else { return nil }
-                if let attribute, GeoData.geosite(list, attribute: attribute).isEmpty { return nil }
+                if let attribute, GeoData.ruleCount(list, attribute: attribute) == 0 { return nil }
             }
             // Before the first download a list name is kept as written (the
             // background service's check below still vets its form).
@@ -148,17 +148,11 @@ enum ListRule: Equatable {
 
     var isNetwork: Bool { if case .network = self { return true } else { return false } }
 
-    /// The background service's rule kinds (DNSForwarder's SplitRules,
-    /// the exit gate's ProtectedSites). A network is [] here: the split
-    /// list routes it, exit protection sends it as "ipcidr:".
+    /// The background service's entries for this one rule (tests and
+    /// checks; the services get whole lists expanded by GeoData.expand).
     var expanded: [String] {
-        switch self {
-        case .domain(let d): return [d]
-        case .full, .keyword, .regexp: return [text]
-        case .geosite(let name, let attribute): return GeoData.geosite(name, attribute: attribute)
-        case .geoip(let code): return GeoData.geoip(code).map { "ipcidr:" + $0 }
-        case .network: return []
-        }
+        if isNetwork { return [] }
+        return GeoData.expand([text], networks: false).split(separator: "\n").map(String.init)
     }
 }
 
@@ -167,24 +161,27 @@ func isValidIPv4Address(_ value: String) -> Bool {
     return inet_pton(AF_INET, value, &a) == 1
 }
 
-/// The site lists and geoip:cn. The site lists are not part of the App
-/// (DESIGN.md §66.30, user 2026-11-25: "默认app都不带"): GeoUpdater
-/// downloads the whole catalogue to Application Support and this reads it
-/// in place, memory-mapped. Only the lists asked for are located (a scan
-/// for their "[name]" line) and only their positions are kept, never an
-/// index of all of them (user: "内存只留用到的数据"). A changed file (an
-/// update by this or the other App process) is noticed by its modification
-/// time. geoip-cn.txt is bundled.
+@_silgen_name("ac_geodata_configure")
+private func ac_geodata_configure(_ geosite: UnsafePointer<CChar>, _ geoip: UnsafePointer<CChar>)
+@_silgen_name("ac_geodata_available")
+private func ac_geodata_available() -> Bool
+@_silgen_name("ac_geodata_has_list")
+private func ac_geodata_has_list(_ name: UnsafePointer<CChar>) -> Bool
+@_silgen_name("ac_geodata_rule_count")
+private func ac_geodata_rule_count(_ name: UnsafePointer<CChar>, _ attribute: UnsafePointer<CChar>?) -> Int64
+@_silgen_name("ac_geodata_expand")
+private func ac_geodata_expand(_ lines: UnsafePointer<CChar>, _ networks: Bool) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_string_free")
+private func geodata_string_free(_ value: UnsafeMutablePointer<CChar>?)
+
+/// The site lists and geoip:cn, read by the Rust core (core/src/geodata.rs,
+/// DESIGN.md §66.30; user 2026-11-25: "这种逻辑肯定要下沉到rust做"). The
+/// site lists are not part of the App: GeoUpdater downloads them to
+/// Application Support. The core maps that file in place, locates only the
+/// lists asked for and expands rules into one text, so the App never holds
+/// the expanded entries as separate strings. geoip-cn.txt is bundled.
 enum GeoData {
     static let geoipCountries: Set<String> = ["cn"]
-
-    private static let lock = NSLock()
-    /// The file, memory-mapped (clean pages the system can drop).
-    private static var mapped: Data?
-    /// Positions of the lists asked for so far (nil = not in the file).
-    private static var found: [String: Range<Int>?] = [:]
-    /// Which file was read: its path and modification time.
-    private static var loaded: (path: String, modified: timespec)?
 
     /// Where the download goes; uninstall removes the folder with the rest (§31).
     static var updateDirectory: URL {
@@ -202,113 +199,42 @@ enum GeoData {
         return updateDirectory.appendingPathComponent("geosite.txt")
     }
 
+    private static var geoipFile: String {
+        if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEODATA"] {
+            return URL(fileURLWithPath: dir).appendingPathComponent("geoip-cn.txt").path
+        }
+        return (Bundle.main.url(forResource: "geoip-cn", withExtension: "txt")
+            ?? Bundle.main.url(forResource: "geoip-cn", withExtension: "txt", subdirectory: "GeoData"))?.path ?? ""
+    }
+
+    /// The core's paths, set on first use.
+    private static let configured: Void = { ac_geodata_configure(siteListFile.path, geoipFile) }()
+
+    /// Before any core call that reads the lists without going through here.
+    static func prepare() { _ = configured }
+
     /// The site lists have been downloaded (until then geosite: rules are
     /// kept as written and match nothing).
-    static var available: Bool { FileManager.default.fileExists(atPath: siteListFile.path) }
+    static var available: Bool { _ = configured; return ac_geodata_available() }
 
-    private static func bundled(_ name: String) -> URL? {
-        if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEODATA"] {
-            return URL(fileURLWithPath: dir).appendingPathComponent(name)
-        }
-        let base = (name as NSString).deletingPathExtension
-        return Bundle.main.url(forResource: base, withExtension: "txt")
-            ?? Bundle.main.url(forResource: base, withExtension: "txt", subdirectory: "GeoData")
+    static func hasList(_ name: String) -> Bool { _ = configured; return ac_geodata_has_list(name) }
+
+    /// How many rules a list has (with an attribute: only those carrying
+    /// it), counted in the core without keeping them.
+    static func ruleCount(_ name: String, attribute: String? = nil) -> Int {
+        _ = configured
+        if let attribute { return Int(ac_geodata_rule_count(name, attribute)) }
+        return Int(ac_geodata_rule_count(name, nil))
     }
 
-    private static func modified(_ path: String) -> timespec? {
-        var info = stat()
-        return stat(path, &info) == 0 ? info.st_mtimespec : nil
-    }
-
-    /// The mapped file, re-read when it changed; the list positions with it.
-    private static func current() -> Data {
-        let file = siteListFile
-        let stamp = modified(file.path)
-        if let mapped, let loaded, loaded.path == file.path,
-           loaded.modified.tv_sec == stamp?.tv_sec, loaded.modified.tv_nsec == stamp?.tv_nsec {
-            return mapped
-        }
-        let data = stamp == nil ? Data() : (try? Data(contentsOf: file, options: .alwaysMapped)) ?? Data()
-        mapped = data
-        found = [:]
-        loaded = stamp.map { (file.path, $0) }
-        return data
-    }
-
-    /// Where one list's lines sit in `data`: the lines after "[name]" up
-    /// to the next "[" line. Scans only for that header.
-    static func range(of name: String, in data: Data) -> Range<Int>? {
-        let header = Array(("[" + name + "]\n").utf8)
-        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Range<Int>? in
-            let bytes = raw.bindMemory(to: UInt8.self)
-            let count = bytes.count
-            var start: Int?
-            var i = 0
-            while i < count {
-                // i is the start of a line.
-                if bytes[i] == UInt8(ascii: "["), i + header.count <= count,
-                   header.indices.allSatisfy({ bytes[i + $0] == header[$0] }) {
-                    start = i + header.count
-                    break
-                }
-                while i < count && bytes[i] != 0x0A { i += 1 }
-                i += 1
-            }
-            guard let start else { return nil }
-            var end = start
-            while end < count && bytes[end] != UInt8(ascii: "[") {
-                while end < count && bytes[end] != 0x0A { end += 1 }
-                end += 1
-            }
-            return start..<min(end, count)
-        }
-    }
-
-    private static func lines(_ name: String) -> [Substring] {
-        lock.lock()
-        let data = current()
-        let range: Range<Int>?
-        if let known = found[name] {
-            range = known
-        } else {
-            range = Self.range(of: name, in: data)
-            found[name] = .some(range)
-        }
-        lock.unlock()
-        guard let range, !range.isEmpty, range.upperBound <= data.count else { return [] }
-        return String(decoding: data[range], as: UTF8.self).split(separator: "\n")
-    }
-
-    static func hasList(_ name: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let data = current()
-        if let known = found[name] { return known != nil }
-        let range = Self.range(of: name, in: data)
-        found[name] = .some(range)
-        return range != nil
-    }
-
-    /// How many rules a list has, without keeping them.
-    static func ruleCount(_ name: String) -> Int { lines(name).count }
-
-    /// "d:x @a" -> "domain:x", "f:" -> "full:", "k:" -> "keyword:",
-    /// "r:" -> "regexp:"; with an attribute, only lines carrying it.
-    static func geosite(_ name: String, attribute: String?) -> [String] {
-        let kinds: [Character: String] = ["d": "domain:", "f": "full:", "k": "keyword:", "r": "regexp:"]
-        return lines(name).compactMap { line in
-            let parts = line.split(separator: " ")
-            guard let head = parts.first, head.count > 2, let prefix = kinds[head.first!] else { return nil }
-            if let attribute, !parts.dropFirst().contains(Substring("@" + attribute)) { return nil }
-            return prefix + head.dropFirst(2)
-        }
-    }
-
-    /// Read when asked and not kept, like the site lists (§32.4): it is
-    /// needed only when the list is sent to the background service.
-    static func geoip(_ code: String) -> [String] {
-        guard code == "cn" else { return [] }
-        let text = bundled("geoip-cn.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
-        return text.split(separator: "\n").map(String.init).filter(isValidCIDR)
+    /// Stored rule lines as the background service's entries, one per
+    /// line, in order and without repeats. Networks become "ipcidr:"
+    /// entries only when asked for (exit protection).
+    static func expand(_ lines: [String], networks: Bool) -> String {
+        _ = configured
+        guard let out = ac_geodata_expand(lines.joined(separator: "\n"), networks) else { return "" }
+        defer { geodata_string_free(out) }
+        return String(cString: out)
     }
 }
 

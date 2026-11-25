@@ -142,9 +142,9 @@ extension DirectSites {
 
 extension AppSettings {
     /// The rules the own connection's DNS forwarder gets: names, site
-    /// lists and geoip expanded (§26.13); networks go elsewhere.
-    var directDomains: [String] {
-        var seen = Set<String>()
-        return listRules.flatMap(\.expanded).filter { seen.insert($0).inserted }
+    /// lists and geoip expanded (§26.13) by the Rust core into one
+    /// newline-joined text (§66.30); networks go elsewhere.
+    var directRuleText: String {
+        GeoData.expand(listRules.map(\.text), networks: false)
     }
 }

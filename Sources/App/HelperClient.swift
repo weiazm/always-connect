@@ -2042,11 +2042,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     private func sendEgress(_ config: EgressProtection, completion: @escaping (Bool) -> Void) {
-        guard let data = try? JSONEncoder().encode(config.forBackgroundService), data.count <= 524_288 else {
+        guard let json = config.backgroundServiceJSON, json.utf8.count <= 524_288 else {
             completion(false)
             return
         }
-        let json = String(decoding: data, as: UTF8.self)
         egressRPC({ $0.setEgressProtection(json, withReply: $1) }) { completion($0 == true) }
     }
 
@@ -2288,16 +2287,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let settings = ProfileStore.loadAppSettings()
         // Without Cisco on this Mac the own connection runs either way;
         // only the switch decides whether the list applies.
-        let domains = settings.splitOn ? settings.directDomains : []
+        let text = settings.splitOn ? settings.directRuleText : ""
+        // A background service built before §66.30 only knows the list form.
+        let legacy = HelperInstaller.installedHelperOutdated
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 if !finished { finished = true; completion?(nil) }
             }
-            proxy.setDirectDomains(domains) { ok in
+            let reply: (Bool) -> Void = { ok in
                 DispatchQueue.main.async {
                     if !finished { finished = true; completion?(ok) }
                 }
+            }
+            if legacy {
+                proxy.setDirectDomains(text.split(separator: "\n").map(String.init), withReply: reply)
+            } else {
+                proxy.setDirectRuleText(text, withReply: reply)
             }
         }
     }

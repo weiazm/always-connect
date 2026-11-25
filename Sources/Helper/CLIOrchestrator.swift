@@ -35,7 +35,7 @@ final class CLIOrchestrator {
         /// Own connection (§二十三): through the App's certificate relay.
         var relay: RelaySettings? = nil
         /// The domain split's list (§26.5). Nil = no forwarder.
-        var directDomains: [String]? = nil
+        var directDomainsText: String? = nil
         /// 断线保护 (§26.19). Default on.
         var dropProtection = true
         var loginTarget: GatewayAddress?
@@ -114,7 +114,7 @@ final class CLIOrchestrator {
         if let relay = config.relay {
             json["relay"] = ["gatewayIp": relay.gatewayIp, "arguments": relay.arguments(server: config.server)]
         }
-        if let domains = config.directDomains { json["directDomains"] = domains }
+        if let text = config.directDomainsText { json["directDomainsText"] = text }
         if let egress = config.egress, let data = try? JSONEncoder().encode(egress) {
             json["egress"] = try? JSONSerialization.jsonObject(with: data)
             if config.dropProtection && egress.isActive {
@@ -197,8 +197,8 @@ final class CLIOrchestrator {
     /// Daemon shutdown: SIGHUP (no log-off), SIGKILL after 2 s.
     func killChild() { ac_oc_kill_child(handle) }
 
-    func updateDirectDomains(_ domains: [String]) {
-        ac_oc_update_direct_domains(handle, domains.joined(separator: "\n"))
+    func updateDirectRules(_ text: String) {
+        ac_oc_update_direct_domains(handle, text)
     }
 
     func updateDropProtection(_ on: Bool) { ac_oc_update_drop_protection(handle, on) }

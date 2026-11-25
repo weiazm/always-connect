@@ -1617,7 +1617,10 @@ pub extern "C" fn ac_oc_new(config: *const c_char, hooks: *const AcEngineHooks) 
             std::ptr::write_volatile(b, 0);
         }
     }
-    let Ok(config) = parsed else { return std::ptr::null_mut() };
+    let Ok(mut config) = parsed else { return std::ptr::null_mut() };
+    if let Some(text) = config.direct_domains_text.take() {
+        config.direct_domains = Some(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect());
+    }
     let ctx = std::sync::Arc::new(Ctx(h.ctx, h.release));
     let c = || std::sync::Arc::clone(&ctx);
     let (state, terminal, physical_network, local_dns, system_roots, stopped) =
@@ -2072,20 +2075,4 @@ pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engin
 #[no_mangle]
 pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
     unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
-}
-
-/// A downloaded `dlc.dat` as the bundled site-list text (DESIGN.md
-/// §66.30); null when the file is damaged or not a full catalogue.
-#[no_mangle]
-pub extern "C" fn ac_geosite_from_dlc(data: *const u8, len: usize) -> *mut c_char {
-    if data.is_null() || len == 0 {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: the App passes a buffer it owns for the length it states.
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    crate::geosite::from_dlc(bytes)
-        .ok()
-        .and_then(|text| CString::new(text).ok())
-        .map(CString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
 }

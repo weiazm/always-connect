@@ -129,6 +129,11 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// their subdomains) that go out the local network. Takes effect at
     /// once in a running session, else at the next connect. Reply: true.
     func setDirectDomains(_ domains: [String], withReply reply: @escaping (Bool) -> Void)
+    /// The same list as one newline-joined text, expanded by the App's
+    /// Rust core (DESIGN.md §66.30): neither process holds the entries as
+    /// separate strings. Only sent to a background service built with it
+    /// (HelperInstaller.installedHelperOutdated is false). Reply: true.
+    func setDirectRuleText(_ text: String, withReply reply: @escaping (Bool) -> Void)
     /// What the split did in the running session (DESIGN.md §26.12): the
     /// list entries looked up so far (latest first, at most 20), how
     /// many addresses went out the local network, and whether an
@@ -163,7 +168,7 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 /// Upgrade safety for the additive methods above (evaluateRule,
 /// getStats, runLeakCheck, updateAllowNetworks, getSessionInfo,
 /// getNetworkHeld, setKillSwitch, prepareRelay, getLastRelease,
-/// setDirectDomains, getSplitActivity, setDropProtection, getConnections, resolveGatewayIPv4):
+/// setDirectDomains, setDirectRuleText, getSplitActivity, setDropProtection, getConnections, resolveGatewayIPv4):
 /// the Helper is installed independently of the App, so a new App
 /// may talk to an old Helper that never replies to them. The App
 /// therefore wraps every call in a 3-second timeout and falls back

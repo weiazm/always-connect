@@ -77,9 +77,11 @@ struct ListRulesTest {
                                 DirectSite(name: "10.9.0.0/16", domains: ["10.9.0.0/16"]),
                                 DirectSite(name: "geosite:github", domains: ["geosite:github"])]
         settings.autoLAN = false
-        check("the forwarder gets names and lists, not networks",
-              settings.directDomains.contains("example.com") && settings.directDomains.contains("domain:ghcr.io")
-              && !settings.directDomains.contains("10.9.0.0/16"))
+        // One newline-joined text from the Rust core (§66.30).
+        let direct = settings.directRuleText.split(separator: "\n").map(String.init)
+        check("the forwarder gets names and lists, not networks, without repeats",
+              direct.contains("example.com") && direct.contains("domain:ghcr.io") && !direct.contains("10.9.0.0/16")
+              && direct.count == Set(direct).count)
         check("the allowlist gets the list's networks", settings.effectiveAllowNetworks == ["10.9.0.0/16"])
         settings.autoLAN = nil
         let local = LocalNetwork.current()
