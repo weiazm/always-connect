@@ -26,7 +26,7 @@ use crate::dns_forwarder::SplitRules;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -355,6 +355,7 @@ fn connect_proxy(server: &Server) -> Result<TcpStream, String> {
 /// proxy's answer come back with the stream.
 pub fn open_through(server: &Server, name: &str, port: u16) -> Result<(TcpStream, Vec<u8>), String> {
     let mut stream = connect_proxy(server)?;
+    no_sigpipe(&stream);
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
     let early = match server.kind {
@@ -419,9 +420,20 @@ struct Open {
 
 pub struct Listener {
     port: u16,
-    stop: Arc<AtomicBool>,
+    stopped: bool,
+    /// Writing a byte here ends the accepting thread (no loopback
+    /// connection needed to wake it).
+    wake: Option<std::os::fd::OwnedFd>,
     open: Arc<Mutex<Open>>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// A reset peer must cost one connection, never the service (SIGPIPE).
+fn no_sigpipe(stream: &TcpStream) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let _ = socket2::SockRef::from(stream).set_nosigpipe(true);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = stream;
 }
 
 fn reset(stream: &TcpStream) {
@@ -432,17 +444,29 @@ fn reset(stream: &TcpStream) {
 
 impl Listener {
     pub fn start(routing: Arc<Routing>, original: OriginalDestination) -> io::Result<Listener> {
+        use std::os::fd::AsRawFd;
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let stop = Arc::new(AtomicBool::new(false));
+        let (read_end, write_end) = crate::child_io::pipe()?;
         let open = Arc::new(Mutex::new(Open::default()));
         let active = Arc::new(AtomicUsize::new(0));
         let thread = std::thread::Builder::new().name("ac-proxy".into()).stack_size(STACK).spawn({
-            let (stop, open) = (stop.clone(), open.clone());
-            move || {
-                for stream in listener.incoming() {
-                    if stop.load(Ordering::Acquire) { break; }
-                    let Ok(stream) = stream else { continue };
+            let open = open.clone();
+            move || loop {
+                // Parked until a connection or the stop pipe: no timers.
+                let mut polled = [
+                    libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd { fd: read_end.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                ];
+                if unsafe { libc::poll(polled.as_mut_ptr(), 2, -1) } < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted { continue; }
+                    return;
+                }
+                if polled[1].revents != 0 { return; }
+                while let Ok((stream, _)) = crate::child_io::accept(&listener) {
+                    no_sigpipe(&stream);
+                    let _ = stream.set_nonblocking(false);
                     if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                         active.fetch_sub(1, Ordering::AcqRel);
                         routing.failed("网站", "同时经代理的连接太多");
@@ -459,15 +483,18 @@ impl Listener {
                 }
             }
         })?;
-        Ok(Listener { port, stop, open, thread: Some(thread) })
+        Ok(Listener { port, stopped: false, wake: Some(write_end), open, thread: Some(thread) })
     }
 
     pub fn port(&self) -> u16 { self.port }
 
     /// Ends the listener and every connection it carries.
     pub fn stop(&mut self) {
-        if self.stop.swap(true, Ordering::AcqRel) { return; }
-        let _ = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)), Duration::from_secs(1));
+        use std::os::fd::AsRawFd;
+        if std::mem::replace(&mut self.stopped, true) { return; }
+        if let Some(wake) = self.wake.take() {
+            unsafe { libc::write(wake.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
+        }
         if let Some(thread) = self.thread.take() { let _ = thread.join(); }
         for (_, (client, upstream)) in self.open.lock().unwrap().streams.drain() {
             let _ = client.shutdown(Shutdown::Both);
