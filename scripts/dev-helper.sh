@@ -91,12 +91,19 @@ install)
     # to record a gateway's output shapes; the App's own install leaves it off.
     DEBUG_ENV=""
     if [ "${ALWAYSCONNECT_DEBUG_CHILD_OUTPUT:-}" = 1 ]; then
-        DEBUG_ENV='  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ALWAYSCONNECT_DEBUG_CHILD_OUTPUT</key>
+        DEBUG_ENV='    <key>ALWAYSCONNECT_DEBUG_CHILD_OUTPUT</key>
     <string>1</string>
-  </dict>
 '
+    fi
+    # The installed App version (root-private): the service's own update
+    # refuses anything older (DESIGN.md §69.11).
+    info="$(cd "$(dirname "$src")/../.." && pwd)/Info.plist"
+    version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info" 2>/dev/null || true)
+    mkdir -p "$SUPPORT"
+    chmod 700 "$SUPPORT"
+    if [ -n "$version" ]; then
+        printf '%s\n' "$version" > "$SUPPORT/installed-version"
+        chmod 600 "$SUPPORT/installed-version"
     fi
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -115,7 +122,14 @@ install)
     <key>$LABEL</key>
     <true/>
   </dict>
-$DEBUG_ENV  <key>StandardErrorPath</key>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- This service can update itself after the user's approval (§69.11);
+         the App reads this world-readable plist to know it may ask. -->
+    <key>ALWAYSCONNECT_SERVICE_UPDATE</key>
+    <string>1</string>
+$DEBUG_ENV  </dict>
+  <key>StandardErrorPath</key>
   <string>$LOGDIR/helper.log</string>
   <key>KeepAlive</key>
   <dict>

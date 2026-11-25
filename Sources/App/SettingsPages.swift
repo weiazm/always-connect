@@ -10,10 +10,12 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage("settingsTab") private var tab = "general"
+    @AppStorage("splitSection") private var splitSection = "direct"
     var connectionPreview: [ConnectionRow]? = nil
 
     var body: some View {
-        TabView(selection: $tab) {
+        // 分流代理 is a part of 分流 (§69.9): "proxy" opens it there.
+        TabView(selection: Binding(get: { tab == "proxy" ? "split" : tab }, set: { tab = $0 })) {
             GeneralPage()
                 .tabItem { Label("通用", systemImage: "gearshape") }
                 .tag("general")
@@ -36,6 +38,14 @@ struct SettingsView: View {
         .frame(minWidth: SettingsWindow.minimumSize.width, maxWidth: .infinity,
                minHeight: SettingsWindow.minimumSize.height, maxHeight: .infinity)
         .toggleStyle(.always)
+        .onAppear(perform: openProxyPart)
+        .onChange(of: tab) { _ in openProxyPart() }
+    }
+
+    private func openProxyPart() {
+        guard tab == "proxy" else { return }
+        splitSection = "proxy"
+        tab = "split"
     }
 }
 
@@ -693,6 +703,8 @@ struct SplitPage: View {
     @State private var siteNote: String?
     @State private var confirmSwitch: Bool?
     @State private var localNetworks: [String] = []
+    /// Which part is shown: 分流直连, 分流代理 or 局域网 (§69.9).
+    @AppStorage("splitSection") private var section = "direct"
 
     var body: some View {
         Form {
@@ -704,7 +716,7 @@ struct SplitPage: View {
                     })) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("按网站分流")
-                        Text(manager.ownConnection ? "名单里的网站走本地网络，其余走 VPN"
+                        Text(manager.ownConnection ? "「分流直连」的网站走本地网络，「分流代理」的网站经你的代理，其余走 VPN"
                                                    : "关闭：全部经 Cisco 走 VPN")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -729,8 +741,8 @@ struct SplitPage: View {
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
                     Footnote(manager.ownConnection
-                             ? "开启后由 AlwaysConnect 自己连公司 VPN（不经 Cisco），登录时出示钥匙串里公司发的证书，私钥不离开钥匙串。VPN 掉线时名单里的网站照常能打开，其余暂停上网。"
-                             : "开启后由 AlwaysConnect 自己连公司 VPN，并让名单里的网站走本地网络。关闭时经 Cisco 连接，分流按公司的规则。")
+                             ? "开启后由 AlwaysConnect 自己连公司 VPN（不经 Cisco），登录时出示钥匙串里公司发的证书，私钥不离开钥匙串。VPN 掉线时分流直连的网站照常能打开，其余暂停上网。"
+                             : "开启后由 AlwaysConnect 自己连公司 VPN，分流直连、分流代理才起作用。关闭时经 Cisco 连接，分流按公司的规则。")
                     if manager.ownConnection, let problem = ownConnectionProblem {
                         Text(problem).font(.caption).foregroundStyle(.red)
                             .fixedSize(horizontal: false, vertical: true)
@@ -739,6 +751,23 @@ struct SplitPage: View {
             }
 
             Section {
+                Picker("", selection: $section) {
+                    Text("分流直连 · \(sites.count) 条").tag("direct")
+                    Text("分流代理 · \((settings.proxyRoutes ?? []).count) 个").tag("proxy")
+                    Text("局域网").tag("lan")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            } footer: {
+                Footnote("同一网站命中多处时：出口保护 > 分流代理 > 分流直连 > 其余走 VPN。")
+            }
+
+            switch section {
+            case "proxy":
+                ProxySections()
+            case "lan":
+                Section {
                 Toggle(isOn: Binding(
                     get: { settings.isAutoLANOn },
                     set: { on in
@@ -756,6 +785,25 @@ struct SplitPage: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                } footer: {
+                    Footnote("你现在连着的局域网（家里的 NAS、打印机）不走 VPN；VPN 掉线时也照常可用。")
+                }
+                if manager.usesCisco {
+                    Section("Cisco 的局域网访问") {
+                        LocalLanStatus()
+                    }
+                }
+            default:
+                if !settings.directOn {
+                    Section {
+                        EgressCallout(icon: "pause.circle.fill", tint: .orange,
+                                      text: "分流直连已在菜单栏面板上关闭。",
+                                      caption: "关闭期间这些网站走 VPN。") {
+                            Button("打开") { setDirect(on: true) }
+                        }
+                    }
+                }
+                Section {
                 if sites.isEmpty {
                     Text("名单是空的。在下面输入；不知道怎么写，鼠标停在问号上看示例。")
                         .foregroundStyle(.secondary)
@@ -797,19 +845,15 @@ struct SplitPage: View {
                     Text(problem).font(.caption).foregroundStyle(.orange)
                 }
             } header: {
-                Text("不走 VPN 的名单")
+                Text("不走 VPN 的网站")
             } footer: {
                 Footnote(siteNote ?? (manager.ownConnection
                     ? "改动立即生效，不用重新连接。写法示例：鼠标停在输入框旁的问号上；点问号打开全部清单名。"
                     : "分流关闭（经 Cisco）时，只有网段和本地局域网起作用：断线保护期间照常可用。网址和清单在分流开启后生效。"))
             }
 
-            SiteListsSection()
 
-            if manager.usesCisco {
-                Section("Cisco 的局域网访问") {
-                    LocalLanStatus()
-                }
+                SiteListsSection()
             }
         }
         .formStyle(.grouped)
@@ -868,6 +912,17 @@ struct SplitPage: View {
     }
 
     private func pushNetworks() { DirectList.pushNetworks() }
+
+    /// The 分流直连 switch (also on the panel): the list rests or applies,
+    /// live, without reconnecting (§69.9).
+    private func setDirect(on: Bool) {
+        var stored = ProfileStore.loadAppSettings()
+        stored.directPaused = on ? nil : true
+        ProfileStore.saveAppSettings(stored)
+        settings = stored
+        DirectList.pushNetworks()
+        if !manager.usesCisco { manager.pushDirectDomains() }
+    }
 
     private func saveSites() {
         settings = DirectList.save(sites) { note in siteNote = note }

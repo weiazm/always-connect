@@ -126,6 +126,83 @@ struct ListRulesTest {
         check("removing from a migrated group keeps the rest",
               DirectSites.removing("example.org", from: group) == [DirectSite(name: "Old group", domains: ["example.com"])])
 
+        // Proxied sites (DESIGN.md §69): old settings have none; the lines
+        // ride in the split list after the direct rules, in the user's order.
+        check("old settings have no proxies and send no proxy lines",
+              migrated.proxyRoutes == nil && migrated.proxyLines.isEmpty)
+        var proxied = AppSettings()
+        proxied.directSites = [DirectSite(name: "d", domains: ["direct.example"])]
+        proxied.proxyRoutes = [
+            ProxyRoute(name: "off", kind: .http, host: "10.0.0.9", port: 3128, sites: ["off.example"], enabled: false),
+            ProxyRoute(name: "a", kind: .socks5, host: "127.0.0.1", port: 1080, sites: ["Example.com", "full:api.example.org", "geosite:github", "10.0.0.0/8"]),
+            ProxyRoute(name: "bad", kind: .http, host: "bad host", port: 99999, sites: ["bad.example"]),
+            ProxyRoute(name: "empty", kind: .http, host: "proxy.lan", port: 8080, sites: []),
+        ]
+        let lines = proxied.directRuleText.split(separator: "\n").map(String.init)
+        check("direct rules first, then the proxies", lines.first == "direct.example" && lines[1] == "proxy:0 socks5 127.0.0.1 1080")
+        check("a proxy's rules are expanded by the same parser",
+              lines.contains("via:0:example.com") && lines.contains("via:0:full:api.example.org") && lines.contains("via:0:domain:github.com"))
+        check("a written network is routed to its proxy", lines.contains("vianet:0:10.0.0.0/8") && !lines.contains { $0.hasPrefix("via:") && $0.contains("10.0.0.0") })
+        check("a switched-off or empty proxy is not sent", !lines.contains { $0.contains("off.example") || $0.contains("proxy.lan") })
+        check("an invalid address is still declared, so its sites are refused, not freed",
+              lines.contains("proxy:1 http invalid 0") && lines.contains("via:1:bad.example"))
+        // The panel's 分流直连 switch (§69.9): the list rests, names and
+        // networks alike; the proxies and the local network are untouched.
+        var restingDirect = proxied
+        restingDirect.directSites = [DirectSite(name: "d", domains: ["direct.example"]), DirectSite(name: "n", domains: ["10.9.0.0/16"])]
+        restingDirect.directPaused = true
+        let restingLines = restingDirect.directRuleText.split(separator: "\n").map(String.init)
+        check("paused direct list sends no direct rule and keeps the proxies",
+              !restingLines.contains("direct.example") && restingLines.first == "proxy:0 socks5 127.0.0.1 1080")
+        check("paused direct list frees no network", !restingDirect.effectiveAllowNetworks.contains("10.9.0.0/16")
+              && DirectSites.sites(restingDirect).count == 2)
+        restingDirect.directPaused = nil
+        check("the direct list applies again when switched on", restingDirect.effectiveAllowNetworks.contains("10.9.0.0/16"))
+        // The panel's 代理 switch (§69.8): paused sends no proxy at all; the
+        // rules stay, and the old settings (no key) count as on.
+        var paused = proxied
+        paused.proxiesPaused = true
+        check("paused proxies send no proxy lines and keep their rules",
+              paused.proxyLines.isEmpty && paused.activeProxyRoutes.isEmpty && paused.proxyRoutes?.count == 4)
+        check("settings without the switch have proxies on", proxied.proxiesOn && proxied.activeProxyRoutes.map(\.name) == ["a", "bad"])
+        check("the check uses the same server line", proxied.proxyRoutes![1].serverLine(password: nil) == "socks5 127.0.0.1 1080")
+        // Username and password: percent-encoded, the password from the keychain stand-in.
+        ProxyPasswords.read = { _ in "p@ss word" }
+        var withLogin = AppSettings()
+        withLogin.proxyRoutes = [ProxyRoute(name: "l", kind: .socks5, host: "127.0.0.1", port: 1080, sites: ["geoip:cn", "x.example"],
+                                            username: "alice", passwordStamp: "s1")]
+        let login = withLogin.proxyLines
+        check("credentials ride encoded on the proxy line", login.first == "proxy:0 socks5 127.0.0.1 1080 alice p%40ss%20word")
+        check("geoip becomes address rules of the proxy", login.contains { $0.hasPrefix("via:0:ipcidr:") } && login.contains("via:0:x.example"))
+        ProxyPasswords.read = { _ in nil }
+        withLogin.proxyRoutes![0].passwordStamp = "s2"
+        check("a missing password still names the user (refused there, not dropped)",
+              withLogin.proxyLines.first == "proxy:0 socks5 127.0.0.1 1080 alice %00")
+        // One-line proxy addresses (the 添加代理 window).
+        func link(_ text: String) -> ProxyLink? { ProxyLink.parse(text).link }
+        let full = link("socks5://al%40ice:p%3Ass@1.2.3.4:1080")
+        check("socks5 URL with percent-encoded login", full?.kind == .socks5 && full?.host == "1.2.3.4" && full?.port == 1080
+              && full?.username == "al@ice" && full?.password == "p:ss" && full?.assumedKind == false)
+        check("http URL, path and name ignored or kept", link("http://proxy.example.net:8080/#家里")?.kind == .http
+              && link("http://proxy.example.net:8080/#家里")?.name == "家里")
+        check("socks5h and socks mean SOCKS5", link("socks5h://h:1")?.kind == .socks5 && link("socks://h:1")?.kind == .socks5)
+        check("bare host:port is SOCKS5, said so", link("127.0.0.1:7891")?.assumedKind == true && link("user:pw@h:2")?.username == "user")
+        check("IPv6 in brackets", link("socks5://[::1]:1080")?.host == "::1")
+        let surge = link("VPS = socks5, 203.0.113.7, 443, bob, secret, udp-relay=true")
+        check("Surge / Clash comma form with a name", surge?.name == "VPS" && surge?.host == "203.0.113.7" && surge?.port == 443
+              && surge?.username == "bob" && surge?.password == "secret")
+        check("bad lines say why", ProxyLink.parse("https://h:443").problem?.contains("HTTPS") == true
+              && ProxyLink.parse("socks4://h:1").problem?.contains("SOCKS4") == true
+              && ProxyLink.parse("1.2.3.4").problem?.contains("端口") == true
+              && ProxyLink.parse("socks5://h:99999").problem?.contains("端口") == true
+              && ProxyLink.parse("").problem != nil)
+        let shown = ProxyLink.display(ProxyRoute(name: "n", kind: .http, host: "h", port: 8080, sites: [], username: "u", passwordStamp: "s"))
+        check("editing shows the line without the password", shown == "http://u@h:8080")
+        let roundTrip = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(proxied))
+        check("proxies survive saving", roundTrip.proxyRoutes == proxied.proxyRoutes)
+        let sparse = try! JSONDecoder().decode(ProxyRoute.self, from: Data(#"{"name":"x","host":"h","port":1}"#.utf8))
+        check("a proxy saved without newer fields still reads", sparse.kind == .socks5 && sparse.enabled && sparse.sites.isEmpty)
+
         print("list-rules FAILS=\(fails)")
         exit(fails == 0 ? 0 : 1)
     }

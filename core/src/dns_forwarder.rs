@@ -992,6 +992,8 @@ pub struct Inner {
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
     protected_answer: RwLock<Option<ProtectedAnswerHook>>,
+    /// Names that go through a proxy (§69): answered from its own range.
+    proxy: RwLock<Option<Arc<crate::split_proxy::Routing>>>,
     inflight: AtomicUsize,
     /// [company DNS, direct/local DNS] upstream exchanges in progress.
     path_inflight: [AtomicUsize; 2],
@@ -1067,12 +1069,43 @@ impl Inner {
     }
 
     fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
+        self.resolve_with(query, session, false)
+    }
+
+    /// A name's IPv4 addresses by the ordinary split, proxy rules skipped:
+    /// a proxy running on this Mac connecting for its own upstream (§69).
+    /// Direct names get their direct route first, as for any lookup.
+    pub fn resolve_plain(&self, name: &str) -> Vec<Ipv4Addr> {
+        let mut query = vec![0x51, 0x7a, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in trim_dots(name).split('.') {
+            if label.is_empty() || label.len() > 63 { return Vec::new(); }
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        self.resolve_with(&query, None, true).map(|answer| ipv4_answers(&answer)).unwrap_or_default()
+    }
+
+    fn resolve_with(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>, skip_proxy: bool) -> Option<Vec<u8>> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
             let settings = self.settings.read().unwrap();
             if !settings.enabled || session.is_some_and(|live| !live.load(Ordering::Acquire)) { return None; }
             (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
         };
+        // Proxied names (§69) come before the direct list: a name in both
+        // goes through its proxy, never direct. Exit-protected names stay
+        // in the VPN. No DNS server is asked about a proxied name.
+        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy && !rules.protects_name(&trim_dots(&q.name)));
+        if let Some(proxy) = &proxy {
+            if let Some(ip) = proxy.answer(&q.name) {
+                return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
+                    .or_else(|| empty_answer(query));
+            }
+            // Already proxied by its address: other types (HTTPS address
+            // hints above all) must not point around the proxy.
+            if q.qtype != TYPE_A && proxy.knows(&q.name) { return empty_answer(query); }
+        }
         let entry = rules.matches(&q.name);
         if q.qtype == TYPE_AAAA { return empty_answer(query); }
         let (servers, interface) = if entry.is_some() {
@@ -1123,6 +1156,15 @@ impl Inner {
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
         let protected = rules.protects_name(&q.name);
+        // Proxy address rules (geoip, networks, §69) after the direct list's
+        // names and before its addresses: the VPN's answer decides, then
+        // the app gets our address and the proxy gets the name.
+        if q.qtype == TYPE_A && entry.is_none() && !protected && !addresses.iter().any(|ip| rules.protects_ip(*ip)) {
+            if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_by_address(&q.name, &addresses)) {
+                if self.settings.read().unwrap().epoch != epoch { return None; }
+                return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
+            }
+        }
         let direct: Vec<_> = addresses.iter().copied()
             .filter(|ip| !protected && !rules.protects_ip(*ip))
             .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
@@ -1300,6 +1342,7 @@ impl Forwarder {
                 names: Mutex::new(HashMap::new()),
                 on_direct,
                 protected_answer: RwLock::new(None),
+                proxy: RwLock::new(None),
                 inflight: AtomicUsize::new(0),
                 path_inflight: [AtomicUsize::new(0), AtomicUsize::new(0)],
                 pool: Pool::default(),
@@ -1315,6 +1358,11 @@ impl Forwarder {
 
     pub(crate) fn set_protected_answer_hook(&self, hook: Option<ProtectedAnswerHook>) {
         *self.inner.protected_answer.write().unwrap() = hook;
+    }
+
+    /// Proxied names (§69); None = no proxy rules.
+    pub fn set_proxy(&self, routing: Option<Arc<crate::split_proxy::Routing>>) {
+        *self.inner.proxy.write().unwrap() = routing;
     }
 
     pub fn set_rules(&self, direct: &[String]) {
@@ -1362,6 +1410,9 @@ impl Forwarder {
     }
 
     pub fn name_for(&self, ip: Ipv4Addr) -> Option<String> {
+        if crate::split_proxy::is_fake(ip) {
+            return self.inner.proxy.read().unwrap().as_ref().and_then(|p| p.name_for(ip));
+        }
         self.inner.names.lock().unwrap().get(&ip).cloned()
     }
 
@@ -1828,6 +1879,65 @@ mod tests {
     }
 
     /// A fake upstream on loopback answering every query with `ip`.
+    #[test]
+    fn proxied_names_answer_from_their_range_before_the_direct_list() {
+        let (local, local_seen) = fake_udp([192, 0, 2, 7], false);
+        let (tunnel, tunnel_seen) = fake_udp([10, 9, 9, 9], false);
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53, Duration::from_secs(1),
+            vec!["shared.example".into(), "direct.example".into()],
+            Upstreams { tunnel: vec![format!("127.0.0.1:{tunnel}")], local: vec![format!("127.0.0.1:{local}")],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        let routing = crate::split_proxy::Routing::new(crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080", "via:0:shared.example", "via:0:full:only.example"]));
+        forwarder.set_proxy(Some(routing.clone()));
+        let inner = forwarder.inner();
+        // In both lists: the proxy wins, and no DNS server hears the name.
+        let a = inner.resolve(&query("www.shared.example", TYPE_A, 1)).unwrap();
+        let ips = ipv4_answers(&a);
+        assert_eq!(ips.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips[0]));
+        assert_eq!(forwarder.name_for(ips[0]).as_deref(), Some("www.shared.example"));
+        for qtype in [TYPE_AAAA, TYPE_HTTPS, TYPE_MX] {
+            let other = inner.resolve(&query("only.example", qtype, 2)).unwrap();
+            assert_eq!(u16::from_be_bytes([other[6], other[7]]), 0, "type {qtype}: empty answer");
+            assert_eq!(other[3] & 0x0f, 0);
+        }
+        assert_eq!(local_seen.load(Ordering::SeqCst) + tunnel_seen.load(Ordering::SeqCst), 0);
+        // The direct list and the VPN keep working for everything else.
+        assert_eq!(ipv4_answers(&inner.resolve(&query("direct.example", TYPE_A, 3)).unwrap()), vec![Ipv4Addr::new(192, 0, 2, 7)]);
+        assert_eq!(ipv4_answers(&inner.resolve(&query("vpn.example", TYPE_A, 4)).unwrap()), vec![Ipv4Addr::new(10, 9, 9, 9)]);
+        // Without proxy rules (an older App, or none set) nothing changes.
+        forwarder.set_proxy(None);
+        assert_eq!(ipv4_answers(&inner.resolve(&query("www.shared.example", TYPE_A, 5)).unwrap()), vec![Ipv4Addr::new(192, 0, 2, 7)]);
+    }
+
+    #[test]
+    fn proxy_address_rules_follow_direct_names_and_precede_direct_addresses() {
+        // Both upstreams answer 1.2.3.4, inside the proxy's geoip-style range
+        // and inside the direct list's range.
+        let (local, _) = fake_udp([1, 2, 3, 4], false);
+        let (tunnel, tunnel_seen) = fake_udp([1, 2, 3, 4], false);
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53, Duration::from_secs(1),
+            vec!["named-direct.example".into(), "ipcidr:1.2.3.0/24".into()],
+            Upstreams { tunnel: vec![format!("127.0.0.1:{tunnel}")], local: vec![format!("127.0.0.1:{local}")],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        let routing = crate::split_proxy::Routing::new(crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080", "via:0:ipcidr:1.2.3.0/24"]));
+        forwarder.set_proxy(Some(routing.clone()));
+        let inner = forwarder.inner();
+        // A direct name rule beats the proxy's address rule.
+        assert_eq!(ipv4_answers(&inner.resolve(&query("named-direct.example", TYPE_A, 1)).unwrap()), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        // The proxy's address rule beats the direct list's address rule:
+        // asked through the VPN's DNS, answered with our address.
+        let seen = tunnel_seen.load(Ordering::SeqCst);
+        let ips = ipv4_answers(&inner.resolve(&query("cdn.example", TYPE_A, 2)).unwrap());
+        assert_eq!(tunnel_seen.load(Ordering::SeqCst), seen + 1);
+        assert!(ips.len() == 1 && crate::split_proxy::is_fake(ips[0]), "{ips:?}");
+        // Its HTTPS record cannot carry address hints around the proxy.
+        let https = inner.resolve(&query("cdn.example", TYPE_HTTPS, 3)).unwrap();
+        assert_eq!(u16::from_be_bytes([https[6], https[7]]), 0);
+    }
+
     fn fake_udp(ip: [u8; 4], truncate: bool) -> (u16, Arc<AtomicUsize>) {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = s.local_addr().unwrap().port();

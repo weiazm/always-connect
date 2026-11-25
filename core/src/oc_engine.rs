@@ -300,6 +300,11 @@ pub fn restore_without_engine(script: &str, reason: &str, support: &Path, boot: 
     if direct != "none" {
         network_guard::log(&format!("direct routes on release: {direct}"));
     }
+    let proxied = direct_routes::undo_at_start(&support.join(PROXY_ROUTES), boot, test_active);
+    if proxied != "none" {
+        network_guard::log(&format!("proxy route on release: {proxied}"));
+    }
+    if let Some(g) = network_guard::shared() { let _ = g.proxy_redirect(None); }
     if route_state_path(support).exists() {
         run_script("restore", script, support, false, test_active);
     }
@@ -379,8 +384,18 @@ pub struct Info {
     pub split_warning: Option<String>,
     #[serde(skip)]
     dns_source: std::sync::Weak<dns_forwarder::Inner>,
+    #[serde(skip)]
+    proxy_source: std::sync::Weak<crate::split_proxy::Routing>,
     pub direct_networks: Vec<String>,
     pub tail: Vec<String>,
+}
+
+/// The proxied sites of one split session (§69).
+struct ProxySession {
+    routing: Arc<crate::split_proxy::Routing>,
+    listener: Option<crate::split_proxy::Listener>,
+    /// The pf text now loaded in the proxy anchor.
+    loaded: Option<String>,
 }
 
 struct Child {
@@ -391,6 +406,10 @@ struct Child {
 
 #[derive(Clone, PartialEq, Eq)]
 struct TunnelLease { name: String, index: u32, generation: u64, confirmed_at: Instant }
+
+/// The proxied range's route journal (§69), next to direct-routes.
+pub const PROXY_ROUTES: &str = "proxy-routes";
+const PROXY_START_ERROR: &str = "代理转发没能接通，走代理的网站暂时打不开（不会改走直连）；可重新连接再试";
 
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
 const SPLIT_CAPACITY_ERROR: &str = "近一小时访问的网站过多，按网站分流暂时全部走 VPN；约一小时内自动恢复，无需重新连接";
@@ -448,6 +467,8 @@ struct Core {
     pf_error: Option<String>,
     pf_needs_load: bool,
     forwarder: Option<Forwarder>,
+    /// Proxied sites (§69) while the split runs with proxy rules.
+    proxy: Option<ProxySession>,
     physical_gateway: Option<String>,
     local_dns: Vec<String>,
     routed_networks: HashSet<String>,
@@ -480,6 +501,9 @@ pub struct Shared {
     hooks: Hooks,
     guard: Arc<Guard>,
     routes: DirectRoutes,
+    /// The proxied range's loopback route (§69), in its own journal: never
+    /// repointed with the physical network or reconciled with the list.
+    proxy_routes: DirectRoutes,
     holder: String,
     tx: Mutex<Sender<Event>>,
     /// The running child, for kill_child from another thread.
@@ -502,6 +526,7 @@ impl Engine {
     pub fn new(config: Config, hooks: Hooks, guard: Arc<Guard>) -> Engine {
         let support = PathBuf::from(&config.support_dir);
         let routes = DirectRoutes::new(support.join("direct-routes"), config.boot_session.clone(), config.no_routes);
+        let proxy_routes = DirectRoutes::new(support.join(PROXY_ROUTES), config.boot_session.clone(), config.no_routes);
         let holder = guard.new_own_holder();
         guard.own_engine_started(&holder);
         let (tx, rx) = mpsc::channel();
@@ -546,6 +571,7 @@ impl Engine {
                 pf_error: None,
                 pf_needs_load: false,
                 forwarder: None,
+                proxy: None,
                 physical_gateway: None,
                 local_dns: Vec::new(),
                 routed_networks: HashSet::new(),
@@ -574,6 +600,7 @@ impl Engine {
             hooks,
             guard,
             routes,
+            proxy_routes,
             holder,
             tx: Mutex::new(tx),
             child_pid: Mutex::new(None),
@@ -711,11 +738,16 @@ impl Engine {
     /// Site names from failed lookups belong only in the local status UI.
     pub fn split_status_json(&self) -> String {
         let info = self.info();
-        let notice = info.dns_source.upgrade().and_then(|source| source.recent_dns_notice());
+        let proxy = info.proxy_source.upgrade();
+        // A proxy failure is the more actionable line (§69); same panel slot.
+        let notice = proxy.as_ref().and_then(|p| p.recent_notice())
+            .or_else(|| info.dns_source.upgrade().and_then(|source| source.recent_dns_notice()));
         serde_json::json!({
             "splitRunning": info.split_running, "splitHits": info.split_hits,
             "splitAddresses": info.split_addresses, "splitWarning": info.split_warning,
             "pfError": info.pf_error, "dnsNotice": notice,
+            "proxyConnections": proxy.as_ref().map(|p| p.connections()),
+            "proxyHealth": proxy.map(|p| p.health_json()),
         }).to_string()
     }
 
@@ -841,6 +873,7 @@ impl Shared {
             last_terminal: c.last_terminal.map(|t| t as i32),
             split_running: c.forwarder.is_some(),
             dns_source: c.forwarder.as_ref().map(|f| Arc::downgrade(f.inner())).unwrap_or_default(),
+            proxy_source: c.proxy.as_ref().map(|p| Arc::downgrade(&p.routing)).unwrap_or_default(),
             split_hits: if c.forwarder.is_some() { c.split_hits.clone() } else { Vec::new() },
             split_warning: if c.split_policy.is_saturated() {Some(SPLIT_CAPACITY_ERROR.into())}else{c.direct_retry_warning.clone()},
             split_addresses: if c.forwarder.is_some() { c.split_addresses.len() } else { 0 },
@@ -921,6 +954,7 @@ impl Shared {
                     let rules = c.split_rules();
                     c.split_policy.revalidate(&rules);
                     self.sync_split_routes(&mut c);
+                    self.sync_proxy(&mut c);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
                 Event::EgressGateLost(generation) => self.recover_lost_gate(&mut c, generation),
@@ -1233,13 +1267,85 @@ impl Shared {
             controller.as_ref()?.steer(name, answer)
         })));
         match forwarder.start() {
-            Ok(()) => c.forwarder = Some(forwarder),
+            Ok(()) => { c.forwarder = Some(forwarder); self.sync_proxy(c); }
             Err(_) => {
                 let e = "本机 53 端口被其他程序占用，暂时不能按域名分流（全部走 VPN）".to_string();
                 c.last_error = Some(e.clone());
                 self.report(c, &e);
             }
         }
+    }
+
+    /// Proxy rules (§69) follow the split list: started with the first,
+    /// updated in place, stopped with the last. Answers start before the
+    /// redirect is in place: until then (or when it fails) a proxied site
+    /// cannot be reached at all, never reached another way.
+    fn sync_proxy(&self, c: &mut Core) {
+        let table = crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default());
+        if c.forwarder.is_none() || table.is_empty() { self.stop_proxy(c); return; }
+        // Networks inside the Mac's own LAN stay local, like the direct list's.
+        let networks = direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks());
+        let udp = table.carries_udp();
+        match &c.proxy {
+            Some(session) => session.routing.set_table(table),
+            None => c.proxy = Some(ProxySession {
+                routing: crate::split_proxy::Routing::new(table), listener: None, loaded: None,
+            }),
+        }
+        let session = c.proxy.as_mut().expect("just set");
+        if let Some(f) = &c.forwarder {
+            f.set_proxy(Some(session.routing.clone()));
+            // A proxy on this Mac resolves through us too: its own
+            // connections get real addresses by the ordinary split.
+            let inner = Arc::downgrade(f.inner());
+            session.routing.set_resolver(Some(Arc::new(move |name: &str| {
+                inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
+            })));
+        }
+        // Tests and the session harness have no pf: answers only.
+        if c.config.no_routes { return; }
+        if session.listener.is_none() {
+            match crate::split_proxy::pf_original_destination()
+                .and_then(|original| crate::split_proxy::Listener::start(session.routing.clone(), original)) {
+                Ok(listener) => session.listener = Some(listener),
+                Err(e) => network_guard::log(&format!("split proxy: listener did not start: {e}")),
+            }
+        }
+        let wanted: HashSet<String> = std::iter::once(crate::split_proxy::FAKE_NETWORK.to_owned()).chain(networks.iter().cloned()).collect();
+        let actual: HashSet<String> = self.proxy_routes.managed_addresses().into_iter().collect();
+        let gone: Vec<_> = actual.difference(&wanted).cloned().collect();
+        let new: Vec<_> = wanted.difference(&actual).cloned().collect();
+        let removed = self.proxy_routes.remove(&gone);
+        let added = self.proxy_routes.add(&new, "127.0.0.1");
+        let routed: HashSet<String> = self.proxy_routes.addresses().into_iter().collect();
+        if !removed || !added || routed != wanted { network_guard::log("split proxy: loopback routes not confirmed"); }
+        let tcp = session.listener.as_ref().map(|l| l.port());
+        let udp_port = session.listener.as_ref().filter(|_| udp).map(|l| l.udp_port());
+        let text = crate::pf::proxy_redirect(tcp, udp_port, &networks);
+        if session.loaded.as_deref() != Some(text.as_str()) {
+            match self.guard.proxy_redirect(Some(&text)) {
+                Ok(()) => session.loaded = Some(text.clone()),
+                Err(e) => { session.loaded = None; network_guard::log(&format!("split proxy: pf redirect failed: {e}")); }
+            }
+        }
+        let redirected = tcp.is_some() && routed == wanted && session.loaded.as_deref() == Some(text.as_str());
+        if !redirected {
+            c.last_error = Some(PROXY_START_ERROR.into());
+            self.report(c, PROXY_START_ERROR);
+        } else if c.last_error.as_deref() == Some(PROXY_START_ERROR) {
+            c.last_error = None;
+        }
+    }
+
+    fn stop_proxy(&self, c: &mut Core) {
+        let Some(mut session) = c.proxy.take() else { return };
+        if let Some(f) = &c.forwarder { f.set_proxy(None); }
+        if !c.config.no_routes {
+            if let Err(e) = self.guard.proxy_redirect(None) { network_guard::log(&format!("split proxy: pf redirect not removed: {e}")); }
+            if !self.proxy_routes.remove_all() { network_guard::log("split proxy: loopback route removal not confirmed"); }
+        }
+        if let Some(listener) = session.listener.as_mut() { listener.stop(); }
+        if c.last_error.as_deref() == Some(PROXY_START_ERROR) { c.last_error = None; }
     }
 
     fn sync_split_routes(&self, c: &mut Core) -> bool {
@@ -1417,7 +1523,10 @@ impl Shared {
     fn route_networks_direct(&self, c: &mut Core) {
         let suspended = c.recovery_suspended();
         if !suspended && !self.repoint_routes(c) { return; }
-        let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks()).into_iter().collect();
+        // A network the proxy rules also wrote goes to the proxy (§69).
+        let proxied=crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default()).networks();
+        let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks())
+            .into_iter().filter(|n|!proxied.contains(n)).collect();
         let actual:HashSet<String>=self.routes.managed_addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         let gone:Vec<_>=actual.difference(&wanted).cloned().collect();
         let new:Vec<_>=wanted.difference(&actual).cloned().collect();
@@ -1439,6 +1548,8 @@ impl Shared {
             let error="直连网段尚未同步完成；基础断线保护保持，可重试恢复网络";
             c.network_routes_error=Some(error.into());self.report(c,error);
         } else {c.network_routes_error=None;}
+        // The Mac's LAN may have changed which proxy networks are routed.
+        if c.proxy.is_some() { self.sync_proxy(c); }
     }
 
     fn repoint_routes(&self, c: &mut Core) -> bool {
@@ -1561,6 +1672,7 @@ impl Shared {
         }
         c.routed_networks.clear();
         c.network_routes_error=None;
+        self.stop_proxy(c);
         if let Some(f) = c.forwarder.take() {
             f.stop();
         }

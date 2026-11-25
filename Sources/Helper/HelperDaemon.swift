@@ -664,6 +664,35 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
+    /// §69.11: the update the user just approved, from the caller's own
+    /// bundle, through the same checks as the password path.
+    func updateService(_ authorization: Data, withReply reply: @escaping (Bool, String) -> Void) {
+        guard let pid = NSXPCConnection.current()?.processIdentifier else { reply(false, "没有找到发起更新的 App"); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard ServiceUpdate.authorized(authorization) else {
+                HelperSession.log("service update refused: no approval")
+                reply(false, "没有得到你的确认")
+                return
+            }
+            guard let requirement = ClientRequirement.forThisProcess,
+                  let bundle = ServiceUpdate.bundlePath(pid: pid) else {
+                HelperSession.log("service update refused: caller bundle or signature unknown")
+                reply(false, "找不到发起更新的 App")
+                return
+            }
+            let script = RootBootstrap.script(bundle: bundle, requirement: requirement, resource: "dev-helper.sh",
+                                              arguments: ["install"], helper: true,
+                                              minimumVersion: ServiceUpdate.installedVersion ?? "0")
+            guard ServiceUpdate.startDetached(script) else {
+                HelperSession.log("service update: could not start the installer")
+                reply(false, "没能启动更新")
+                return
+            }
+            HelperSession.log("service update started from the approved App bundle")
+            reply(true, "")
+        }
+    }
+
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void) {
         queue.async {
             guard self.dropProtection, self.egress.isActive, let engine = self.engine else { reply(false); return }

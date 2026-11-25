@@ -185,6 +185,8 @@ elif [ -f "$RESET" ]; then
 else
     say "reset-network.sh not found: empty our pf anchor only"
     sys pfctl -a "$ANCHOR" -F all
+    sys pfctl -a com.apple/301.AlwaysConnectProxy -F nat
+    sys pfctl -a com.apple/301.AlwaysConnectProxy -F rules
 fi
 sys launchctl bootout "system/$LABEL"
 

@@ -326,6 +326,8 @@ pub struct Guard {
     grace_wake: Condvar,
     login_wake: Condvar,
     on_grace_expired: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// The proxied sites' anchor (§69), with its own enable reference.
+    proxy: Mutex<Pfctl>,
 }
 
 static GUARD: OnceLock<Arc<Guard>> = OnceLock::new();
@@ -341,6 +343,14 @@ pub fn shared() -> Option<Arc<Guard>> {
 
 impl Guard {
     pub fn new(settings: Settings) -> Guard {
+        let proxy_pf = Pfctl {
+            path: settings.pfctl.clone(),
+            token: None,
+            #[cfg(test)]
+            bounded_load_attempts: 0,
+            #[cfg(test)]
+            audit_child_timed_out: std::cell::Cell::new(false),
+        };
         let pf = Pfctl {
             path: settings.pfctl.clone(),
             token: None,
@@ -366,7 +376,44 @@ impl Guard {
             grace_wake: Condvar::new(),
             login_wake: Condvar::new(),
             on_grace_expired: Mutex::new(None),
+            proxy: Mutex::new(proxy_pf),
         }
+    }
+
+    fn proxy_token_path(&self) -> PathBuf { self.settings.support_dir.join("proxy-pf-token") }
+
+    /// The proxied sites' redirect (§69): Some(rules text from
+    /// pf::proxy_redirect) loads it, None takes it out. Its pf enable
+    /// reference is kept in proxy-pf-token so a crashed service's is
+    /// released at the next start.
+    pub fn proxy_redirect(&self, rules: Option<&str>) -> Result<(), String> {
+        let mut pf = self.proxy.lock().unwrap();
+        let path = self.proxy_token_path();
+        match rules {
+            Some(rules) => {
+                pf.acquire_enable()?;
+                if let Some(token) = &pf.token { let _ = std::fs::write(&path, token); }
+                pf.run_input(&["-a", pf::PROXY_ANCHOR, "-f", "-"], Some(rules)).map(|_| ())
+            }
+            None => {
+                let nat = pf.run(&["-a", pf::PROXY_ANCHOR, "-F", "nat"]);
+                let rules = pf.run(&["-a", pf::PROXY_ANCHOR, "-F", "rules"]);
+                pf.release_enable();
+                let _ = std::fs::remove_file(&path);
+                nat.and(rules).map(|_| ())
+            }
+        }
+    }
+
+    /// Service start: whatever an earlier run left in the proxied sites'
+    /// anchor goes, with its enable reference.
+    fn clear_proxy_at_start(&self) {
+        let path = self.proxy_token_path();
+        let saved = std::fs::read_to_string(&path).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        let mut pf = self.proxy.lock().unwrap();
+        if pf.token.is_none() { pf.token = saved; }
+        drop(pf);
+        if self.proxy_redirect(None).is_ok() && path.exists() { let _ = std::fs::remove_file(&path); }
     }
 
     pub fn set_on_grace_expired(&self, f: Arc<dyn Fn() + Send + Sync>) {
@@ -684,6 +731,7 @@ impl Guard {
     /// grace clock. Another boot: drop it, block nothing. Files of older
     /// builds (pf-state.json) are dropped too.
     pub fn adopt_at_start(self: &Arc<Self>) {
+        self.clear_proxy_at_start();
         let mut s = self.state.lock().unwrap();
         let legacy = self.settings.support_dir.join("pf-state.json");
         if legacy.exists() {

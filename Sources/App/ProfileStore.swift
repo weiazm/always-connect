@@ -293,6 +293,18 @@ struct AppSettings: Codable, Equatable {
     var onDemandEnabled: Bool?
     var onDemandRules: [OnDemandRule]?
     var egressProtection: EgressProtection?
+    /// Sites that go through the user's SOCKS5 / HTTP proxies (DESIGN.md
+    /// §69), in order. Nil in settings from before proxies.
+    var proxyRoutes: [ProxyRoute]?
+    /// The panel's 分流直连 switch off: the 不走 VPN list rests (its rules
+    /// kept), those sites go through the VPN (§69.9). Nil = on.
+    var directPaused: Bool?
+    /// The panel's 分流代理 switch off: every proxy rests, its rules kept
+    /// (§69.8). Nil = on.
+    var proxiesPaused: Bool?
+    /// The panel's 出口保护 switch turned these protections off; turning
+    /// it on again restores them (§69.8).
+    var egressPausedRules: [UInt32]?
     /// Keep the site lists (geosite:) current from their publisher
     /// (DESIGN.md §66.30). Nil = on.
     var siteListsAutoUpdate: Bool?

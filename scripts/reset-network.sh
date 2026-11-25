@@ -42,6 +42,8 @@ fi
 LABEL=com.alwaysconnect.app.helper
 SUPPORT="/Library/Application Support/AlwaysConnect"
 ANCHOR=com.apple/300.AlwaysConnect
+# Proxied sites (DESIGN.md §69): their own anchor, route journal and pf reference.
+PROXY_ANCHOR=com.apple/301.AlwaysConnectProxy
 say() { echo "• $*"; }
 run() {
     if [ $DRY = 1 ]; then echo "  [dry-run] $*"; else "$@" >/dev/null 2>&1; fi
@@ -227,9 +229,10 @@ done
 # 2 held state (and our pf enable reference, released in step 5).
 # The route journal is undone by the script that wrote it first
 # (DESIGN.md §26.3): gateway host route, default route, tunnel DNS.
-SCOPED_PENDING=0; DIRECT_PENDING=0
+SCOPED_PENDING=0; DIRECT_PENDING=0; PROXY_PENDING=0
 restore_scoped_routes_from_journal "$SUPPORT/route-state" "$(/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null)" || SCOPED_PENDING=1
 TOKEN=$(plutil -extract token raw -o - "$SUPPORT/guard.json" 2>/dev/null || true)
+PROXY_TOKEN=$(/usr/bin/head -n 1 "$SUPPORT/proxy-pf-token" 2>/dev/null | /usr/bin/tr -cd '0-9' || true)
 if [ -f "$SUPPORT/route-state" ] && [ -x "$SUPPORT/alwaysconnect-vpnc.sh" ]; then
     say "undo the route journal"
     run env ALWAYSCONNECT_ROUTE_STATE_PATH="$SUPPORT/route-state" "$SUPPORT/alwaysconnect-vpnc.sh" restore || SCOPED_PENDING=1
@@ -257,9 +260,22 @@ if [ -f "$SUPPORT/direct-routes" ]; then
         [ -n "$NET" ] && run route -n add -net "$NET" -interface "$i"
     done
 fi
-for f in guard.json pf-state.json route-state manual-disconnect direct-routes egress.sock; do
+# The proxied range's loopback route, from its own journal (§69).
+if [ -f "$SUPPORT/proxy-routes" ]; then
+    own_known=0; own_addresses=""
+    if interface_output=$(/sbin/ifconfig -a 2>/dev/null); then
+        own_known=1
+        own_addresses=$(printf '%s\n' "$interface_output" | /usr/bin/awk '/inet / { print $2 }')
+    fi
+    retire_direct_routes "$SUPPORT/proxy-routes" "$(/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null)" "$own_known" "$own_addresses" || PROXY_PENDING=1
+fi
+for f in guard.json pf-state.json route-state manual-disconnect direct-routes proxy-routes proxy-pf-token egress.sock; do
     if [ "$f" = route-state ] && [ "$SCOPED_PENDING" = 1 ]; then
         say "scoped route cleanup unconfirmed; keep its journal for retry"
+        continue
+    fi
+    if [ "$f" = proxy-routes ] && [ "$PROXY_PENDING" = 1 ]; then
+        say "proxy route cleanup unconfirmed; keep its journal for retry"
         continue
     fi
     if [ "$f" = direct-routes ] && [ "$DIRECT_PENDING" = 1 ]; then
@@ -328,6 +344,10 @@ say "empty our pf anchor"
 ANCHOR_CONFIRMED=1
 clear_our_anchor || { ANCHOR_CONFIRMED=0; say "our pf anchor still has rules or could not be read"; }
 [ -n "$TOKEN" ] && { say "release our pf enable reference"; run pfctl -X "$TOKEN"; }
+say "empty the proxied sites' pf anchor"
+run pfctl -a "$PROXY_ANCHOR" -F nat
+run pfctl -a "$PROXY_ANCHOR" -F rules
+[ -n "$PROXY_TOKEN" ] && { say "release the proxied sites' pf enable reference"; run pfctl -X "$PROXY_TOKEN"; }
 
 # The background service back in place, idle: nothing is held any more,
 # so it starts only when the App asks and exits again without it.

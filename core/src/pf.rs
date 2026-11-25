@@ -167,6 +167,47 @@ fn valid_cidr(s: &str) -> bool {
     }
 }
 
+/// The proxied sites' anchor (DESIGN.md §69), apart from the kill switch's
+/// so it exists exactly while proxy rules run, with or without drop
+/// protection. A sibling under com.apple/, which the main ruleset evaluates
+/// for translation (rdr-anchor) and filtering alike.
+pub const PROXY_ANCHOR: &str = "com.apple/301.AlwaysConnectProxy";
+
+/// TCP to the proxied range and the networks the proxy rules wrote comes
+/// back to the listener on `tcp`, UDP to the one on `udp` (only when a
+/// SOCKS5 proxy can carry it); every other packet to them is refused at
+/// once (an ICMP error, so apps fall back without waiting). Without a
+/// listener everything to them is refused: never passed on another way.
+pub fn proxy_redirect(tcp: Option<u16>, udp: Option<u16>, networks: &[String]) -> String {
+    let range = crate::split_proxy::FAKE_NETWORK;
+    let mut targets = vec![range.to_owned()];
+    for n in networks {
+        if valid_cidr(n) && !n.contains(':') && !targets.contains(n) { targets.push(n.clone()); }
+    }
+    let to = if targets.len() == 1 { targets[0].clone() } else { format!("{{ {} }}", targets.join(", ")) };
+    let mut out = String::from("# AlwaysConnect proxied sites (generated; do not hand-edit)\n");
+    let tcp = tcp.filter(|p| *p > 0);
+    let udp = udp.filter(|p| *p > 0);
+    if let Some(port) = tcp {
+        out.push_str(&format!("rdr on lo0 inet proto tcp from any to {to} -> 127.0.0.1 port {port}\n"));
+    }
+    if let Some(port) = udp {
+        out.push_str(&format!("rdr on lo0 inet proto udp from any to {to} -> 127.0.0.1 port {port}\n"));
+    }
+    // The redirected packets are passed here, not by `rdr pass`: its states
+    // float (interface "all"), which the pre-login check refuses to judge,
+    // so a later login stopped and drop protection held the network
+    // (measured on the real Mac 2026-11-25). These states stay on lo0.
+    if let Some(port) = tcp {
+        out.push_str(&format!("pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port {port} keep state (if-bound)\n"));
+    }
+    if let Some(port) = udp {
+        out.push_str(&format!("pass in quick on lo0 inet proto udp from any to 127.0.0.1 port {port} keep state (if-bound)\n"));
+    }
+    out.push_str(&format!("block return in quick on lo0 inet from any to {to}\n"));
+    out
+}
+
 /// Before authentication there is no trusted tunnel. Keep DNS on loopback and
 /// admit only the selected gateway transport and directly attached private LANs.
 pub fn login_rules(physical: &str, gateways: &[String], port: u16, udp: bool, lans: &[String]) -> Option<String> {
@@ -310,6 +351,31 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxied_range_redirects_tcp_and_refuses_the_rest() {
+        let lines = |text: String| text.lines().filter(|l| !l.starts_with('#')).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(lines(proxy_redirect(Some(50123), None, &[])), vec![
+            "rdr on lo0 inet proto tcp from any to 198.19.128.0/17 -> 127.0.0.1 port 50123",
+            "pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port 50123 keep state (if-bound)",
+            "block return in quick on lo0 inet from any to 198.19.128.0/17",
+        ]);
+        let nets = vec!["203.0.113.0/24".to_owned(), "bad".to_owned(), "2001:db8::/32".to_owned(), "203.0.113.0/24".to_owned()];
+        assert_eq!(lines(proxy_redirect(Some(1), Some(2), &nets)), vec![
+            "rdr on lo0 inet proto tcp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 1",
+            "rdr on lo0 inet proto udp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 2",
+            "pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port 1 keep state (if-bound)",
+            "pass in quick on lo0 inet proto udp from any to 127.0.0.1 port 2 keep state (if-bound)",
+            "block return in quick on lo0 inet from any to { 198.19.128.0/17, 203.0.113.0/24 }",
+        ]);
+        // No floating states: the pre-login check reads every state.
+        assert!(!proxy_redirect(Some(1), Some(2), &nets).contains("rdr pass"));
+        assert!(!proxy_redirect(None, None, &nets).contains("rdr"));
+        assert!(proxy_redirect(None, None, &nets).contains("203.0.113.0/24"), "no listener: still refused");
+        assert!(!proxy_redirect(Some(0), None, &[]).contains("rdr"));
+        assert_ne!(PROXY_ANCHOR, ANCHOR);
+        assert!(PROXY_ANCHOR.starts_with("com.apple/"));
+    }
 
     #[test]
     fn unauthenticated_login_has_only_the_carrier_and_lan_exceptions() {

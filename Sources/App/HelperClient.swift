@@ -58,6 +58,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private var loginPreparationProfileName: String?
     private var loginIntentActive = false
     private var pendingProtectedStart: UInt64?
+    /// The background service did not answer the protected-login request
+    /// in time (it had just started, e.g. after an update): tries again
+    /// itself, twice, before saying so (§69.10).
+    private var protectedLoginRetries = 0
+    private var protectedLoginRetryPending = false
+    static let protectedLoginRetryLimit = 2
     private var endingApp = false
     private let connectionCheck = ConnectionCheck()
     @Published private(set) var helperAvailable = false
@@ -474,6 +480,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         state != .disconnected || networkHeld || loginProtectionNotice != nil || gatewayTrustFailed
     }
 
+    /// A protected login that stopped before connecting (its notice says
+    /// why) with the network not held: nothing is on, so the panel's VPN
+    /// switch shows off and turning it on tries again (user 2026-11-25:
+    /// "没连上开关为什么是打开的").
+    var loginStopped: Bool {
+        state == .disconnected && !networkHeld && !gatewayTrustFailed && pendingProtectedStart == nil && !protectedLoginRetryPending
+            && loginProtectionNotice != nil && loginProtectionNotice != ProtectedLoginNotice.preparingGateway
+    }
+
     private func connect(server: String, group: String, username: String, password: String, session: UInt64, onAccepted: (() -> Void)? = nil) {
         guard onDemand.permitsConnection() else { return }
         guard protection.isSessionCurrent(session) else { return }
@@ -618,6 +633,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     func disconnectByUser() {
+        protectedLoginRetries = 0
+        protectedLoginRetryPending = false
         protection.invalidate(.manualStop)
         onDemand.userStop()
     }
@@ -875,17 +892,61 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     return
                 }
                 self.helperUpdatePending = true
-                HelperInstaller.install(prompt: HelperInstaller.updatePrompt) { [weak self] _ in
+                HelperInstaller.install(prompt: HelperInstaller.updatePrompt) { [weak self] result in
                     DispatchQueue.main.async {
                         guard let self else { return }
                         self.helperUpdatePending = false
                         self.refreshStatus()
-                        self.finishLaunchConnection(connect)
+                        guard case .success = result else { self.finishLaunchConnection(connect); return }
+                        // Connect only once the new service answers (§69.10).
+                        self.waitUntilServiceAnswers(deadline: Date().addingTimeInterval(10)) { [weak self] _ in
+                            self?.finishLaunchConnection(connect)
+                        }
                     }
                 }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { decide(-1) }
             proxy.getStatus { code, _ in DispatchQueue.main.async { decide(code) } }
+        }
+    }
+
+    /// §69.11: hands the user's approval to the installed service, which
+    /// updates itself. nil = no answer in 3 s (the caller falls back to the
+    /// password path); false + reason = refused; true = started.
+    func askServiceToUpdate(_ authorization: Data, completion: @escaping (Bool?, String) -> Void) {
+        var pending = true
+        func finish(_ started: Bool?, _ reason: String) {
+            guard pending else { return }
+            pending = false
+            completion(started, reason)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil, "") }
+        ensureConnection { proxy in
+            proxy.updateService(authorization) { started, reason in
+                DispatchQueue.main.async { finish(started, reason) }
+            }
+        }
+    }
+
+    /// After the service was replaced: true once the new one answers
+    /// (getStatus), false at `deadline`. Logging in before it is ready
+    /// left the first protected login unanswered (§69.10).
+    func waitUntilServiceAnswers(deadline: Date, completion: @escaping (Bool) -> Void) {
+        var answered = false
+        ensureConnection { proxy in
+            proxy.getStatus { _, _ in
+                DispatchQueue.main.async {
+                    guard !answered else { return }
+                    answered = true
+                    completion(true)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, !answered else { return }
+            answered = true
+            if Date() >= deadline { completion(false); return }
+            self.waitUntilServiceAnswers(deadline: deadline, completion: completion)
         }
     }
 
@@ -938,8 +999,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
                             var splitRunning: Bool; var splitWarning: String?; var pfError: String?; var dnsNotice: String?
+                            var proxyHealth: [ProxyTraffic]?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
+                        if let rows = status?.proxyHealth, !rows.isEmpty {
+                            ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
+                        }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
                         self.dnsNotice = status?.dnsNotice
                         self.splitWarning = status?.splitWarning
@@ -1093,6 +1158,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             SettingsLink.shared.send("connect")
             return true
         }
+        if manual { protectedLoginRetries = 0; protectedLoginRetryPending = false }
         onDemand.requestConnection(manual: manual) { [weak self] in _ = self?.startStoredConnection(allowLookup: manual) }
         return hasCredentials
     }
@@ -1153,10 +1219,28 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             pendingProtectedStart = nil
             resetGatewayPreparation()
             guard let (ok, peers, notice) = result else {
-                loginProtectionNotice = "后台服务没有及时确认网络拦截，已停止登录。"
+                // No answer in 3 s: nothing was logged in and the network
+                // was not cut. A service that just started (an update, a
+                // restart) is usually ready a moment later.
                 refreshHeld()
+                if protectedLoginRetries < Self.protectedLoginRetryLimit {
+                    protectedLoginRetries += 1
+                    protectedLoginRetryPending = true
+                    loginProtectionNotice = ProtectedLoginNotice.serviceSlowRetrying
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        guard let self, self.protectedLoginRetryPending else { return }
+                        self.protectedLoginRetryPending = false
+                        guard self.loginIntentActive, self.state == .disconnected, !self.networkHeld,
+                              self.pendingProtectedStart == nil, !self.endingApp, !self.resettingNetwork else { return }
+                        _ = self.startStoredConnection()
+                    }
+                    return
+                }
+                protectedLoginRetries = 0
+                loginProtectionNotice = ProtectedLoginNotice.serviceDidNotAnswer
                 return
             }
+            protectedLoginRetries = 0
             guard ok else {
                 loginProtectionNotice = notice
                 if [ProtectedLoginNotice.noTrustedAddress, ProtectedLoginNotice.preparationTimedOut,

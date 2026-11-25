@@ -9,31 +9,42 @@ import SwiftUI
 /// hidden label (labelsHidden) is honoured; otherwise label left,
 /// switch right, as in System Settings rows.
 struct AlwaysSwitchStyle: ToggleStyle {
-    @Environment(\.isEnabled) private var isEnabled
-
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 8) {
             configuration.label
             Spacer(minLength: 8)
-            ZStack(alignment: configuration.isOn ? .trailing : .leading) {
-                Capsule()
-                    .fill(configuration.isOn ? Color.accentColor : Color.secondary.opacity(0.32))
-                Circle()
-                    .fill(Color.white)
-                    .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
-                    .padding(2)
-            }
-            .frame(width: 34, height: 20)
-            .opacity(isEnabled ? 1 : 0.45)
-            .animation(.easeOut(duration: 0.15), value: configuration.isOn)
-            .contentShape(Capsule())
-            .onTapGesture { configuration.isOn.toggle() }
-            .accessibilityElement()
-            .accessibilityLabel("开关")
-            .accessibilityValue(configuration.isOn ? "开" : "关")
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { configuration.isOn.toggle() }
+            AlwaysSwitchTrack(isOn: configuration.$isOn)
         }
+    }
+}
+
+/// The switch itself, also on its own where a label would take room
+/// (the panel's tiles).
+struct AlwaysSwitchTrack: View {
+    @Binding var isOn: Bool
+    var width: CGFloat = 34
+    var height: CGFloat = 20
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        ZStack(alignment: isOn ? .trailing : .leading) {
+            Capsule()
+                .fill(isOn ? Color.accentColor : Color.secondary.opacity(0.32))
+            Circle()
+                .fill(Color.white)
+                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                .padding(2)
+        }
+        .frame(width: width, height: height)
+        .opacity(isEnabled ? 1 : 0.45)
+        .animation(.easeOut(duration: 0.15), value: isOn)
+        .contentShape(Capsule())
+        .onTapGesture { if isEnabled { isOn.toggle() } }
+        .accessibilityElement()
+        .accessibilityLabel("开关")
+        .accessibilityValue(isOn ? "开" : "关")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { if isEnabled { isOn.toggle() } }
     }
 }
 

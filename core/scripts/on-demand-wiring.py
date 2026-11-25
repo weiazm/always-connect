@@ -224,6 +224,9 @@ final class Client {
     var endingApp = false
     var protectsDrops: Bool { ProfileStore.loadAppSettings().isDropProtectionOn }
     var pendingProtectedStart: UInt64?
+    var protectedLoginRetries = 0
+    var protectedLoginRetryPending = false
+    static let protectedLoginRetryLimit = 2
     var splitWarning: String?
     var awaitingCiscoStart = false
     var loginIntentActive = false
@@ -279,7 +282,10 @@ final class Client {
     func refreshStatus() { onDemandDisconnect.recheck() }
     func markHelperReachable() { helperUnresponsive = false }
     func scheduleRestartRecovery(wasActive: Bool) {}
+    /// The service gives no answer within the App's 3 s.
+    var rpcSilent = false
     func egressRPC<Value>(_ call: @escaping (Proxy, @escaping (Value) -> Void) -> Void, completion: @escaping (Value?) -> Void) {
+        if rpcSilent { completion(nil); return }
         call(proxy) { completion($0) }
     }
     var exerciseCommonLogin = false
@@ -685,6 +691,28 @@ final class ViewLifecycle {
         check(failedJoin.starts == 0 && failedJoin.loginPreparation.checks == 0 &&
               failedJoin.proxy.finishPeers == [""] && failedJoin.gatewayTrustFailed && failedJoin.rejectedLoginHeld,
               "rejection during the service round trip blocks without a second lookup")
+        // §69.10: a service that does not answer in time (it just
+        // started) is asked again twice; then the login stops, said plainly.
+        let silent = Client()
+        silent.exerciseCommonLogin = true
+        silent.rpcSilent = true
+        silent.onDemand.configure(enabled: false, rules: [])
+        DispatchQueue.main.timers = []
+        _ = silent.connectWithStoredCredentials()
+        check(silent.loginProtectionNotice == ProtectedLoginNotice.serviceSlowRetrying && silent.protectedLoginRetryPending
+              && DispatchQueue.main.timers.count == 1 && silent.starts == 0 && !silent.networkHeld,
+              "an unanswered protected login is retried, never logged in unprotected")
+        for _ in 0..<3 {
+            let due = DispatchQueue.main.timers
+            DispatchQueue.main.timers = []
+            due.forEach { $0() }
+        }
+        check(silent.loginProtectionNotice == ProtectedLoginNotice.serviceDidNotAnswer && !silent.protectedLoginRetryPending
+              && silent.protectedLoginRetries == 0 && silent.starts == 0 && !silent.networkHeld && DispatchQueue.main.timers.isEmpty,
+              "after two retries the login stops with a plain reason")
+        silent.rpcSilent = false
+        _ = silent.connectWithStoredCredentials(manual: true)
+        check(silent.starts == 1 && silent.networkHeld, "turning it on again logs in once the service answers")
         let restored = Client()
         restored.exerciseCommonLogin = true
         restored.proxy.cachedGateway = false

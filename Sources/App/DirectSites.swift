@@ -143,8 +143,11 @@ extension DirectSites {
 extension AppSettings {
     /// The rules the own connection's DNS forwarder gets: names, site
     /// lists and geoip expanded (§26.13) by the Rust core into one
-    /// newline-joined text (§66.30); networks go elsewhere.
+    /// newline-joined text (§66.30); networks go elsewhere. The proxies'
+    /// lines ride along after it (§69): an older service ignores them.
     var directRuleText: String {
-        GeoData.expand(listRules.map(\.text), networks: false)
+        let direct = GeoData.expand(listRules.map(\.text), networks: false)
+        let proxies = proxyLines.joined(separator: "\n")
+        return direct.isEmpty ? proxies : (proxies.isEmpty ? direct : direct + "\n" + proxies)
     }
 }

@@ -152,6 +152,15 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Own connection: send the scheduled login retry now (an expired phone
     /// approval, §30.9). False when no retry is waiting.
     func retryLoginNow(withReply reply: @escaping (Bool) -> Void)
+    /// The service updates itself from the calling App's bundle (DESIGN.md
+    /// §69.11). `authorization`: an AuthorizationExternalForm holding the
+    /// ServiceUpdateRight the user just granted (Touch ID or password).
+    /// The service checks that right with the system, then runs the same
+    /// root bootstrap as the password path (snapshot, certificate pin,
+    /// no older version) detached, and replies at once: true = started.
+    /// Only called when the installed service declares it can (its
+    /// launchd plist carries ALWAYSCONNECT_SERVICE_UPDATE).
+    func updateService(_ authorization: Data, withReply reply: @escaping (Bool, String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the
     /// engine loads no pf set and a drop gives the local network back
     /// while it retries. In force at once in a running session, else
@@ -184,9 +193,19 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 }
 
 
+/// The right the App asks the user for before the service updates itself
+/// (§69.11): an Apple-defined admin right that is not password-only, so
+/// the system dialog offers Touch ID; not shared, five minutes.
+enum ServiceUpdateRight {
+    static let name = "com.apple.auth.admin"
+}
+
 enum ProtectedLoginNotice {
     static let preparationTimedOut = "查找 VPN 服务器超时。网络已拦截，请恢复直连后重试。"
     static let preparationUnavailable = "网络已拦截。无法确认可用于查找网关的直连网络，请恢复直连后重试。"
     static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
     static let preparingGateway = "首次连接正在查网关，当前仍直连"
+    /// The App's own (§69.10): the service did not answer in 3 s.
+    static let serviceSlowRetrying = "后台服务还在准备断线保护，稍后自动重试；网络照常直连"
+    static let serviceDidNotAnswer = "没有连接：后台服务没能及时设好断线保护，为免漏网先不登录。网络照常直连，打开开关可重试"
 }

@@ -11,13 +11,24 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/.local-build/AlwaysConnect.app"
 DST=/Applications/AlwaysConnect.app
 [ -d "$SRC" ] || { echo "build first: scripts/build-local.sh" >&2; exit 1; }
-if pgrep -f "AlwaysConnect.app/Contents/MacOS/AlwaysConnect" >/dev/null; then
+running() { pgrep -f "AlwaysConnect.app/Contents/MacOS/AlwaysConnect" >/dev/null; }
+if running; then
     echo "quitting the running AlwaysConnect (VPN off, direct network)"
-    osascript -e 'tell application id "com.alwaysconnect.app" to quit' >/dev/null 2>&1 || true
-    for _ in $(seq 1 20); do
-        pgrep -f "AlwaysConnect.app/Contents/MacOS/AlwaysConnect" >/dev/null || break
-        sleep 1
+    # The first quit may not take while a session winds down: ask again,
+    # and never replace the bundle under a running App (2026-11-25: the
+    # old App kept running from the replaced bundle).
+    for attempt in 1 2; do
+        osascript -e 'tell application id "com.alwaysconnect.app" to quit' >/dev/null 2>&1 || true
+        for _ in $(seq 1 20); do
+            running || break
+            sleep 1
+        done
+        running || break
     done
+    if running; then
+        echo "AlwaysConnect did not quit; nothing replaced" >&2
+        exit 1
+    fi
 fi
 rm -rf "$DST"
 ditto "$SRC" "$DST"
