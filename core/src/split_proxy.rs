@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod owner;
 mod protocol;
 mod relay;
 pub use protocol::{http_connect, open_through, socks5_connect, udp_associate, udp_unwrap, udp_wrap};
@@ -212,6 +213,17 @@ impl Table {
         out
     }
 
+    /// Ports of proxies running on this Mac: their own connections come
+    /// back here and must not be sent to them again.
+    fn local_ports(&self) -> Vec<u16> {
+        let mut out: Vec<u16> = self.servers.iter().flatten()
+            .filter(|s| s.host == "localhost" || s.host == "::1" || s.host.starts_with("127."))
+            .map(|s| s.port).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// UDP is redirected only when some proxy can carry it (SOCKS5).
     pub fn carries_udp(&self) -> bool {
         self.servers.iter().flatten().any(|s| s.kind == Kind::Socks5)
@@ -267,10 +279,23 @@ impl Pool {
     fn knows(&self, name: &str) -> bool { self.by_name.contains_key(name) }
 }
 
+/// The real addresses of a name by the ordinary split (proxy rules
+/// skipped), for a local proxy's own connections.
+pub type Resolver = Arc<dyn Fn(&str) -> Vec<Ipv4Addr> + Send + Sync>;
+
+/// How long the processes behind local proxies' ports are remembered.
+const LOCAL_PIDS_FOR: Duration = Duration::from_secs(30);
+
 /// Shared by the DNS forwarder (answers) and the listener (connections).
 #[derive(Default)]
 pub struct Routing {
     table: RwLock<Arc<Table>>,
+    resolver: RwLock<Option<Resolver>>,
+    /// Processes listening on local proxies' ports, and when looked up.
+    local_pids: Mutex<Option<(Instant, Vec<u16>, Vec<i32>)>>,
+    /// Tests whose stand-in proxies share the test's own process.
+    #[cfg(test)]
+    same_process_proxies: std::sync::atomic::AtomicBool,
     pool: Mutex<Pool>,
     notice: Mutex<Option<(Instant, String)>>,
     logged: Mutex<HashMap<String, Instant>>,
@@ -291,6 +316,43 @@ impl Routing {
     }
 
     pub fn table(&self) -> Arc<Table> { self.table.read().unwrap().clone() }
+
+    pub fn set_resolver(&self, resolver: Option<Resolver>) { *self.resolver.write().unwrap() = resolver; }
+
+    /// Whether the app socket on `port` belongs to a proxy running on this
+    /// Mac (its own outbound connection, after resolving the proxied name
+    /// through the same resolver). Looked up only when such a proxy exists.
+    pub(crate) fn from_local_proxy(&self, proto: Proto, port: u16) -> bool {
+        #[cfg(test)]
+        if self.same_process_proxies.load(Ordering::Relaxed) { return false; }
+        let ports = self.table().local_ports();
+        if ports.is_empty() { return false; }
+        let lookup = |ports: &[u16]| -> Vec<i32> { ports.iter().flat_map(|p| owner::listeners(*p)).collect() };
+        let alive = |pid: &i32| unsafe { libc::kill(*pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let mut cached = self.local_pids.lock().unwrap();
+        // Looked up again when the ports changed, every LOCAL_PIDS_FOR, when
+        // a proxy process ended (restarted) or, if none was found, after 5 s:
+        // never a scan of every process per connection.
+        let stale = match cached.as_ref() {
+            None => true,
+            Some((at, known, pids)) => *known != ports || at.elapsed() >= LOCAL_PIDS_FOR || !pids.iter().all(alive)
+                || (pids.is_empty() && at.elapsed() >= Duration::from_secs(5)),
+        };
+        if stale { *cached = Some((Instant::now(), ports.clone(), lookup(&ports))); }
+        let pids = cached.as_ref().map(|c| c.2.clone()).unwrap_or_default();
+        drop(cached);
+        pids.iter().any(|pid| owner::owns(*pid, proto, port))
+    }
+
+    /// Where a local proxy's own connection to `target` really goes: the
+    /// name's address by the ordinary split. A written network is never
+    /// passed through (its route leads back here); None refuses.
+    pub(crate) fn passthrough(&self, target: &Target) -> Option<Ipv4Addr> {
+        let Target::Name(name) = target else { return None };
+        let resolver = self.resolver.read().unwrap().clone()?;
+        let table = self.table();
+        resolver(name).into_iter().find(|ip| !is_fake(*ip) && table.route_ip(*ip).is_none())
+    }
 
     pub fn is_empty(&self) -> bool { self.table.read().unwrap().is_empty() }
 

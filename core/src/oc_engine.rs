@@ -1292,7 +1292,15 @@ impl Shared {
             }),
         }
         let session = c.proxy.as_mut().expect("just set");
-        if let Some(f) = &c.forwarder { f.set_proxy(Some(session.routing.clone())); }
+        if let Some(f) = &c.forwarder {
+            f.set_proxy(Some(session.routing.clone()));
+            // A proxy on this Mac resolves through us too: its own
+            // connections get real addresses by the ordinary split.
+            let inner = Arc::downgrade(f.inner());
+            session.routing.set_resolver(Some(Arc::new(move |name: &str| {
+                inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
+            })));
+        }
         // Tests and the session harness have no pf: answers only.
         if c.config.no_routes { return; }
         if session.listener.is_none() {

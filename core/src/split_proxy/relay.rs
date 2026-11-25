@@ -96,7 +96,11 @@ enum FlowState {
     Refused(Instant),
 }
 
-struct Flow { state: FlowState, target: Target, port: u16, last: Instant, control: Option<TcpStream> }
+struct Flow {
+    state: FlowState, target: Target, port: u16, last: Instant, control: Option<TcpStream>,
+    /// A local proxy's own datagrams: sent as they are to the real address.
+    raw: bool,
+}
 
 type Flows = Arc<Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Flow>>>;
 
@@ -215,6 +219,9 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
         Ok(target) => target,
         Err((site, reason)) => { routing.failed(&site, &reason); reset(&client); return; }
     };
+    // A proxy on this Mac connecting for its own upstream: the ordinary
+    // split, never back into the proxy (a loop).
+    let local_proxy = addresses.is_some_and(|(peer, _)| routing.from_local_proxy(Proto::Tcp, peer.port()));
     let id = {
         let mut open = open.lock().unwrap();
         open.next += 1;
@@ -223,7 +230,17 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
         id
     };
     let forget = || { open.lock().unwrap().streams.remove(&id); };
-    let (upstream, early) = match open_through(&server, &target, destination.port()) {
+    let opened = if local_proxy {
+        match routing.passthrough(&target) {
+            Some(ip) => TcpStream::connect_timeout(&SocketAddr::from((ip, destination.port())), Duration::from_secs(8))
+                .map(|stream| { no_sigpipe(&stream); (stream, Vec::new()) })
+                .map_err(|e| format!("本机代理自己的连接没能接通（{e}）")),
+            None => Err("本机代理自己的连接没有可用的真实地址".to_owned()),
+        }
+    } else {
+        open_through(&server, &target, destination.port())
+    };
+    let (upstream, early) = match opened {
         Ok(opened) => opened,
         Err(reason) => { routing.failed(&target.label(), &reason); reset(&client); forget(); return; }
     };
@@ -270,7 +287,8 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         match &flow.state {
             FlowState::Ready(relay) => {
                 flow.last = now;
-                if let Some(packet) = udp_wrap(&flow.target, flow.port, payload) { let _ = relay.send(&packet); }
+                if flow.raw { let _ = relay.send(payload); }
+                else if let Some(packet) = udp_wrap(&flow.target, flow.port, payload) { let _ = relay.send(&packet); }
                 return;
             }
             FlowState::Pending => return,
@@ -282,7 +300,8 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         Ok(target) => target,
         Err((site, reason)) => { routing.failed(&site, &reason); return; }
     };
-    if server.kind != Kind::Socks5 {
+    let raw = routing.from_local_proxy(Proto::Udp, app.port());
+    if server.kind != Kind::Socks5 && !raw {
         // HTTP CONNECT carries TCP only; the app falls back to TCP.
         return;
     }
@@ -290,14 +309,23 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         table.retain(|_, flow| flow.last.elapsed() < UDP_IDLE);
         if table.len() >= MAX_FLOWS { routing.failed(&target.label(), "同时经代理的 UDP 太多"); return; }
     }
-    table.insert(key, Flow { state: FlowState::Pending, target: target.clone(), port: destination.port(), last: now, control: None });
+    table.insert(key, Flow { state: FlowState::Pending, target: target.clone(), port: destination.port(), last: now, control: None, raw });
     drop(table);
     let first = payload.to_vec();
     let (udp, routing, stopped) = (udp.clone(), routing.clone(), stopped.clone());
     let thread_flows = flows.clone();
     let started = std::thread::Builder::new().name("ac-proxy-udp".into()).stack_size(STACK).spawn(move || {
         let flows = thread_flows;
-        let (control, relay) = match udp_associate(&server) {
+        let opened = if raw {
+            routing.passthrough(&target).ok_or_else(|| "本机代理自己的 UDP 没有可用的真实地址".to_owned())
+                .and_then(|ip| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                    .and_then(|s| s.connect((ip, destination.port())).map(|_| s))
+                    .map_err(|e| format!("本机代理自己的 UDP 没能接通（{e}）")))
+                .map(|socket| (None, socket))
+        } else {
+            udp_associate(&server).map(|(control, socket)| (Some(control), socket))
+        };
+        let (control, relay) = match opened {
             Ok(opened) => opened,
             Err(reason) => {
                 routing.failed(&target.label(), &reason);
@@ -312,15 +340,17 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
             let Some(flow) = table.get_mut(&key) else { return };
             if stopped.load(Ordering::Acquire) { return; }
             flow.state = FlowState::Ready(relay.clone());
-            flow.control = control.try_clone().ok();
+            flow.control = control.as_ref().and_then(|c| c.try_clone().ok());
         }
         routing.opened();
-        if let Some(packet) = udp_wrap(&target, destination.port(), &first) { let _ = relay.send(&packet); }
+        if raw { let _ = relay.send(&first); }
+        else if let Some(packet) = udp_wrap(&target, destination.port(), &first) { let _ = relay.send(&packet); }
         let mut buffer = vec![0u8; 65535];
         loop {
             match relay.recv(&mut buffer) {
                 Ok(n) => {
-                    if let Some(data) = udp_unwrap(&buffer[..n]) {
+                    let data = if raw { Some(&buffer[..n]) } else { udp_unwrap(&buffer[..n]) };
+                    if let Some(data) = data {
                         // pf turns our source back into the address the app used.
                         let _ = udp.send_to(data, app);
                         if let Some(flow) = flows.lock().unwrap().get_mut(&key) { flow.last = Instant::now(); }

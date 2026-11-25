@@ -1069,6 +1069,24 @@ impl Inner {
     }
 
     fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
+        self.resolve_with(query, session, false)
+    }
+
+    /// A name's IPv4 addresses by the ordinary split, proxy rules skipped:
+    /// a proxy running on this Mac connecting for its own upstream (§69).
+    /// Direct names get their direct route first, as for any lookup.
+    pub fn resolve_plain(&self, name: &str) -> Vec<Ipv4Addr> {
+        let mut query = vec![0x51, 0x7a, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in trim_dots(name).split('.') {
+            if label.is_empty() || label.len() > 63 { return Vec::new(); }
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        self.resolve_with(&query, None, true).map(|answer| ipv4_answers(&answer)).unwrap_or_default()
+    }
+
+    fn resolve_with(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>, skip_proxy: bool) -> Option<Vec<u8>> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
             let settings = self.settings.read().unwrap();
@@ -1078,7 +1096,7 @@ impl Inner {
         // Proxied names (§69) come before the direct list: a name in both
         // goes through its proxy, never direct. Exit-protected names stay
         // in the VPN. No DNS server is asked about a proxied name.
-        let proxy = self.proxy.read().unwrap().clone().filter(|_| !rules.protects_name(&trim_dots(&q.name)));
+        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy && !rules.protects_name(&trim_dots(&q.name)));
         if let Some(proxy) = &proxy {
             if let Some(ip) = proxy.answer(&q.name) {
                 return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }

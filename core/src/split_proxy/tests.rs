@@ -274,6 +274,8 @@ struct Rig { listener: Listener, routing: Arc<Routing>, meant: Arc<Mutex<HashMap
 
 fn rig(lines: &[String]) -> Rig {
     let routing = Routing::new(Table::parse(lines));
+    // The stand-in proxies live in this process, like the test's apps.
+    routing.same_process_proxies.store(true, Ordering::Relaxed);
     let meant: Arc<Mutex<HashMap<u16, SocketAddrV4>>> = Arc::default();
     let lookup = meant.clone();
     let original: OriginalDestination = Arc::new(move |_proto, peer: SocketAddrV4, _local| lookup.lock().unwrap().get(&peer.port()).copied());
@@ -573,4 +575,51 @@ fn interop_with_a_reference_socks5_server() {
         }
         assert_eq!(answered.as_deref(), Some(&b"datagram"[..]), "UDP via {target:?}");
     }
+}
+
+/// A proxy running on this Mac (another process) resolves the proxied
+/// name through us and connects to our address for its own upstream:
+/// that connection goes to the real address, never back into the proxy.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_local_proxys_own_connection_goes_to_the_real_address() {
+    use std::io::BufRead;
+    let site = origin();
+    let r = rig(&list(&[]));
+    r.routing.same_process_proxies.store(false, Ordering::Relaxed);
+    let script = "import socket,sys\n\
+l=socket.socket(); l.bind(('127.0.0.1',0)); l.listen(1)\n\
+c=socket.socket(); c.bind(('127.0.0.1',0))\n\
+print(l.getsockname()[1], c.getsockname()[1], flush=True)\n\
+sys.stdin.readline()\n\
+c.connect(('127.0.0.1', int(sys.argv[1]))); c.sendall(b'ping')\n\
+print(c.recv(16).decode() or 'closed', flush=True)\n";
+    let mut child = std::process::Command::new("/usr/bin/python3").args(["-c", script, &r.listener.port().to_string()])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut out = io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let ports: Vec<u16> = line.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    // The child's listening port is the configured proxy.
+    r.routing.set_table(Table::parse(&list(&[&format!("proxy:0 socks5 127.0.0.1 {}", ports[0]), "via:0:site.example"])));
+    let resolved = Arc::new(AtomicUsize::new(0));
+    let count = resolved.clone();
+    r.routing.set_resolver(Some(Arc::new(move |name: &str| {
+        assert_eq!(name, "site.example");
+        count.fetch_add(1, Ordering::SeqCst);
+        vec![Ipv4Addr::LOCALHOST]
+    })));
+    let ip = r.routing.answer("site.example").unwrap();
+    r.meant.lock().unwrap().insert(ports[1], SocketAddrV4::new(ip, site.address.port()));
+    child.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+    line.clear();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ping", "echoed by the real site");
+    assert_eq!(site.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(resolved.load(Ordering::SeqCst), 1);
+    let _ = child.wait();
+    // This process is not the proxy: its connection still goes to the proxy
+    // (which does not speak SOCKS here, so it is refused, never passed through).
+    refused(r.open("site.example", site.address.port()));
+    assert_eq!(site.accepted.load(Ordering::SeqCst), 1);
 }
