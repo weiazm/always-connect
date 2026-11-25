@@ -938,8 +938,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
                             var splitRunning: Bool; var splitWarning: String?; var pfError: String?; var dnsNotice: String?
+                            var proxyHealth: [ProxyTraffic]?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
+                        if let rows = status?.proxyHealth, !rows.isEmpty {
+                            ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
+                        }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
                         self.dnsNotice = status?.dnsNotice
                         self.splitWarning = status?.splitWarning

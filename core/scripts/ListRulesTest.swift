@@ -146,6 +146,14 @@ struct ListRulesTest {
         check("a switched-off or empty proxy is not sent", !lines.contains { $0.contains("off.example") || $0.contains("proxy.lan") })
         check("an invalid address is still declared, so its sites are refused, not freed",
               lines.contains("proxy:1 http invalid 0") && lines.contains("via:1:bad.example"))
+        // The panel's 代理 switch (§69.8): paused sends no proxy at all; the
+        // rules stay, and the old settings (no key) count as on.
+        var paused = proxied
+        paused.proxiesPaused = true
+        check("paused proxies send no proxy lines and keep their rules",
+              paused.proxyLines.isEmpty && paused.activeProxyRoutes.isEmpty && paused.proxyRoutes?.count == 4)
+        check("settings without the switch have proxies on", proxied.proxiesOn && proxied.activeProxyRoutes.map(\.name) == ["a", "bad"])
+        check("the check uses the same server line", proxied.proxyRoutes![1].serverLine(password: nil) == "socks5 127.0.0.1 1080")
         // Username and password: percent-encoded, the password from the keychain stand-in.
         ProxyPasswords.read = { _ in "p@ss word" }
         var withLogin = AppSettings()

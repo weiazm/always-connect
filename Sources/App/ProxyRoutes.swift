@@ -99,7 +99,34 @@ func proxyFieldEncode(_ value: String) -> String {
     }.joined()
 }
 
+extension ProxyRoute {
+    /// "<kind> <host> <port> [<user> <password>]" as the Rust core reads
+    /// it. An invalid address still declares the proxy (it is refused
+    /// there): its sites must not fall back to another path. A missing
+    /// password still sends the username: the proxy's refusal names the
+    /// problem instead of a silent change.
+    func serverLine(password: String?) -> String {
+        let host = Self.validHost(host) ? host : "invalid"
+        let port = Self.validPort(port) ? port : 0
+        var line = "\(kind.rawValue) \(host) \(port)"
+        if let user = username, !user.isEmpty {
+            let password = password ?? ""
+            line += " \(proxyFieldEncode(user)) \(password.isEmpty ? "%00" : proxyFieldEncode(password))"
+        }
+        return line
+    }
+}
+
 extension AppSettings {
+    var proxiesOn: Bool { proxiesPaused != true }
+
+    /// The proxies the background service gets, in order: proxy n in its
+    /// status is the n-th of these.
+    var activeProxyRoutes: [ProxyRoute] {
+        guard proxiesOn else { return [] }
+        return (proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
+    }
+
     /// The proxies as the background service reads them, inside the split
     /// list: "proxy:<n> <kind> <host> <port> [<user> <password>]", then
     /// "via:<n>:<rule>" per expanded rule (geoip as "ipcidr:") and
@@ -109,20 +136,8 @@ extension AppSettings {
     /// there, never direct.
     var proxyLines: [String] {
         var out: [String] = []
-        let routes = (proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
-        for (index, route) in routes.enumerated() {
-            // An invalid address still declares the proxy (it is refused
-            // there): its sites must not fall back to another path.
-            let host = ProxyRoute.validHost(route.host) ? route.host : "invalid"
-            let port = ProxyRoute.validPort(route.port) ? route.port : 0
-            var line = "proxy:\(index) \(route.kind.rawValue) \(host) \(port)"
-            if let user = route.username, !user.isEmpty {
-                // A missing password still sends the username: the proxy's
-                // refusal names the problem instead of a silent change.
-                let password = ProxyPasswords.password(for: route) ?? ""
-                line += " \(proxyFieldEncode(user)) \(password.isEmpty ? "%00" : proxyFieldEncode(password))"
-            }
-            out.append(line)
+        for (index, route) in activeProxyRoutes.enumerated() {
+            out.append("proxy:\(index) " + route.serverLine(password: ProxyPasswords.password(for: route)))
             let rules = route.sites.compactMap(ListRule.parse)
             for rule in rules {
                 if case .network(let cidr) = rule { out.append("vianet:\(index):\(cidr)") }

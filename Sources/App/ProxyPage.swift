@@ -6,7 +6,9 @@ import SwiftUI
 /// site takes it, before the 不走 VPN list.
 struct ProxyPage: View {
     @ObservedObject private var manager = HelperClient.shared
+    @ObservedObject private var health = ProxyHealth.shared
     @State private var routes: [ProxyRoute]
+    @State private var paused: Bool
     @State private var editing: ProxyRoute?
     @State private var note: String?
     private let preview: Bool
@@ -18,6 +20,7 @@ struct ProxyPage: View {
         let settings = ProfileStore.loadAppSettings()
         _routes = State(initialValue: previewRoutes ?? settings.proxyRoutes ?? [])
         preview = previewRoutes != nil
+        _paused = State(initialValue: previewRoutes == nil && !settings.proxiesOn)
         splitOn = previewRoutes != nil ? previewSplitOn : settings.splitOn
         _serviceTooOld = State(initialValue: previewRoutes == nil && HelperInstaller.installedHelperOutdated)
     }
@@ -47,6 +50,19 @@ struct ProxyPage: View {
                                   text: "代理只在「按网站分流」开启时生效。",
                                   caption: "经 Cisco 连接时由 Cisco 决定流量去向，这里的规则不起作用。") {
                         Button("去「分流」打开") { UserDefaults.standard.set("split", forKey: "settingsTab") }
+                    }
+                }
+                if paused {
+                    EgressCallout(icon: "pause.circle.fill", tint: .orange,
+                                  text: "代理已在菜单栏面板上关闭。",
+                                  caption: "关闭期间这些网站照常按分流名单走 VPN 或直连。") {
+                        Button("打开代理") {
+                            var stored = ProfileStore.loadAppSettings()
+                            stored.proxiesPaused = nil
+                            ProfileStore.saveAppSettings(stored)
+                            paused = false
+                            save()
+                        }
                     }
                 }
                 if serviceTooOld && routes.contains(where: \.enabled) {
@@ -80,6 +96,7 @@ struct ProxyPage: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { if !preview { health.check(routes) } }
         .sheet(item: $editing) { route in
             ProxyEditor(route: route, isNew: !routes.contains(where: { $0.id == route.id }),
                         cancel: { editing = nil }) { saved in
@@ -117,6 +134,7 @@ struct ProxyPage: View {
                 Text(route.name).font(.body.weight(.medium)).lineLimit(1)
                 Text(ProxyLink.display(route).replacingOccurrences(of: "://", with: " · "))
                     .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+                ProxyStatusLine(route: route, check: health.checks[route.id], checking: health.checking.contains(route.id))
             }
             Spacer(minLength: 8)
             Text("\(route.sites.count) 条规则")
@@ -129,6 +147,7 @@ struct ProxyPage: View {
                     guard let i = routes.firstIndex(where: { $0.id == route.id }) else { return }
                     routes[i].enabled = on
                     save()
+                    if on && !preview { health.check([routes[i]], force: true) }
                 }))
                 .labelsHidden()
                 .toggleStyle(.switch)
@@ -136,11 +155,13 @@ struct ProxyPage: View {
                 .accessibilityLabel("启用 \(route.name)")
             Menu {
                 Button("编辑…") { editing = route }
+                if route.enabled { Button("重新检测") { health.check([route], force: true) } }
                 if index > 0 { Button("排到前面") { move(route, by: -1) } }
                 if index < routes.count - 1 { Button("排到后面") { move(route, by: 1) } }
                 Divider()
                 Button("删除", role: .destructive) {
                     routes.removeAll { $0.id == route.id }
+                    health.forget(route.id)
                     if !preview { ProxyPasswords.delete(for: route) }
                     save()
                 }
@@ -185,15 +206,23 @@ struct ProxyEditor: View {
     @State private var link: String
     @State private var name: String
     @State private var rules: String
+    /// The check made on 完成, for the address and rules it was made with.
+    @State private var result: (key: String, check: ProxyCheck)?
+    @State private var checkingNow = false
 
-    init(route: ProxyRoute, isNew: Bool, cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
+    /// `previewCheck`: a check result shown as if just made (screenshots).
+    init(route: ProxyRoute, isNew: Bool, previewCheck: ProxyCheck? = nil,
+         cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
         self.isNew = isNew
         self.cancel = cancel
         self.done = done
         original = route
-        _link = State(initialValue: isNew ? "" : ProxyLink.display(route))
+        let link = isNew ? "" : ProxyLink.display(route)
+        let rules = route.sites.joined(separator: "\n")
+        _link = State(initialValue: link)
         _name = State(initialValue: isNew ? "" : route.name)
-        _rules = State(initialValue: route.sites.joined(separator: "\n"))
+        _rules = State(initialValue: rules)
+        _result = State(initialValue: previewCheck.map { (link + "\u{0}" + rules, $0) })
     }
 
     private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
@@ -203,6 +232,9 @@ struct ProxyEditor: View {
         guard let l = parsed.link, l.password == nil, let user = l.username else { return false }
         return original.passwordStamp != nil && original.username == user
     }
+    private var checkKey: String { link + "\u{0}" + rules }
+    /// A failed check shown for what is typed now: 完成 saves anyway.
+    private var overriding: Bool { result.map { $0.key == checkKey && $0.check.level != .ok } ?? false }
     private var canSave: Bool {
         guard let l = parsed.link, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty else { return false }
         return l.username == nil || l.password != nil || keepsPassword
@@ -232,13 +264,16 @@ struct ProxyEditor: View {
                 EgressRuleIssues(issues: rulesParsed.issues)
             }
 
+            checkView
+
             HStack {
                 Spacer()
                 Button("取消", action: cancel).keyboardShortcut(.cancelAction)
-                Button("完成", action: save)
+                Button(overriding ? "仍然保存" : "完成", action: save)
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canSave)
+                    .tint(overriding ? .orange : nil)
+                    .disabled(!canSave || checkingNow)
             }
         }
         .padding(24)
@@ -263,8 +298,33 @@ struct ProxyEditor: View {
         }
     }
 
-    private func save() {
-        guard let l = parsed.link else { return }
+    /// Under the rules: the check 完成 runs before saving (§69.8).
+    @ViewBuilder private var checkView: some View {
+        if checkingNow {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在检测：连代理、核对密码、试着经它打开规则里的网站…").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if let result, result.key == checkKey {
+            let check = result.check
+            let tint: Color = check.level == .ok ? .green : (check.level == .warn ? .orange : .red)
+            VStack(alignment: .leading, spacing: 3) {
+                Label(check.level == .ok ? check.short + "：" + check.text : check.text,
+                      systemImage: check.level == .ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(tint)
+                    .fixedSize(horizontal: false, vertical: true)
+                if check.level != .ok {
+                    Text(check.level == .fail
+                         ? "这样保存的话，规则里的网站会打不开（不会改走别的路）。改好地址再点「完成」会重新检测。"
+                         : "代理本身能用。如果这个网站本来就打不开，可以照样保存。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func candidate(_ l: ProxyLink) -> ProxyRoute {
         var saved = original
         saved.kind = l.kind
         saved.host = l.host
@@ -273,6 +333,30 @@ struct ProxyEditor: View {
         let typedName = name.trimmingCharacters(in: .whitespaces)
         saved.name = !typedName.isEmpty ? typedName : (l.name ?? "\(l.host):\(l.port)")
         saved.username = l.username
+        return saved
+    }
+
+    /// 完成 checks first; saves at once when the proxy works, otherwise
+    /// shows why and turns into 仍然保存.
+    private func save() {
+        guard let l = parsed.link, canSave, !checkingNow else { return }
+        if overriding { commit(l, check: result?.check); return }
+        let route = candidate(l)
+        let password = l.password ?? (keepsPassword ? ProxyPasswords.password(for: original) : nil)
+        let key = checkKey
+        checkingNow = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let check = ProxyCheck.run(route, password: password)
+            DispatchQueue.main.async {
+                checkingNow = false
+                result = (key, check)
+                if check.level == .ok, key == checkKey { commit(l, check: check) }
+            }
+        }
+    }
+
+    private func commit(_ l: ProxyLink, check: ProxyCheck?) {
+        var saved = candidate(l)
         if l.username == nil {
             ProxyPasswords.delete(for: saved)
             saved.passwordStamp = nil
@@ -280,6 +364,7 @@ struct ProxyEditor: View {
             // Only a stamp goes into the settings; the password into the keychain.
             saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
         }
+        if let check { ProxyHealth.shared.record(check, for: saved.id) }
         done(saved)
     }
 }
@@ -304,5 +389,32 @@ struct ProxyRuleInput {
             if seen.insert(rule.text).inserted { sites.append(rule.text) }
         }
         if sites.count > Self.siteLimit { issues.append(.init(id: 0, message: "最多 \(Self.siteLimit) 条")) }
+    }
+}
+
+/// A proxy's state under its address: a dot and a short line.
+struct ProxyStatusLine: View {
+    let route: ProxyRoute
+    let check: ProxyCheck?
+    let checking: Bool
+
+    var body: some View {
+        let (text, tint): (String, Color) = {
+            if !route.enabled { return ("已停用", .secondary) }
+            if checking && check == nil { return ("检测中…", .secondary) }
+            guard let check else { return ("未检测", .secondary) }
+            switch check.level {
+            case .ok: return (check.short, .green)
+            case .warn: return (check.text, .orange)
+            case .fail: return (check.text, .red)
+            }
+        }()
+        HStack(spacing: 5) {
+            Circle().fill(tint).frame(width: 6, height: 6)
+            Text(text).font(.caption).foregroundStyle(tint == .secondary ? Color.secondary : tint)
+                .lineLimit(1).truncationMode(.tail)
+            if checking && check != nil { ProgressView().controlSize(.mini) }
+        }
+        .help(check.map { $0.text + ($0.fromTraffic ? "（来自实际连接）" : "") } ?? "")
     }
 }
