@@ -1838,6 +1838,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         state = parsed
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
+        if parsed == .connected && old != .connected && !AppRole.isSettings {
+            // The network is usable now: a site-list check that found none
+            // (launch while connecting) runs again (§66.30).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { GeoUpdater.shared.checkIfDue(networkReady: true) }
+        }
         self.detail = detail
         if parsed != .connected { splitWarning = nil; dnsNotice = nil }
         if parsed != old, !usesCisco {

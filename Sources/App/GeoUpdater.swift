@@ -45,6 +45,11 @@ final class GeoUpdater: ObservableObject {
     static let bundledVersion = "2026-11-05"
     static let dayInterval: TimeInterval = 24 * 3600
     static let retryInterval: TimeInterval = 3600
+    /// No reply at all is usually the network, not GitHub: the first try
+    /// 30 s after launch often lands while the VPN is still connecting and
+    /// drop protection holds the network (seen on the real Mac, 2026-11-25).
+    static let unreachable = "连不上 GitHub"
+    static let unreachableRetry: TimeInterval = 600
     private static let maxDownload = 32 << 20
 
     private enum Key {
@@ -71,10 +76,17 @@ final class GeoUpdater: ObservableObject {
         lastError = defaults.string(forKey: Key.lastError)
     }
 
-    func checkIfDue() {
+    /// `networkReady`: the VPN has just connected, so a try that found no
+    /// network at all is due again at once.
+    func checkIfDue(networkReady: Bool = false) {
         reload()
         guard ProfileStore.loadAppSettings().isSiteListsAutoUpdateOn else { return }
-        let wait = lastError == nil ? Self.dayInterval : Self.retryInterval
+        let wait: TimeInterval
+        switch lastError {
+        case nil: wait = Self.dayInterval
+        case Self.unreachable?: wait = networkReady ? 0 : Self.unreachableRetry
+        default: wait = Self.retryInterval
+        }
         if Date().timeIntervalSince1970 - defaults.double(forKey: Key.lastAttempt) >= wait { check { _ in } }
     }
 
@@ -99,7 +111,7 @@ final class GeoUpdater: ObservableObject {
         Self.fetch(session, URL(string: Self.api)) { body in
             guard let body, let tag = Self.tag(in: body) else {
                 session.finishTasksAndInvalidate()
-                self.finish(error: body == nil ? "连不上 GitHub" : "GitHub 没有给出清单版本", tag: nil, done: done)
+                self.finish(error: body == nil ? Self.unreachable : "GitHub 没有给出清单版本", tag: nil, done: done)
                 return
             }
             if tag == current, FileManager.default.fileExists(atPath: Self.target.path) {

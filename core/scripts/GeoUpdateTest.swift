@@ -62,6 +62,20 @@ struct GeoUpdateTest {
         release("20261127000000")
         check(run(updater) == "清单内容不完整", "a file that is not a full catalogue is refused")
 
+        // A try that found no network (launch while the VPN connects) is
+        // repeated as soon as the VPN is up, not an hour later.
+        let store = GeoUpdater.store
+        store.set(GeoUpdater.unreachable, forKey: "siteListsLastError")
+        let failedAt = Date().timeIntervalSince1970
+        store.set(failedAt, forKey: "siteListsLastAttempt")
+        updater.checkIfDue()
+        check(store.double(forKey: "siteListsLastAttempt") == failedAt, "right after a no-network failure nothing is tried")
+        updater.checkIfDue(networkReady: true)
+        let deadline = Date().addingTimeInterval(30)
+        while updater.checking && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        check(store.double(forKey: "siteListsLastAttempt") > failedAt && updater.lastError == "清单内容不完整",
+              "the VPN coming up retries a no-network failure at once")
+
         updater.useBundled()
         check(!FileManager.default.fileExists(atPath: target.path) && updater.version == nil && installs == 3,
               "going back to the bundled lists removes the download")
