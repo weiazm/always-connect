@@ -18,13 +18,16 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::egress_gate::{evidence_clock_ms, ProtectedSites, SiteGroup};
 
 mod activity;
 use activity::{Denied, SiteStatus};
+mod refresh;
 mod steer;
+pub use refresh::{DEFAULT_PREFETCH, MAX_PREFETCH};
+use refresh::{Bell, Cache};
 use steer::Ledger;
 
 const MAX_GROUPS: usize = 16;
@@ -44,6 +47,13 @@ pub const MAX_RECORDS: usize = 10;
 pub struct EgressConfig {
     pub enabled: bool,
     pub groups: Vec<Group>,
+    /// How many of the busiest servers are re-probed in the background
+    /// (§66.31); None = the default, 0 = off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch: Option<u32>,
+    /// Steer protected names to a verified entry (§66.28); None = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steer: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -131,6 +141,14 @@ impl Group {
 }
 
 impl EgressConfig {
+    pub fn prefetch_limit(&self) -> usize {
+        self.prefetch.unwrap_or(DEFAULT_PREFETCH).min(MAX_PREFETCH) as usize
+    }
+
+    pub fn steering(&self) -> bool {
+        self.steer.unwrap_or(true)
+    }
+
     pub fn active(&self) -> bool {
         self.enabled && self.groups.iter().any(|g| g.enabled && !g.sites.is_empty())
     }
@@ -140,6 +158,7 @@ impl EgressConfig {
     pub fn valid(&self) -> bool {
         let ids: std::collections::HashSet<_> = self.groups.iter().map(|g| g.id).collect();
         ids.len() == self.groups.len() && self.groups.len() <= MAX_GROUPS
+            && self.prefetch.is_none_or(|n| n <= MAX_PREFETCH)
             && self.groups.iter().all(|g| {
                 g.sites.len() <= MAX_SITES
                     && g.sites.iter().all(|site| valid_rule(site, false))
@@ -434,6 +453,8 @@ struct Shared {
     marker: String,
     hook: ProbeHook,
     stop: AtomicBool,
+    /// Wakes the refresher (§66.31).
+    bell: Bell,
 }
 
 #[derive(Clone, PartialEq)]
@@ -466,6 +487,8 @@ struct ControlState {
     peer_counts: HashMap<u32, Denied>,
     /// Exits seen per (name, address), for steering DNS answers (§66.28).
     ledger: Ledger,
+    /// Recent results and the busiest servers (§66.31).
+    cache: Cache,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
 }
 
@@ -488,8 +511,14 @@ impl ControlState {
         serde_json::json!({ "probe_alpn": marker, "groups": self.config.site_groups() }).to_string()
     }
 
-    /// Note one probe result. Returns the gate's verdict for it.
-    fn record(&mut self, group: &Group, target: Target, mut obs: Observation) -> &'static str {
+    /// Note one probe result for a connection. Returns the gate's verdict.
+    fn record(&mut self, group: &Group, target: Target, obs: Observation) -> &'static str {
+        self.record_probe(group, target, obs, true)
+    }
+
+    /// Note one probe result; `connection` is false for a background
+    /// refresh, which does not count as another unreadable connection.
+    fn record_probe(&mut self, group: &Group, target: Target, mut obs: Observation, connection: bool) -> &'static str {
         if let Some(country) = obs.country.as_deref() {
             self.ledger.note(&target.host, target.ip, country, std::time::Instant::now());
         }
@@ -518,7 +547,7 @@ impl ControlState {
                 if group.unverified == Unverified::WhenWrong && failed.iter().any(|f| f.observation.country.is_some()) {
                     return "block";
                 }
-                self.note_unverified(group);
+                if connection { self.note_unverified(group); }
                 return "unverified";
             }
         };
@@ -560,6 +589,7 @@ impl ControlState {
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.epoch = self.epoch.wrapping_add(1);
         self.ledger.clear();
+        self.cache.forget();
         let sites = cfg.protected_sites();
         self.failures.retain(|id, failed| {
             let Some(group) = cfg.enabled_group(*id) else { return false };
@@ -580,6 +610,7 @@ impl ControlState {
     fn retire_checks(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.ledger.clear();
+        self.cache.forget();
     }
 
     fn disconnect(&mut self) {
@@ -616,9 +647,10 @@ impl Controller {
             state: Mutex::new(ControlState {
                 sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
-                ledger: Ledger::default(), on_peer_loss: None,
+                ledger: Ledger::default(), cache: Cache::default(), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
+            bell: Bell::default(),
         });
         let controller = Controller { shared, path: path.to_path_buf(), wake_stop: Some(wake_stop) };
         use std::os::unix::fs::PermissionsExt;
@@ -626,6 +658,8 @@ impl Controller {
         let shared = controller.shared.clone();
         listener.set_nonblocking(true)?;
         std::thread::Builder::new().name("egress-control".into()).spawn(move || accept_loop(listener, wake, shared))?;
+        let shared = controller.shared.clone();
+        std::thread::Builder::new().name("egress-refresher".into()).spawn(move || refresh::refresh_loop(shared))?;
         Ok(controller)
     }
 
@@ -715,6 +749,7 @@ impl Drop for Controller {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.state.lock().expect("controller").disconnect();
+        self.shared.bell.0.notify_all();
         self.wake_stop.take();
         let _ = std::fs::remove_file(&self.path);
     }
@@ -840,6 +875,22 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
             }
             continue;
         }
+        // §66.31: a young result answers at once; a probe of the same
+        // server already running is waited for instead of repeated.
+        let server = (check.group, host.clone(), check.ip);
+        let now = Instant::now();
+        state.cache.bump(&server, now);
+        shared.bell.0.notify_one();
+        if let Some(fresh) = state.cache.reusable(&server, state.epoch, now) {
+            let line = verdict(check.group, id, fresh.answer, fresh.evidence_at);
+            state.send(&line);
+            continue;
+        }
+        if let Some(waiting) = state.cache.running.get_mut(&server) {
+            waiting.push((peer_id, id));
+            continue;
+        }
+        state.cache.running.insert(server, Vec::new());
         let epoch = state.epoch;
         let interface = state.interface.clone();
         state.checks.insert(key, ActiveCheck { group: check.group, epoch });
@@ -878,19 +929,27 @@ fn run_check(shared: &Arc<Shared>, group: u32, targets: Vec<Target>, interface: 
     let mut answer = "block";
     let mut at = None;
     let mut searches = Vec::new();
+    let mut joined = Vec::new();
     for (target, obs) in results {
         at = obs.evidence_at_ms;
         let wrong_cloudflare = obs.country.is_some() && matches!(target.ip, IpAddr::V4(ip) if steer::cloudflare(ip));
         let host = target.host.clone();
-        answer = state.record(&rule, target, obs);
+        let server = (group, target.host.clone(), target.ip);
+        answer = state.record(&rule, target, obs.clone());
+        let epoch = state.epoch;
+        state.cache.note(server.clone(), answer, &obs, epoch, Instant::now());
+        joined.extend(state.cache.running.remove(&server).unwrap_or_default().into_iter().map(|w| (w, answer, at)));
         // A wrong exit at a Cloudflare entry: look for a verified one now,
         // so the next DNS answer can point there (§66.28).
-        if answer == "block" && wrong_cloudflare {
+        if answer == "block" && wrong_cloudflare && state.config.steering() {
             searches.extend(state.search_job(shared, &rule, &host));
         }
     }
     if key.0 != 0 {
         state.send(&verdict(group, key.1, answer, at));
+    }
+    for ((peer, id), answer, at) in joined {
+        if peer == state.peer_id { state.send(&verdict(group, id, answer, at)); }
     }
     drop(state);
     for job in searches {

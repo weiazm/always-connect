@@ -5,6 +5,15 @@ import Foundation
 struct EgressProtection: Codable, Equatable {
     var enabled = false
     var groups: [Group] = []
+    /// How many of the busiest servers are re-checked in the background
+    /// (DESIGN §66.31); nil = 5, 0 = off, at most 20.
+    var prefetch: Int? = nil
+    /// Steer protected names to an entry with a verified exit (§66.28);
+    /// nil = on.
+    var steer: Bool? = nil
+
+    static let defaultPrefetch = 5
+    static let maxPrefetch = 20
 
     var isActive: Bool { enabled && groups.contains { $0.enabled && !$0.sites.isEmpty } }
 

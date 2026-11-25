@@ -20,7 +20,8 @@ fn rule(id: u32, sites: &[&str], expect: &[&str]) -> Group {
 }
 
 fn cfg() -> EgressConfig {
-    EgressConfig { enabled: true, groups: vec![Group { unverified: Unverified::Allow, ..rule(1, &["a.example"], &["ZZ"]) }, Group { enabled: false, ..rule(2, &["d.example"], &["ZZ"]) }] }
+    // No background refresh here: these tests count probes (§66.31 has its own).
+    EgressConfig { enabled: true, prefetch: Some(0), groups: vec![Group { unverified: Unverified::Allow, ..rule(1, &["a.example"], &["ZZ"]) }, Group { enabled: false, ..rule(2, &["d.example"], &["ZZ"]) }], ..Default::default() }
 }
 
 #[test]
@@ -446,7 +447,7 @@ fn a_wrong_cloudflare_entry_is_bypassed_by_one_verified_for_the_name() {
     let dir = TestDirectory::new();
     let sock = dir.0.join("egress.sock");
     let (hook, seen) = exits(&[("104.16.0.1", Some("ZZ")), ("104.16.0.2", Some("YY"))]);
-    let config = EgressConfig { enabled: true, groups: vec![Group { unverified: Unverified::WhenWrong, ..rule(1, &["a.example"], &["ZZ"]) }] };
+    let config = EgressConfig { enabled: true, prefetch: Some(0), groups: vec![Group { unverified: Unverified::WhenWrong, ..rule(1, &["a.example"], &["ZZ"]) }], ..Default::default() };
     let ctl = Controller::start(&sock, config, hook).unwrap();
     let (mut gate, _) = Peer::connect(&sock);
     let right: std::net::Ipv4Addr = "104.16.0.1".parse().unwrap();
@@ -478,4 +479,68 @@ fn a_rule_whose_site_lists_are_not_downloaded_yet_is_accepted_and_protects_nothi
     assert!(cfg.active(), "the rule stays on, so the lists apply without reconnecting once they arrive");
     let sites = cfg.protected_sites();
     assert_eq!(sites.group_for_target("www.example.com", "192.0.2.1".parse().unwrap()), None);
+}
+
+#[test]
+fn a_busy_server_is_refreshed_in_the_background_and_new_connections_do_not_wait() {
+    let dir = TestDirectory::new();
+    let sock = dir.0.join("egress.sock");
+    let (hook, seen) = exits(&[("192.0.2.10", Some("ZZ")), ("192.0.2.11", Some("ZZ"))]);
+    let config = EgressConfig { enabled: true, prefetch: Some(1), groups: vec![rule(1, &["a.example"], &["ZZ"])], ..Default::default() };
+    let ctl = Controller::start(&sock, config, hook).unwrap();
+    let (mut gate, _) = Peer::connect(&sock);
+    let probes = |host: &str| seen.lock().unwrap().iter().filter(|r| r.host == host).count();
+    // Two connections to one server, one to another: the first is busier.
+    assert_eq!(gate.check(1, "www.a.example", "192.0.2.10", 1)["result"], "allow");
+    assert_eq!(gate.check(1, "www.a.example", "192.0.2.10", 2)["result"], "allow", "a young result is reused");
+    assert_eq!(probes("www.a.example"), 1, "the second connection did not wait for another probe");
+    assert_eq!(gate.check(1, "b.a.example", "192.0.2.11", 3)["result"], "allow");
+    // Only the top server (limit 1) is refreshed in the background.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probes("www.a.example") < 3 {
+        assert!(Instant::now() < deadline, "the busy server was not refreshed: {} probes", probes("www.a.example"));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(probes("b.a.example"), 1, "the less busy server is not refreshed beyond the limit");
+    let answered = Instant::now();
+    assert_eq!(gate.check(1, "www.a.example", "192.0.2.10", 4)["result"], "allow");
+    assert!(answered.elapsed() < Duration::from_millis(200), "answered from the refreshed result");
+    assert_eq!(status(&ctl)["groups"][0]["unverifiedCount"].as_u64().unwrap_or(0), 0);
+    // A network change forgets the results; the limit 0 stops refreshing.
+    ctl.invalidate();
+    let mut off = ctl.shared.state.lock().unwrap().config.clone();
+    off.prefetch = Some(0);
+    ctl.update(off);
+    std::thread::sleep(Duration::from_millis(700));
+    let settled = probes("www.a.example");
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(probes("www.a.example"), settled, "no background probes with the limit at 0");
+}
+
+#[test]
+fn concurrent_connections_to_one_server_share_one_probe() {
+    let dir = TestDirectory::new();
+    let sock = dir.0.join("egress.sock");
+    let seen = Arc::new(Mutex::new(0usize));
+    let count = seen.clone();
+    let hook: ProbeHook = Arc::new(move |r: &ProbeRequest, peer| {
+        *count.lock().unwrap() += 1;
+        std::thread::sleep(Duration::from_millis(300));
+        *peer = r.connect_ip;
+        Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=192.0.2.200\nloc=ZZ\n".to_vec())
+    });
+    let config = EgressConfig { enabled: true, prefetch: Some(0), groups: vec![rule(1, &["a.example"], &["ZZ"])], ..Default::default() };
+    let _ctl = Controller::start(&sock, config, hook).unwrap();
+    let (mut gate, _) = Peer::connect(&sock);
+    for id in 1..=3 {
+        gate.send(json!({"check": {"group": 1, "host": "www.a.example", "ip": "192.0.2.10", "port": 443, "requestId": id}}));
+    }
+    let mut answered: Vec<u64> = (0..3).map(|_| {
+        let v = gate.read();
+        assert_eq!(v["verdict"]["result"], "allow");
+        v["verdict"]["requestId"].as_u64().unwrap()
+    }).collect();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3], "every waiting connection gets the answer");
+    assert_eq!(*seen.lock().unwrap(), 1, "one probe for all three");
 }

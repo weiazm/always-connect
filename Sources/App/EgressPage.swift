@@ -90,6 +90,9 @@ struct EgressProtectionPage: View {
                 }
             }
             .disabled(!available || busy)
+            if !config.groups.isEmpty {
+                checkingSection
+            }
             if let records = liveStatus?.records, !records.isEmpty {
                 Section {
                     DisclosureGroup {
@@ -221,6 +224,32 @@ struct EgressProtectionPage: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 22)
+    }
+
+    // MARK: - How checks run (§66.31)
+
+    private var checkingSection: some View {
+        let prefetch = config.prefetch ?? EgressProtection.defaultPrefetch
+        return Section {
+            Stepper(value: Binding(get: { prefetch }, set: { n in change { $0.prefetch = n } }),
+                    in: 0...EgressProtection.maxPrefetch) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(prefetch == 0 ? "不主动刷新" : "主动刷新访问最多的 \(prefetch) 台服务器")
+                    Text("提前查好出口，新连接不用等。每台约每秒两次很小的检查请求；很久没访问的自动停。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Toggle(isOn: Binding(get: { config.steer ?? true }, set: { on in change { $0.steer = on } })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动换到出口正确的入口")
+                    Text("出口不对时，在同一 CDN 里换一个出口正确的地址，仍走 VPN。关掉后只拦截。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        } header: {
+            Text("检查方式")
+        }
+        .disabled(!available || busy)
     }
 
     // MARK: - Table

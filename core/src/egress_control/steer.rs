@@ -178,6 +178,7 @@ impl Controller {
     /// resolver's. Never waits: a busy controller keeps the answer.
     pub(crate) fn steer(&self, name: &str, answer: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> {
         let Ok(mut state) = self.shared.state.try_lock() else { return None };
+        if !state.config.steering() { return None; }
         let id = state.sites.group_for(name)?;
         let group = state.config.enabled_group(id)?.clone();
         let now = Instant::now();
