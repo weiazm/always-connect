@@ -1,10 +1,22 @@
 import SwiftUI
 
-/// 代理 (DESIGN.md §六十九, UI-DESIGN.md): sites that go through the
+/// 分流代理 on its own (offscreen screenshots); in the App it is a part
+/// of the 分流 page (§69.9).
+struct ProxyPage: View {
+    var previewRoutes: [ProxyRoute]? = nil
+    var previewSplitOn = true
+
+    var body: some View {
+        Form { ProxySections(previewRoutes: previewRoutes, previewSplitOn: previewSplitOn) }
+            .formStyle(.grouped)
+    }
+}
+
+/// 分流代理 (DESIGN.md §六十九, UI-DESIGN.md): sites that go through the
 /// user's own SOCKS5 or HTTP proxy. Each proxy is an address and a rule
 /// box in the split list's syntax; the first proxy whose rules match a
-/// site takes it, before the 不走 VPN list.
-struct ProxyPage: View {
+/// site takes it, before 分流直连. Sections of the 分流 page.
+struct ProxySections: View {
     @ObservedObject private var manager = HelperClient.shared
     @ObservedObject private var health = ProxyHealth.shared
     @State private var routes: [ProxyRoute]
@@ -27,7 +39,7 @@ struct ProxyPage: View {
 
 
     var body: some View {
-        Form {
+        Group {
             Section {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 3) {
@@ -47,16 +59,14 @@ struct ProxyPage: View {
                 }
                 if !splitOn {
                     EgressCallout(icon: "info.circle.fill", tint: .blue,
-                                  text: "代理只在「按网站分流」开启时生效。",
-                                  caption: "经 Cisco 连接时由 Cisco 决定流量去向，这里的规则不起作用。") {
-                        Button("去「分流」打开") { UserDefaults.standard.set("split", forKey: "settingsTab") }
-                    }
+                                  text: "分流代理只在上面的「按网站分流」开启时生效。",
+                                  caption: "经 Cisco 连接时由 Cisco 决定流量去向，这里的规则不起作用。") { EmptyView() }
                 }
                 if paused {
                     EgressCallout(icon: "pause.circle.fill", tint: .orange,
-                                  text: "代理已在菜单栏面板上关闭。",
+                                  text: "分流代理已在菜单栏面板上关闭。",
                                   caption: "关闭期间这些网站照常按分流名单走 VPN 或直连。") {
-                        Button("打开代理") {
+                        Button("打开") {
                             var stored = ProfileStore.loadAppSettings()
                             stored.proxiesPaused = nil
                             ProfileStore.saveAppSettings(stored)
@@ -95,7 +105,6 @@ struct ProxyPage: View {
                 }
             }
         }
-        .formStyle(.grouped)
         .onAppear { if !preview { health.check(routes) } }
         .sheet(item: $editing) { route in
             ProxyEditor(route: route, isNew: !routes.contains(where: { $0.id == route.id }),
@@ -309,9 +318,9 @@ struct ProxyEditor: View {
             let check = result.check
             let tint: Color = check.level == .ok ? .green : (check.level == .warn ? .orange : .red)
             VStack(alignment: .leading, spacing: 3) {
-                Label(check.level == .ok ? check.short + "：" + check.text : check.text,
-                      systemImage: check.level == .ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .font(.callout).foregroundStyle(tint)
+                Label(check.short, systemImage: check.level == .ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.medium)).foregroundStyle(tint)
+                Text(check.text).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if check.level != .ok {
                     Text(check.level == .fail
@@ -405,8 +414,8 @@ struct ProxyStatusLine: View {
             guard let check else { return ("未检测", .secondary) }
             switch check.level {
             case .ok: return (check.short, .green)
-            case .warn: return (check.text, .orange)
-            case .fail: return (check.text, .red)
+            case .warn: return (check.short, .orange)
+            case .fail: return (check.short, .red)
             }
         }()
         HStack(spacing: 5) {

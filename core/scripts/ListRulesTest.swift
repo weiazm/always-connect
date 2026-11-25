@@ -146,6 +146,18 @@ struct ListRulesTest {
         check("a switched-off or empty proxy is not sent", !lines.contains { $0.contains("off.example") || $0.contains("proxy.lan") })
         check("an invalid address is still declared, so its sites are refused, not freed",
               lines.contains("proxy:1 http invalid 0") && lines.contains("via:1:bad.example"))
+        // The panel's 分流直连 switch (§69.9): the list rests, names and
+        // networks alike; the proxies and the local network are untouched.
+        var restingDirect = proxied
+        restingDirect.directSites = [DirectSite(name: "d", domains: ["direct.example"]), DirectSite(name: "n", domains: ["10.9.0.0/16"])]
+        restingDirect.directPaused = true
+        let restingLines = restingDirect.directRuleText.split(separator: "\n").map(String.init)
+        check("paused direct list sends no direct rule and keeps the proxies",
+              !restingLines.contains("direct.example") && restingLines.first == "proxy:0 socks5 127.0.0.1 1080")
+        check("paused direct list frees no network", !restingDirect.effectiveAllowNetworks.contains("10.9.0.0/16")
+              && DirectSites.sites(restingDirect).count == 2)
+        restingDirect.directPaused = nil
+        check("the direct list applies again when switched on", restingDirect.effectiveAllowNetworks.contains("10.9.0.0/16"))
         // The panel's 代理 switch (§69.8): paused sends no proxy at all; the
         // rules stay, and the old settings (no key) count as on.
         var paused = proxied

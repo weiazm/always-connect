@@ -66,7 +66,7 @@ pub(super) fn socks5_hello(stream: &mut TcpStream, auth: Option<&(String, String
             read_exact(stream, &mut status)?;
             if status[1] == 0 { Ok(()) } else { Err("代理拒绝了用户名或密码".into()) }
         }
-        (0xff, None) | (2, None) => Err("代理要求用户名密码，请在「代理」页填写".into()),
+        (0xff, None) | (2, None) => Err("代理要求用户名密码，请在「分流代理」里填写".into()),
         (0xff, Some(_)) => Err("代理不接受用户名密码这种认证方式".into()),
         _ => Err("代理要求不支持的认证方式".into()),
     }
@@ -164,7 +164,7 @@ pub fn http_connect(stream: &mut TcpStream, auth: Option<&(String, String)>, tar
     match code {
         200..=299 => Ok(buffer[end..].to_vec()),
         407 if auth.is_some() => Err("代理拒绝了用户名或密码（407）".into()),
-        407 => Err("代理要求用户名密码，请在「代理」页填写".into()),
+        407 => Err("代理要求用户名密码，请在「分流代理」里填写".into()),
         403 => Err("代理拒绝了这个连接（403）".into()),
         _ => Err(format!("代理拒绝了这个连接（{code}）")),
     }

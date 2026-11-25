@@ -271,10 +271,14 @@ extension AppSettings {
     /// "本地局域网直连", on unless switched off.
     var isAutoLANOn: Bool { autoLAN ?? true }
 
-    /// The list's parsed rules, in order.
+    /// The list's parsed rules, in order, as they apply now: empty while 分流直连 is paused
+    /// (§69.9), so neither names nor networks go direct.
     var listRules: [ListRule] {
-        DirectSites.sites(self).flatMap(\.domains).compactMap(ListRule.parse)
+        guard directOn else { return [] }
+        return DirectSites.sites(self).flatMap(\.domains).compactMap(ListRule.parse)
     }
+
+    var directOn: Bool { directPaused != true }
 
     /// What the drop-protection allowlist (and split-mode direct routes)
     /// get: the list's networks, plus the local network when on.

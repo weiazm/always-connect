@@ -18,11 +18,14 @@ struct ProxyCheck: Equatable {
     /// Reported by the background service from real connections.
     var fromTraffic = false
 
-    /// The short form for a row or a tile.
+    /// The short form for a row or a tile: what it means, not how it
+    /// failed (user 2026-11-25: "代理连不上就说连不上"). The reason is
+    /// `text`, shown on hover and in the editor.
     var short: String {
         switch level {
         case .ok: return millis.map { "正常 · \($0) ms" } ?? "正常"
-        case .warn, .fail: return text
+        case .warn: return "部分网站打不开"
+        case .fail: return "连不上"
         }
     }
 
@@ -106,19 +109,13 @@ final class ProxyHealth: ObservableObject {
     /// The panel tile's line for the proxies in use.
     func summary(_ routes: [ProxyRoute]) -> (text: String, level: ProxyCheck.Level?) {
         let results = routes.map { checks[$0.id] }
-        let failing = zip(routes, results).filter { $0.1?.level == .fail }
-        if let first = failing.first {
-            return (failing.count == 1 ? "「\(first.0.name)」连不上" : "\(failing.count) 个代理连不上", .fail)
-        }
-        let warning = zip(routes, results).filter { $0.1?.level == .warn }
-        if let first = warning.first {
-            return (warning.count == 1 ? "「\(first.0.name)」有网站打不开" : "\(warning.count) 个代理有问题", .warn)
-        }
+        if results.contains(where: { $0?.level == .fail }) { return ("连不上", .fail) }
+        if results.contains(where: { $0?.level == .warn }) { return ("部分网站打不开", .warn) }
         if results.allSatisfy({ $0?.level == .ok }) {
             let fastest = results.compactMap { $0?.millis }.min()
-            return ("\(routes.count) 个正常" + (fastest.map { " · \($0) ms" } ?? ""), .ok)
+            return ("正常" + (fastest.map { " · \($0) ms" } ?? ""), .ok)
         }
-        return ("\(routes.count) 个 · 检测中…", nil)
+        return ("检测中…", nil)
     }
 }
 

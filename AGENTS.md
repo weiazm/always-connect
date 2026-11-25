@@ -137,7 +137,7 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
 
 ## 目录
 
-- `Sources/App/` 菜单栏 App：面板、设置五页（通用/账号/分流/连接/诊断）、分流名单规则与数据（ListRules、GeoData）、向导、Cisco 引擎（CiscoEngine）、证书转接（CertificateRelay）、钥匙串、图标
+- `Sources/App/` 菜单栏 App：面板、设置六页（通用/账号/分流/出口保护/连接/诊断；分流含分流直连、分流代理、局域网）、分流名单规则与数据（ListRules、GeoData）、向导、Cisco 引擎（CiscoEngine）、证书转接（CertificateRelay）、钥匙串、图标
 - `Sources/Helper/` 后台服务（root LaunchDaemon）：openconnect 引擎、vpnc-script、pf（PfController、
   KillSwitch）、诊断
 - `Sources/Shared/` App 与后台服务共用的模型与 XPC 协议
