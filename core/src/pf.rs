@@ -186,11 +186,23 @@ pub fn proxy_redirect(tcp: Option<u16>, udp: Option<u16>, networks: &[String]) -
     }
     let to = if targets.len() == 1 { targets[0].clone() } else { format!("{{ {} }}", targets.join(", ")) };
     let mut out = String::from("# AlwaysConnect proxied sites (generated; do not hand-edit)\n");
-    if let Some(port) = tcp.filter(|p| *p > 0) {
-        out.push_str(&format!("rdr pass on lo0 inet proto tcp from any to {to} -> 127.0.0.1 port {port}\n"));
+    let tcp = tcp.filter(|p| *p > 0);
+    let udp = udp.filter(|p| *p > 0);
+    if let Some(port) = tcp {
+        out.push_str(&format!("rdr on lo0 inet proto tcp from any to {to} -> 127.0.0.1 port {port}\n"));
     }
-    if let Some(port) = udp.filter(|p| *p > 0) {
-        out.push_str(&format!("rdr pass on lo0 inet proto udp from any to {to} -> 127.0.0.1 port {port}\n"));
+    if let Some(port) = udp {
+        out.push_str(&format!("rdr on lo0 inet proto udp from any to {to} -> 127.0.0.1 port {port}\n"));
+    }
+    // The redirected packets are passed here, not by `rdr pass`: its states
+    // float (interface "all"), which the pre-login check refuses to judge,
+    // so a later login stopped and drop protection held the network
+    // (measured on the real Mac 2026-11-25). These states stay on lo0.
+    if let Some(port) = tcp {
+        out.push_str(&format!("pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port {port} keep state (if-bound)\n"));
+    }
+    if let Some(port) = udp {
+        out.push_str(&format!("pass in quick on lo0 inet proto udp from any to 127.0.0.1 port {port} keep state (if-bound)\n"));
     }
     out.push_str(&format!("block return in quick on lo0 inet from any to {to}\n"));
     out
@@ -344,15 +356,20 @@ mod tests {
     fn proxied_range_redirects_tcp_and_refuses_the_rest() {
         let lines = |text: String| text.lines().filter(|l| !l.starts_with('#')).map(str::to_owned).collect::<Vec<_>>();
         assert_eq!(lines(proxy_redirect(Some(50123), None, &[])), vec![
-            "rdr pass on lo0 inet proto tcp from any to 198.19.128.0/17 -> 127.0.0.1 port 50123",
+            "rdr on lo0 inet proto tcp from any to 198.19.128.0/17 -> 127.0.0.1 port 50123",
+            "pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port 50123 keep state (if-bound)",
             "block return in quick on lo0 inet from any to 198.19.128.0/17",
         ]);
         let nets = vec!["203.0.113.0/24".to_owned(), "bad".to_owned(), "2001:db8::/32".to_owned(), "203.0.113.0/24".to_owned()];
         assert_eq!(lines(proxy_redirect(Some(1), Some(2), &nets)), vec![
-            "rdr pass on lo0 inet proto tcp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 1",
-            "rdr pass on lo0 inet proto udp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 2",
+            "rdr on lo0 inet proto tcp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 1",
+            "rdr on lo0 inet proto udp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 2",
+            "pass in quick on lo0 inet proto tcp from any to 127.0.0.1 port 1 keep state (if-bound)",
+            "pass in quick on lo0 inet proto udp from any to 127.0.0.1 port 2 keep state (if-bound)",
             "block return in quick on lo0 inet from any to { 198.19.128.0/17, 203.0.113.0/24 }",
         ]);
+        // No floating states: the pre-login check reads every state.
+        assert!(!proxy_redirect(Some(1), Some(2), &nets).contains("rdr pass"));
         assert!(!proxy_redirect(None, None, &nets).contains("rdr"));
         assert!(proxy_redirect(None, None, &nets).contains("203.0.113.0/24"), "no listener: still refused");
         assert!(!proxy_redirect(Some(0), None, &[]).contains("rdr"));

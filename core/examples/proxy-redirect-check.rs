@@ -214,6 +214,34 @@ mod macos {
         if seen != "socks5 203.0.113.9:7" { return Err(format!("socks proxy asked {seen}")); }
         println!("SOCKS5 and HTTP CONNECT carried names and a written network through pf");
 
+        // With redirected connections open, the states are bound to lo0 and
+        // the pre-login check accepts them (a floating state stopped the
+        // next login on the real Mac).
+        stage("states with open proxied connections");
+        let held = TcpStream::connect_timeout(&SocketAddr::from((socks_ip, 443)), Duration::from_secs(5)).map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_millis(200));
+        let states = command("/sbin/pfctl", &["-s", "states"]);
+        let ours: Vec<&str> = states.lines().filter(|l| l.contains("198.19.128.")).collect();
+        if ours.is_empty() || ours.iter().any(|l| !l.trim_start().starts_with("lo0 ")) {
+            return Err(format!("redirected states are not bound to lo0: {ours:?}"));
+        }
+        let policy = alwaysconnect_core::pf_verify::BlockingPolicy::new("en0", &[], 443, false, &[]).map_err(|e| format!("{e:?}"))?;
+        // Only our states are judged: the runner's own are not this check's.
+        alwaysconnect_core::pf_verify::check_states(&policy, |args| {
+            std::process::Command::new("/sbin/pfctl").args(args).output().map(|o| {
+                let text = String::from_utf8_lossy(&o.stdout).into_owned();
+                let mut kept = String::new();
+                let mut keep = false;
+                for line in text.lines() {
+                    if !line.starts_with(char::is_whitespace) { keep = line.contains("198.19.128."); }
+                    if keep { kept.push_str(line); kept.push('\n'); }
+                }
+                alwaysconnect_core::pf_verify::PfOutput { stdout: kept, stderr: String::from_utf8_lossy(&o.stderr).into() }
+            })
+        }).map_err(|e| format!("pre-login state check refused open proxied connections: {e:?}"))?;
+        drop(held);
+        println!("redirected states sit on lo0 and pass the pre-login state check");
+
         stage("udp through socks5");
         let answer = match udp_answer(socks_ip, 443) {
             Ok(answer) => answer,

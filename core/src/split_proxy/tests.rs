@@ -552,9 +552,14 @@ fn interop_with_a_reference_socks5_server() {
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         round_trip(&mut stream, "");
     }
-    // The server requires the password: without it, or with a wrong one, a clear refusal.
+    // The server requires the password: without it, or with a wrong one, a
+    // clear refusal (AC_SOCKS5_INTEROP_LAX=1: a server that lets clients
+    // without a password in, as some do; only the wrong password is checked).
+    let lax = std::env::var_os("AC_SOCKS5_INTEROP_LAX").is_some();
+    if !lax {
     let missing = open_through(&server(None), &Target::Ip(Ipv4Addr::LOCALHOST), site_port).unwrap_err();
     assert!(missing.contains("要求用户名密码") || missing.contains("认证方式"), "{missing}");
+    }
     let wrong = open_through(&server(Some((user.clone(), "wrong".into()))), &Target::Ip(Ipv4Addr::LOCALHOST), site_port).unwrap_err();
     assert!(wrong.contains("拒绝了用户名或密码"), "{wrong}");
     // UDP ASSOCIATE through the server's relay to a local UDP echo.
