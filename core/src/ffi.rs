@@ -1130,6 +1130,11 @@ pub extern "C" fn ac_routes_addresses(r: *const DirectRoutes) -> *mut c_char {
 pub extern "C" fn ac_routes_undo_at_start(journal: *const c_char, boot: *const c_char, no_routes: bool) -> *mut c_char {
     let Some(journal) = c_str(journal) else { return std::ptr::null_mut() };
     let result = direct_routes::undo_at_start(std::path::Path::new(&journal), c_str(boot).as_deref(), no_routes);
+    // The proxied range's route (§69) sits in its own journal beside it.
+    if let Some(dir) = std::path::Path::new(&journal).parent() {
+        let proxied = direct_routes::undo_at_start(&dir.join(crate::oc_engine::PROXY_ROUTES), c_str(boot).as_deref(), no_routes);
+        if proxied != "none" { crate::network_guard::log(&format!("proxy route at start: {proxied}")); }
+    }
     CString::new(result).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 

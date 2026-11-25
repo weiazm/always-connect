@@ -31,6 +31,7 @@ pub mod route_watch;
 pub mod rules;
 pub mod session;
 pub mod split_policy;
+pub mod split_proxy;
 pub mod state_machine;
 pub mod traffic;
 pub mod geodata;

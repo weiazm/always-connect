@@ -167,6 +167,26 @@ fn valid_cidr(s: &str) -> bool {
     }
 }
 
+/// The proxied sites' anchor (DESIGN.md §69), apart from the kill switch's
+/// so it exists exactly while proxy rules run, with or without drop
+/// protection. A sibling under com.apple/, which the main ruleset evaluates
+/// for translation (rdr-anchor) and filtering alike.
+pub const PROXY_ANCHOR: &str = "com.apple/301.AlwaysConnectProxy";
+
+/// TCP to the proxied range comes back to the listener on `port`; every
+/// other packet to it is refused at once (UDP such as QUIC gets an ICMP
+/// error, so browsers fall back to TCP without waiting). Without a
+/// listener everything is refused.
+pub fn proxy_redirect(port: Option<u16>) -> String {
+    let range = crate::split_proxy::FAKE_NETWORK;
+    let mut out = String::from("# AlwaysConnect proxied sites (generated; do not hand-edit)\n");
+    if let Some(port) = port.filter(|p| *p > 0) {
+        out.push_str(&format!("rdr pass on lo0 inet proto tcp from any to {range} -> 127.0.0.1 port {port}\n"));
+    }
+    out.push_str(&format!("block return in quick on lo0 inet from any to {range}\n"));
+    out
+}
+
 /// Before authentication there is no trusted tunnel. Keep DNS on loopback and
 /// admit only the selected gateway transport and directly attached private LANs.
 pub fn login_rules(physical: &str, gateways: &[String], port: u16, udp: bool, lans: &[String]) -> Option<String> {
@@ -310,6 +330,19 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxied_range_redirects_tcp_and_refuses_the_rest() {
+        let text = proxy_redirect(Some(50123));
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>(), vec![
+            "rdr pass on lo0 inet proto tcp from any to 198.19.128.0/17 -> 127.0.0.1 port 50123",
+            "block return in quick on lo0 inet from any to 198.19.128.0/17",
+        ]);
+        assert!(!proxy_redirect(None).contains("rdr"));
+        assert!(!proxy_redirect(Some(0)).contains("rdr"));
+        assert_ne!(PROXY_ANCHOR, ANCHOR);
+        assert!(PROXY_ANCHOR.starts_with("com.apple/"));
+    }
 
     #[test]
     fn unauthenticated_login_has_only_the_carrier_and_lan_exceptions() {
