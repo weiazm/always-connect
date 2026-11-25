@@ -26,6 +26,22 @@ struct ProxyPage: View {
     var body: some View {
         Form {
             Section {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text("经代理访问的网站").font(.headline)
+                            HoverHelp(action: {}) { explanation }
+                        }
+                        Text("命中规则的网站经你的 SOCKS5 / HTTP 代理访问；代理不通时直接打不开，不会改走别的路。")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 12)
+                    Button {
+                        editing = ProxyRoute(name: "", kind: .socks5, host: "", port: 0, sites: [])
+                    } label: { Label("添加代理", systemImage: "plus") }
+                    .controlSize(.large)
+                }
                 if !splitOn {
                     EgressCallout(icon: "info.circle.fill", tint: .blue,
                                   text: "代理只在「按网站分流」开启时生效。",
@@ -43,30 +59,24 @@ struct ProxyPage: View {
                         Button("知道了") { self.note = nil }
                     }
                 }
+            }
+            Section {
                 if routes.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(spacing: 8) {
+                        Image(systemName: "arrow.triangle.swap").font(.system(size: 28)).foregroundStyle(.secondary)
                         Text("还没有代理").font(.body.weight(.medium))
-                        Text("添加一个 SOCKS5 或 HTTP 代理，再写上哪些网站经它访问。")
+                        Text("点「添加代理」，粘贴一行代理地址，再写上哪些网站经它访问。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 4)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
                 } else {
-                    ForEach(routes) { route in row(route) }
+                    ForEach(Array(routes.enumerated()), id: \.element.id) { index, route in row(route, index: index) }
                 }
-                HStack {
-                    Button {
-                        editing = ProxyRoute(name: "代理 \(routes.count + 1)", kind: .socks5, host: "127.0.0.1", port: 1080, sites: [])
-                    } label: { Label("添加代理", systemImage: "plus") }
-                    Spacer()
-                }
-            } header: {
-                Text("经代理访问的网站")
             } footer: {
-                Text("命中规则的网站经所选代理访问；几个代理都命中时，用排在前面的。按域名的规则排在「不走 VPN 的网站」之前，"
-                     + "这些网站的域名交给代理解析，本机不查 DNS；geoip 和网段按 VPN 的 DNS 答复地址判断，直接写的网段连 IP 也走代理。"
-                     + "TCP 两种代理都转发；UDP（如 QUIC）只经 SOCKS5 转发，HTTP 代理的网站 UDP 不通，浏览器会自动改用 TCP。"
-                     + "代理连不上、拒绝或密码不对时，这些网站打不开，不会改走直连或 VPN。连接代理本身按分流名单走：在局域网或直连名单里就走本地网络，否则经 VPN。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if routes.count > 1 {
+                    Text("几个代理都命中同一个网站时，用排在前面的。").font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
@@ -80,36 +90,68 @@ struct ProxyPage: View {
         }
     }
 
-    private func row(_ route: ProxyRoute) -> some View {
-        HStack(spacing: 10) {
+    private var explanation: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach([
+                "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 VPN 的网站」之前。",
+                "geoip、网段规则：按 VPN 的 DNS 答复地址判断；直接写的网段，连 IP 也走代理。",
+                "TCP 两种代理都转发；UDP（如 QUIC）只经 SOCKS5，HTTP 代理的网站浏览器会自动改用 TCP。",
+                "连代理本身按分流名单走：在局域网或「不走 VPN 的网站」里就走本地网络，否则经 VPN。",
+                "代理连不上、拒绝或密码不对：这些网站直接打不开，不会改走直连或 VPN。",
+            ], id: \.self) { line in
+                Text("• " + line).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(.callout)
+        .frame(width: 380, alignment: .leading)
+        .padding(12)
+    }
+
+    private func row(_ route: ProxyRoute, index: Int) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: route.kind == .socks5 ? "point.3.connected.trianglepath.dotted" : "globe")
+                .font(.system(size: 16))
+                .foregroundStyle(route.enabled ? Color.accentColor : Color.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(route.name).font(.body.weight(.medium)).lineLimit(1)
+                Text(ProxyLink.display(route).replacingOccurrences(of: "://", with: " · "))
+                    .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text("\(route.sites.count) 条规则")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.secondary.opacity(0.12)))
             Toggle("", isOn: Binding(
                 get: { route.enabled },
                 set: { on in
-                    guard let index = routes.firstIndex(where: { $0.id == route.id }) else { return }
-                    routes[index].enabled = on
+                    guard let i = routes.firstIndex(where: { $0.id == route.id }) else { return }
+                    routes[i].enabled = on
                     save()
                 }))
                 .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
                 .accessibilityLabel("启用 \(route.name)")
-            VStack(alignment: .leading, spacing: 2) {
-                Text(route.name).font(.body.weight(.medium))
-                Text(route.summary).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-            if routes.first?.id != route.id {
-                Button { move(route, by: -1) } label: { Image(systemName: "arrow.up") }
-                    .buttonStyle(.borderless).help("排到前面（几个代理都命中时用前面的）")
-            }
-            Button("编辑") { editing = route }
-            Button(role: .destructive) {
-                routes.removeAll { $0.id == route.id }
-                if !preview { ProxyPasswords.delete(for: route) }
-                save()
-            } label: { Image(systemName: "trash") }
-                .buttonStyle(.borderless)
-                .help("删除这个代理；它的网站回到原来的分流")
+            Menu {
+                Button("编辑…") { editing = route }
+                if index > 0 { Button("排到前面") { move(route, by: -1) } }
+                if index < routes.count - 1 { Button("排到后面") { move(route, by: 1) } }
+                Divider()
+                Button("删除", role: .destructive) {
+                    routes.removeAll { $0.id == route.id }
+                    if !preview { ProxyPasswords.delete(for: route) }
+                    save()
+                }
+            } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { editing = route }
     }
 
     private func move(_ route: ProxyRoute, by offset: Int) {
@@ -133,102 +175,112 @@ struct ProxyPage: View {
     }
 }
 
-/// One proxy: name, kind, address and its rule box, saved on 完成.
+/// One proxy: its address as one line (parsed here, ProxyLink), an
+/// optional name and its rule box, saved on 完成.
 struct ProxyEditor: View {
     let isNew: Bool
     let cancel: () -> Void
     let done: (ProxyRoute) -> Void
-    @State private var route: ProxyRoute
-    @State private var portText: String
+    private let original: ProxyRoute
+    @State private var link: String
+    @State private var name: String
     @State private var rules: String
-    @State private var username: String
-    /// Empty = keep the saved password (never read back into the window).
-    @State private var password = ""
 
     init(route: ProxyRoute, isNew: Bool, cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
         self.isNew = isNew
         self.cancel = cancel
         self.done = done
-        _route = State(initialValue: route)
-        _portText = State(initialValue: route.port > 0 ? String(route.port) : "")
+        original = route
+        _link = State(initialValue: isNew ? "" : ProxyLink.display(route))
+        _name = State(initialValue: isNew ? "" : route.name)
         _rules = State(initialValue: route.sites.joined(separator: "\n"))
-        _username = State(initialValue: route.username ?? "")
     }
 
-    private var hasSavedPassword: Bool { route.passwordStamp != nil && !(route.username ?? "").isEmpty }
-
-    private var parsed: ProxyRuleInput { ProxyRuleInput(rules) }
-    private var port: Int? { Int(portText.trimmingCharacters(in: .whitespaces)).flatMap { ProxyRoute.validPort($0) ? $0 : nil } }
-    private var host: String { route.host.trimmingCharacters(in: .whitespaces) }
-    private var addressProblem: String? {
-        if !ProxyRoute.validHost(host) { return "地址只能是 IP 或域名，例如 127.0.0.1 或 proxy.example.com" }
-        if port == nil { return "端口是 1–65535 之间的数字" }
-        let user = username.trimmingCharacters(in: .whitespaces)
-        if user.utf8.count > 255 || password.utf8.count > 255 { return "用户名和密码各最多 255 字节" }
-        if !user.isEmpty && password.isEmpty && !hasSavedPassword { return "填了用户名就要填密码" }
-        if user.isEmpty && !password.isEmpty { return "填了密码就要填用户名" }
-        return nil
+    private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
+    private var rulesParsed: ProxyRuleInput { ProxyRuleInput(rules) }
+    /// A saved password is kept when the line names the same user without one.
+    private var keepsPassword: Bool {
+        guard let l = parsed.link, l.password == nil, let user = l.username else { return false }
+        return original.passwordStamp != nil && original.username == user
     }
     private var canSave: Bool {
-        addressProblem == nil && parsed.issues.isEmpty && !route.name.trimmingCharacters(in: .whitespaces).isEmpty
+        guard let l = parsed.link, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty else { return false }
+        return l.username == nil || l.password != nil || keepsPassword
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             Text(isNew ? "添加代理" : "编辑代理").font(.title3.weight(.semibold))
-            Form {
-                TextField("名称", text: $route.name)
-                Picker("类型", selection: $route.kind) {
-                    ForEach(ProxyRoute.Kind.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                HStack {
-                    TextField("地址", text: $route.host, prompt: Text("127.0.0.1"))
-                    TextField("端口", text: $portText, prompt: Text(route.kind == .socks5 ? "1080" : "8080"))
-                        .frame(width: 90)
-                }
-                HStack {
-                    TextField("用户名", text: $username, prompt: Text("不需要就留空"))
-                    SecureField("密码", text: $password, prompt: Text(hasSavedPassword ? "已保存，不改就留空" : "密码"))
-                }
-                if let addressProblem, !route.host.isEmpty || !portText.isEmpty {
-                    Text(addressProblem).font(.caption).foregroundStyle(.orange)
-                }
-            }
-            .formStyle(.columns)
+
             VStack(alignment: .leading, spacing: 6) {
-                Text("经这个代理访问的网站").font(.body.weight(.medium))
-                EgressRuleText(input: $rules, height: 150)
-                Text("域名和网站清单在查 DNS 之前就交给代理；geoip 和网段按 VPN 的 DNS 答复地址判断，直接写的网段连 IP 也走代理。")
-                    .font(.caption).foregroundStyle(.secondary)
-                EgressRuleIssues(issues: parsed.issues)
+                Text("代理地址").font(.callout.weight(.medium))
+                TextField("", text: $link, prompt: Text("socks5://用户名:密码@1.2.3.4:1080"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                status
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("名称").font(.callout.weight(.medium))
+                TextField("", text: $name, prompt: Text(parsed.link.map { $0.name ?? "\($0.host):\($0.port)" } ?? "可不填"))
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("经这个代理访问的网站").font(.callout.weight(.medium))
+                EgressRuleText(input: $rules, height: 140)
+                EgressRuleIssues(issues: rulesParsed.issues)
+            }
+
             HStack {
                 Spacer()
                 Button("取消", action: cancel).keyboardShortcut(.cancelAction)
-                Button("完成") {
-                    var saved = route
-                    saved.name = saved.name.trimmingCharacters(in: .whitespaces)
-                    saved.host = host
-                    saved.port = port ?? 0
-                    saved.sites = parsed.sites
-                    let user = username.trimmingCharacters(in: .whitespaces)
-                    saved.username = user.isEmpty ? nil : user
-                    if user.isEmpty {
-                        ProxyPasswords.delete(for: saved)
-                        saved.passwordStamp = nil
-                    } else if !password.isEmpty {
-                        // Only the stamp is stored with the settings.
-                        saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
-                    }
-                    done(saved)
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canSave)
+                Button("完成", action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSave)
             }
         }
-        .padding(20)
+        .padding(24)
         .frame(width: 520)
+    }
+
+    @ViewBuilder private var status: some View {
+        switch parsed {
+        case .link(let l):
+            let missingPassword = l.username != nil && l.password == nil && !keepsPassword
+            Label(missingPassword ? "\(l.summary)，还缺密码：写成 用户名:密码@地址" : l.summary + (keepsPassword ? "，沿用已存的密码" : ""),
+                  systemImage: missingPassword ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(missingPassword ? Color.orange : Color.green)
+        case .problem(let problem):
+            if link.trimmingCharacters(in: .whitespaces).isEmpty {
+                Text("支持 socks5://、http://、主机:端口，也可粘贴 socks5, 1.2.3.4, 1080, 用户名, 密码 这种逗号写法")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Label(problem, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func save() {
+        guard let l = parsed.link else { return }
+        var saved = original
+        saved.kind = l.kind
+        saved.host = l.host
+        saved.port = l.port
+        saved.sites = rulesParsed.sites
+        let typedName = name.trimmingCharacters(in: .whitespaces)
+        saved.name = !typedName.isEmpty ? typedName : (l.name ?? "\(l.host):\(l.port)")
+        saved.username = l.username
+        if l.username == nil {
+            ProxyPasswords.delete(for: saved)
+            saved.passwordStamp = nil
+        } else if let password = l.password {
+            // Only a stamp goes into the settings; the password into the keychain.
+            saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
+        }
+        done(saved)
     }
 }
 

@@ -158,6 +158,26 @@ struct ListRulesTest {
         withLogin.proxyRoutes![0].passwordStamp = "s2"
         check("a missing password still names the user (refused there, not dropped)",
               withLogin.proxyLines.first == "proxy:0 socks5 127.0.0.1 1080 alice %00")
+        // One-line proxy addresses (the 添加代理 window).
+        func link(_ text: String) -> ProxyLink? { ProxyLink.parse(text).link }
+        let full = link("socks5://al%40ice:p%3Ass@1.2.3.4:1080")
+        check("socks5 URL with percent-encoded login", full?.kind == .socks5 && full?.host == "1.2.3.4" && full?.port == 1080
+              && full?.username == "al@ice" && full?.password == "p:ss" && full?.assumedKind == false)
+        check("http URL, path and name ignored or kept", link("http://proxy.example.net:8080/#家里")?.kind == .http
+              && link("http://proxy.example.net:8080/#家里")?.name == "家里")
+        check("socks5h and socks mean SOCKS5", link("socks5h://h:1")?.kind == .socks5 && link("socks://h:1")?.kind == .socks5)
+        check("bare host:port is SOCKS5, said so", link("127.0.0.1:7891")?.assumedKind == true && link("user:pw@h:2")?.username == "user")
+        check("IPv6 in brackets", link("socks5://[::1]:1080")?.host == "::1")
+        let surge = link("VPS = socks5, 203.0.113.7, 443, bob, secret, udp-relay=true")
+        check("Surge / Clash comma form with a name", surge?.name == "VPS" && surge?.host == "203.0.113.7" && surge?.port == 443
+              && surge?.username == "bob" && surge?.password == "secret")
+        check("bad lines say why", ProxyLink.parse("https://h:443").problem?.contains("HTTPS") == true
+              && ProxyLink.parse("socks4://h:1").problem?.contains("SOCKS4") == true
+              && ProxyLink.parse("1.2.3.4").problem?.contains("端口") == true
+              && ProxyLink.parse("socks5://h:99999").problem?.contains("端口") == true
+              && ProxyLink.parse("").problem != nil)
+        let shown = ProxyLink.display(ProxyRoute(name: "n", kind: .http, host: "h", port: 8080, sites: [], username: "u", passwordStamp: "s"))
+        check("editing shows the line without the password", shown == "http://u@h:8080")
         let roundTrip = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(proxied))
         check("proxies survive saving", roundTrip.proxyRoutes == proxied.proxyRoutes)
         let sparse = try! JSONDecoder().decode(ProxyRoute.self, from: Data(#"{"name":"x","host":"h","port":1}"#.utf8))
