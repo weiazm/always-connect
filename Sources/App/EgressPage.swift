@@ -228,48 +228,50 @@ struct EgressProtectionPage: View {
 
     // MARK: - How checks run (§66.31)
 
-    /// Every setting says what it does and what changing it costs (user,
-    /// 2026-11-25: "给出作用与效果的说明，让用户能理解怎么设置").
+    /// Name on the left, the value as a menu on the right, one plain line
+    /// under it (user, 2026-11-25: "我都看不出来这个数字能设置"; "写用户能
+    /// 看懂的直白的说明").
     private var checkingSection: some View {
         let prefetch = config.prefetch ?? EgressProtection.defaultPrefetch
         let halfLife = config.halfLife ?? EgressProtection.defaultHalfLife
-        return Section {
-            Stepper(value: Binding(get: { prefetch }, set: { n in change { $0.prefetch = n } }),
-                    in: 0...EgressProtection.maxPrefetch) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(prefetch == 0 ? "主动刷新：关" : "主动刷新访问最多的 \(prefetch) 台服务器")
-                    Text("每个新连接都要先确认出口，约多等半秒。被主动刷新的服务器在后台每 0.6 秒查一次，新连接直接放行、不用等。"
-                         + "调大：更多网站打开更快，后台检查请求更多（每台约每秒两次很小的请求）；调小或设成 0：更省，但新连接要等。"
-                         + "默认 5，一般够覆盖常用网站的主站、接口和静态资源。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        return Section("检查方式") {
+            Picker(selection: Binding(get: { prefetch }, set: { n in change { $0.prefetch = n } })) {
+                ForEach(Self.prefetchChoices(prefetch), id: \.self) { n in
+                    Text(n == 0 ? "关闭" : "\(n) 台" + (n == EgressProtection.defaultPrefetch ? "（默认）" : "")).tag(n)
                 }
+            } label: {
+                settingLabel("提前查好出口", "常去的几台服务器提前查好，网站打开更快；台数越多，后台请求越多。")
             }
-            Stepper(value: Binding(get: { halfLife }, set: { m in change { $0.halfLife = m } }),
-                    in: 1...EgressProtection.maxHalfLife) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("活跃度每 \(halfLife) 分钟减半")
-                    Text("决定\u{201C}访问最多\u{201D}怎么算：每个新连接给服务器加 1 分，分数每过这段时间减半，低于 0.5 分就停止主动刷新。"
-                         + "调小：离开网站后更快停止后台检查，更省；调大：偶尔用一下的网站也能保持提前查好。"
-                         + "默认 2 分钟：只开过一次的网站约 2 分钟后停，连续用过一阵的约 10 分钟后停。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Picker(selection: Binding(get: { halfLife }, set: { m in change { $0.halfLife = m } })) {
+                ForEach(Self.halfLifeChoices(halfLife), id: \.self) { m in
+                    Text("\(m) 分钟" + (m == EgressProtection.defaultHalfLife ? "（默认）" : "")).tag(m)
                 }
+            } label: {
+                settingLabel("不用后多快停", "网站不用了，热度每过这么久减半，降下来就不再提前查。")
             }
             .disabled(prefetch == 0)
             Toggle(isOn: Binding(get: { config.steer ?? true }, set: { on in change { $0.steer = on } })) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("自动换到出口正确的入口")
-                    Text("同一网站在 CDN 上有多台服务器，出口可能不同。打开时，本机 DNS 只给出口正确的那几台，走错的被拦后约一分钟内自动换好，仍走 VPN。"
-                         + "关掉后只拦截、不换，走错出口的服务器会一直连不上。建议保持打开。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
+                settingLabel("自动换到出口正确的服务器", "出口不对时，换到同一网站里出口正确的服务器，仍走 VPN。")
             }
-        } header: {
-            Text("检查方式")
-        } footer: {
-            Text("刚查过的结果只在 1 秒内复用，保证出口是实时确认的。")
-                .font(.caption).foregroundStyle(.secondary)
         }
+        .pickerStyle(.menu)
         .disabled(!available || busy)
+    }
+
+    private func settingLabel(_ title: String, _ caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(caption).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The menu's values; a value set elsewhere (an imported backup) stays listed.
+    static func prefetchChoices(_ current: Int) -> [Int] {
+        Array(Set([0, 3, 5, 10, 20, current])).sorted()
+    }
+
+    static func halfLifeChoices(_ current: Int) -> [Int] {
+        Array(Set([1, 2, 5, 10, 30, current])).sorted()
     }
 
     // MARK: - Table
