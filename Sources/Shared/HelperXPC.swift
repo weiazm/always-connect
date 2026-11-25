@@ -189,4 +189,7 @@ enum ProtectedLoginNotice {
     static let preparationUnavailable = "网络已拦截。无法确认可用于查找网关的直连网络，请恢复直连后重试。"
     static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
     static let preparingGateway = "首次连接正在查网关，当前仍直连"
+    /// The App's own (§69.10): the service did not answer in 3 s.
+    static let serviceSlowRetrying = "后台服务还在准备断线保护，稍后自动重试；网络照常直连"
+    static let serviceDidNotAnswer = "没有连接：后台服务没能及时设好断线保护，为免漏网先不登录。网络照常直连，打开开关可重试"
 }

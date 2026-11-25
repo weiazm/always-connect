@@ -408,6 +408,7 @@ struct PanelView: View {
                 case .unknown: return ("已连接\(since)", .green)
                 }
             }
+            if manager.loginStopped { return (header.subtitle, .orange) }
             let tint: Color = red ? .red : (manager.state == .disconnected ? .secondary : .orange)
             if manager.state == .disconnected && !red { return (header.subtitle, tint) }
             return (header.look.headline + (header.subtitle.isEmpty ? "" : " · " + header.subtitle), tint)
@@ -457,7 +458,7 @@ struct PanelView: View {
                 .help("上网检测：面板开着时每 10 秒试着打开几个常用网址，取最快的应答")
             }
             Spacer(minLength: 8)
-            AlwaysSwitchTrack(isOn: Binding(get: { manager.switchIsOn }, set: { on in
+            AlwaysSwitchTrack(isOn: Binding(get: { manager.switchIsOn && !manager.loginStopped }, set: { on in
                 if on {
                     showConfirmDisconnect = false
                     if manager.hasCredentials { onStart() } else { onOpenSettings("credentials") }
