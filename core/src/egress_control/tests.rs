@@ -469,3 +469,13 @@ fn a_wrong_cloudflare_entry_is_bypassed_by_one_verified_for_the_name() {
     ctl.invalidate();
     assert_eq!(ctl.steer("x.a.example", &[wrong]), None, "a network change forgets the exits");
 }
+
+#[test]
+fn a_rule_whose_site_lists_are_not_downloaded_yet_is_accepted_and_protects_nothing() {
+    let cfg: EgressConfig = serde_json::from_str(r#"{"enabled":true,"groups":[{"id":5,"name":"lists","enabled":true,
+        "sites":["geosite:example"],"matches":[],"expect":["ZZ"],"unverified":"whenWrong"}]}"#).unwrap();
+    assert!(cfg.valid(), "an empty expansion must not refuse the settings (and with them the VPN)");
+    assert!(cfg.active(), "the rule stays on, so the lists apply without reconnecting once they arrive");
+    let sites = cfg.protected_sites();
+    assert_eq!(sites.group_for_target("www.example.com", "192.0.2.1".parse().unwrap()), None);
+}

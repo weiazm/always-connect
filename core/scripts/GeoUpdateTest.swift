@@ -3,6 +3,14 @@
 // user's files, preferences or the real publisher.
 import Foundation
 
+@_silgen_name("ac_egress_config_valid")
+private func ac_egress_config_valid(_ json: UnsafePointer<CChar>) -> Bool
+
+func egressConfigValid(_ config: EgressProtection) -> Bool {
+    guard let data = try? JSONEncoder().encode(config) else { return false }
+    return ac_egress_config_valid(String(decoding: data, as: UTF8.self))
+}
+
 @main
 struct GeoUpdateTest {
     static var fails = 0
@@ -48,10 +56,21 @@ struct GeoUpdateTest {
               && ListRule.parse("geosite:example")?.expanded == [] && ListRule.parse("geosite:example")?.kind.contains("还没下载") == true,
               "geosite: rules are kept as written before the first download and match nothing yet")
 
+        // A rule made only of site lists must not stop the VPN from connecting
+        // before the download (real Mac, 2026-11-25): the background service
+        // accepts it and it protects nothing yet.
+        let onlyLists = EgressProtection(enabled: true, groups: [
+            .init(id: 9, name: "lists", enabled: true, sites: ["geosite:example"], expect: ["ZZ"], unverified: .whenWrong)])
+        let sent = onlyLists.forBackgroundService
+        check(sent.groups[0].matches == [] && egressConfigValid(sent),
+              "before the download a list-only rule goes out with no matches and is accepted")
+
         updater.checkIfDue()  // missing lists: due at once
         wait(updater)
         check(GeoData.available && updater.version == "20261124090120" && updater.versionText == "2026-11-24 版" && installs == 1,
               "the first check downloads at once, puts the lists in place and re-sends the rules")
+        check(onlyLists.forBackgroundService.groups[0].matches == ["domain:example.com", "full:www.example.net"],
+              "after the download the same rule carries the list's names")
         check(GeoData.hasList("example") && ListRule.parse("geosite:example")?.expanded == ["domain:example.com", "full:www.example.net"]
               && ListRule.parse("geosite:nosuchlist") == nil, "rules read the downloaded lists; unknown names are refused again")
         check(GeoUpdater.stamp()?.tag == "20261124090120", "the version sits in a file beside the lists")

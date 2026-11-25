@@ -263,6 +263,9 @@ struct EgressProtectionPage: View {
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             if let problem {
                                 Text(problem).font(.caption).foregroundStyle(badge.color).lineLimit(2)
+                            } else if !GeoData.available && group.sites.contains(where: { $0.hasPrefix("geosite:") }) {
+                                // §66.30: until the lists arrive those lines check nothing.
+                                Text("网站清单还没下载，清单里的网站下载后开始检查").font(.caption).foregroundStyle(.orange)
                             } else if unverified > 0 {
                                 Text("\(unverified) 次查不到出口，已放行").font(.caption).foregroundStyle(.secondary)
                             }

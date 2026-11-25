@@ -143,8 +143,12 @@ impl EgressConfig {
             && self.groups.iter().all(|g| {
                 g.sites.len() <= MAX_SITES
                     && g.sites.iter().all(|site| valid_rule(site, false))
+                    // Empty matches are valid: a rule made only of site lists
+                    // the App has not downloaded yet protects nothing until
+                    // they arrive, and must not stop the VPN from connecting
+                    // (§66.30; on the real Mac it held the network, so the
+                    // lists could not download either).
                     && g.matches.as_ref().is_none_or(|entries| entries.len() <= MAX_MATCHES
-                        && (!self.enabled || !g.enabled || g.sites.is_empty() || !entries.is_empty())
                         && entries.iter().all(|entry| valid_rule(entry, true)))
                     && g.expect.iter().all(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
                     && (!g.enabled || g.sites.is_empty() || !g.expect.is_empty())
