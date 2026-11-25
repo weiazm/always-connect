@@ -97,6 +97,18 @@ grep -q '^retire 203.0.113.9' "$WORK/direct"
 direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
 retire_direct_routes "$WORK/direct" boot-1 1 ''
 [ ! -e "$WORK/direct" ]
+# The proxied range's loopback route (DESIGN §69) is retired from its own
+# journal by the same reader: deleted as a network, journal gone.
+: > "$WORK/direct-calls"
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n198.19.128/17 127.0.0.1 UGSc lo0\n'; }
+printf 'boot boot-1\n198.19.128.0/17 127.0.0.1\n' > "$WORK/proxy-routes"
+retire_direct_routes "$WORK/proxy-routes" boot-1 1 '127.0.0.1'
+grep -qx '/sbin/route -n delete -net 198.19.128.0/17' "$WORK/direct-calls"
+[ ! -e "$WORK/proxy-routes" ]
+grep -q 'PROXY_ANCHOR=com.apple/301.AlwaysConnectProxy' "$ROOT/scripts/reset-network.sh"
+grep -q 'pfctl -a "$PROXY_ANCHOR" -F nat' "$ROOT/scripts/reset-network.sh"
+grep -q 'proxy-routes proxy-pf-token' "$ROOT/scripts/reset-network.sh"
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
 # Fail the final metadata write after one deletion completed and one failed.
 # The durable intent must prevent another deletion after a process restart.
 writer_definition=$(declare -f write_direct_journal)
