@@ -11,4 +11,4 @@ swiftc -O -parse-as-library "$ROOT/Sources/App/ListRules.swift" "$ROOT/Sources/A
     "$ROOT/Sources/App/OnDemand.swift" "$ROOT/Sources/App/ProfileStore.swift" "$ROOT/Sources/App/DropHistory.swift" "$ROOT/Sources/App/CiscoProfiles.swift" "$ROOT"/Sources/Shared/*.swift \
     "$ROOT/core/scripts/ListRulesTest.swift" "$ROOT/core/target/release/libalwaysconnect_core.a" \
     -o "$WORK/test" 2>&1 | grep -v "built for newer" || true
-ALWAYSCONNECT_GEODATA="$ROOT/Sources/App/GeoData" "$WORK/test"
+ALWAYSCONNECT_GEODATA="$ROOT/core/scripts/fixtures/geodata" "$WORK/test"

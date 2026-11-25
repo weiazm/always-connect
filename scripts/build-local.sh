@@ -78,7 +78,7 @@ cp "$SRC/App/AlwaysConnectHelper.plist" \
 mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/scripts/dev-helper.sh" "$APP/Contents/Resources/dev-helper.sh"
 # The split list's site lists and geoip data (scripts/make-geo-data.py).
-cp "$SRC"/App/GeoData/*.txt "$APP/Contents/Resources/"
+cp "$SRC"/App/GeoData/geoip-cn.txt "$APP/Contents/Resources/"  # site lists are downloaded (§66.30)
 # App icon (scripts/make-app-icon.swift draws it from the menu-bar globe).
 cp "$SRC/App/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Emergency network reset, usable without the App (DESIGN.md §24.6).

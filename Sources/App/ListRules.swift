@@ -42,9 +42,14 @@ enum ListRule: Equatable {
         let rule: ListRule
         if let name = value("geosite:") {
             let parts = name.lowercased().split(separator: "@", maxSplits: 1).map(String.init)
-            guard let list = parts.first, GeoData.hasList(list) else { return nil }
+            guard let list = parts.first, !list.isEmpty else { return nil }
             let attribute = parts.count == 2 ? parts[1] : nil
-            if let attribute, GeoData.geosite(list, attribute: attribute).isEmpty { return nil }
+            if GeoData.available {
+                guard GeoData.hasList(list) else { return nil }
+                if let attribute, GeoData.geosite(list, attribute: attribute).isEmpty { return nil }
+            }
+            // Before the first download a list name is kept as written (the
+            // background service's check below still vets its form).
             rule = .geosite(list, attribute: attribute)
         } else if let code = value("geoip:") {
             guard GeoData.geoipCountries.contains(code.lowercased()) else { return nil }
@@ -135,7 +140,7 @@ enum ListRule: Equatable {
         case .keyword: return "域名里含这个词"
         case .regexp: return "域名符合这个正则"
         case .geosite(let name, _):
-            return "网站清单 · \(GeoData.ruleCount(name)) 条规则"
+            return GeoData.available ? "网站清单 · \(GeoData.ruleCount(name)) 条规则" : "网站清单 · 还没下载，下载后生效"
         case .geoip: return "国家 IP · 解析到这些地址的网站"
         case .network: return "网段"
         }
@@ -162,25 +167,26 @@ func isValidIPv4Address(_ value: String) -> Bool {
     return inet_pton(AF_INET, value, &a) == 1
 }
 
-/// The site lists and geoip:cn. geosite.txt is the downloaded one
-/// (GeoUpdater, DESIGN.md §66.30) when there is one, else the bundled
-/// one (scripts/make-geo-data.py); geoip-cn.txt is bundled. Read on first
-/// use and again whenever the downloaded file changes (the settings
-/// process and the menu-bar App each notice the other's update).
+/// The site lists and geoip:cn. The site lists are not part of the App
+/// (DESIGN.md §66.30, user 2026-11-25: "默认app都不带"): GeoUpdater
+/// downloads the whole catalogue to Application Support and this reads it
+/// in place, memory-mapped. Only the lists asked for are located (a scan
+/// for their "[name]" line) and only their positions are kept, never an
+/// index of all of them (user: "内存只留用到的数据"). A changed file (an
+/// update by this or the other App process) is noticed by its modification
+/// time. geoip-cn.txt is bundled.
 enum GeoData {
     static let geoipCountries: Set<String> = ["cn"]
 
     private static let lock = NSLock()
-    /// The geosite file, memory-mapped (clean pages the system can drop),
-    /// and where each list's lines sit in it. Only the lists asked for
-    /// are ever turned into strings, and those are not kept (§27.4: the
-    /// whole file parsed and cached cost the App ~20 MB).
+    /// The file, memory-mapped (clean pages the system can drop).
     private static var mapped: Data?
-    private static var index: [String: Range<Int>]?
+    /// Positions of the lists asked for so far (nil = not in the file).
+    private static var found: [String: Range<Int>?] = [:]
     /// Which file was read: its path and modification time.
     private static var loaded: (path: String, modified: timespec)?
 
-    /// Where updates go; uninstall removes the folder with the rest (§31).
+    /// Where the download goes; uninstall removes the folder with the rest (§31).
     static var updateDirectory: URL {
         if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEO_DIR"] {
             return URL(fileURLWithPath: dir)  // the harness never touches the user's copy
@@ -189,18 +195,21 @@ enum GeoData {
             .appendingPathComponent("Library/Application Support/AlwaysConnect/GeoData")
     }
 
-    private static func url(_ name: String) -> URL? {
+    static var siteListFile: URL {
+        if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEODATA"] {
+            return URL(fileURLWithPath: dir).appendingPathComponent("geosite.txt")
+        }
+        return updateDirectory.appendingPathComponent("geosite.txt")
+    }
+
+    /// The site lists have been downloaded (until then geosite: rules are
+    /// kept as written and match nothing).
+    static var available: Bool { FileManager.default.fileExists(atPath: siteListFile.path) }
+
+    private static func bundled(_ name: String) -> URL? {
         if let dir = ProcessInfo.processInfo.environment["ALWAYSCONNECT_GEODATA"] {
             return URL(fileURLWithPath: dir).appendingPathComponent(name)
         }
-        if name == "geosite.txt" {
-            let updated = updateDirectory.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: updated.path) { return updated }
-        }
-        return bundled(name)
-    }
-
-    static func bundled(_ name: String) -> URL? {
         let base = (name as NSString).deletingPathExtension
         return Bundle.main.url(forResource: base, withExtension: "txt")
             ?? Bundle.main.url(forResource: base, withExtension: "txt", subdirectory: "GeoData")
@@ -211,53 +220,72 @@ enum GeoData {
         return stat(path, &info) == 0 ? info.st_mtimespec : nil
     }
 
-    private static func loadIndex() -> (Data, [String: Range<Int>]) {
-        lock.lock(); defer { lock.unlock() }
-        let file = url("geosite.txt")
-        let stamp = file.flatMap { modified($0.path) }
-        if let mapped, let index, let loaded, loaded.path == file?.path,
+    /// The mapped file, re-read when it changed; the list positions with it.
+    private static func current() -> Data {
+        let file = siteListFile
+        let stamp = modified(file.path)
+        if let mapped, let loaded, loaded.path == file.path,
            loaded.modified.tv_sec == stamp?.tv_sec, loaded.modified.tv_nsec == stamp?.tv_nsec {
-            return (mapped, index)
+            return mapped
         }
-        let data = file.flatMap { try? Data(contentsOf: $0, options: .alwaysMapped) } ?? Data()
-        let found = Self.listRanges(in: data)
+        let data = stamp == nil ? Data() : (try? Data(contentsOf: file, options: .alwaysMapped)) ?? Data()
         mapped = data
-        index = found
-        loaded = file.flatMap { file in stamp.map { (file.path, $0) } }
-        return (data, found)
+        found = [:]
+        loaded = stamp.map { (file.path, $0) }
+        return data
     }
 
-    /// Where each "[name]" list's lines sit in the text.
-    static func listRanges(in data: Data) -> [String: Range<Int>] {
-        var found: [String: Range<Int>] = [:]
-        var current: String?
-        var bodyStart = 0
-        var lineStart = 0
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+    /// Where one list's lines sit in `data`: the lines after "[name]" up
+    /// to the next "[" line. Scans only for that header.
+    static func range(of name: String, in data: Data) -> Range<Int>? {
+        let header = Array(("[" + name + "]\n").utf8)
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Range<Int>? in
             let bytes = raw.bindMemory(to: UInt8.self)
-            for i in 0...bytes.count {
-                guard i == bytes.count || bytes[i] == 0x0A else { continue }
-                if i > lineStart, bytes[lineStart] == UInt8(ascii: "["), bytes[i - 1] == UInt8(ascii: "]") {
-                    if let current { found[current] = bodyStart..<lineStart }
-                    current = String(decoding: UnsafeRawBufferPointer(rebasing: raw[(lineStart + 1)..<(i - 1)]),
-                                     as: UTF8.self)
-                    bodyStart = i + 1
+            let count = bytes.count
+            var start: Int?
+            var i = 0
+            while i < count {
+                // i is the start of a line.
+                if bytes[i] == UInt8(ascii: "["), i + header.count <= count,
+                   header.indices.allSatisfy({ bytes[i + $0] == header[$0] }) {
+                    start = i + header.count
+                    break
                 }
-                lineStart = i + 1
+                while i < count && bytes[i] != 0x0A { i += 1 }
+                i += 1
             }
+            guard let start else { return nil }
+            var end = start
+            while end < count && bytes[end] != UInt8(ascii: "[") {
+                while end < count && bytes[end] != 0x0A { end += 1 }
+                end += 1
+            }
+            return start..<min(end, count)
         }
-        if let current { found[current] = bodyStart..<max(bodyStart, data.count) }
-        return found
     }
-
-    static func hasList(_ name: String) -> Bool { loadIndex().1[name] != nil }
-
-    static var listNames: [String] { loadIndex().1.keys.sorted() }
 
     private static func lines(_ name: String) -> [Substring] {
-        let (data, index) = loadIndex()
-        guard let range = index[name], !range.isEmpty, range.upperBound <= data.count else { return [] }
+        lock.lock()
+        let data = current()
+        let range: Range<Int>?
+        if let known = found[name] {
+            range = known
+        } else {
+            range = Self.range(of: name, in: data)
+            found[name] = .some(range)
+        }
+        lock.unlock()
+        guard let range, !range.isEmpty, range.upperBound <= data.count else { return [] }
         return String(decoding: data[range], as: UTF8.self).split(separator: "\n")
+    }
+
+    static func hasList(_ name: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let data = current()
+        if let known = found[name] { return known != nil }
+        let range = Self.range(of: name, in: data)
+        found[name] = .some(range)
+        return range != nil
     }
 
     /// How many rules a list has, without keeping them.
@@ -279,7 +307,7 @@ enum GeoData {
     /// needed only when the list is sent to the background service.
     static func geoip(_ code: String) -> [String] {
         guard code == "cn" else { return [] }
-        let text = url("geoip-cn.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+        let text = bundled("geoip-cn.txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
         return text.split(separator: "\n").map(String.init).filter(isValidCIDR)
     }
 }

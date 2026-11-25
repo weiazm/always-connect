@@ -89,8 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // here and on panel open, after the launch's own work settled.
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             UpdateChecker.shared.checkIfDue()
-            GeoUpdater.shared.checkIfDue()  // §66.30, the same rhythm
         }
+        // Site lists (§66.30): at once, so a fresh install has them as soon
+        // as the network lets it out (user, 2026-11-25: "可以先下载").
+        GeoUpdater.shared.checkIfDue()
         // Auto-connect on launch when credentials are stored — after
         // updating a background service older than this App (one
         // password prompt, §30.5), so the update never lands on a live

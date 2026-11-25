@@ -44,7 +44,7 @@ setup() {
         "$R/Library/Logs/AlwaysConnect/helper.log" \
         "$H/Library/Logs/AlwaysConnect/relay.log" "$H/Library/Logs/AlwaysConnect/update.log" \
         "$H/Library/Application Support/AlwaysConnect/alwaysconnect-vpnc.sh" \
-        "$H/Library/Application Support/AlwaysConnect/GeoData/geosite.txt" \
+        "$H/Library/Application Support/AlwaysConnect/GeoData/geosite.txt" "$H/Library/Application Support/AlwaysConnect/GeoData/version" \
         "$H/Library/Preferences/com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.app.plist" \
         "$H/Library/Preferences/group.com.alwaysconnect.render.plist" \

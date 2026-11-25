@@ -27,14 +27,19 @@ def catalogue(extra):
     lists += [site("list%04d" % i, [domain(2, "d%d.l%d.example" % (j, i)) for j in range(41)]) for i in range(520)]
     return b"".join(field(1, s) for s in lists)
 good = catalogue([("EXAMPLE", [domain(2, "example.com"), domain(3, "www.example.net")])])
+other = catalogue([("EXAMPLE", [domain(2, "example.com"), domain(3, "www.example.net")]),
+                   ("UNUSED", [domain(2, "unused.example")])])
+grown = catalogue([("EXAMPLE", [domain(2, "example.com"), domain(3, "www.example.net"), domain(2, "added.example")])])
 def release(tag, dat, digest=None):
     d = os.path.join(feed, "download", tag); os.makedirs(d, exist_ok=True)
     open(os.path.join(d, "dlc.dat"), "wb").write(dat)
     open(os.path.join(d, "dlc.dat.sha256sum"), "w").write((digest or hashlib.sha256(dat).hexdigest()) + "  dlc.dat\n")
 release("20261124090120", good)
-release("20261125000000", good, "0" * 64)
-release("20261126000000", good)
-release("20261127000000", b"not a catalogue")
+release("20261125000000", good)              # same content, new tag
+release("20261126000000", other, "0" * 64)   # published hash does not match
+release("20261127000000", other)             # a list nobody uses changed
+release("20261128000000", grown)             # a list the rules use changed
+release("20261129000000", b"not a catalogue")
 open(os.path.join(feed, "api"), "w").write('{"tag_name":"20261124090120"}')
 PY
 PORT=$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')

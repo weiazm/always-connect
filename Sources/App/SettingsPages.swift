@@ -963,9 +963,13 @@ struct SiteListsSection: View {
         Section {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("现用 \(updater.versionText)")
-                    if let error = updater.lastError {
-                        Text("上次更新没成功：\(error)").font(.caption).foregroundStyle(.orange)
+                    Text(updater.version == nil ? "还没下载" : "现用 \(updater.versionText)")
+                    if updater.checking {
+                        Text(updater.version == nil ? "正在下载…" : "正在检查…").font(.caption).foregroundStyle(.secondary)
+                    } else if let error = updater.lastError {
+                        Text((updater.version == nil ? "还没下载成功：" : "上次更新没成功：") + error
+                             + (error == GeoUpdater.unreachable ? "（VPN 连上后会自动再试）" : ""))
+                            .font(.caption).foregroundStyle(.orange)
                     } else if let result {
                         Text(result).font(.caption).foregroundStyle(.secondary)
                     } else if let when = updater.lastSuccess {
@@ -974,12 +978,12 @@ struct SiteListsSection: View {
                     }
                 }
                 Spacer()
-                if updater.checking { ProgressView().controlSize(.small) }
-                Button("立即更新") {
+                Button(updater.version == nil ? "立即下载" : "立即更新") {
                     let before = updater.version
                     result = nil
                     updater.check { error in
-                        result = error ?? (updater.version == before ? "已经是最新" : "已更新，规则已重新生效")
+                        guard error == nil else { return }
+                        result = updater.version == before ? "已经是最新" : "已更新，规则已按新清单生效"
                     }
                 }
                 .disabled(updater.checking)
@@ -990,14 +994,10 @@ struct SiteListsSection: View {
                     settings.siteListsAutoUpdate = on
                     ProfileStore.saveAppSettings(settings)
                 }
-            if updater.version != nil {
-                Button("改回 App 自带的清单") { updater.useBundled() }
-                    .buttonStyle(.borderless).font(.caption)
-            }
         } header: {
             Text("网站清单（geosite）")
         } footer: {
-            Footnote("分流名单和出口保护里的 geosite: 都按这份清单展开。开着自动更新时，App 每天看一次 v2fly/domain-list-community 有没有新版，校验通过才换上，换上后规则马上按新清单生效。")
+            Footnote("分流名单和出口保护里的 geosite: 都按这份清单展开。清单来自 v2fly/domain-list-community，第一次启动时自动下载、存在本机；开着自动更新时每天看一次有没有新版，内容变了才下载，校验通过才换上。")
         }
         .onAppear { updater.reload() }
     }

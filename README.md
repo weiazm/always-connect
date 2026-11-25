@@ -236,8 +236,8 @@ scripts/install-app.sh                # 装到「应用程序」
 ## 许可证
 
 本仓库代码采用 [MIT](LICENSE) 协议。App 内随附的第三方组件各按自己的许可证提供：OpenConnect 及其依赖库（LGPL 等，
-可替换，对应源码由 `scripts/fetch-third-party-sources.sh` 下载）、链接进核心的 Rust 库（MIT）、分流用的
-v2fly/domain-list-community 清单（MIT）与 APNIC 公开数据。完整清单、许可证正文和源码获取方式见
+可替换，对应源码由 `scripts/fetch-third-party-sources.sh` 下载）、链接进核心的 Rust 库（MIT）、APNIC 公开数据；
+网站清单（v2fly/domain-list-community，MIT）不随 App 打包，首次启动时下载。完整清单、许可证正文和源码获取方式见
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；App 里在 设置 → 通用 → 关于 →「许可证与第三方声明」。
 
 ## 商标声明

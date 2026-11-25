@@ -47,9 +47,10 @@ proc-macro2、unicode-ident）不进入产物，不在此列。
 
 ## 3. 分流名单数据
 
-- `geosite.txt`：由 [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) 生成，
-  MIT License，Copyright (c) 2018-2019 V2Ray；全文见 `third_party/licenses/v2fly-domain-list-community.txt`。
-  它只是公开的"域名 → 类别"清单，用于用户自己选择哪些网站走本地网络。
+- 网站清单（`geosite:`）：不随 App 打包。App 首次启动时从 [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)
+  的发布下载 `dlc.dat`，转成本机文件并按日更新（DESIGN §66.30）。MIT License，Copyright (c) 2018-2019 V2Ray；
+  全文见 `third_party/licenses/v2fly-domain-list-community.txt`（仍随 App 附带）。
+  它只是公开的"域名 → 类别"清单，用于用户自己选择哪些网站走本地网络或检查出口。
 - `geoip-cn.txt`：由 APNIC 公开的地址分配统计（`https://ftp.apnic.net/stats/apnic/delegated-apnic-latest`）
   合并生成的网段列表，属公开事实数据。
 
