@@ -293,8 +293,7 @@ pub struct Routing {
     resolver: RwLock<Option<Resolver>>,
     /// Processes listening on local proxies' ports, and when looked up.
     local_pids: Mutex<Option<(Instant, Vec<u16>, Vec<i32>)>>,
-    /// Tests whose stand-in proxies share the test's own process.
-    #[cfg(test)]
+    /// Harnesses whose stand-in proxies share the test's own process.
     same_process_proxies: std::sync::atomic::AtomicBool,
     pool: Mutex<Pool>,
     notice: Mutex<Option<(Instant, String)>>,
@@ -319,11 +318,14 @@ impl Routing {
 
     pub fn set_resolver(&self, resolver: Option<Resolver>) { *self.resolver.write().unwrap() = resolver; }
 
+    /// Harnesses only: stand-in proxies in the same process as the apps
+    /// being tested would look like a local proxy's own connections.
+    pub fn treat_same_process_as_apps(&self) { self.same_process_proxies.store(true, Ordering::Relaxed); }
+
     /// Whether the app socket on `port` belongs to a proxy running on this
     /// Mac (its own outbound connection, after resolving the proxied name
     /// through the same resolver). Looked up only when such a proxy exists.
     pub(crate) fn from_local_proxy(&self, proto: Proto, port: u16) -> bool {
-        #[cfg(test)]
         if self.same_process_proxies.load(Ordering::Relaxed) { return false; }
         let ports = self.table().local_ports();
         if ports.is_empty() { return false; }

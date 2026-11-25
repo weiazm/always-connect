@@ -194,6 +194,8 @@ mod macos {
             format!("proxy:0 socks5 127.0.0.1 {socks}"), "via:0:domain:socks.example".into(), format!("vianet:0:{NETWORK}"),
             format!("proxy:1 http 127.0.0.1 {http}"), "via:1:full:http.example".into(),
         ]));
+        // The stand-in proxies live in this process, like the apps here.
+        routing.treat_same_process_as_apps();
         let original = split_proxy::pf_original_destination().map_err(|e| format!("/dev/pf: {e}"))?;
         let mut listener = Listener::start(routing.clone(), original).map_err(|e| e.to_string())?;
         if !routes.add(&[split_proxy::FAKE_NETWORK.into(), NETWORK.into()], "127.0.0.1") { return Err("route add failed".into()); }
