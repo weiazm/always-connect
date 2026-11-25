@@ -1,7 +1,9 @@
 import SwiftUI
 
-/// Menu-bar popover: a big coloured status header, ONE labelled action
-/// button, server line, last error. The old small switch read the same
+/// Menu-bar popover: a big coloured status header, four switches as
+/// tiles (VPN, 代理, 出口保护, 断线保护; layout B, user 2026-11-25), the
+/// speed, server and split, last error. The red recovery button stays
+/// whenever the network is held. The old small switch read the same
 /// on and off inside a popover (user, 2026-11-03), so the state is now
 /// spelled out and the button says what it will do (UI-DESIGN.md §四).
 /// Disconnecting a working connection goes through an inline confirm
@@ -41,6 +43,12 @@ struct PanelView: View {
     @State private var installMessage: String?
     /// The 网速 card's reader, only while the panel is open (§45.4).
     @StateObject private var speed = PanelSpeed()
+    /// Whether the network answers through the VPN, while open (§69.8).
+    @StateObject private var link = LinkCheck()
+    @ObservedObject private var proxyHealth = ProxyHealth.shared
+    @State private var settings = ProfileStore.loadAppSettings()
+    /// The 出口保护 switch asked for a reconnect: the change waits here.
+    @State private var egressSwitch: (change: EgressRuleChange, paused: [UInt32])?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -55,7 +63,23 @@ struct PanelView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            primaryButton
+            if primaryButtonNeeded { primaryButton }
+            tiles
+            if showConfirmDisconnect {
+                HStack {
+                    Text("断开后网络恢复直连")
+                        .font(.callout)
+                    Spacer()
+                    Button("确认断开") {
+                        showConfirmDisconnect = false
+                        onStop()
+                    }
+                    Button("取消") {
+                        showConfirmDisconnect = false
+                    }
+                }
+            }
+            egressFollowUps
             if manager.showsConnected {
                 speedCard
             }
@@ -90,20 +114,6 @@ struct PanelView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            if showConfirmDisconnect {
-                HStack {
-                    Text("断开后网络恢复直连")
-                        .font(.callout)
-                    Spacer()
-                    Button("确认断开") {
-                        showConfirmDisconnect = false
-                        onStop()
-                    }
-                    Button("取消") {
-                        showConfirmDisconnect = false
-                    }
-                }
             }
             if let error = manager.lastError {
                 Text(error)
@@ -263,13 +273,14 @@ struct PanelView: View {
             }
         }
         .padding(16)
-        .frame(width: 320)
+        .frame(width: 340)
         .toggleStyle(.always)
         .onAppear {
             manager.prepareGatewayWhileDirect()
             speed.start()
             manager.refreshSplitActivity()
             manager.refreshEgress()
+            checkHealth()
             let active = manager.state != .disconnected
             let cisco = manager.usesCisco
             let split = manager.ownConnection
@@ -282,44 +293,46 @@ struct PanelView: View {
         .onReceive(activityTimer) { _ in
             manager.refreshSplitActivity()
             manager.expireGatewayPreparation()
+            checkHealth()
         }
+        .onChange(of: manager.showsConnected) { _ in link.reset(); checkHealth() }
         .onDisappear { speed.stop() }
     }
 
     /// 网速 (DESIGN.md §45.4): the VPN and the direct part side by side,
     /// only while connected; "连接详情" opens the per-connection page.
     private var speedCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("网速").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                Button("连接详情 ›") { onOpenSettings("connections") }
-                    .buttonStyle(.link)
-                    .font(.caption)
-            }
-            HStack(spacing: 12) {
+        Button { onOpenSettings("connections") } label: {
+            HStack(spacing: 10) {
                 speedColumn("走 VPN", color: .green, speed.totals?.vpn)
-                Divider().frame(height: 40)
+                Divider().frame(height: 30)
                 speedColumn("直连", color: .orange, speed.totals?.direct)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
+            .contentShape(Rectangle())
         }
-        .padding(12)
+        .buttonStyle(.plain)
+        .help("网速；点开看每条连接")
+        .padding(.horizontal, 12).padding(.vertical, 9)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
     }
 
     private func speedColumn(_ title: String, color: Color, _ rate: [Int]?) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
-                Circle().fill(color).frame(width: 7, height: 7)
+                Circle().fill(color).frame(width: 6, height: 6)
                 Text(title).font(.caption).foregroundStyle(.secondary)
             }
-            Text("↓ " + (rate.map { PanelSpeed.text($0[0]) } ?? "…"))
-                .font(.system(size: 15, weight: .semibold).monospacedDigit())
-                .lineLimit(1)
-            Text("↑ " + (rate.map { PanelSpeed.text($0[1]) } ?? "…"))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("↓ " + (rate.map { PanelSpeed.text($0[0]) } ?? "…"))
+                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                Text("↑ " + (rate.map { PanelSpeed.text($0[1]) } ?? "…"))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -342,42 +355,6 @@ struct PanelView: View {
                 }
             }
         }
-    }
-
-    /// 出口保护 in the panel, laid out like the other rows: icon, title and
-    /// state on the left, a chevron to the 出口保护 page on the right
-    /// (user, 2026-11-24: the centred row looked broken).
-    private func egressRow(_ line: String) -> some View {
-        let tint: Color = {
-            switch manager.egressLevel {
-            case .ok: return .green
-            case .partial: return .orange
-            case .unknown: return .secondary
-            }
-        }()
-        return Button { onOpenSettings("egress") } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "shield.lefthalf.filled")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("出口保护")
-                    Text(line)
-                        .font(.caption)
-                        .foregroundStyle(tint)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 6)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.vertical, 8)
-        .help("打开出口保护")
     }
 
     /// 按网站分流 in the panel (§26.12): the switch, and in one line what
@@ -489,80 +466,253 @@ struct PanelView: View {
             .padding(.vertical, 9)
             Divider()
             splitRow
-            if !manager.gatewayTrustFailed, let line = manager.egressLine {
-                Divider()
-                egressRow(line)
-                if !manager.egressNotices.isEmpty || manager.egressRecheckRule != nil {
-                    HStack(spacing: 12) {
-                        if let id = manager.egressRecheckRule {
-                            Button(egressRechecking ? "正在重新检查…" : "重新检查") {
-                                egressRechecking = true
-                                manager.recheckEgressRule(id) { ok in
-                                    egressRechecking = false
-                                    egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
-                                }
-                            }.disabled(egressRechecking)
-                        }
-                        if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
-                            Button("暂停保护", role: .destructive) { askToDisableEgressGroup(notice.id) }
-                        } else if !manager.egressNotices.isEmpty {
-                            Menu("暂停保护") {
-                                ForEach(manager.egressNotices) { notice in
-                                    Button(notice.name, role: .destructive) { askToDisableEgressGroup(notice.id) }
-                                }
-                            }
-                            .fixedSize()
-                        }
-                        Spacer()
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .padding(.leading, 28)
-                    .padding(.bottom, 8)
-                }
-                if let id = egressStopConfirmation {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Button("取消") { egressStopConfirmation = nil }
-                            Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 28).padding(.bottom, 8)
-                }
-                if let egressActionError {
-                    Text(egressActionError).font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.leading, 28).padding(.bottom, 8)
-                }
-            }
-            // Both connection ways (DESIGN.md §26.19): off = a drop uses
-            // the local network instead of pausing it.
-            Divider()
-            Toggle(isOn: Binding(
-                get: { protectionOn },
-                set: { on in
-                    protectionOn = on
-                    var settings = ProfileStore.loadAppSettings()
-                    settings.dropProtection = on
-                    egressDisabledWithDrop = !on && settings.egressProtection?.enabled == true
-                    if !on { settings.egressProtection?.enabled = false }
-                    ProfileStore.saveAppSettings(settings, updatingEgress: !on)
-                    manager.dropProtectionChanged()
-                })) {
-                rowLabel(protectionOn ? "lock.shield" : "lock.open", "断线保护",
-                         protectionOn ? "掉线时暂停上网，不漏走直连" : "关：掉线时改走本地网络")
-            }
-            .padding(.vertical, 8)
-            if egressDisabledWithDrop {
-                Text("出口保护已关闭。自建连接需要重新连接一次才能生效。")
-                    .font(.caption).foregroundStyle(.secondary).padding(.bottom, 8)
-            }
         }
         .font(.callout)
         .padding(.horizontal, 12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
+    }
+
+    // MARK: - The four switches (layout B, UI-DESIGN.md 面板)
+
+    /// The everyday button is the VPN tile; the big button stays only where
+    /// it says more than a switch can: the red way back to the direct
+    /// network (never trapped, §24.6), missing credentials, and cancelling
+    /// a protected login.
+    private var primaryButtonNeeded: Bool {
+        manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+            || !manager.hasCredentials
+            || (manager.state == .disconnected && manager.loginProtectionNotice != nil)
+    }
+
+    private var tiles: some View {
+        // Two equal columns; a long state line is cut, never widens one.
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                vpnTile
+                proxyTile
+            }
+            HStack(spacing: 8) {
+                egressTile
+                dropTile
+            }
+        }
+    }
+
+    private var vpnTile: some View {
+        let red = manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+        let (caption, tint): (String, Color) = {
+            if !manager.hasCredentials { return ("先填账号和密码", .secondary) }
+            if manager.gatewayTrustFailed { return ("网关证书不对", .red) }
+            if manager.networkHeld && manager.state != .connected { return ("网络已暂停", .red) }
+            switch manager.state {
+            case .connected:
+                switch link.state {
+                case .ok(let ms): return ("已连接 · \(ms) ms", .green)
+                case .slow(let ms): return ("已连接 · 慢 \(ms) ms", .orange)
+                case .down: return ("已连接 · 网络不通", .red)
+                case .unknown: return ("已连接 · 检测中…", .green)
+                }
+            case .reconnecting: return ("掉线重连中", .orange)
+            case .disconnected:
+                return (manager.onDemandPaused ? "按网络规则暂停" : "未连接", .secondary)
+            default: return ("正在连接…", .orange)
+            }
+        }()
+        return PanelTile(symbol: "lock.shield.fill", title: "VPN", caption: caption, tint: tint,
+                         isOn: manager.switchIsOn,
+                         help: "上网检测：每 10 秒试着打开几个常用网址，取最快的应答（面板开着时才测）") { on in
+            if on {
+                showConfirmDisconnect = false
+                if manager.hasCredentials { onStart() } else { onOpenSettings("credentials") }
+            } else if red {
+                onStop()
+            } else {
+                showConfirmDisconnect = true
+            }
+        } open: { onOpenSettings("credentials") }
+    }
+
+    private var proxyTile: some View {
+        let all = (settings.proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
+        let on = settings.proxiesOn && !all.isEmpty
+        let (caption, tint): (String, Color) = {
+            if all.isEmpty { return ((settings.proxyRoutes ?? []).isEmpty ? "未添加" : "都已停用", .secondary) }
+            if !settings.proxiesOn { return ("关 · 网站照常分流", .secondary) }
+            if !manager.ownConnection { return ("要开按网站分流", .orange) }
+            let summary = proxyHealth.summary(all)
+            let color: Color = summary.level == .ok ? .green : summary.level == .warn ? .orange : summary.level == .fail ? .red : .secondary
+            if !manager.showsConnected { return ("\(all.count) 个 · 连上 VPN 生效", .secondary) }
+            return (summary.text, color)
+        }()
+        return PanelTile(symbol: "arrow.triangle.swap", title: "代理", caption: caption, tint: tint, isOn: on,
+                         help: proxyHelp(all)) { turnOn in
+            if all.isEmpty { onOpenSettings("proxy"); return }
+            var stored = ProfileStore.loadAppSettings()
+            stored.proxiesPaused = turnOn ? nil : true
+            ProfileStore.saveAppSettings(stored)
+            settings = stored
+            if !manager.usesCisco { manager.pushDirectDomains() }
+            if turnOn { proxyHealth.check(all, force: true) }
+        } open: { onOpenSettings("proxy") }
+    }
+
+    /// Each proxy and its state, on hover.
+    private func proxyHelp(_ routes: [ProxyRoute]) -> String {
+        routes.map { route in
+            "\(route.name)：" + (proxyHealth.checks[route.id]?.short ?? "未检测")
+        }.joined(separator: "\n")
+    }
+
+    private var egressTile: some View {
+        let config = settings.egressProtection ?? EgressProtection()
+        let available = !manager.usesCisco && protectionOn
+        let (caption, tint): (String, Color) = {
+            if config.groups.isEmpty { return ("未设置", .secondary) }
+            if manager.usesCisco { return ("经 Cisco 时不可用", .secondary) }
+            if !protectionOn { return ("要先开断线保护", .secondary) }
+            guard config.isActive else { return ("关", .secondary) }
+            guard let line = manager.egressLine, !manager.gatewayTrustFailed else { return ("开", .secondary) }
+            switch manager.egressLevel {
+            case .ok: return (line, .green)
+            case .partial: return (line, .orange)
+            case .unknown: return (line, .secondary)
+            }
+        }()
+        return PanelTile(symbol: "checkmark.shield.fill", title: "出口保护", caption: caption, tint: tint,
+                         isOn: config.isActive && available, enabled: available || config.groups.isEmpty,
+                         help: manager.egressLine ?? "") { on in
+            if config.groups.isEmpty { onOpenSettings("egress"); return }
+            setEgress(on: on)
+        } open: { onOpenSettings("egress") }
+    }
+
+    private var dropTile: some View {
+        PanelTile(symbol: protectionOn ? "lock.fill" : "lock.open.fill", title: "断线保护",
+                  caption: protectionOn ? "掉线时暂停上网" : "关 · 掉线走本地网络",
+                  tint: .secondary, isOn: protectionOn,
+                  help: protectionOn ? "掉线时暂停上网，不漏走直连" : "掉线时改走本地网络") { on in
+            protectionOn = on
+            var stored = ProfileStore.loadAppSettings()
+            stored.dropProtection = on
+            egressDisabledWithDrop = !on && stored.egressProtection?.enabled == true
+            if !on { stored.egressProtection?.enabled = false }
+            ProfileStore.saveAppSettings(stored, updatingEgress: !on)
+            settings = ProfileStore.loadAppSettings()
+            manager.dropProtectionChanged()
+        } open: { onOpenSettings("general") }
+    }
+
+    /// While the panel is open: the VPN's answer time, and each proxy at
+    /// most every 30 s (§69.8). Nothing runs once it closes.
+    private func checkHealth() {
+        if manager.showsConnected { link.checkIfDue() }
+        if manager.showsConnected, manager.ownConnection, settings.proxiesOn {
+            proxyHealth.check(settings.activeProxyRoutes)
+        }
+    }
+
+    /// The 出口保护 switch: off pauses every protection that is on and
+    /// remembers which; on brings those back (or, if none were noted,
+    /// every protection that has sites and countries).
+    private func setEgress(on: Bool) {
+        let stored = ProfileStore.loadAppSettings()
+        let config = stored.egressProtection ?? EgressProtection()
+        let paused = config.enabled ? config.groups.filter(\.enabled).map(\.id) : []
+        let wanted = Set(stored.egressPausedRules ?? [])
+        let change = EgressRuleChange(config: config) { result in
+            for index in result.groups.indices {
+                let group = result.groups[index]
+                let ready = !group.sites.isEmpty && !group.expect.isEmpty
+                result.groups[index].enabled = on && ready && (wanted.isEmpty || wanted.contains(group.id))
+            }
+        }
+        guard !on || change.after.isActive else {
+            egressActionError = "没有能打开的保护（要有网站和允许的国家）。"
+            onOpenSettings("egress")
+            return
+        }
+        guard change.after.permitsActivation(comparedTo: config) else { egressActionError = "这组保护还不能打开。"; return }
+        if change.needsReconnect(connected: manager.showsConnected) {
+            egressSwitch = (change, paused)
+        } else {
+            applyEgressSwitch(change, paused: paused)
+        }
+    }
+
+    private func applyEgressSwitch(_ change: EgressRuleChange, paused: [UInt32]) {
+        manager.saveEgress(change.after, replacing: change.before) { ok in
+            if ok {
+                var latest = ProfileStore.loadAppSettings()
+                latest.egressPausedRules = change.after.isActive ? nil : paused
+                ProfileStore.saveAppSettings(latest)
+            }
+            egressActionError = ok ? nil : "没有改成。请在出口保护页重试。"
+            settings = ProfileStore.loadAppSettings()
+            manager.refreshEgress()
+        }
+    }
+
+    /// Under the tiles: what 出口保护 needs from the user right now.
+    @ViewBuilder private var egressFollowUps: some View {
+        if let pending = egressSwitch {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button("取消") { egressSwitch = nil }
+                    Button(pending.change.confirmationTitle) {
+                        egressSwitch = nil
+                        applyEgressSwitch(pending.change, paused: pending.paused)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        if !manager.gatewayTrustFailed, manager.egressLine != nil,
+           !manager.egressNotices.isEmpty || manager.egressRecheckRule != nil {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
+                if let id = manager.egressRecheckRule {
+                    Button(egressRechecking ? "正在重新检查…" : "重新检查出口") {
+                        egressRechecking = true
+                        manager.recheckEgressRule(id) { ok in
+                            egressRechecking = false
+                            egressActionError = ok ? "重新检查已完成，请查看当前状态。" : "这次未完成重新检查。"
+                        }
+                    }.disabled(egressRechecking)
+                }
+                if let notice = manager.egressNotices.first, manager.egressNotices.count == 1 {
+                    Button("暂停这个保护", role: .destructive) { askToDisableEgressGroup(notice.id) }
+                } else if !manager.egressNotices.isEmpty {
+                    Menu("暂停保护") {
+                        ForEach(manager.egressNotices) { notice in
+                            Button(notice.name, role: .destructive) { askToDisableEgressGroup(notice.id) }
+                        }
+                    }
+                    .fixedSize()
+                }
+                Spacer()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        if let id = egressStopConfirmation {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(EgressRuleChange.reconnectCaption).font(.caption).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button("取消") { egressStopConfirmation = nil }
+                    Button("关闭并重连") { egressStopConfirmation = nil; disableEgressGroup(id) }
+                }
+            }
+        }
+        if let egressActionError {
+            Text(egressActionError).font(.caption).foregroundStyle(.secondary)
+        }
+        if egressDisabledWithDrop {
+            Text("出口保护已关闭。自建连接需要重新连接一次才能生效。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     private func disableEgressGroup(_ id: UInt32) {
@@ -668,7 +818,7 @@ struct PanelView: View {
 /// memory for as long as it shows (animated or not), this ~7 MB.
 final class MenuPanel: NSPanel {
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 332, height: 200),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 340, height: 200),
                    styleMask: [.borderless], backing: .buffered, defer: true)
         isFloatingPanel = true
         level = .statusBar
@@ -820,6 +970,70 @@ final class PanelController: NSObject, NSWindowDelegate {
         // Credentials come from the Keychain; without them the panel
         // switch is disabled, so this guard is a second line only.
         _ = manager.connectWithStoredCredentials(manual: true)
+    }
+}
+
+/// One of the panel's switches (layout B, user 2026-11-25: low tiles,
+/// no empty right half): icon and name with the switch on the first line,
+/// the state across the whole tile under them. Clicking the words opens
+/// that page of Settings.
+struct PanelTile: View {
+    var symbol: String
+    var title: String
+    var caption: String
+    var tint: Color = .secondary
+    var isOn: Bool
+    var enabled = true
+    var help = ""
+    var toggle: (Bool) -> Void
+    var open: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Button(action: open) {
+                    HStack(spacing: 7) {
+                        ZStack {
+                            Circle().fill(isOn ? Color.accentColor : Color.primary.opacity(0.12))
+                            Image(systemName: symbol)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(isOn ? Color.white : Color.secondary)
+                        }
+                        .frame(width: 22, height: 22)
+                        Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                            .fixedSize()
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                // The App's own switch (§21.14): the system one turns grey
+                // whenever the panel is not the active window.
+                AlwaysSwitchTrack(isOn: Binding(get: { isOn }, set: toggle), width: 32, height: 19)
+                    .disabled(!enabled)
+                    .accessibilityLabel(title)
+            }
+            Button(action: open) {
+                HStack(spacing: 4) {
+                    if tint != .secondary { Circle().fill(tint).frame(width: 5, height: 5) }
+                    Text(caption)
+                        .font(.system(size: 11))
+                        .frame(minWidth: 0, alignment: .leading)
+                        .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color.primary.opacity(isOn ? 0.08 : 0.045)))
+        .help(help)
     }
 }
 
