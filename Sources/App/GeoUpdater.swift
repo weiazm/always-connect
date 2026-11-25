@@ -142,6 +142,10 @@ final class GeoUpdater: ObservableObject {
             self.checking = false
             self.reload()
             if changed { Self.installed() }
+            // The download, the conversion and the rules expanded again for
+            // the background service are freed by now: hand the pages back
+            // (§45.5; on the real Mac the App stayed 17 MB larger without it).
+            if !AppRole.isSettings { MemoryRelief.soon(after: 5) }
             done(error)
         }
     }
