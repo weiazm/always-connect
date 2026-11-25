@@ -215,7 +215,25 @@ mod macos {
         println!("SOCKS5 and HTTP CONNECT carried names and a written network through pf");
 
         stage("udp through socks5");
-        let answer = udp_answer(socks_ip, 443).map_err(|e| format!("UDP through SOCKS5: {e}"))?;
+        let answer = match udp_answer(socks_ip, 443) {
+            Ok(answer) => answer,
+            Err(e) => {
+                // Where it stopped: pf's record of the flow, and whether the
+                // datagram reached the proxy at all.
+                let probe = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+                probe.connect(SocketAddr::from((socks_ip, 443))).map_err(|e| e.to_string())?;
+                let _ = probe.send(b"probe");
+                std::thread::sleep(Duration::from_millis(300));
+                let local = probe.local_addr().map_err(|e| e.to_string())?;
+                let look = split_proxy::pf_original_destination().ok().and_then(|o| match local {
+                    SocketAddr::V4(v4) => o(split_proxy::Proto::Udp, v4, std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, listener.udp_port())),
+                    _ => None,
+                });
+                let reached: Vec<String> = asked.try_iter().collect();
+                println!("{}", command("/sbin/pfctl", &["-s", "state"]).lines().filter(|l| l.contains("198.19.") || l.contains(&listener.udp_port().to_string())).collect::<Vec<_>>().join("\n"));
+                return Err(format!("UDP through SOCKS5: {e}; app source {local}; pf original {look:?}; proxy saw {reached:?}"));
+            }
+        };
         if answer != b"echo:quic?" { return Err(format!("UDP answer {answer:?}")); }
         println!("UDP went through the SOCKS5 association and came back from the address the app used");
 
