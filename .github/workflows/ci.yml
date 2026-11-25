@@ -69,6 +69,12 @@ jobs:
         run: |
           (cd core && cargo build --release --bin alwaysconnect-gate)
           sudo --preserve-env=AC_TEST_URL,AC_TEST_CA core/scripts/gate-harness.sh core/target/release/alwaysconnect-gate
+      - name: SOCKS5 interop with a reference server (Dante; password, UDP; DESIGN §69)
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends dante-server
+          sudo systemctl stop danted 2>/dev/null || true
+          scripts/socks5-interop-test.sh
       - name: Stop test gateway
         if: always()
         run: sudo core/scripts/ocserv-test.sh stop

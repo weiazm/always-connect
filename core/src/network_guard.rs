@@ -382,17 +382,18 @@ impl Guard {
 
     fn proxy_token_path(&self) -> PathBuf { self.settings.support_dir.join("proxy-pf-token") }
 
-    /// The proxied sites' redirect (§69): Some(port) loads it, None takes
-    /// it out. Its pf enable reference is kept in proxy-pf-token so a
-    /// crashed service's is released at the next start.
-    pub fn proxy_redirect(&self, port: Option<u16>) -> Result<(), String> {
+    /// The proxied sites' redirect (§69): Some(rules text from
+    /// pf::proxy_redirect) loads it, None takes it out. Its pf enable
+    /// reference is kept in proxy-pf-token so a crashed service's is
+    /// released at the next start.
+    pub fn proxy_redirect(&self, rules: Option<&str>) -> Result<(), String> {
         let mut pf = self.proxy.lock().unwrap();
         let path = self.proxy_token_path();
-        match port {
-            Some(port) => {
+        match rules {
+            Some(rules) => {
                 pf.acquire_enable()?;
                 if let Some(token) = &pf.token { let _ = std::fs::write(&path, token); }
-                pf.run_input(&["-a", pf::PROXY_ANCHOR, "-f", "-"], Some(&pf::proxy_redirect(Some(port)))).map(|_| ())
+                pf.run_input(&["-a", pf::PROXY_ANCHOR, "-f", "-"], Some(rules)).map(|_| ())
             }
             None => {
                 let nat = pf.run(&["-a", pf::PROXY_ANCHOR, "-F", "nat"]);

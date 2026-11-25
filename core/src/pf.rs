@@ -173,17 +173,26 @@ fn valid_cidr(s: &str) -> bool {
 /// for translation (rdr-anchor) and filtering alike.
 pub const PROXY_ANCHOR: &str = "com.apple/301.AlwaysConnectProxy";
 
-/// TCP to the proxied range comes back to the listener on `port`; every
-/// other packet to it is refused at once (UDP such as QUIC gets an ICMP
-/// error, so browsers fall back to TCP without waiting). Without a
-/// listener everything is refused.
-pub fn proxy_redirect(port: Option<u16>) -> String {
+/// TCP to the proxied range and the networks the proxy rules wrote comes
+/// back to the listener on `tcp`, UDP to the one on `udp` (only when a
+/// SOCKS5 proxy can carry it); every other packet to them is refused at
+/// once (an ICMP error, so apps fall back without waiting). Without a
+/// listener everything to them is refused: never passed on another way.
+pub fn proxy_redirect(tcp: Option<u16>, udp: Option<u16>, networks: &[String]) -> String {
     let range = crate::split_proxy::FAKE_NETWORK;
-    let mut out = String::from("# AlwaysConnect proxied sites (generated; do not hand-edit)\n");
-    if let Some(port) = port.filter(|p| *p > 0) {
-        out.push_str(&format!("rdr pass on lo0 inet proto tcp from any to {range} -> 127.0.0.1 port {port}\n"));
+    let mut targets = vec![range.to_owned()];
+    for n in networks {
+        if valid_cidr(n) && !n.contains(':') && !targets.contains(n) { targets.push(n.clone()); }
     }
-    out.push_str(&format!("block return in quick on lo0 inet from any to {range}\n"));
+    let to = if targets.len() == 1 { targets[0].clone() } else { format!("{{ {} }}", targets.join(", ")) };
+    let mut out = String::from("# AlwaysConnect proxied sites (generated; do not hand-edit)\n");
+    if let Some(port) = tcp.filter(|p| *p > 0) {
+        out.push_str(&format!("rdr pass on lo0 inet proto tcp from any to {to} -> 127.0.0.1 port {port}\n"));
+    }
+    if let Some(port) = udp.filter(|p| *p > 0) {
+        out.push_str(&format!("rdr pass on lo0 inet proto udp from any to {to} -> 127.0.0.1 port {port}\n"));
+    }
+    out.push_str(&format!("block return in quick on lo0 inet from any to {to}\n"));
     out
 }
 
@@ -333,13 +342,20 @@ mod tests {
 
     #[test]
     fn proxied_range_redirects_tcp_and_refuses_the_rest() {
-        let text = proxy_redirect(Some(50123));
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>(), vec![
+        let lines = |text: String| text.lines().filter(|l| !l.starts_with('#')).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(lines(proxy_redirect(Some(50123), None, &[])), vec![
             "rdr pass on lo0 inet proto tcp from any to 198.19.128.0/17 -> 127.0.0.1 port 50123",
             "block return in quick on lo0 inet from any to 198.19.128.0/17",
         ]);
-        assert!(!proxy_redirect(None).contains("rdr"));
-        assert!(!proxy_redirect(Some(0)).contains("rdr"));
+        let nets = vec!["203.0.113.0/24".to_owned(), "bad".to_owned(), "2001:db8::/32".to_owned(), "203.0.113.0/24".to_owned()];
+        assert_eq!(lines(proxy_redirect(Some(1), Some(2), &nets)), vec![
+            "rdr pass on lo0 inet proto tcp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 1",
+            "rdr pass on lo0 inet proto udp from any to { 198.19.128.0/17, 203.0.113.0/24 } -> 127.0.0.1 port 2",
+            "block return in quick on lo0 inet from any to { 198.19.128.0/17, 203.0.113.0/24 }",
+        ]);
+        assert!(!proxy_redirect(None, None, &nets).contains("rdr"));
+        assert!(proxy_redirect(None, None, &nets).contains("203.0.113.0/24"), "no listener: still refused");
+        assert!(!proxy_redirect(Some(0), None, &[]).contains("rdr"));
         assert_ne!(PROXY_ANCHOR, ANCHOR);
         assert!(PROXY_ANCHOR.starts_with("com.apple/"));
     }

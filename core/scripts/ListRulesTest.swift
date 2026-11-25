@@ -142,10 +142,22 @@ struct ListRulesTest {
         check("direct rules first, then the proxies", lines.first == "direct.example" && lines[1] == "proxy:0 socks5 127.0.0.1 1080")
         check("a proxy's rules are expanded by the same parser",
               lines.contains("via:0:example.com") && lines.contains("via:0:full:api.example.org") && lines.contains("via:0:domain:github.com"))
-        check("networks never become proxy rules", !lines.contains { $0.hasPrefix("via:") && ($0.contains("10.0.0.0") || $0.contains("ipcidr:")) })
+        check("a written network is routed to its proxy", lines.contains("vianet:0:10.0.0.0/8") && !lines.contains { $0.hasPrefix("via:") && $0.contains("10.0.0.0") })
         check("a switched-off or empty proxy is not sent", !lines.contains { $0.contains("off.example") || $0.contains("proxy.lan") })
         check("an invalid address is still declared, so its sites are refused, not freed",
               lines.contains("proxy:1 http invalid 0") && lines.contains("via:1:bad.example"))
+        // Username and password: percent-encoded, the password from the keychain stand-in.
+        ProxyPasswords.read = { _ in "p@ss word" }
+        var withLogin = AppSettings()
+        withLogin.proxyRoutes = [ProxyRoute(name: "l", kind: .socks5, host: "127.0.0.1", port: 1080, sites: ["geoip:cn", "x.example"],
+                                            username: "alice", passwordStamp: "s1")]
+        let login = withLogin.proxyLines
+        check("credentials ride encoded on the proxy line", login.first == "proxy:0 socks5 127.0.0.1 1080 alice p%40ss%20word")
+        check("geoip becomes address rules of the proxy", login.contains { $0.hasPrefix("via:0:ipcidr:") } && login.contains("via:0:x.example"))
+        ProxyPasswords.read = { _ in nil }
+        withLogin.proxyRoutes![0].passwordStamp = "s2"
+        check("a missing password still names the user (refused there, not dropped)",
+              withLogin.proxyLines.first == "proxy:0 socks5 127.0.0.1 1080 alice %00")
         let roundTrip = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(proxied))
         check("proxies survive saving", roundTrip.proxyRoutes == proxied.proxyRoutes)
         let sparse = try! JSONDecoder().decode(ProxyRoute.self, from: Data(#"{"name":"x","host":"h","port":1}"#.utf8))

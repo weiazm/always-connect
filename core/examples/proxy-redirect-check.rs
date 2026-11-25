@@ -5,8 +5,8 @@
 //! app connection to a proxied name through a local SOCKS5 and a local
 //! HTTP CONNECT proxy to a local site. Then: UDP to the range is refused
 //! at once, a stopped listener means refused (never direct), and cleanup
-//! leaves no route and an empty anchor. Touches only 198.19.128.0/17 and
-//! loopback; everything is taken out again on every path.
+//! leaves no route and an empty anchor. Touches only 198.19.128.0/17,
+//! 203.0.113.0/24 (TEST-NET-3) and loopback; everything is taken out again on every path.
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -44,6 +44,8 @@ mod macos {
         std::thread::spawn(move || { let _ = io::copy(&mut b2, &mut a2); let _ = a2.shutdown(Shutdown::Write); });
     }
 
+    /// CONNECT (by name or address, always to the local site) and UDP
+    /// ASSOCIATE (each datagram comes back as "echo:<payload>").
     fn socks5(site: SocketAddr, asked: mpsc::Sender<String>) -> io::Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -53,10 +55,37 @@ mod macos {
                 let mut b = [0u8; 2]; s.read_exact(&mut b)?;
                 let mut m = vec![0u8; b[1] as usize]; s.read_exact(&mut m)?;
                 s.write_all(&[5, 0])?;
-                let mut r = [0u8; 5]; s.read_exact(&mut r)?;
-                let mut name = vec![0u8; r[4] as usize + 2]; s.read_exact(&mut name)?;
-                let p = u16::from_be_bytes([name[name.len() - 2], name[name.len() - 1]]);
-                let _ = asked.send(format!("socks5 {}:{p}", String::from_utf8_lossy(&name[..name.len() - 2])));
+                let mut r = [0u8; 4]; s.read_exact(&mut r)?;
+                let target = if r[3] == 3 {
+                    let mut n = [0u8; 1]; s.read_exact(&mut n)?;
+                    let mut name = vec![0u8; n[0] as usize + 2]; s.read_exact(&mut name)?;
+                    format!("{}:{}", String::from_utf8_lossy(&name[..name.len() - 2]), u16::from_be_bytes([name[name.len() - 2], name[name.len() - 1]]))
+                } else {
+                    let mut a = [0u8; 6]; s.read_exact(&mut a)?;
+                    format!("{}.{}.{}.{}:{}", a[0], a[1], a[2], a[3], u16::from_be_bytes([a[4], a[5]]))
+                };
+                if r[1] == 3 {
+                    let relay = UdpSocket::bind("127.0.0.1:0")?;
+                    let mut reply = vec![5, 0, 0, 1, 0, 0, 0, 0];
+                    reply.extend_from_slice(&relay.local_addr()?.port().to_be_bytes());
+                    s.write_all(&reply)?;
+                    let asked = asked.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 2048];
+                        while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                            let header = match buf[3] { 1 => 10, 3 => 7 + buf[4] as usize, _ => continue };
+                            let _ = asked.send("socks5 udp".to_owned());
+                            let mut answer = buf[..header].to_vec();
+                            answer.extend_from_slice(b"echo:");
+                            answer.extend_from_slice(&buf[header..n]);
+                            let _ = relay.send_to(&answer, from);
+                        }
+                    });
+                    let mut rest = Vec::new();
+                    let _ = s.read_to_end(&mut rest);
+                    return Ok(());
+                }
+                let _ = asked.send(format!("socks5 {target}"));
                 s.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])?;
                 splice(s, TcpStream::connect(site)?);
                 Ok(())
@@ -126,9 +155,35 @@ mod macos {
         pf.map_err(|e| format!("redirect removal: {e}"))?;
         if !route { return Err("route removal not confirmed".into()); }
         if left.contains("rdr") { return Err(format!("anchor still has rules: {left}")); }
-        if table.lines().any(|l| l.starts_with("198.19.128/17") || l.starts_with("198.19.128.0/17")) { return Err("route still present".into()); }
+        if table.lines().any(|l| l.starts_with("198.19.128/17") || l.starts_with("203.0.113/24")) { return Err("route still present".into()); }
         Ok(())
     }
+
+    fn load(guard: &Guard, tcp: Option<u16>, udp: Option<u16>) -> Result<(), String> {
+        let text = alwaysconnect_core::pf::proxy_redirect(tcp, udp, &[NETWORK.to_owned()]);
+        guard.proxy_redirect(Some(&text)).map_err(|e| format!("pf load: {e}"))
+    }
+
+    fn udp_answer(ip: std::net::Ipv4Addr, port: u16) -> io::Result<Vec<u8>> {
+        let udp = UdpSocket::bind("0.0.0.0:0")?;
+        udp.connect(SocketAddr::from((ip, port)))?;
+        udp.set_read_timeout(Some(Duration::from_millis(300)))?;
+        let mut buf = [0u8; 64];
+        let mut last = io::Error::from(io::ErrorKind::TimedOut);
+        // The first datagrams go while the association is set up.
+        for _ in 0..20 {
+            udp.send(b"quic?")?;
+            match udp.recv(&mut buf) {
+                Ok(n) => return Ok(buf[..n].to_vec()),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return Err(e),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// TEST-NET-3: never a real destination, safe to route on the runner.
+    const NETWORK: &str = "203.0.113.0/24";
 
     fn check(guard: &Guard, routes: &DirectRoutes) -> Result<(), String> {
         let site = echo_site().map_err(|e| e.to_string())?;
@@ -136,16 +191,16 @@ mod macos {
         let socks = socks5(site, tx.clone()).map_err(|e| e.to_string())?;
         let http = http(site, tx).map_err(|e| e.to_string())?;
         let routing = Routing::new(Table::parse(&[
-            format!("proxy:0 socks5 127.0.0.1 {socks}"), "via:0:domain:socks.example".into(),
+            format!("proxy:0 socks5 127.0.0.1 {socks}"), "via:0:domain:socks.example".into(), format!("vianet:0:{NETWORK}"),
             format!("proxy:1 http 127.0.0.1 {http}"), "via:1:full:http.example".into(),
         ]));
         let original = split_proxy::pf_original_destination().map_err(|e| format!("/dev/pf: {e}"))?;
         let mut listener = Listener::start(routing.clone(), original).map_err(|e| e.to_string())?;
-        if !routes.add(&[split_proxy::FAKE_NETWORK.into()], "127.0.0.1") { return Err("route add failed".into()); }
-        guard.proxy_redirect(Some(listener.port())).map_err(|e| format!("pf load: {e}"))?;
+        if !routes.add(&[split_proxy::FAKE_NETWORK.into(), NETWORK.into()], "127.0.0.1") { return Err("route add failed".into()); }
+        load(guard, Some(listener.port()), Some(listener.udp_port()))?;
         println!("{}", command("/sbin/pfctl", &["-a", alwaysconnect_core::pf::PROXY_ANCHOR, "-s", "nat"]).trim());
 
-        stage("socks5 exchange");
+        stage("tcp exchanges");
         let socks_ip = routing.answer("www.socks.example").ok_or("no answer")?;
         exchange(socks_ip, 443)?;
         let seen = asked.recv_timeout(Duration::from_secs(5)).map_err(|_| "socks proxy not asked")?;
@@ -154,26 +209,28 @@ mod macos {
         exchange(http_ip, 8080)?;
         let seen = asked.recv_timeout(Duration::from_secs(5)).map_err(|_| "http proxy not asked")?;
         if seen != "http http.example:8080" { return Err(format!("http proxy asked {seen}")); }
-        println!("SOCKS5 and HTTP CONNECT carried the names through pf");
+        exchange(std::net::Ipv4Addr::new(203, 0, 113, 9), 7)?;
+        let seen = asked.recv_timeout(Duration::from_secs(5)).map_err(|_| "socks proxy not asked for the network")?;
+        if seen != "socks5 203.0.113.9:7" { return Err(format!("socks proxy asked {seen}")); }
+        println!("SOCKS5 and HTTP CONNECT carried names and a written network through pf");
 
-        // UDP (QUIC) to the range: refused at once, not left to time out.
-        let udp = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        udp.connect(SocketAddr::from((socks_ip, 443))).map_err(|e| e.to_string())?;
-        udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stage("udp through socks5");
+        let answer = udp_answer(socks_ip, 443).map_err(|e| format!("UDP through SOCKS5: {e}"))?;
+        if answer != b"echo:quic?" { return Err(format!("UDP answer {answer:?}")); }
+        println!("UDP went through the SOCKS5 association and came back from the address the app used");
+
+        // UDP not carried (no SOCKS5 UDP redirect): refused at once.
+        stage("udp refused");
+        load(guard, Some(listener.port()), None)?;
         let started = Instant::now();
-        let _ = udp.send(b"quic?");
-        let mut buf = [0u8; 16];
-        match udp.recv(&mut buf) {
+        match udp_answer(http_ip, 443) {
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => println!("UDP refused after {:?}", started.elapsed()),
-            other => return Err(format!("UDP to the range was not refused: {other:?}")),
+            other => return Err(format!("UDP was not refused: {other:?}")),
         }
 
         // No listener: the redirect stays, connections are refused.
         stage("stop listener");
         listener.stop();
-        stage("reload redirect");
-        guard.proxy_redirect(None).map_err(|e| e.to_string())?;
-        guard.proxy_redirect(Some(listener.port())).map_err(|e| e.to_string())?;
         stage("connect without listener");
         let started = Instant::now();
         match TcpStream::connect_timeout(&SocketAddr::from((socks_ip, 443)), Duration::from_secs(5)) {

@@ -394,7 +394,8 @@ pub struct Info {
 struct ProxySession {
     routing: Arc<crate::split_proxy::Routing>,
     listener: Option<crate::split_proxy::Listener>,
-    redirected: bool,
+    /// The pf text now loaded in the proxy anchor.
+    loaded: Option<String>,
 }
 
 struct Child {
@@ -949,10 +950,10 @@ impl Shared {
                     if let Some(f) = &c.forwarder {
                         f.set_parsed_rules(c.split_rules());
                     }
-                    self.sync_proxy(&mut c);
                     let rules = c.split_rules();
                     c.split_policy.revalidate(&rules);
                     self.sync_split_routes(&mut c);
+                    self.sync_proxy(&mut c);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
                 Event::EgressGateLost(generation) => self.recover_lost_gate(&mut c, generation),
@@ -1281,13 +1282,13 @@ impl Shared {
     fn sync_proxy(&self, c: &mut Core) {
         let table = crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default());
         if c.forwarder.is_none() || table.is_empty() { self.stop_proxy(c); return; }
+        // Networks inside the Mac's own LAN stay local, like the direct list's.
+        let networks = direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks());
+        let udp = table.carries_udp();
         match &c.proxy {
-            Some(session) => {
-                session.routing.set_table(table);
-                if session.redirected || c.config.no_routes { return; }
-            }
+            Some(session) => session.routing.set_table(table),
             None => c.proxy = Some(ProxySession {
-                routing: crate::split_proxy::Routing::new(table), listener: None, redirected: false,
+                routing: crate::split_proxy::Routing::new(table), listener: None, loaded: None,
             }),
         }
         let session = c.proxy.as_mut().expect("just set");
@@ -1301,13 +1302,24 @@ impl Shared {
                 Err(e) => network_guard::log(&format!("split proxy: listener did not start: {e}")),
             }
         }
-        let port = session.listener.as_ref().map(|l| l.port());
-        let routed = self.proxy_routes.add(&[crate::split_proxy::FAKE_NETWORK.into()], "127.0.0.1");
-        let redirect = self.guard.proxy_redirect(port);
-        if let Err(e) = &redirect { network_guard::log(&format!("split proxy: pf redirect failed: {e}")); }
-        if !routed { network_guard::log("split proxy: loopback route not confirmed"); }
-        let redirected = port.is_some() && routed && redirect.is_ok();
-        session.redirected = redirected;
+        let wanted: HashSet<String> = std::iter::once(crate::split_proxy::FAKE_NETWORK.to_owned()).chain(networks.iter().cloned()).collect();
+        let actual: HashSet<String> = self.proxy_routes.managed_addresses().into_iter().collect();
+        let gone: Vec<_> = actual.difference(&wanted).cloned().collect();
+        let new: Vec<_> = wanted.difference(&actual).cloned().collect();
+        let removed = self.proxy_routes.remove(&gone);
+        let added = self.proxy_routes.add(&new, "127.0.0.1");
+        let routed: HashSet<String> = self.proxy_routes.addresses().into_iter().collect();
+        if !removed || !added || routed != wanted { network_guard::log("split proxy: loopback routes not confirmed"); }
+        let tcp = session.listener.as_ref().map(|l| l.port());
+        let udp_port = session.listener.as_ref().filter(|_| udp).map(|l| l.udp_port());
+        let text = crate::pf::proxy_redirect(tcp, udp_port, &networks);
+        if session.loaded.as_deref() != Some(text.as_str()) {
+            match self.guard.proxy_redirect(Some(&text)) {
+                Ok(()) => session.loaded = Some(text.clone()),
+                Err(e) => { session.loaded = None; network_guard::log(&format!("split proxy: pf redirect failed: {e}")); }
+            }
+        }
+        let redirected = tcp.is_some() && routed == wanted && session.loaded.as_deref() == Some(text.as_str());
         if !redirected {
             c.last_error = Some(PROXY_START_ERROR.into());
             self.report(c, PROXY_START_ERROR);
@@ -1502,7 +1514,10 @@ impl Shared {
     fn route_networks_direct(&self, c: &mut Core) {
         let suspended = c.recovery_suspended();
         if !suspended && !self.repoint_routes(c) { return; }
-        let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks()).into_iter().collect();
+        // A network the proxy rules also wrote goes to the proxy (§69).
+        let proxied=crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default()).networks();
+        let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks())
+            .into_iter().filter(|n|!proxied.contains(n)).collect();
         let actual:HashSet<String>=self.routes.managed_addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         let gone:Vec<_>=actual.difference(&wanted).cloned().collect();
         let new:Vec<_>=wanted.difference(&actual).cloned().collect();
@@ -1524,6 +1539,8 @@ impl Shared {
             let error="直连网段尚未同步完成；基础断线保护保持，可重试恢复网络";
             c.network_routes_error=Some(error.into());self.report(c,error);
         } else {c.network_routes_error=None;}
+        // The Mac's LAN may have changed which proxy networks are routed.
+        if c.proxy.is_some() { self.sync_proxy(c); }
     }
 
     fn repoint_routes(&self, c: &mut Core) -> bool {

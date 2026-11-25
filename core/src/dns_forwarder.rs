@@ -1078,12 +1078,15 @@ impl Inner {
         // Proxied names (§69) come before the direct list: a name in both
         // goes through its proxy, never direct. Exit-protected names stay
         // in the VPN. No DNS server is asked about a proxied name.
-        let proxied = self.proxy.read().unwrap().clone()
-            .filter(|_| !rules.protects_name(&trim_dots(&q.name)))
-            .and_then(|proxy| proxy.answer(&q.name));
-        if let Some(ip) = proxied {
-            return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
-                .or_else(|| empty_answer(query));
+        let proxy = self.proxy.read().unwrap().clone().filter(|_| !rules.protects_name(&trim_dots(&q.name)));
+        if let Some(proxy) = &proxy {
+            if let Some(ip) = proxy.answer(&q.name) {
+                return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
+                    .or_else(|| empty_answer(query));
+            }
+            // Already proxied by its address: other types (HTTPS address
+            // hints above all) must not point around the proxy.
+            if q.qtype != TYPE_A && proxy.knows(&q.name) { return empty_answer(query); }
         }
         let entry = rules.matches(&q.name);
         if q.qtype == TYPE_AAAA { return empty_answer(query); }
@@ -1135,6 +1138,15 @@ impl Inner {
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
         let protected = rules.protects_name(&q.name);
+        // Proxy address rules (geoip, networks, §69) after the direct list's
+        // names and before its addresses: the VPN's answer decides, then
+        // the app gets our address and the proxy gets the name.
+        if q.qtype == TYPE_A && entry.is_none() && !protected && !addresses.iter().any(|ip| rules.protects_ip(*ip)) {
+            if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_by_address(&q.name, &addresses)) {
+                if self.settings.read().unwrap().epoch != epoch { return None; }
+                return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
+            }
+        }
         let direct: Vec<_> = addresses.iter().copied()
             .filter(|ip| !protected && !rules.protects_ip(*ip))
             .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
@@ -1879,6 +1891,33 @@ mod tests {
         // Without proxy rules (an older App, or none set) nothing changes.
         forwarder.set_proxy(None);
         assert_eq!(ipv4_answers(&inner.resolve(&query("www.shared.example", TYPE_A, 5)).unwrap()), vec![Ipv4Addr::new(192, 0, 2, 7)]);
+    }
+
+    #[test]
+    fn proxy_address_rules_follow_direct_names_and_precede_direct_addresses() {
+        // Both upstreams answer 1.2.3.4, inside the proxy's geoip-style range
+        // and inside the direct list's range.
+        let (local, _) = fake_udp([1, 2, 3, 4], false);
+        let (tunnel, tunnel_seen) = fake_udp([1, 2, 3, 4], false);
+        let forwarder = Forwarder::new("127.0.0.1:0".parse().unwrap(), 53, Duration::from_secs(1),
+            vec!["named-direct.example".into(), "ipcidr:1.2.3.0/24".into()],
+            Upstreams { tunnel: vec![format!("127.0.0.1:{tunnel}")], local: vec![format!("127.0.0.1:{local}")],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        let routing = crate::split_proxy::Routing::new(crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080", "via:0:ipcidr:1.2.3.0/24"]));
+        forwarder.set_proxy(Some(routing.clone()));
+        let inner = forwarder.inner();
+        // A direct name rule beats the proxy's address rule.
+        assert_eq!(ipv4_answers(&inner.resolve(&query("named-direct.example", TYPE_A, 1)).unwrap()), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        // The proxy's address rule beats the direct list's address rule:
+        // asked through the VPN's DNS, answered with our address.
+        let seen = tunnel_seen.load(Ordering::SeqCst);
+        let ips = ipv4_answers(&inner.resolve(&query("cdn.example", TYPE_A, 2)).unwrap());
+        assert_eq!(tunnel_seen.load(Ordering::SeqCst), seen + 1);
+        assert!(ips.len() == 1 && crate::split_proxy::is_fake(ips[0]), "{ips:?}");
+        // Its HTTPS record cannot carry address hints around the proxy.
+        let https = inner.resolve(&query("cdn.example", TYPE_HTTPS, 3)).unwrap();
+        assert_eq!(u16::from_be_bytes([https[6], https[7]]), 0);
     }
 
     fn fake_udp(ip: [u8; 4], truncate: bool) -> (u16, Arc<AtomicUsize>) {
