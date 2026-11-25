@@ -62,10 +62,10 @@ struct ProxyPage: View {
             } header: {
                 Text("经代理访问的网站")
             } footer: {
-                Text("命中规则的网站经所选代理访问，排在「不走 VPN 的网站」之前；几个代理都命中时，用排在前面的。"
-                     + "这些网站的域名交给代理解析，本机不向任何 DNS 查询。只转发 TCP（网页、HTTPS 等）；"
-                     + "UDP（如 QUIC）会被拒绝，浏览器会自动改用 TCP。代理连不上或拒绝时，这些网站打不开，不会改走直连或 VPN。"
-                     + "连接代理本身按分流名单走：在局域网或直连名单里就走本地网络，否则经 VPN。暂不支持需要用户名密码的代理。")
+                Text("命中规则的网站经所选代理访问；几个代理都命中时，用排在前面的。按域名的规则排在「不走 VPN 的网站」之前，"
+                     + "这些网站的域名交给代理解析，本机不查 DNS；geoip 和网段按 VPN 的 DNS 答复地址判断，直接写的网段连 IP 也走代理。"
+                     + "TCP 两种代理都转发；UDP（如 QUIC）只经 SOCKS5 转发，HTTP 代理的网站 UDP 不通，浏览器会自动改用 TCP。"
+                     + "代理连不上、拒绝或密码不对时，这些网站打不开，不会改走直连或 VPN。连接代理本身按分流名单走：在局域网或直连名单里就走本地网络，否则经 VPN。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -103,6 +103,7 @@ struct ProxyPage: View {
             Button("编辑") { editing = route }
             Button(role: .destructive) {
                 routes.removeAll { $0.id == route.id }
+                if !preview { ProxyPasswords.delete(for: route) }
                 save()
             } label: { Image(systemName: "trash") }
                 .buttonStyle(.borderless)
@@ -140,6 +141,9 @@ struct ProxyEditor: View {
     @State private var route: ProxyRoute
     @State private var portText: String
     @State private var rules: String
+    @State private var username: String
+    /// Empty = keep the saved password (never read back into the window).
+    @State private var password = ""
 
     init(route: ProxyRoute, isNew: Bool, cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
         self.isNew = isNew
@@ -148,7 +152,10 @@ struct ProxyEditor: View {
         _route = State(initialValue: route)
         _portText = State(initialValue: route.port > 0 ? String(route.port) : "")
         _rules = State(initialValue: route.sites.joined(separator: "\n"))
+        _username = State(initialValue: route.username ?? "")
     }
+
+    private var hasSavedPassword: Bool { route.passwordStamp != nil && !(route.username ?? "").isEmpty }
 
     private var parsed: ProxyRuleInput { ProxyRuleInput(rules) }
     private var port: Int? { Int(portText.trimmingCharacters(in: .whitespaces)).flatMap { ProxyRoute.validPort($0) ? $0 : nil } }
@@ -156,6 +163,10 @@ struct ProxyEditor: View {
     private var addressProblem: String? {
         if !ProxyRoute.validHost(host) { return "地址只能是 IP 或域名，例如 127.0.0.1 或 proxy.example.com" }
         if port == nil { return "端口是 1–65535 之间的数字" }
+        let user = username.trimmingCharacters(in: .whitespaces)
+        if user.utf8.count > 255 || password.utf8.count > 255 { return "用户名和密码各最多 255 字节" }
+        if !user.isEmpty && password.isEmpty && !hasSavedPassword { return "填了用户名就要填密码" }
+        if user.isEmpty && !password.isEmpty { return "填了密码就要填用户名" }
         return nil
     }
     private var canSave: Bool {
@@ -176,6 +187,10 @@ struct ProxyEditor: View {
                     TextField("端口", text: $portText, prompt: Text(route.kind == .socks5 ? "1080" : "8080"))
                         .frame(width: 90)
                 }
+                HStack {
+                    TextField("用户名", text: $username, prompt: Text("不需要就留空"))
+                    SecureField("密码", text: $password, prompt: Text(hasSavedPassword ? "已保存，不改就留空" : "密码"))
+                }
                 if let addressProblem, !route.host.isEmpty || !portText.isEmpty {
                     Text(addressProblem).font(.caption).foregroundStyle(.orange)
                 }
@@ -184,7 +199,7 @@ struct ProxyEditor: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("经这个代理访问的网站").font(.body.weight(.medium))
                 EgressRuleText(input: $rules, height: 150)
-                Text("网段和 geoip 不能用：代理按域名选，本机不先查这些网站的地址。")
+                Text("域名和网站清单在查 DNS 之前就交给代理；geoip 和网段按 VPN 的 DNS 答复地址判断，直接写的网段连 IP 也走代理。")
                     .font(.caption).foregroundStyle(.secondary)
                 EgressRuleIssues(issues: parsed.issues)
             }
@@ -197,6 +212,15 @@ struct ProxyEditor: View {
                     saved.host = host
                     saved.port = port ?? 0
                     saved.sites = parsed.sites
+                    let user = username.trimmingCharacters(in: .whitespaces)
+                    saved.username = user.isEmpty ? nil : user
+                    if user.isEmpty {
+                        ProxyPasswords.delete(for: saved)
+                        saved.passwordStamp = nil
+                    } else if !password.isEmpty {
+                        // Only the stamp is stored with the settings.
+                        saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
+                    }
                     done(saved)
                 }
                 .keyboardShortcut(.defaultAction)
@@ -209,8 +233,7 @@ struct ProxyEditor: View {
 }
 
 /// A proxy's rule box, read like the exit protection's (one rule per
-/// line, comments allowed, pasted Clash lines normalized), with networks
-/// and geoip refused.
+/// line, comments allowed, pasted Clash lines normalized).
 struct ProxyRuleInput {
     static let siteLimit = 512
 
@@ -226,12 +249,7 @@ struct ProxyRuleInput {
                 issues.append(.init(id: index + 1, message: ListRule.problem(text) ?? "写法无效"))
                 continue
             }
-            switch rule {
-            case .network, .geoip:
-                issues.append(.init(id: index + 1, message: "代理只按域名分流，网段和 geoip 不能用"))
-            default:
-                if seen.insert(rule.text).inserted { sites.append(rule.text) }
-            }
+            if seen.insert(rule.text).inserted { sites.append(rule.text) }
         }
         if sites.count > Self.siteLimit { issues.append(.init(id: 0, message: "最多 \(Self.siteLimit) 条")) }
     }
