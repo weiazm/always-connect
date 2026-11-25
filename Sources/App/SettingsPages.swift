@@ -26,13 +26,13 @@ struct SettingsView: View {
 
     var body: some View {
         // 分流代理 is a part of 分流 (§69.9): "proxy" opens it there.
-        let current = tab == "proxy" ? "split" : (Self.pages.contains { $0.tag == tab } ? tab : "general")
+        let current = Self.pages.firstIndex { $0.tag == (tab == "proxy" ? "split" : tab) } ?? 0
         VStack(spacing: 0) {
             // Icon above name, like System Settings' toolbars (the user's
             // chosen design); the system TabView draws a text-only pill.
             HStack(spacing: 4) {
                 ForEach(Self.pages, id: \.tag) { page in
-                    SettingsTabButton(title: page.title, symbol: page.symbol, selected: page.tag == current) {
+                    SettingsTabButton(title: page.title, symbol: page.symbol, selected: page.tag == Self.pages[current].tag) {
                         tab = page.tag
                     }
                 }
@@ -41,29 +41,62 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(Color.primary.opacity(0.04))
             Divider()
-            Group {
-                switch current {
-                case "credentials": CredentialsPage()
-                case "split": SplitPage(preview: splitPreview)
-                case "egress": EgressProtectionPage()
-                case "connections": ConnectionSettingsPage(preview: connectionPreview)
-                case "diagnostics": DiagnosticsPage()
-                default: GeneralPage()
-                }
-            }
+            SettingsPageContainer(selection: current, pages: Self.pages.map { page in
+                AnyView(content(for: page.tag)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .toggleStyle(.always))
+            })
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: SettingsWindow.minimumSize.width, maxWidth: .infinity,
                minHeight: SettingsWindow.minimumSize.height, maxHeight: .infinity)
-        .toggleStyle(.always)
         .onAppear(perform: openProxyPart)
         .onChange(of: tab) { _ in openProxyPart() }
+    }
+
+    @ViewBuilder private func content(for tag: String) -> some View {
+        switch tag {
+        case "credentials": CredentialsPage()
+        case "split": SplitPage(preview: splitPreview, section: $splitSection)
+        case "egress": EgressProtectionPage()
+        case "connections": ConnectionSettingsPage(preview: connectionPreview)
+        case "diagnostics": DiagnosticsPage()
+        default: GeneralPage()
+        }
     }
 
     private func openProxyPart() {
         guard tab == "proxy" else { return }
         splitSection = "proxy"
         tab = "split"
+    }
+}
+
+/// AppKit displays only the selected page and keeps its view state while
+/// the window is open, including unsaved edits when switching tabs.
+private struct SettingsPageContainer: NSViewControllerRepresentable {
+    let selection: Int
+    let pages: [AnyView]
+
+    func makeNSViewController(context: Context) -> NSTabViewController {
+        let controller = NSTabViewController()
+        controller.tabStyle = .unspecified
+        controller.tabView.tabViewType = .noTabsNoBorder
+        controller.transitionOptions = []
+        for page in pages {
+            controller.addChild(NSHostingController(rootView: page))
+        }
+        controller.selectedTabViewItemIndex = selection
+        return controller
+    }
+
+    func updateNSViewController(_ controller: NSTabViewController, context: Context) {
+        for (child, page) in zip(controller.children, pages) {
+            (child as? NSHostingController<AnyView>)?.rootView = page
+        }
+        if controller.selectedTabViewItemIndex != selection {
+            controller.selectedTabViewItemIndex = selection
+        }
     }
 }
 
@@ -749,6 +782,8 @@ struct SplitPagePreview {
 
 struct SplitPage: View {
     var preview: SplitPagePreview? = nil
+    /// 分流直连, 分流代理 or 局域网 (§69.9).
+    @Binding var section: String
     @ObservedObject private var manager = HelperClient.shared
     @ObservedObject private var window = SettingsWindow.shared
     @State private var settings = ProfileStore.loadAppSettings()
@@ -758,9 +793,6 @@ struct SplitPage: View {
     @State private var siteNote: String?
     @State private var confirmSwitch: Bool?
     @State private var localNetworks: [String] = []
-    /// Which part is shown: 分流直连, 分流代理 or 局域网 (§69.9).
-    @AppStorage("splitSection") private var section = "direct"
-
     private var own: Bool { preview?.ownConnection ?? manager.ownConnection }
     private var proxyCount: Int { preview.map { $0.routes.count } ?? (settings.proxyRoutes ?? []).count }
 

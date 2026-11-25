@@ -13,9 +13,11 @@ private final class Fixture: ObservableObject {
 
 private struct FixtureSettings: View {
     @ObservedObject var fixture: Fixture
+    let defaults: UserDefaults
 
     var body: some View {
         SettingsView(connectionPreview: fixture.rows)
+            .defaultAppStorage(defaults)
     }
 }
 
@@ -40,8 +42,11 @@ struct ConnectionsUITest {
         check(manager.showsConnected && PanelStatusHeader(client: manager, subtitle: "").badge == .lock, "healthy settings snapshot restores the lock")
         manager.applyRemoteSnapshot(#"{"state":0}"#)
         CiscoEngine.cliPath = "/nonexistent/connections-ui-test/vpn"
+        let defaults = UserDefaults(suiteName: AppGroups.suiteName)!
+        defaults.set("connections", forKey: "settingsTab")
+        defer { defaults.removeObject(forKey: "settingsTab") }
         let fixture = Fixture()
-        let controller = NSHostingController(rootView: FixtureSettings(fixture: fixture))
+        let controller = NSHostingController(rootView: FixtureSettings(fixture: fixture, defaults: defaults))
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: SettingsWindow.size),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -128,7 +133,15 @@ struct ConnectionsUITest {
         settle()
         check(table.numberOfRows == 1 && !SettingsWindow.shared.vpnConnectionsRequested,
               "the empty-state shortcut shows VPN connections and is consumed once")
+        defaults.set("general", forKey: "settingsTab")
+        settle()
+        check(findTable(in: root) == nil, "a hidden page leaves the settings window")
+        defaults.set("connections", forKey: "settingsTab")
+        settle()
+        check(findTable(in: root) === table && table.numberOfRows == 1,
+              "returning to a tab retains its view and current filter")
         print("PASS connection table scrolls both ways, tracks resizing and keeps position across row updates")
+        print("PASS tab navigation hides detached pages and keeps their view state")
     }
 
     private static func checkEgressEditing() {
