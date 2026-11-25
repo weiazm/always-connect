@@ -442,6 +442,20 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    #[test]
+    fn proxy_probe_answers_json_and_rejects_bad_input() {
+        assert!(ac_proxy_probe(std::ptr::null(), std::ptr::null()).is_null());
+        let bad = CString::new("socks5 bad host 0").unwrap();
+        let rules = CString::new("geoip:cn\nexample.com").unwrap();
+        let out = ac_proxy_probe(bad.as_ptr(), rules.as_ptr());
+        let text = unsafe { CStr::from_ptr(out).to_str().unwrap().to_owned() };
+        ac_string_free(out);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["level"], "fail");
+        assert_eq!(json["site"], "example.com");
+        assert_eq!(json["text"], "代理地址无效");
+    }
+
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
     }
@@ -1735,6 +1749,25 @@ pub extern "C" fn ac_egress_config_valid(json: *const c_char) -> bool {
     c_str(json).filter(|s| s.len() <= 524_288)
         .and_then(|s| serde_json::from_str::<crate::egress_control::EgressConfig>(&s).ok())
         .is_some_and(|cfg| cfg.valid())
+}
+
+/// Checks one proxy now (§69.8): `server` as in the split list
+/// ("socks5|http <host> <port> [<user> <password>]", percent-encoded),
+/// `rules` the proxy's rules one per line (the first plain name is asked
+/// of the proxy). Blocks up to ~20 s: call off the main thread. Returns
+/// {"level":"ok|warn|fail","text":…,"millis":…,"site":…} for
+/// ac_string_free; null on bad input.
+#[no_mangle]
+pub extern "C" fn ac_proxy_probe(server: *const c_char, rules: *const c_char) -> *mut c_char {
+    let Some(line) = c_str(server) else { return std::ptr::null_mut() };
+    let rules: Vec<String> = c_str(rules).unwrap_or_default().lines().map(str::to_owned).collect();
+    let site = crate::split_proxy::site_from_rules(&rules);
+    let result = match crate::split_proxy::Server::parse(&line) {
+        Some(server) => crate::split_proxy::probe(&server, site.as_deref()),
+        None => crate::split_proxy::Probe { level: crate::split_proxy::Level::Fail, text: "代理地址无效".into(), millis: 0 },
+    };
+    let json = serde_json::json!({"level": result.level.word(), "text": result.text, "millis": result.millis, "site": site});
+    CString::new(json.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]

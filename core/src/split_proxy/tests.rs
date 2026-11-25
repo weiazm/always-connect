@@ -628,3 +628,70 @@ print(c.recv(16).decode() or 'closed', flush=True)\n";
     refused(r.open("site.example", site.address.port()));
     assert_eq!(site.accepted.load(Ordering::SeqCst), 1);
 }
+
+// MARK: - Checks and health (§69.8)
+
+#[test]
+fn a_check_tells_reach_password_and_site_apart() {
+    let site = origin();
+    let socks = socks_proxy(site.address, Behaviour { password: Some(("alice", "pw")), ..Default::default() });
+    let http = http_proxy(site.address, Behaviour { password: Some(("alice", "pw")), ..Default::default() });
+    let refusing_socks = socks_proxy(site.address, Behaviour { refuse: true, ..Default::default() });
+    let refusing_http = http_proxy(site.address, Behaviour { refuse: true, ..Default::default() });
+    let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+    let down = unused.local_addr().unwrap().port();
+    drop(unused);
+    let check = |line: String, site: Option<&str>| probe(&Server::parse(&line).unwrap(), site);
+    for (line, site, level, expect) in [
+        (format!("socks5 127.0.0.1 {} alice pw", socks.port), Some("s.example"), Level::Ok, "经代理打开 s.example 正常"),
+        (format!("socks5 127.0.0.1 {} alice pw", socks.port), None, Level::Ok, "用户名密码正确"),
+        (format!("socks5 127.0.0.1 {} alice wrong", socks.port), Some("s.example"), Level::Fail, "拒绝了用户名或密码"),
+        (format!("socks5 127.0.0.1 {}", socks.port), Some("s.example"), Level::Fail, "要求用户名密码"),
+        (format!("socks5 127.0.0.1 {}", refusing_socks.port), Some("s.example"), Level::Warn, "打不开 s.example"),
+        (format!("socks5 127.0.0.1 {down}"), Some("s.example"), Level::Fail, "拒绝连接"),
+        (format!("http 127.0.0.1 {} alice pw", http.port), Some("h.example"), Level::Ok, "经代理打开 h.example 正常"),
+        (format!("http 127.0.0.1 {} alice wrong", http.port), Some("h.example"), Level::Fail, "拒绝了用户名或密码"),
+        (format!("http 127.0.0.1 {}", refusing_http.port), Some("h.example"), Level::Warn, "403"),
+        (format!("http 127.0.0.1 {}", http.port), None, Level::Ok, "密码要等用时才核对"),
+        // Something that is not a proxy at all (the echo server).
+        (format!("socks5 127.0.0.1 {}", site.address.port()), Some("s.example"), Level::Fail, "不支持的认证方式"),
+        (format!("http 127.0.0.1 {}", site.address.port()), Some("h.example"), Level::Fail, "不是 HTTP 代理"),
+    ] {
+        let result = check(line.clone(), site);
+        assert_eq!(result.level, level, "{line}: {}", result.text);
+        assert!(result.text.contains(expect), "{line}: {}", result.text);
+    }
+}
+
+#[test]
+fn the_site_to_check_is_the_first_plain_name() {
+    assert_eq!(site_from_rules(&["geosite:github", "geoip:cn", "keyword:abc", "203.0.113.0/24", "full:Api.Example.org", "example.com"]),
+               Some("api.example.org".into()));
+    assert_eq!(site_from_rules(&["example.com"]), Some("example.com".into()));
+    assert_eq!(site_from_rules(&["geosite:github", "10.0.0.1", "regexp:.*"]), None);
+    assert_eq!(site_from_rules::<&str>(&[]), None);
+}
+
+#[test]
+fn each_proxy_reports_its_last_success_and_failure() {
+    let site = origin();
+    let good = socks_proxy(site.address, Behaviour::default());
+    let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+    let down = unused.local_addr().unwrap().port();
+    drop(unused);
+    let r = rig(&list(&[
+        &format!("proxy:0 socks5 127.0.0.1 {}", good.port), "via:0:full:good.example",
+        &format!("proxy:1 socks5 127.0.0.1 {down}"), "via:1:full:down.example",
+    ]));
+    assert_eq!(r.routing.health_json(), serde_json::json!([]));
+    round_trip(&mut r.open("good.example", 443), "");
+    refused(r.open("down.example", 443));
+    let health = r.routing.health_json();
+    let rows = health.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{health}");
+    assert_eq!(rows[0]["proxy"], 0);
+    assert!(rows[0]["okAgo"].is_u64() && rows[0]["failedAgo"].is_null(), "{health}");
+    assert_eq!(rows[1]["proxy"], 1);
+    assert!(rows[1]["okAgo"].is_null() && rows[1]["failedAgo"].is_u64(), "{health}");
+    assert!(rows[1]["reason"].as_str().unwrap().contains("拒绝连接"), "{health}");
+}

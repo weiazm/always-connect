@@ -36,8 +36,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 mod owner;
+mod probe;
 mod protocol;
 mod relay;
+pub use probe::{probe, site_from_rules, Level, Probe};
 pub use protocol::{http_connect, open_through, socks5_connect, udp_associate, udp_unwrap, udp_wrap};
 pub use relay::{pf_original_destination, Listener, OriginalDestination, Proto};
 
@@ -55,6 +57,8 @@ const MAX_NAMES: usize = 8192;
 const MAX_PROXIES: usize = 64;
 /// A failure is shown on the panel this long and logged once per this.
 const NOTICE_FOR: Duration = Duration::from_secs(60);
+/// How long a proxy's last success or failure is reported (§69.8).
+const HEALTH_FOR: Duration = Duration::from_secs(600);
 
 pub fn is_fake(ip: Ipv4Addr) -> bool {
     u32::from(ip) & !(FAKE_SIZE - 1) == FAKE_BASE
@@ -108,7 +112,9 @@ fn percent_decode(text: &str) -> Option<String> {
 }
 
 impl Server {
-    fn parse(text: &str) -> Option<Server> {
+    /// "socks5|http <host> <port> [<user> <password>]", percent-encoded
+    /// as in the split list (the App's checks use the same line).
+    pub fn parse(text: &str) -> Option<Server> {
         let fields: Vec<&str> = text.split_whitespace().collect();
         let kind = match *fields.first()? { "socks5" => Kind::Socks5, "http" => Kind::Http, _ => return None };
         let host = fields.get(1)?.trim_matches(|c| c == '[' || c == ']').to_owned();
@@ -299,7 +305,13 @@ pub struct Routing {
     notice: Mutex<Option<(Instant, String)>>,
     logged: Mutex<HashMap<String, Instant>>,
     connections: AtomicU64,
+    /// Per proxy (the App's index): the last connection that opened
+    /// through it, and the last that did not, with why.
+    health: Mutex<HashMap<usize, Health>>,
 }
+
+#[derive(Default, Clone)]
+struct Health { ok: Option<Instant>, failed: Option<(Instant, String)> }
 
 pub(crate) type Refusal = (String, String);
 
@@ -388,7 +400,7 @@ impl Routing {
     /// The target and proxy for a connection to `ip`, decided by the
     /// rules now: a rule changed since the answer goes to its new proxy,
     /// or is refused when no proxy takes it any more.
-    pub(crate) fn target(&self, ip: Ipv4Addr) -> Result<(Target, Server), Refusal> {
+    pub(crate) fn target(&self, ip: Ipv4Addr) -> Result<(Target, Server, usize), Refusal> {
         let table = self.table();
         let (target, n) = if is_fake(ip) {
             let (name, addresses) = self.pool.lock().unwrap().entry(ip, Instant::now())
@@ -401,7 +413,7 @@ impl Routing {
             (Target::Ip(ip), n)
         };
         match table.server(n) {
-            Some(server) => Ok((target, server.clone())),
+            Some(server) => Ok((target, server.clone(), n)),
             None => Err((target.label(), "规则指向的代理不存在或地址无效".to_owned())),
         }
     }
@@ -426,6 +438,36 @@ impl Routing {
             Some((at, text)) if at.elapsed() < NOTICE_FOR => Some(text.clone()),
             _ => { *notice = None; None }
         }
+    }
+
+    /// A connection through proxy `n` opened (None) or failed (Some(why)).
+    pub(crate) fn record(&self, n: usize, failure: Option<&str>) {
+        let now = Instant::now();
+        let mut health = self.health.lock().unwrap();
+        let entry = health.entry(n).or_default();
+        match failure {
+            None => entry.ok = Some(now),
+            Some(reason) => entry.failed = Some((now, reason.to_owned())),
+        }
+    }
+
+    /// Each proxy's recent results, for the panel: seconds since the last
+    /// success and the last failure (within the last ten minutes).
+    pub fn health_json(&self) -> serde_json::Value {
+        let mut health = self.health.lock().unwrap();
+        health.retain(|_, h| {
+            if h.ok.is_some_and(|at| at.elapsed() >= HEALTH_FOR) { h.ok = None; }
+            if h.failed.as_ref().is_some_and(|(at, _)| at.elapsed() >= HEALTH_FOR) { h.failed = None; }
+            h.ok.is_some() || h.failed.is_some()
+        });
+        let mut rows: Vec<_> = health.iter().map(|(n, h)| serde_json::json!({
+            "proxy": n,
+            "okAgo": h.ok.map(|at| at.elapsed().as_secs()),
+            "failedAgo": h.failed.as_ref().map(|(at, _)| at.elapsed().as_secs()),
+            "reason": h.failed.as_ref().map(|(_, why)| why.clone()),
+        })).collect();
+        rows.sort_by_key(|row| row["proxy"].as_u64());
+        serde_json::Value::Array(rows)
     }
 
     /// Connections and UDP flows opened through a proxy so far.

@@ -746,7 +746,8 @@ impl Engine {
             "splitRunning": info.split_running, "splitHits": info.split_hits,
             "splitAddresses": info.split_addresses, "splitWarning": info.split_warning,
             "pfError": info.pf_error, "dnsNotice": notice,
-            "proxyConnections": proxy.map(|p| p.connections()),
+            "proxyConnections": proxy.as_ref().map(|p| p.connections()),
+            "proxyHealth": proxy.map(|p| p.health_json()),
         }).to_string()
     }
 

@@ -215,7 +215,7 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
         reset(&client);
         return;
     };
-    let (target, server) = match routing.target(*destination.ip()) {
+    let (target, server, n) = match routing.target(*destination.ip()) {
         Ok(target) => target,
         Err((site, reason)) => { routing.failed(&site, &reason); reset(&client); return; }
     };
@@ -242,8 +242,15 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
     };
     let (upstream, early) = match opened {
         Ok(opened) => opened,
-        Err(reason) => { routing.failed(&target.label(), &reason); reset(&client); forget(); return; }
+        Err(reason) => {
+            if !local_proxy { routing.record(n, Some(&reason)); }
+            routing.failed(&target.label(), &reason);
+            reset(&client);
+            forget();
+            return;
+        }
     };
+    if !local_proxy { routing.record(n, None); }
     routing.opened();
     if let (Some(entry), Ok(copy)) = (open.lock().unwrap().streams.get_mut(&id), upstream.try_clone()) { entry.1 = Some(copy); }
     let _ = client.set_nodelay(true);
@@ -296,7 +303,7 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
             FlowState::Refused(_) => { table.remove(&key); }
         }
     }
-    let (target, server) = match routing.target(*destination.ip()) {
+    let (target, server, n) = match routing.target(*destination.ip()) {
         Ok(target) => target,
         Err((site, reason)) => { routing.failed(&site, &reason); return; }
     };
@@ -328,11 +335,13 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         let (control, relay) = match opened {
             Ok(opened) => opened,
             Err(reason) => {
+                if !raw { routing.record(n, Some(&reason)); }
                 routing.failed(&target.label(), &reason);
                 if let Some(flow) = flows.lock().unwrap().get_mut(&key) { flow.state = FlowState::Refused(Instant::now() + UDP_RETRY); }
                 return;
             }
         };
+        if !raw { routing.record(n, None); }
         let relay = Arc::new(relay);
         let _ = relay.set_read_timeout(Some(UDP_CHECK));
         {

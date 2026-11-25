@@ -9,11 +9,13 @@ use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const PROXY_CLOSED: &str = "代理关闭了连接";
+pub(super) const HTTP_NOT_A_PROXY: &str = "对方不是 HTTP 代理";
 
 fn read_exact(stream: &mut TcpStream, bytes: &mut [u8]) -> Result<(), String> {
     stream.read_exact(bytes).map_err(|e| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "代理没有回应（超时）".to_owned(),
-        io::ErrorKind::UnexpectedEof => "代理关闭了连接".to_owned(),
+        io::ErrorKind::UnexpectedEof => PROXY_CLOSED.to_owned(),
         _ => format!("与代理通信出错（{e}）"),
     })
 }
@@ -47,7 +49,7 @@ fn socks_address(target: &Target, port: u16) -> Result<Vec<u8>, String> {
 }
 
 /// Method negotiation and, when the proxy asks for it, RFC 1929.
-fn socks5_hello(stream: &mut TcpStream, auth: Option<&(String, String)>) -> Result<(), String> {
+pub(super) fn socks5_hello(stream: &mut TcpStream, auth: Option<&(String, String)>) -> Result<(), String> {
     write_all(stream, if auth.is_some() { &[5, 2, 0, 2] } else { &[5, 1, 0] })?;
     let mut choice = [0u8; 2];
     read_exact(stream, &mut choice)?;
@@ -71,7 +73,7 @@ fn socks5_hello(stream: &mut TcpStream, auth: Option<&(String, String)>) -> Resu
 }
 
 /// One SOCKS5 request; the proxy's bound address on success.
-fn socks5_request(stream: &mut TcpStream, command: u8, target: &Target, port: u16) -> Result<Option<SocketAddr>, String> {
+pub(super) fn socks5_request(stream: &mut TcpStream, command: u8, target: &Target, port: u16) -> Result<Option<SocketAddr>, String> {
     let mut request = vec![5, command, 0];
     request.extend(socks_address(target, port)?);
     write_all(stream, &request)?;
@@ -150,14 +152,14 @@ pub fn http_connect(stream: &mut TcpStream, auth: Option<&(String, String)>, tar
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "代理没有回应（超时）".to_owned(),
             _ => format!("与代理通信出错（{e}）"),
         })?;
-        if n == 0 { return Err("代理关闭了连接".into()); }
+        if n == 0 { return Err(PROXY_CLOSED.into()); }
         buffer.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buffer[..end]);
     let mut parts = head.lines().next().unwrap_or("").split_whitespace();
     let code = match (parts.next(), parts.next().and_then(|c| c.parse::<u16>().ok())) {
         (Some(v), Some(code)) if v.starts_with("HTTP/") => code,
-        _ => return Err("对方不是 HTTP 代理".into()),
+        _ => return Err(HTTP_NOT_A_PROXY.into()),
     };
     match code {
         200..=299 => Ok(buffer[end..].to_vec()),
@@ -169,7 +171,7 @@ pub fn http_connect(stream: &mut TcpStream, auth: Option<&(String, String)>, tar
 }
 
 /// Connect to the proxy itself, through the ordinary system path.
-fn connect_proxy(server: &Server) -> Result<TcpStream, String> {
+pub(super) fn connect_proxy(server: &Server) -> Result<TcpStream, String> {
     let addresses: Vec<SocketAddr> = (server.host.as_str(), server.port).to_socket_addrs()
         .map_err(|_| format!("解析不了代理地址 {}", server.host))?.collect();
     if addresses.iter().any(|a| matches!(a, SocketAddr::V4(v4) if is_fake(*v4.ip()))) {
