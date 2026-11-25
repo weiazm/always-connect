@@ -23,6 +23,9 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
+            ProxyPage()
+                .tabItem { Label("代理", systemImage: "arrow.triangle.swap") }
+                .tag("proxy")
             EgressProtectionPage()
                 .tabItem { Label("出口保护", systemImage: "checkmark.shield") }
                 .tag("egress")

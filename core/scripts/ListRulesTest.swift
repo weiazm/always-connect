@@ -126,6 +126,31 @@ struct ListRulesTest {
         check("removing from a migrated group keeps the rest",
               DirectSites.removing("example.org", from: group) == [DirectSite(name: "Old group", domains: ["example.com"])])
 
+        // Proxied sites (DESIGN.md §69): old settings have none; the lines
+        // ride in the split list after the direct rules, in the user's order.
+        check("old settings have no proxies and send no proxy lines",
+              migrated.proxyRoutes == nil && migrated.proxyLines.isEmpty)
+        var proxied = AppSettings()
+        proxied.directSites = [DirectSite(name: "d", domains: ["direct.example"])]
+        proxied.proxyRoutes = [
+            ProxyRoute(name: "off", kind: .http, host: "10.0.0.9", port: 3128, sites: ["off.example"], enabled: false),
+            ProxyRoute(name: "a", kind: .socks5, host: "127.0.0.1", port: 1080, sites: ["Example.com", "full:api.example.org", "geosite:github", "10.0.0.0/8"]),
+            ProxyRoute(name: "bad", kind: .http, host: "bad host", port: 99999, sites: ["bad.example"]),
+            ProxyRoute(name: "empty", kind: .http, host: "proxy.lan", port: 8080, sites: []),
+        ]
+        let lines = proxied.directRuleText.split(separator: "\n").map(String.init)
+        check("direct rules first, then the proxies", lines.first == "direct.example" && lines[1] == "proxy:0 socks5 127.0.0.1 1080")
+        check("a proxy's rules are expanded by the same parser",
+              lines.contains("via:0:example.com") && lines.contains("via:0:full:api.example.org") && lines.contains("via:0:domain:github.com"))
+        check("networks never become proxy rules", !lines.contains { $0.hasPrefix("via:") && ($0.contains("10.0.0.0") || $0.contains("ipcidr:")) })
+        check("a switched-off or empty proxy is not sent", !lines.contains { $0.contains("off.example") || $0.contains("proxy.lan") })
+        check("an invalid address is still declared, so its sites are refused, not freed",
+              lines.contains("proxy:1 http invalid 0") && lines.contains("via:1:bad.example"))
+        let roundTrip = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(proxied))
+        check("proxies survive saving", roundTrip.proxyRoutes == proxied.proxyRoutes)
+        let sparse = try! JSONDecoder().decode(ProxyRoute.self, from: Data(#"{"name":"x","host":"h","port":1}"#.utf8))
+        check("a proxy saved without newer fields still reads", sparse.kind == .socks5 && sparse.enabled && sparse.sites.isEmpty)
+
         print("list-rules FAILS=\(fails)")
         exit(fails == 0 ? 0 : 1)
     }

@@ -293,6 +293,9 @@ struct AppSettings: Codable, Equatable {
     var onDemandEnabled: Bool?
     var onDemandRules: [OnDemandRule]?
     var egressProtection: EgressProtection?
+    /// Sites that go through the user's SOCKS5 / HTTP proxies (DESIGN.md
+    /// §69), in order. Nil in settings from before proxies.
+    var proxyRoutes: [ProxyRoute]?
     /// Keep the site lists (geosite:) current from their publisher
     /// (DESIGN.md §66.30). Nil = on.
     var siteListsAutoUpdate: Bool?
