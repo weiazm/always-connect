@@ -892,17 +892,61 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     return
                 }
                 self.helperUpdatePending = true
-                HelperInstaller.install(prompt: HelperInstaller.updatePrompt) { [weak self] _ in
+                HelperInstaller.install(prompt: HelperInstaller.updatePrompt) { [weak self] result in
                     DispatchQueue.main.async {
                         guard let self else { return }
                         self.helperUpdatePending = false
                         self.refreshStatus()
-                        self.finishLaunchConnection(connect)
+                        guard case .success = result else { self.finishLaunchConnection(connect); return }
+                        // Connect only once the new service answers (§69.10).
+                        self.waitUntilServiceAnswers(deadline: Date().addingTimeInterval(10)) { [weak self] _ in
+                            self?.finishLaunchConnection(connect)
+                        }
                     }
                 }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { decide(-1) }
             proxy.getStatus { code, _ in DispatchQueue.main.async { decide(code) } }
+        }
+    }
+
+    /// §69.11: hands the user's approval to the installed service, which
+    /// updates itself. nil = no answer in 3 s (the caller falls back to the
+    /// password path); false + reason = refused; true = started.
+    func askServiceToUpdate(_ authorization: Data, completion: @escaping (Bool?, String) -> Void) {
+        var pending = true
+        func finish(_ started: Bool?, _ reason: String) {
+            guard pending else { return }
+            pending = false
+            completion(started, reason)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil, "") }
+        ensureConnection { proxy in
+            proxy.updateService(authorization) { started, reason in
+                DispatchQueue.main.async { finish(started, reason) }
+            }
+        }
+    }
+
+    /// After the service was replaced: true once the new one answers
+    /// (getStatus), false at `deadline`. Logging in before it is ready
+    /// left the first protected login unanswered (§69.10).
+    func waitUntilServiceAnswers(deadline: Date, completion: @escaping (Bool) -> Void) {
+        var answered = false
+        ensureConnection { proxy in
+            proxy.getStatus { _, _ in
+                DispatchQueue.main.async {
+                    guard !answered else { return }
+                    answered = true
+                    completion(true)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, !answered else { return }
+            answered = true
+            if Date() >= deadline { completion(false); return }
+            self.waitUntilServiceAnswers(deadline: deadline, completion: completion)
         }
     }
 

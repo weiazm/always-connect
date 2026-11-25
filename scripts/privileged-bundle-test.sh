@@ -6,10 +6,24 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 (cd "$ROOT/core" && cargo build --release --quiet)
 swiftc -O -parse-as-library "$ROOT/Sources/Shared/PrivatePipe.swift" "$ROOT/core/target/release/libalwaysconnect_core.a" "$ROOT/Sources/App/AppIdentity.swift" "$ROOT/Sources/App/AdminScript.swift" \
-    "$ROOT/Sources/App/PrivilegedBundle.swift" "$ROOT/core/scripts/PrivilegedBundleTest.swift" -o "$WORK/test"
-"$WORK/test" "$WORK/bootstrap.sh"
+    "$ROOT/Sources/Shared/RootBootstrap.swift" "$ROOT/Sources/App/PrivilegedBundle.swift" "$ROOT/core/scripts/PrivilegedBundleTest.swift" -o "$WORK/test"
+"$WORK/test" "$WORK/bootstrap.sh" "$WORK/update.sh" "$WORK/version-check.sh"
 bash -n "$WORK/bootstrap.sh"
+bash -n "$WORK/update.sh"
 echo 'PASS bootstrap shell syntax (not executed)'
+# The service's own update (§69.11) refuses older versions: run only the
+# version check, on a fake snapshot, never the bootstrap.
+for case in "0.2.9 0.2.9 ok" "0.3.0 0.2.9 ok" "0.2.10 0.2.9 ok" "1.0 0.9.9 ok" "0.2.8 0.2.9 stop" "0.2 0.2.1 stop" "x.1 0.2.9 stop" "'' 0.2.9 stop"; do
+    set -- $case
+    app="$WORK/v/AlwaysConnect.app"; rm -rf "$WORK/v"; mkdir -p "$app/Contents"
+    new=${1//\'/}
+    if [ -n "$new" ]; then
+        /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $new" "$app/Contents/Info.plist" >/dev/null
+    fi
+    got=$(app="$app" MIN="$2" bash -c 'set -euo pipefail; source "$0"; echo ok' "$WORK/version-check.sh" 2>/dev/null || echo stop)
+    [ "$got" = "$3" ] || { echo "FAIL version check $1 vs $2: $got"; exit 1; }
+done
+echo 'PASS update refuses older or unreadable versions, takes equal and newer'
 # An ad-hoc bundle cannot satisfy the root bootstrap's certificate pin.
 APP="$WORK/AlwaysConnect.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

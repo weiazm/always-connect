@@ -17,6 +17,20 @@ import Foundation
         precondition(script.contains("exit 1"))
         let output = URL(fileURLWithPath: CommandLine.arguments[1])
         try script.write(to: output, atomically: true, encoding: .utf8)
+        // §69.11: the service's own update adds the version check after the
+        // certificate check and before anything from the snapshot runs.
+        let update = RootBootstrap.script(bundle: bundle, requirement: requirement, resource: "dev-helper.sh",
+                                          arguments: ["install"], helper: true, minimumVersion: "0.2.9")
+        let pinned = update.range(of: "/usr/bin/codesign --verify --strict --deep -R=")!
+        let versioned = update.range(of: "不能换成比已装版本更旧的版本")!
+        let runs = update.range(of: "/bin/bash \"$app/Contents/Resources/dev-helper.sh\"")!
+        precondition(pinned.lowerBound < versioned.lowerBound && versioned.lowerBound < runs.lowerBound)
+        precondition(!script.contains("不能换成比已装版本更旧的版本"), "the password path keeps no version floor")
+        try update.write(to: URL(fileURLWithPath: CommandLine.arguments[2]), atomically: true, encoding: .utf8)
+        // The fragment alone, with the floor from the environment (harness).
+        try RootBootstrap.versionCheck(minimum: "MIN_PLACEHOLDER")
+            .replacingOccurrences(of: "'MIN_PLACEHOLDER'", with: "\"$MIN\"")
+            .write(to: URL(fileURLWithPath: CommandLine.arguments[3]), atomically: true, encoding: .utf8)
         // Compile the complete AppleScript, including both shell and AppleScript
         // quoting. Never execute it or request administrator authorization.
         let source = "do shell script " + PrivilegedBundle.appleScriptString("/bin/bash -c " + PrivilegedBundle.shellQuoted(script))

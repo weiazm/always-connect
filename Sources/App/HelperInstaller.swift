@@ -87,6 +87,93 @@ enum HelperInstaller {
         }
     }
 
+    // MARK: - The service updates itself (§69.11)
+
+    static let servicePlistPath = "/Library/LaunchDaemons/com.alwaysconnect.app.helper.plist"
+
+    /// The installed service declares (in its world-readable launchd
+    /// plist) that it knows updateService: asking an older one would drop
+    /// the XPC connection.
+    static var serviceCanUpdateItself: Bool {
+        guard let plist = NSDictionary(contentsOfFile: servicePlistPath) as? [String: Any],
+              let environment = plist["EnvironmentVariables"] as? [String: String] else { return false }
+        return environment["ALWAYSCONNECT_SERVICE_UPDATE"] == "1"
+    }
+
+    enum ServiceUpdateOutcome { case updated, cancelled, failed(String), notTaken }
+
+    /// The user's approval for ServiceUpdateRight, kept by `authorization`
+    /// until the service has checked it. Blocks on the system dialog.
+    private static func approval(prompt: String) -> (AuthorizationRef, Data)? {
+        var authorization: AuthorizationRef?
+        guard AuthorizationCreate(nil, nil, [], &authorization) == errAuthorizationSuccess,
+              let authorization else { return nil }
+        let granted: OSStatus = ServiceUpdateRight.name.withCString { name in
+            kAuthorizationEnvironmentPrompt.withCString { promptKey in
+                prompt.withCString { text in
+                    var item = AuthorizationItem(name: name, valueLength: 0, value: nil, flags: 0)
+                    var promptItem = AuthorizationItem(name: promptKey, valueLength: Int(strlen(text)),
+                                                       value: UnsafeMutableRawPointer(mutating: text), flags: 0)
+                    return withUnsafeMutablePointer(to: &item) { items in
+                        withUnsafeMutablePointer(to: &promptItem) { environmentItems in
+                            var rights = AuthorizationRights(count: 1, items: items)
+                            var environment = AuthorizationEnvironment(count: 1, items: environmentItems)
+                            return AuthorizationCopyRights(authorization, &rights, &environment,
+                                                           [.interactionAllowed, .extendRights, .preAuthorize], nil)
+                        }
+                    }
+                }
+            }
+        }
+        guard granted == errAuthorizationSuccess else {
+            AuthorizationFree(authorization, [.destroyRights])
+            return granted == errAuthorizationCanceled ? (authorization, Data()) : nil
+        }
+        var external = AuthorizationExternalForm()
+        guard AuthorizationMakeExternalForm(authorization, &external) == errAuthorizationSuccess else {
+            AuthorizationFree(authorization, [.destroyRights])
+            return nil
+        }
+        return (authorization, withUnsafeBytes(of: &external) { Data($0) })
+    }
+
+    private static func updateThroughService(prompt: String, completion: @escaping (ServiceUpdateOutcome) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let (authorization, form) = approval(prompt: prompt) else {
+                DispatchQueue.main.async { completion(.notTaken) }
+                return
+            }
+            guard !form.isEmpty else {
+                DispatchQueue.main.async { completion(.cancelled) }
+                return
+            }
+            DispatchQueue.main.async {
+                HelperClient.shared.askServiceToUpdate(form) { started, reason in
+                    AuthorizationFree(authorization, [.destroyRights])
+                    guard let started else { completion(.notTaken); return }
+                    guard started else { completion(.failed(reason)); return }
+                    waitForUpdatedService(deadline: Date().addingTimeInterval(60), completion: completion)
+                }
+            }
+        }
+    }
+
+    /// The replaced service is ours once its code matches this App's and
+    /// it answers again.
+    private static func waitForUpdatedService(deadline: Date, completion: @escaping (ServiceUpdateOutcome) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if installedHelperMatchesBundle {
+                HelperClient.shared.waitUntilServiceAnswers(deadline: deadline) { answered in
+                    completion(answered ? .updated : .failed("新的后台服务没有回应"))
+                }
+            } else if Date() >= deadline {
+                completion(.failed("后台服务没有在一分钟内完成更新"))
+            } else {
+                waitForUpdatedService(deadline: deadline, completion: completion)
+            }
+        }
+    }
+
     /// The way out when the background service does not answer
     /// (DESIGN.md §25.5, F9): the bundled dev-helper.sh `recover`, as
     /// root behind the standard administrator password dialog —
@@ -145,7 +232,21 @@ enum HelperInstaller {
     static func install(prompt: String = installPrompt,
                         completion: @escaping (Result<Void, Error>) -> Void) {
         guard isTeamSigned else {
-            installWithAdminPassword(prompt: prompt, completion: completion)
+            // An installed service that can update itself does it after the
+            // user's approval in a dialog that offers Touch ID (§69.11); any
+            // other case, or a refusal by the service, keeps the password path.
+            guard installedHelperOutdated, serviceCanUpdateItself else {
+                installWithAdminPassword(prompt: prompt, completion: completion)
+                return
+            }
+            updateThroughService(prompt: prompt) { outcome in
+                switch outcome {
+                case .updated: completion(.success(()))
+                case .cancelled: completion(.failure(InstallError.cancelled))
+                case .failed(let reason): completion(.failure(InstallError.scriptFailed(reason)))
+                case .notTaken: installWithAdminPassword(prompt: prompt, completion: completion)
+                }
+            }
             return
         }
         let service = SMAppService.daemon(plistName: plistName)
