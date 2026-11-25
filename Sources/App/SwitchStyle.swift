@@ -27,24 +27,25 @@ struct AlwaysSwitchTrack: View {
     @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
-        ZStack(alignment: isOn ? .trailing : .leading) {
-            Capsule()
-                .fill(isOn ? Color.accentColor : Color.secondary.opacity(0.32))
-            Circle()
-                .fill(Color.white)
-                .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
-                .padding(2)
+        Button {
+            isOn.toggle()
+        } label: {
+            ZStack(alignment: isOn ? .trailing : .leading) {
+                Capsule()
+                    .fill(isOn ? Color.accentColor : Color.secondary.opacity(0.32))
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                    .padding(2)
+            }
+            .frame(width: width, height: height)
+            .opacity(isEnabled ? 1 : 0.45)
+            .animation(.easeOut(duration: 0.15), value: isOn)
+            .contentShape(Capsule())
         }
-        .frame(width: width, height: height)
-        .opacity(isEnabled ? 1 : 0.45)
-        .animation(.easeOut(duration: 0.15), value: isOn)
-        .contentShape(Capsule())
-        .onTapGesture { if isEnabled { isOn.toggle() } }
-        .accessibilityElement()
+        .buttonStyle(.plain)
         .accessibilityLabel("开关")
         .accessibilityValue(isOn ? "开" : "关")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { if isEnabled { isOn.toggle() } }
     }
 }
 

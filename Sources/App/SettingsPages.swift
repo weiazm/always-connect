@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage("settingsTab") private var tab = "general"
     @AppStorage("splitSection") private var splitSection = "direct"
     var connectionPreview: [ConnectionRow]? = nil
+    var splitPreview: SplitPagePreview? = nil
 
     /// The pages in order (UI-DESIGN.md 设置, layout A, 2026-11-25).
     static let pages: [(tag: String, title: String, symbol: String)] = [
@@ -43,7 +44,7 @@ struct SettingsView: View {
             Group {
                 switch current {
                 case "credentials": CredentialsPage()
-                case "split": SplitPage()
+                case "split": SplitPage(preview: splitPreview)
                 case "egress": EgressProtectionPage()
                 case "connections": ConnectionSettingsPage(preview: connectionPreview)
                 case "diagnostics": DiagnosticsPage()
@@ -775,8 +776,7 @@ struct SplitPage: View {
                         .frame(width: 28)
                     VStack(alignment: .leading, spacing: 3) {
                         Text("按网站分流").font(.headline)
-                        Text(own ? "开：AlwaysConnect 自己连 VPN，「分流直连」的网站走本地网络，「分流代理」的网站经你的代理，其余走 VPN。"
-                                 : "关：经 Cisco 连接，全部按公司的规则走；分流直连、分流代理不起作用。")
+                        Text("开：按名单直连或走代理，其余走 VPN。关：经 Cisco 连接，按公司的规则分流。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -835,7 +835,7 @@ struct SplitPage: View {
 
             switch section {
             case "proxy":
-                ProxySections(previewRoutes: preview?.routes, previewSplitOn: own)
+                ProxySections(splitOn: own, previewRoutes: preview?.routes) { settings = $0 }
             case "lan":
                 Section {
                 Toggle(isOn: Binding(
@@ -1023,8 +1023,10 @@ struct SplitPage: View {
     }
 
     private func setCertificate(_ value: String?) {
-        settings.clientCertificate = value
-        ProfileStore.saveAppSettings(settings)
+        var stored = ProfileStore.loadAppSettings()
+        stored.clientCertificate = value
+        ProfileStore.saveAppSettings(stored)
+        settings = stored
     }
 
     /// What the certificate row says: the automatic pick, the manual
