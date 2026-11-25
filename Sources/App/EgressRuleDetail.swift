@@ -60,7 +60,7 @@ struct EgressRuleDetail: View {
                     if state.observed.contains(where: { $0.country == nil }) {
                         Section("查不到出口的服务器") {
                             ForEach(state.observed.filter { $0.country == nil }) { observation in
-                                Text(observation.plainCaption)
+                                Text(observation.plainCaption).help(observation.addressHelp)
                             }
                             Button(rechecking ? "正在检查…" : "重新检查") {
                                 rechecking = true
@@ -234,6 +234,7 @@ struct EgressRuleDetail: View {
             }
             ForEach(record.observed.indices, id: \.self) { index in
                 Text(record.observed[index].plainCaption).font(.caption).foregroundStyle(.secondary)
+                    .help(record.observed[index].addressHelp)
                     .padding(.leading, 26)
             }
         }
@@ -241,11 +242,15 @@ struct EgressRuleDetail: View {
 }
 
 extension EgressProtection.Observation {
-    /// The record line without lookup jargon: host, server, where it left from.
+    /// The record line in words: the site and where it left from. The
+    /// addresses are in `addressHelp` (hover), not in the line (user,
+    /// 2026-11-25: "ip我怎么看懂是哪个域名").
     var plainCaption: String {
-        let server = host.isEmpty ? "" : peerAddress.map { "（服务器 \($0)）" } ?? ""
         let place = country.map { "从 \(egressCountryLabel($0)) 出去" } ?? (host.isEmpty ? "看不到网站名" : "查不到出口")
-        let exit = ip.map { "，出口 \($0)" } ?? ""
-        return displayedHost + server + " " + place + exit
+        return displayedHost + " " + place
+    }
+
+    var addressHelp: String {
+        "服务器 \(peerAddress ?? "—")" + (ip.map { "，出口地址 \($0)" } ?? "")
     }
 }

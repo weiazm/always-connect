@@ -334,8 +334,11 @@ fn probe(hook: &ProbeHook, host: &str, ip: IpAddr, marker: &str, interface: &str
         interface: interface.into(), timeout_ms: PROBE_TIMEOUT_MS,
     };
     let mut peer = None;
-    let started_at = evidence_clock_ms();
     let raw = hook(&req, &mut peer);
+    // The exit is what the answer says at the moment it arrived (§66.31:
+    // stamping the start made a reused result look up to a probe's
+    // duration older, and the gate dropped connections on the real Mac).
+    let answered_at = evidence_clock_ms();
     if peer.is_some_and(|peer| peer != ip) {
         obs.error = Some("探测对端与指定地址不符".into());
         return obs;
@@ -344,7 +347,7 @@ fn probe(hook: &ProbeHook, host: &str, ip: IpAddr, marker: &str, interface: &str
         None => obs.error = Some("连不上或没有回答".into()),
         Some(resp) => match read_trace(&resp) {
             Ok((country, exit)) => {
-                obs.evidence_at_ms = started_at;
+                obs.evidence_at_ms = answered_at;
                 obs.country = Some(country);
                 obs.ip = exit;
             }

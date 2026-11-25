@@ -544,3 +544,25 @@ fn concurrent_connections_to_one_server_share_one_probe() {
     assert_eq!(answered, vec![1, 2, 3], "every waiting connection gets the answer");
     assert_eq!(*seen.lock().unwrap(), 1, "one probe for all three");
 }
+
+#[test]
+fn a_reused_result_reaches_the_gate_young_even_after_a_slow_probe() {
+    let dir = TestDirectory::new();
+    let sock = dir.0.join("egress.sock");
+    let hook: ProbeHook = Arc::new(move |r: &ProbeRequest, peer| {
+        std::thread::sleep(Duration::from_millis(700));
+        *peer = r.connect_ip;
+        Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=192.0.2.200\nloc=ZZ\n".to_vec())
+    });
+    let config = EgressConfig { enabled: true, prefetch: Some(0), groups: vec![rule(1, &["a.example"], &["ZZ"])], ..Default::default() };
+    let _ctl = Controller::start(&sock, config, hook).unwrap();
+    let (mut gate, _) = Peer::connect(&sock);
+    assert_eq!(gate.check(1, "www.a.example", "192.0.2.10", 1)["result"], "allow");
+    std::thread::sleep(Duration::from_millis(250));
+    let reused = gate.check(1, "www.a.example", "192.0.2.10", 2);
+    assert_eq!(reused["result"], "allow");
+    let age = evidence_clock_ms().unwrap() - reused["evidenceAtMs"].as_u64().unwrap();
+    // Stamped at the probe's start this was ~950 ms: the gate (one second)
+    // dropped such connections on the real Mac.
+    assert!(age < 500, "reused evidence is {age} ms old");
+}

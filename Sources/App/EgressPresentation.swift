@@ -69,16 +69,6 @@ extension EgressProtection {
 }
 
 extension EgressProtection.Observation {
-    private var countryAndAddress: String {
-        guard let country else { return "未查到" }
-        return country + (ip.map { "（出口 IP \($0)）" } ?? "")
-    }
-
-    var observationCaption: String {
-        let address = peerAddress.map { "（目的地址 \($0)）" } ?? ""
-        return "\(host.isEmpty ? "无网站名" : host)\(address)：\(countryAndAddress)"
-    }
-
     func isOutside(_ expected: [String]) -> Bool {
         guard let country else { return true }
         return !expected.contains { $0.caseInsensitiveCompare(country) == .orderedSame }

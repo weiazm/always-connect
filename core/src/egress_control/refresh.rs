@@ -69,9 +69,18 @@ impl Cache {
         }
     }
 
-    /// A result young enough to answer a new check with.
+    /// A result young enough to answer a new check with. A result with
+    /// evidence is aged by the gate's own clock, so what is reused here is
+    /// still under the gate's one second on arrival.
     pub fn reusable(&self, key: &Key, epoch: u64, now: Instant) -> Option<&Fresh> {
-        self.fresh.get(key).filter(|f| f.epoch == epoch && now.duration_since(f.at) < REUSE_UNDER)
+        self.reusable_at(key, epoch, now, evidence_clock_ms())
+    }
+
+    pub fn reusable_at(&self, key: &Key, epoch: u64, now: Instant, clock_ms: Option<u64>) -> Option<&Fresh> {
+        self.fresh.get(key).filter(|f| f.epoch == epoch && match (f.evidence_at, clock_ms) {
+            (Some(at), Some(clock)) => clock.saturating_sub(at) < REUSE_UNDER.as_millis() as u64,
+            _ => now.duration_since(f.at) < REUSE_UNDER,
+        })
     }
 
     /// The servers to re-probe now: the top `limit` by score that are busy
@@ -195,9 +204,13 @@ mod tests {
         let start = Instant::now();
         let mut cache = Cache::default();
         read(&mut cache, &key(1), start);
-        assert!(cache.reusable(&key(1), 0, start + Duration::from_millis(700)).is_some());
-        assert!(cache.reusable(&key(1), 0, start + REUSE_UNDER).is_none());
-        assert!(cache.reusable(&key(1), 1, start).is_none(), "a network change or new rules start over");
+        // Evidence stamped at 1 ms on the gate's clock: aged by that clock.
+        assert!(cache.reusable_at(&key(1), 0, start, Some(700)).is_some());
+        assert!(cache.reusable_at(&key(1), 0, start, Some(1 + REUSE_UNDER.as_millis() as u64)).is_none(),
+                "a result the gate would find too old is not reused");
+        assert!(cache.reusable_at(&key(1), 0, start + Duration::from_millis(700), None).is_some());
+        assert!(cache.reusable_at(&key(1), 0, start + REUSE_UNDER, None).is_none());
+        assert!(cache.reusable_at(&key(1), 1, start, Some(2)).is_none(), "a network change or new rules start over");
         let unreadable = Observation { error: Some("x".into()), ..Default::default() };
         cache.bump(&key(2), start);
         cache.note(key(2), "unverified", &unreadable, 0, start);

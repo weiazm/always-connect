@@ -187,6 +187,8 @@ struct EgressCountryChips: View {
 struct EgressDecision: Identifiable {
     let approval: EgressCountryApproval
     let ruleName: String
+    /// DNS steering is on, so the site usually recovers by itself (§66.28).
+    var steering = true
     var id: String { approval.id }
     var rule: UInt32 { approval.group }
 }
@@ -197,7 +199,7 @@ extension EgressProtection.Status {
         return config.groups.filter(\.enabled).flatMap { rule -> [EgressDecision] in
             approvals(for: rule.id).filter { approval in
                 records.first { $0.group == rule.id && $0.started == approval.started }?.expected == rule.expect
-            }.map { EgressDecision(approval: $0, ruleName: rule.name) }
+            }.map { EgressDecision(approval: $0, ruleName: rule.name, steering: config.steer ?? true) }
         }
     }
 }
@@ -250,14 +252,19 @@ struct EgressDecisionList: View {
 
     private func row(_ decision: EgressDecision) -> some View {
         let approval = decision.approval
+        // The site first, in words (user, 2026-11-25: "ip我怎么看懂是哪个域名");
+        // the server and exit addresses only on hover.
+        let site = approval.observation.displayedHost
+        let fix = decision.steering ? "正在换到同一网站出口正确的服务器，通常一分钟内恢复。" : ""
         return EgressCallout(icon: "exclamationmark.shield.fill", tint: .orange,
-                             text: "\(decision.ruleName) 的出口变成了 \(egressCountryLabel(approval.country))，已先拦住",
-                             caption: "服务器 \(approval.observation.peerAddress ?? approval.observation.host)"
-                                 + (approval.observation.ip.map { " · 出口 \($0)" } ?? "")) {
+                             text: "\(site) 这台服务器走了 \(egressCountryLabel(approval.country)) 出口，已拦住",
+                             caption: "它属于「\(decision.ruleName)」这条保护。" + fix) {
             if let open { Button("详情") { open(approval.group) } }
             Button(busy ? "正在检查…" : "重新检查") { recheck(approval.group) }
             Button("允许" + egressCountryName(approval.country)) { pending = .country(approval) }
         }
+        .help("服务器 \(approval.observation.peerAddress ?? "—")"
+              + (approval.observation.ip.map { "，出口地址 \($0)" } ?? ""))
         .disabled(busy || !manager.showsConnected)
     }
 
