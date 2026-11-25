@@ -10,7 +10,8 @@
 //! another.
 //!
 //! Each check also adds one to the server's score, which halves every
-//! [`HALF_LIFE`]. A background thread re-probes the top N servers by score
+//! half-life (set on the 出口保护 page, default [`DEFAULT_HALF_LIFE_MIN`]
+//! minutes). A background thread re-probes the top N servers by score
 //! (N set on the 出口保护 page, default 5, 0 = off) every
 //! [`REFRESH_EVERY`], so a new connection to a busy server finds a fresh
 //! result instead of waiting for a probe. A server whose score fell below
@@ -24,7 +25,12 @@ use std::sync::Condvar;
 
 pub(super) const REUSE_UNDER: Duration = Duration::from_millis(800);
 pub(super) const REFRESH_EVERY: Duration = Duration::from_millis(600);
-pub(super) const HALF_LIFE: Duration = Duration::from_secs(300);
+/// Two minutes: while a site is in use its connections keep it on top;
+/// after leaving it, one visit stops being refreshed after about two
+/// minutes and a busy session after about ten (user 2026-11-25: defaults
+/// "按实际情况优化", the half-life adjustable).
+pub const DEFAULT_HALF_LIFE_MIN: u32 = 2;
+pub const MAX_HALF_LIFE_MIN: u32 = 30;
 pub(super) const MIN_SCORE: f64 = 0.5;
 pub const DEFAULT_PREFETCH: u32 = 5;
 pub const MAX_PREFETCH: u32 = 20;
@@ -41,28 +47,45 @@ pub(super) struct Fresh {
     pub read: bool,
 }
 
-#[derive(Default)]
 pub(super) struct Cache {
     pub fresh: HashMap<Key, Fresh>,
     /// Probes running now, with the gate requests waiting for them.
     pub running: HashMap<Key, Vec<(u64, u64)>>,
     scores: HashMap<Key, (f64, Instant)>,
+    pub half_life: Duration,
 }
 
-fn decayed(score: f64, since: Instant, now: Instant) -> f64 {
-    score * 0.5f64.powf(now.duration_since(since).as_secs_f64() / HALF_LIFE.as_secs_f64())
+impl Default for Cache {
+    fn default() -> Self {
+        Cache { fresh: HashMap::new(), running: HashMap::new(), scores: HashMap::new(),
+                half_life: Duration::from_secs(60 * u64::from(DEFAULT_HALF_LIFE_MIN)) }
+    }
+}
+
+fn decayed_by(half_life: Duration, score: f64, since: Instant, now: Instant) -> f64 {
+    score * 0.5f64.powf(now.duration_since(since).as_secs_f64() / half_life.as_secs_f64().max(1.0))
 }
 
 impl Cache {
+    pub fn with_half_life(half_life: Duration) -> Self {
+        Cache { half_life, ..Cache::default() }
+    }
+
+    fn decayed(&self, score: f64, since: Instant, now: Instant) -> f64 {
+        decayed_by(self.half_life, score, since, now)
+    }
+
     /// One more connection to this server.
     pub fn bump(&mut self, key: &Key, now: Instant) {
+        let half_life = self.half_life;
         let entry = self.scores.entry(key.clone()).or_insert((0.0, now));
-        *entry = (decayed(entry.0, entry.1, now) + 1.0, now);
+        *entry = (decayed_by(half_life, entry.0, entry.1, now) + 1.0, now);
         if self.scores.len() > MAX_SCORED {
-            self.scores.retain(|_, (s, at)| decayed(*s, *at, now) >= MIN_SCORE / 4.0);
+            self.scores.retain(|_, (s, at)| decayed_by(half_life, *s, *at, now) >= MIN_SCORE / 4.0);
             while self.scores.len() > MAX_SCORED {
                 let lowest = self.scores.iter()
-                    .min_by(|a, b| decayed(a.1 .0, a.1 .1, now).total_cmp(&decayed(b.1 .0, b.1 .1, now)))
+                    .min_by(|a, b| decayed_by(half_life, a.1 .0, a.1 .1, now)
+                        .total_cmp(&decayed_by(half_life, b.1 .0, b.1 .1, now)))
                     .map(|(k, _)| k.clone());
                 match lowest { Some(k) => { self.scores.remove(&k); } None => break }
             }
@@ -87,7 +110,7 @@ impl Cache {
     /// enough, last read a country, and are not being probed.
     pub fn due(&self, limit: usize, epoch: u64, now: Instant) -> Vec<Key> {
         let mut ranked: Vec<(&Key, f64)> = self.scores.iter()
-            .map(|(k, (s, at))| (k, decayed(*s, *at, now)))
+            .map(|(k, (s, at))| (k, self.decayed(*s, *at, now)))
             .filter(|(_, s)| *s >= MIN_SCORE)
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -101,14 +124,15 @@ impl Cache {
 
     /// Anything worth waking up for (busy servers with a readable exit).
     pub fn any_hot(&self, epoch: u64, now: Instant) -> bool {
-        self.scores.iter().any(|(k, (s, at))| decayed(*s, *at, now) >= MIN_SCORE
+        self.scores.iter().any(|(k, (s, at))| self.decayed(*s, *at, now) >= MIN_SCORE
             && self.fresh.get(k).is_some_and(|f| f.epoch == epoch && f.read))
     }
 
     pub fn note(&mut self, key: Key, answer: &'static str, obs: &Observation, epoch: u64, now: Instant) {
         self.fresh.insert(key, Fresh { answer, evidence_at: obs.evidence_at_ms, at: now, epoch, read: obs.country.is_some() });
         if self.fresh.len() > MAX_SCORED {
-            self.fresh.retain(|_, f| f.epoch == epoch && now.duration_since(f.at) < HALF_LIFE);
+            let keep = self.half_life;
+            self.fresh.retain(|_, f| f.epoch == epoch && now.duration_since(f.at) < keep);
         }
     }
 
@@ -192,11 +216,25 @@ mod tests {
         assert_eq!(cache.due(5, 0, later).len(), 3);
         assert!(cache.due(5, 0, start).is_empty(), "a result younger than the interval is not re-probed");
         // One connection, then quiet: below the floor after about one half-life.
-        let quiet = start + HALF_LIFE + Duration::from_secs(1);
+        let quiet = start + cache.half_life + Duration::from_secs(1);
         let due = cache.due(5, 0, quiet);
         assert!(due.contains(&key(1)) && !due.contains(&key(3)));
         cache.running.insert(key(1), Vec::new());
         assert!(!cache.due(5, 0, quiet).contains(&key(1)), "a server being probed is not probed twice");
+    }
+
+    #[test]
+    fn a_longer_half_life_keeps_an_occasional_site_refreshed_longer() {
+        let start = Instant::now();
+        let mut short = Cache::default();
+        let mut long = Cache { half_life: Duration::from_secs(600), ..Cache::default() };
+        for cache in [&mut short, &mut long] {
+            cache.bump(&key(1), start);
+            read(cache, &key(1), start);
+        }
+        let later = start + Duration::from_secs(300);
+        assert!(short.due(5, 0, later).is_empty(), "two minutes: gone after five");
+        assert_eq!(long.due(5, 0, later), vec![key(1)], "ten minutes: still refreshed after five");
     }
 
     #[test]

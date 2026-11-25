@@ -11,9 +11,13 @@ struct EgressProtection: Codable, Equatable {
     /// Steer protected names to an entry with a verified exit (§66.28);
     /// nil = on.
     var steer: Bool? = nil
+    /// Minutes after which a server's busyness halves (§66.31); nil = 2.
+    var halfLife: Int? = nil
 
     static let defaultPrefetch = 5
     static let maxPrefetch = 20
+    static let defaultHalfLife = 2
+    static let maxHalfLife = 30
 
     var isActive: Bool { enabled && groups.contains { $0.enabled && !$0.sites.isEmpty } }
 

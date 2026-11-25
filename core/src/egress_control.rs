@@ -26,7 +26,7 @@ mod activity;
 use activity::{Denied, SiteStatus};
 mod refresh;
 mod steer;
-pub use refresh::{DEFAULT_PREFETCH, MAX_PREFETCH};
+pub use refresh::{DEFAULT_HALF_LIFE_MIN, DEFAULT_PREFETCH, MAX_HALF_LIFE_MIN, MAX_PREFETCH};
 use refresh::{Bell, Cache};
 use steer::Ledger;
 
@@ -54,6 +54,9 @@ pub struct EgressConfig {
     /// Steer protected names to a verified entry (§66.28); None = on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steer: Option<bool>,
+    /// Minutes after which a server's busyness halves (§66.31); None = the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub half_life: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -145,6 +148,10 @@ impl EgressConfig {
         self.prefetch.unwrap_or(DEFAULT_PREFETCH).min(MAX_PREFETCH) as usize
     }
 
+    pub fn half_life(&self) -> Duration {
+        Duration::from_secs(60 * u64::from(self.half_life.unwrap_or(DEFAULT_HALF_LIFE_MIN).clamp(1, MAX_HALF_LIFE_MIN)))
+    }
+
     pub fn steering(&self) -> bool {
         self.steer.unwrap_or(true)
     }
@@ -159,6 +166,7 @@ impl EgressConfig {
         let ids: std::collections::HashSet<_> = self.groups.iter().map(|g| g.id).collect();
         ids.len() == self.groups.len() && self.groups.len() <= MAX_GROUPS
             && self.prefetch.is_none_or(|n| n <= MAX_PREFETCH)
+            && self.half_life.is_none_or(|m| (1..=MAX_HALF_LIFE_MIN).contains(&m))
             && self.groups.iter().all(|g| {
                 g.sites.len() <= MAX_SITES
                     && g.sites.iter().all(|site| valid_rule(site, false))
@@ -601,6 +609,7 @@ impl ControlState {
                     |country| !group.allows(country)));
             !failed.is_empty()
         });
+        self.cache.half_life = cfg.half_life();
         self.config = cfg;
         self.sites = sites;
         self.settle();
@@ -644,13 +653,14 @@ pub struct Controller {
 impl Controller {
     pub fn start(path: &Path, cfg: EgressConfig, hook: ProbeHook) -> std::io::Result<Controller> {
         let _ = std::fs::remove_file(path);
+        let half_life = cfg.half_life();
         let (wake, wake_stop) = crate::child_io::pipe()?;
         let listener = crate::child_io::creation(|| UnixListener::bind(path))?;
         let shared = Arc::new(Shared {
             state: Mutex::new(ControlState {
                 sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
-                ledger: Ledger::default(), cache: Cache::default(), on_peer_loss: None,
+                ledger: Ledger::default(), cache: Cache::with_half_life(half_life), on_peer_loss: None,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
             bell: Bell::default(),

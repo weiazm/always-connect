@@ -228,26 +228,46 @@ struct EgressProtectionPage: View {
 
     // MARK: - How checks run (§66.31)
 
+    /// Every setting says what it does and what changing it costs (user,
+    /// 2026-11-25: "给出作用与效果的说明，让用户能理解怎么设置").
     private var checkingSection: some View {
         let prefetch = config.prefetch ?? EgressProtection.defaultPrefetch
+        let halfLife = config.halfLife ?? EgressProtection.defaultHalfLife
         return Section {
             Stepper(value: Binding(get: { prefetch }, set: { n in change { $0.prefetch = n } }),
                     in: 0...EgressProtection.maxPrefetch) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(prefetch == 0 ? "不主动刷新" : "主动刷新访问最多的 \(prefetch) 台服务器")
-                    Text("提前查好出口，新连接不用等。每台约每秒两次很小的检查请求；很久没访问的自动停。")
+                    Text(prefetch == 0 ? "主动刷新：关" : "主动刷新访问最多的 \(prefetch) 台服务器")
+                    Text("每个新连接都要先确认出口，约多等半秒。被主动刷新的服务器在后台每 0.6 秒查一次，新连接直接放行、不用等。"
+                         + "调大：更多网站打开更快，后台检查请求更多（每台约每秒两次很小的请求）；调小或设成 0：更省，但新连接要等。"
+                         + "默认 5，一般够覆盖常用网站的主站、接口和静态资源。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
+            Stepper(value: Binding(get: { halfLife }, set: { m in change { $0.halfLife = m } }),
+                    in: 1...EgressProtection.maxHalfLife) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("活跃度每 \(halfLife) 分钟减半")
+                    Text("决定\u{201C}访问最多\u{201D}怎么算：每个新连接给服务器加 1 分，分数每过这段时间减半，低于 0.5 分就停止主动刷新。"
+                         + "调小：离开网站后更快停止后台检查，更省；调大：偶尔用一下的网站也能保持提前查好。"
+                         + "默认 2 分钟：只开过一次的网站约 2 分钟后停，连续用过一阵的约 10 分钟后停。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .disabled(prefetch == 0)
             Toggle(isOn: Binding(get: { config.steer ?? true }, set: { on in change { $0.steer = on } })) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("自动换到出口正确的入口")
-                    Text("出口不对时，在同一 CDN 里换一个出口正确的地址，仍走 VPN。关掉后只拦截。")
+                    Text("同一网站在 CDN 上有多台服务器，出口可能不同。打开时，本机 DNS 只给出口正确的那几台，走错的被拦后约一分钟内自动换好，仍走 VPN。"
+                         + "关掉后只拦截、不换，走错出口的服务器会一直连不上。建议保持打开。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
         } header: {
             Text("检查方式")
+        } footer: {
+            Text("刚查过的结果只在 1 秒内复用，保证出口是实时确认的。")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .disabled(!available || busy)
     }

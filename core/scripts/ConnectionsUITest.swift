@@ -258,7 +258,7 @@ struct ConnectionsUITest {
             refresh: {}, edit: { _ in }, remove: {}, saveSites: { _, _, done in done(nil) })))
         let second = EgressProtection.Group(id: 8, name: "第二个保护", enabled: false,
             sites: ["example.org", "geosite:test"], expect: ["ZZ", "YY"], unverified: .whenWrong)
-        render("egress-page", 360, AnyView(EgressProtectionPage(preview: EgressPagePreview(
+        render("egress-page", 820, AnyView(EgressProtectionPage(preview: EgressPagePreview(
             config: EgressProtection(enabled: true, groups: [group, second]), status: nil, connected: false))))
         print("PASS offscreen add, detail and page views")
     }
