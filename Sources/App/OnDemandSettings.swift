@@ -15,7 +15,11 @@ struct OnDemandSettings: View {
 
     var body: some View {
         Section {
-            Toggle("按规则自动连接", isOn: $enabled).onChange(of: enabled) { _ in save() }
+            Toggle(isOn: $enabled) {
+                IconLabel(title: "按规则自动连接", subtitle: "按 Wi-Fi、网络等条件自动连上或断开",
+                          symbol: "wifi", color: SettingsTone.account)
+            }
+            .onChange(of: enabled) { _ in save() }
             ForEach(Array(rules.enumerated()), id: \.element.id) { index, rule in
                 OnDemandRuleRow(rule: rule, first: index == 0, last: index + 1 == rules.count,
                     move: { offset in
@@ -37,6 +41,11 @@ struct OnDemandSettings: View {
                     save()
                 }
                 .id(draft.id)
+            } else if rules.isEmpty {
+                EmptyGuide(symbol: "wifi", color: SettingsTone.account, title: "还没有规则",
+                           text: "例如：连着家里的 Wi-Fi 时断开 VPN，到了别处自动连上。") {
+                    Button("添加第一条规则") { editing = OnDemandRule() }
+                }
             } else {
                 Button { editing = OnDemandRule() } label: {
                     Label("添加规则", systemImage: "plus.circle.fill")

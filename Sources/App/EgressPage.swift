@@ -60,7 +60,6 @@ struct EgressProtectionPage: View {
         let decisions = liveStatus?.decisions(config: config) ?? []
         Form {
             Section {
-                statusBar
                 if let confirm {
                     EgressReconnectPrompt(change: confirm, cancel: { self.confirm = nil }) {
                         self.confirm = nil
@@ -75,21 +74,23 @@ struct EgressProtectionPage: View {
                         Button("知道了") { self.message = nil }
                     }
                 }
+                Group {
+                    if config.groups.isEmpty {
+                        emptyState
+                    } else {
+                        tableHeader
+                        ForEach(config.groups) { group in
+                            ruleRow(group, decisions: decisions.filter { $0.rule == group.id })
+                        }
+                    }
+                }
+                .disabled(!available || busy)
+            } header: {
+                statusBar
             } footer: {
                 Text("命中规则的新连接先检查出口，走错国家就拦。查不到出口时按各保护的设置处理。出口保护开启时，VPN 内的 QUIC 流量会被拦。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            Section {
-                if config.groups.isEmpty {
-                    emptyState
-                } else {
-                    tableHeader
-                    ForEach(config.groups) { group in
-                        ruleRow(group, decisions: decisions.filter { $0.rule == group.id })
-                    }
-                }
-            }
-            .disabled(!available || busy)
             if !config.groups.isEmpty {
                 checkingSection
             }
@@ -152,23 +153,24 @@ struct EgressProtectionPage: View {
 
     // MARK: - Top
 
+    /// The page's status card (§69.14): how protection stands now, and
+    /// what to do next on the right.
     private var statusBar: some View {
         let look = statusLook
-        return HStack(spacing: 10) {
-            Circle().fill(look.tint).frame(width: 10, height: 10)
-            Text(look.line).fontWeight(.medium).foregroundStyle(look.lineColor)
-            Spacer(minLength: 8)
-            if preview == nil && manager.usesCisco {
-                Button("去「分流」打开") { UserDefaults.standard.set("split", forKey: "settingsTab") }
-            } else if !(preview?.available ?? manager.protectsDrops) {
-                Button("打开断线保护") { confirmDropProtection = true }
+        return PageHero(symbol: "checkmark.shield.fill", color: SettingsTone.shield, title: "出口保护",
+                        status: look.line, dot: look.tint) {
+            HStack(spacing: 8) {
+                if preview == nil && manager.usesCisco {
+                    Button("去「分流」打开") { UserDefaults.standard.set("split", forKey: "settingsTab") }
+                } else if !(preview?.available ?? manager.protectsDrops) {
+                    Button("打开断线保护") { confirmDropProtection = true }
+                }
+                moreMenu
+                Button { sheet = .addSites } label: { Label("添加保护", systemImage: "plus") }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!available || busy)
             }
-            moreMenu
-            Button { sheet = .addSites } label: { Label("添加保护", systemImage: "plus") }
-                .buttonStyle(.borderedProminent)
-                .disabled(!available || busy)
         }
-        .padding(.vertical, 2)
     }
 
     private var moreMenu: some View {
@@ -214,16 +216,11 @@ struct EgressProtectionPage: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "globe.asia.australia.fill").font(.system(size: 34)).foregroundStyle(.secondary)
-            Text("还没有出口保护").font(.headline)
-            Text("加入要保护的网站或网段，并选择允许的出口国家。")
-                .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button("添加保护…") { sheet = .addSites }
-                .buttonStyle(.borderedProminent).controlSize(.large).padding(.top, 4)
+        EmptyGuide(symbol: "globe.asia.australia.fill", color: SettingsTone.shield, title: "还没有出口保护",
+                   text: "加入要保护的网站或网段，并选择允许的出口国家。") {
+            Button("添加第一个保护…") { sheet = .addSites }
+                .buttonStyle(.borderedProminent)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 22)
     }
 
     // MARK: - How checks run (§66.31)

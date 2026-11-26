@@ -89,14 +89,13 @@ struct ProxySections: View {
             }
             Section {
                 if routes.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "arrow.triangle.swap").font(.system(size: 28)).foregroundStyle(.secondary)
-                        Text("还没有代理").font(.body.weight(.medium))
-                        Text("点「添加代理」，粘贴一行代理地址，再写上哪些网站经它访问。")
-                            .font(.caption).foregroundStyle(.secondary)
+                    EmptyGuide(symbol: "server.rack", color: SettingsTone.proxy, title: "还没有代理",
+                               text: "粘贴一行代理地址，再写上哪些网站经它访问。") {
+                        Button("添加第一个代理") {
+                            editing = ProxyRoute(name: "", kind: .socks5, host: "", port: 0, sites: [])
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 28)
                 } else {
                     ForEach(Array(routes.enumerated()), id: \.element.id) { index, route in row(route, index: index) }
                 }
@@ -136,10 +135,8 @@ struct ProxySections: View {
 
     private func row(_ route: ProxyRoute, index: Int) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: route.kind == .socks5 ? "point.3.connected.trianglepath.dotted" : "globe")
-                .font(.system(size: 16))
-                .foregroundStyle(route.enabled ? Color.accentColor : Color.secondary)
-                .frame(width: 22)
+            IconTile(symbol: route.kind == .socks5 ? "point.3.connected.trianglepath.dotted" : "globe",
+                     color: route.enabled ? SettingsTone.proxy : SettingsTone.neutral, size: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(route.name).font(.body.weight(.medium)).lineLimit(1)
                 Text(ProxyLink.display(route).replacingOccurrences(of: "://", with: " · "))

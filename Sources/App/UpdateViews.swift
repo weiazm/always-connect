@@ -97,67 +97,61 @@ enum UpdateSteps {
     static let what = "下载并校验新版，然后自动退出、换上新版并重新打开；VPN 断开几秒后自动重连。"
 }
 
-/// Settings → General → 版本 (UI-DESIGN.md §六): this version, a button
-/// that checks now, and what it found; 更新 starts at once.
-struct UpdateSection: View {
+/// Settings → 通用 → 关于 AlwaysConnect (UI-DESIGN.md §六, §69.14): this
+/// version with a button that checks now, and what it found; 更新 starts
+/// at once. Rows only: the card is AboutSection's.
+struct UpdateRows: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @State private var message: String?
     @State private var startedFromSettings = false
 
     var body: some View {
-        Section {
-            LabeledContent("当前版本") {
-                HStack(spacing: 8) {
-                    Text(UpdateChecker.currentVersion)
-                        .foregroundStyle(.secondary)
-                    Button(updates.checking ? "正在检查…" : "检查更新") { checkNow() }
-                        .disabled(updates.checking || updates.installing)
-                }
+        LabeledContent {
+            HStack(spacing: 8) {
+                Text(UpdateChecker.currentVersion)
+                    .foregroundStyle(.secondary)
+                Button(updates.checking ? "正在检查…" : "检查更新") { checkNow() }
+                    .disabled(updates.checking || updates.installing)
             }
-            if let update = updates.available {
-                LabeledContent {
-                    HStack(spacing: 8) {
-                        Menu("更多") {
-                            Button("跳过这个版本") {
-                                updates.skip(update)
-                                message = "已跳过 \(update.version)，更新的版本出来时会再提示"
-                            }
-                            Button("打开发布页") { updates.openReleasePage(update) }
+        } label: {
+            IconLabel(title: "当前版本", subtitle: schedule, symbol: "arrow.down.circle.fill", color: SettingsTone.account)
+        }
+        if let update = updates.available {
+            LabeledContent {
+                HStack(spacing: 8) {
+                    Menu("更多") {
+                        Button("跳过这个版本") {
+                            updates.skip(update)
+                            message = "已跳过 \(update.version)，更新的版本出来时会再提示"
                         }
-                        .fixedSize()
-                        Button("更新到 \(update.version)") { start(update) }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(updates.installing || startedFromSettings)
+                        Button("打开发布页") { updates.openReleasePage(update) }
                     }
-                    .disabled(updates.installing)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")")
-                        Text(UpdateSteps.what)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    .fixedSize()
+                    Button("更新到 \(update.version)") { start(update) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(updates.installing || startedFromSettings)
                 }
-                if startedFromSettings && !updates.installing {
-                    Text("正在更新：下载并校验好后会自动退出并打开新版；出了问题会在菜单栏面板里说明。")
+                .disabled(updates.installing)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")")
+                    Text(UpdateSteps.what)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    UpdateProgress(update: update)
                 }
             }
-            if let message {
-                Text(message)
+            if startedFromSettings && !updates.installing {
+                Text("正在更新：下载并校验好后会自动退出并打开新版；出了问题会在菜单栏面板里说明。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            } else {
+                UpdateProgress(update: update)
             }
-        } header: {
-            Text("版本")
-        } footer: {
-            Text(footer)
+        }
+        if let message {
+            Text(message)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -176,15 +170,13 @@ struct UpdateSection: View {
         }
     }
 
-    private var footer: String {
-        var text = "每天自动查一次 GitHub 上的发布（含预发布）；有新版时这里和菜单栏面板都会提示，点「更新」才下载安装。"
-        if let last = updates.lastSuccess {
-            let f = DateFormatter()
-            f.locale = Locale(identifier: "zh_CN")
-            f.dateFormat = "M月d日 HH:mm"
-            text += "上次检查：\(f.string(from: last))。"
-        }
-        return text
+    /// When it looks (no notification, no switch: user's choice, §33).
+    private var schedule: String {
+        guard let last = updates.lastSuccess else { return "每天自动检查一次" }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "M月d日 HH:mm"
+        return "每天自动检查一次 · 上次 \(f.string(from: last))"
     }
 
     private func checkNow() {

@@ -104,26 +104,39 @@ struct ConnectionsPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // The page's status card, kept to one line so the table keeps
+            // its room (user, 2026-11-26: "没必要为了美观精简信息密度").
             HStack(spacing: 12) {
-                Picker("", selection: $filter) {
-                    ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+                IconTile(symbol: "chart.bar.xaxis", color: SettingsTone.traffic, size: 32)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("流量").font(.system(size: 15, weight: .bold))
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 290)
-                Spacer(minLength: 0)
+                Spacer(minLength: 8)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("搜程序或地址", text: $search, prompt: Text("搜程序或地址"))
                         .textFieldStyle(.roundedBorder)
                         .labelsHidden()
                 }
-                .frame(minWidth: 180, maxWidth: 340)
+                .frame(minWidth: 180, maxWidth: 300)
                 Button("刷新", action: refresh)
             }
-            Text(summary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(LinearGradient(colors: [SettingsTone.traffic.opacity(0.2), SettingsTone.traffic.opacity(0.04)],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing)))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(SettingsTone.traffic.opacity(0.26), lineWidth: 1))
+            Picker("", selection: $filter) {
+                ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 320)
             if showEgressTip && filter == .vpn {
                 Text("点行尾的「操作」→「保护这个网站的出口…」。")
                     .font(.caption).foregroundStyle(.secondary)
@@ -215,10 +228,10 @@ struct ConnectionsPage: View {
                     Button("撤销") { undoEgress(egressNotice) }
                 }
             }
-            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。「走代理」是按分流代理经你的代理出去的连接，原因里写是哪个代理。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
-                 + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
-                    : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
-                    : "打开按网站分流后，这里可以一键加直连。"))
+            Text("只列正在通信的连接，每 5 秒刷新，速度是这 5 秒的平均；点「速度」标题按速度排。"
+                 + (manager.ownConnection ? "行尾的「加直连」「操作」把网站加进名单或出口保护。"
+                    : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后可一键加直连。"
+                    : "打开按网站分流后可一键加直连。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -228,11 +241,9 @@ struct ConnectionsPage: View {
         .onAppear {
             egressVisible = true
             consumeVPNFilter()
-            if preview == nil {
-                let settings = ProfileStore.loadAppSettings()
-                sites = DirectSites.sites(settings)
-                proxyNames = settings.activeProxyRoutes.map(\.name)
-            }
+            let settings = ProfileStore.loadAppSettings()
+            proxyNames = settings.activeProxyRoutes.map(\.name)
+            if preview == nil { sites = DirectSites.sites(settings) }
             refreshEgressState()
             refresh()
         }
