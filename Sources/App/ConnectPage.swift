@@ -27,7 +27,7 @@ struct ConnectPage: View {
             } header: {
                 TimelineView(.periodic(from: .now, by: 30)) { _ in
                     let look = self.look
-                    PageHero(symbol: "power", color: look.color, title: "连接", status: look.line, dot: look.dot) {
+                    PageHeader(symbol: "power", color: look.color, title: "连接", status: look.line, dot: look.dot) {
                         if manager.state == .disconnected, !manager.networkHeld, manager.hasCredentials {
                             Button("连接") { _ = manager.connectWithStoredCredentials(manual: true) }
                                 .buttonStyle(.borderedProminent)

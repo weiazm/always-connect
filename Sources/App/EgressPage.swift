@@ -157,7 +157,7 @@ struct EgressProtectionPage: View {
     /// what to do next on the right.
     private var statusBar: some View {
         let look = statusLook
-        return PageHero(symbol: "checkmark.shield.fill", color: SettingsTone.shield, title: "出口保护",
+        return PageHeader(symbol: "checkmark.shield.fill", color: SettingsTone.shield, title: "出口保护",
                         status: look.line, dot: look.tint) {
             HStack(spacing: 8) {
                 if preview == nil && manager.usesCisco {

@@ -176,7 +176,7 @@ struct GeneralPage: View {
                     Text(loginError).foregroundStyle(.red)
                 }
             } header: {
-                PageHero(symbol: "gearshape.fill", color: SettingsTone.neutral, title: "通用",
+                PageHeader(symbol: "gearshape.fill", color: SettingsTone.neutral, title: "通用",
                          status: versionLine, dot: updates.available == nil ? nil : .accentColor)
             }
 
@@ -188,12 +188,14 @@ struct GeneralPage: View {
                     ProfileStore.saveAppSettings(settings)
                     HotkeyManager.shared.apply(settings)
                 }
-                LabeledContent("连接 / 断开") {
+                LabeledContent {
                     HStack(spacing: 8) {
                         Text(HotkeyManager.describe(settings: settings))
                             .foregroundStyle(.secondary)
                         Button(recording ? "请按下组合键…" : "录制") { toggleRecording() }
                     }
+                } label: {
+                    IconLabel(title: "连接 / 断开", symbol: "keyboard", color: .indigo)
                 }
                 .disabled(!settings.globalHotkeyEnabled)
             } header: {
@@ -599,7 +601,7 @@ struct CredentialForm: View {
         } header: {
             if hero {
                 let name = username.trimmingCharacters(in: .whitespaces)
-                PageHero(symbol: "person.fill", color: SettingsTone.account,
+                PageHeader(symbol: "person.fill", color: SettingsTone.account,
                          title: name.isEmpty ? "还没有填账号" : name,
                          status: accountLine,
                          dot: manager.hasCredentials ? .green : .orange,
@@ -687,7 +689,7 @@ struct LoginCertificateSection: View {
                     .fixedSize()
                 }
             } label: {
-                IconLabel(title: "登录证书", symbol: "person.text.rectangle.fill", color: SettingsTone.account)
+                Text("登录证书")
             }
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
@@ -902,16 +904,11 @@ struct SplitPage: View {
                         Button("去「账号」") { UserDefaults.standard.set("credentials", forKey: "settingsTab") }
                     }
                 }
-                Picker("", selection: $section) {
-                    Text("分流直连 · \(sites.count) 条").tag("direct")
-                    Text("分流代理 · \(proxyCount) 个").tag("proxy")
-                    Text("局域网").tag("lan")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: .infinity)
+                SettingsSegments(items: [("direct", "分流直连 · \(sites.count) 条"),
+                                         ("proxy", "分流代理 · \(proxyCount) 个"),
+                                         ("lan", "局域网")], selection: $section)
             } header: {
-                PageHero(symbol: "arrow.triangle.branch", color: SettingsTone.direct, title: "按网站分流",
+                PageHeader(symbol: "arrow.triangle.branch", color: SettingsTone.direct, title: "按网站分流",
                          status: own
                             ? "开 · \(sites.count) 条直连，\(proxyCount) 个代理，其余走 VPN"
                             : "关 · 经 Cisco 连接，按公司的规则分流",
@@ -921,7 +918,7 @@ struct SplitPage: View {
                         set: { on in
                             guard preview == nil else { return }
                             if manager.switchIsOn { confirmSwitch = on } else { manager.setSplit(on: on) }
-                        }), width: 44, height: 26)
+                        }))
                         .disabled(manager.splitSwitchPending)
                         .accessibilityLabel("按网站分流")
                 }
@@ -1238,8 +1235,8 @@ struct DiagnosticsPage: View {
                     }
                 }
             } header: {
-                PageHero(symbol: "stethoscope", color: SettingsTone.diagnostics, title: "诊断",
-                         status: dropLine, dot: lastDropColor, wash: SettingsTone.neutral) {
+                PageHeader(symbol: "stethoscope", color: SettingsTone.diagnostics, title: "诊断",
+                         status: dropLine, dot: lastDropColor) {
                     Button(checking ? "正在体检…" : "一键体检") { runCheckup() }
                         .buttonStyle(.borderedProminent)
                         .disabled(checking)

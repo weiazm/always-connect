@@ -104,18 +104,9 @@ struct ConnectionsPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // The page's status card, kept to one line so the table keeps
+            // The page's first line, as on the other pages; the table keeps
             // its room (user, 2026-11-26: "没必要为了美观精简信息密度").
-            HStack(spacing: 12) {
-                IconTile(symbol: "chart.bar.xaxis", color: SettingsTone.traffic, size: 32)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("流量").font(.system(size: 15, weight: .bold))
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                Spacer(minLength: 8)
+            PageHeader(symbol: "chart.bar.xaxis", color: SettingsTone.traffic, title: "流量", status: summary) {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("搜程序或地址", text: $search, prompt: Text("搜程序或地址"))
@@ -125,12 +116,6 @@ struct ConnectionsPage: View {
                 .frame(minWidth: 180, maxWidth: 300)
                 Button("刷新", action: refresh)
             }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(LinearGradient(colors: [SettingsTone.traffic.opacity(0.2), SettingsTone.traffic.opacity(0.04)],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing)))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(SettingsTone.traffic.opacity(0.26), lineWidth: 1))
             Picker("", selection: $filter) {
                 ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
             }

@@ -165,7 +165,7 @@ struct OnDemandRuleRow: View {
     }
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "network").foregroundStyle(.secondary).frame(width: 18)
+            IconTile(symbol: "network", color: SettingsTone.account)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(rule.name).lineLimit(1)

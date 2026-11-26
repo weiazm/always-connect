@@ -42,22 +42,6 @@ struct ProxySections: View {
     var body: some View {
         Group {
             Section {
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text("经代理访问的网站").font(.headline)
-                            HoverHelp(action: {}) { explanation }
-                        }
-                        Text("命中规则的网站经你的 SOCKS5 / HTTP 代理访问；代理不通时直接打不开，不会改走别的路。")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 12)
-                    Button {
-                        editing = ProxyRoute(name: "", kind: .socks5, host: "", port: 0, sites: [])
-                    } label: { Label("添加代理", systemImage: "plus") }
-                    .controlSize(.large)
-                }
                 if !splitOn {
                     EgressCallout(icon: "info.circle.fill", tint: .blue,
                                   text: "分流代理只在上面的「按网站分流」开启时生效。",
@@ -86,23 +70,26 @@ struct ProxySections: View {
                         Button("知道了") { self.note = nil }
                     }
                 }
-            }
-            Section {
                 if routes.isEmpty {
                     EmptyGuide(symbol: "server.rack", color: SettingsTone.proxy, title: "还没有代理",
                                text: "粘贴一行代理地址，再写上哪些网站经它访问。") {
-                        Button("添加第一个代理") {
-                            editing = ProxyRoute(name: "", kind: .socks5, host: "", port: 0, sites: [])
-                        }
-                        .buttonStyle(.borderedProminent)
+                        Button("添加第一个代理") { addProxy() }
+                            .buttonStyle(.borderedProminent)
                     }
                 } else {
                     ForEach(Array(routes.enumerated()), id: \.element.id) { index, route in row(route, index: index) }
                 }
-            } footer: {
-                if routes.count > 1 {
-                    Text("几个代理都命中同一个网站时，用排在前面的。").font(.caption).foregroundStyle(.secondary)
+            } header: {
+                HStack(spacing: 6) {
+                    Text("经代理访问的网站")
+                    HoverHelp(action: {}) { explanation }
+                    Spacer()
+                    Button(action: addProxy) { Label("添加代理", systemImage: "plus") }
+                        .buttonStyle(.borderless)
                 }
+            } footer: {
+                Footnote("命中规则的网站经你的 SOCKS5 / HTTP 代理访问；代理不通时直接打不开，不会改走别的路。"
+                         + (routes.count > 1 ? "几个代理都命中同一个网站时，用排在前面的。" : ""))
             }
         }
         .onAppear { if !preview { health.check(routes) } }
@@ -114,6 +101,10 @@ struct ProxySections: View {
                 save()
             }
         }
+    }
+
+    private func addProxy() {
+        editing = ProxyRoute(name: "", kind: .socks5, host: "", port: 0, sites: [])
     }
 
     private var explanation: some View {
@@ -136,7 +127,7 @@ struct ProxySections: View {
     private func row(_ route: ProxyRoute, index: Int) -> some View {
         HStack(spacing: 12) {
             IconTile(symbol: route.kind == .socks5 ? "point.3.connected.trianglepath.dotted" : "globe",
-                     color: route.enabled ? SettingsTone.proxy : SettingsTone.neutral, size: 26)
+                     color: route.enabled ? SettingsTone.proxy : SettingsTone.neutral)
             VStack(alignment: .leading, spacing: 2) {
                 Text(route.name).font(.body.weight(.medium)).lineLimit(1)
                 Text(ProxyLink.display(route).replacingOccurrences(of: "://", with: " · "))

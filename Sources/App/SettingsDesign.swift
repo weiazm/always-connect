@@ -3,9 +3,9 @@ import SwiftUI
 
 // The settings window's design language (UI-DESIGN.md 设置, DESIGN.md §69.14;
 // user, 2026-11-26: "可以有点自己的设计语言跟思路吗？别搞得这么糙"):
-// - every page opens with a status card in the page's own colour: what the
-//   page is about and how it is right now, its main control on the right
-//   (the panel's VPN card, same idea);
+// - every page opens with one line: the page's icon and name, how it is
+//   right now, its main control on the right (no coloured block behind it);
+// - one size per kind of thing (SettingsSize);
 // - rows carry a small coloured icon, one plain line under the name at most;
 // - colour means the route, here, on the panel and on the 流量 page alike:
 //   green VPN, orange 直连, purple 代理, teal 出口保护.
@@ -113,7 +113,7 @@ private struct WindowDragArea: NSViewRepresentable {
 struct IconTile: View {
     var symbol: String
     var color: Color
-    var size: CGFloat = 22
+    var size: CGFloat = SettingsSize.rowIcon
 
     var body: some View {
         Image(systemName: symbol)
@@ -148,9 +148,22 @@ struct IconLabel: View {
     }
 }
 
-/// The page's status card. Put it in the first section's header: it
-/// scrolls with the page and lines up with the cards below.
-struct PageHero<Trailing: View>: View {
+/// One size for each kind of thing, on every page (user, 2026-11-26:
+/// "有的大小还不协调").
+enum SettingsSize {
+    /// The page header's icon and the first-time guides' icon.
+    static let pageIcon: CGFloat = 30
+    /// The icon in front of a row's name.
+    static let rowIcon: CGFloat = 22
+    static let pageTitle = Font.system(size: 16, weight: .semibold)
+}
+
+/// The page's first line: its icon and name, how it is right now, and the
+/// page's main action on the right. No coloured block behind it (user,
+/// 2026-11-26: "每个tab页上面的渐变色块 没必要吧？"). In a Form, put it
+/// in the first section's header: it scrolls with the page and starts
+/// where the section titles start.
+struct PageHeader<Trailing: View>: View {
     var symbol: String
     var color: Color
     var title: String
@@ -159,30 +172,26 @@ struct PageHero<Trailing: View>: View {
     var dot: Color? = nil
     /// A letter in a circle instead of the symbol (the account).
     var letter: String? = nil
-    /// The card's wash when it differs from the icon's colour (a page
-    /// whose colour would read as a warning, like 诊断's).
-    var wash: Color? = nil
     @ViewBuilder var trailing: () -> Trailing
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             if let letter {
                 Text(letter)
-                    .font(.system(size: 19, weight: .semibold))
+                    .font(.system(size: SettingsSize.pageIcon * 0.45, weight: .semibold))
                     .foregroundStyle(.white)
-                    .frame(width: 42, height: 42)
-                    .background(Circle().fill(LinearGradient(colors: [color, color.opacity(0.7)],
-                                                             startPoint: .topLeading, endPoint: .bottomTrailing)))
+                    .frame(width: SettingsSize.pageIcon, height: SettingsSize.pageIcon)
+                    .background(Circle().fill(color.gradient))
                     .accessibilityHidden(true)
             } else {
-                IconTile(symbol: symbol, color: color, size: 42)
+                IconTile(symbol: symbol, color: color, size: SettingsSize.pageIcon)
             }
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 18, weight: .bold))
+                    .font(SettingsSize.pageTitle)
                     .foregroundStyle(.primary)
-                HStack(alignment: .center, spacing: 6) {
-                    if let dot { Circle().fill(dot).frame(width: 7, height: 7) }
+                HStack(alignment: .center, spacing: 5) {
+                    if let dot { Circle().fill(dot).frame(width: 6, height: 6) }
                     Text(status)
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -192,26 +201,45 @@ struct PageHero<Trailing: View>: View {
             Spacer(minLength: 12)
             trailing()
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(LinearGradient(colors: [(wash ?? color).opacity(0.22), (wash ?? color).opacity(0.05)],
-                                 startPoint: .topLeading, endPoint: .bottomTrailing)))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .strokeBorder((wash ?? color).opacity(0.28), lineWidth: 1))
-        // A section header is inset like the rows: reach the card edges.
-        .padding(.horizontal, -10)
         .padding(.bottom, 6)
         .textCase(nil)
         .accessibilityElement(children: .contain)
     }
 }
 
-extension PageHero where Trailing == EmptyView {
-    init(symbol: String, color: Color, title: String, status: String, dot: Color? = nil, letter: String? = nil,
-         wash: Color? = nil) {
-        self.init(symbol: symbol, color: color, title: title, status: status, dot: dot, letter: letter, wash: wash) {
-            EmptyView()
+extension PageHeader where Trailing == EmptyView {
+    init(symbol: String, color: Color, title: String, status: String, dot: Color? = nil, letter: String? = nil) {
+        self.init(symbol: symbol, color: color, title: title, status: status, dot: dot, letter: letter) { EmptyView() }
+    }
+}
+
+/// Parts of one page, as wide as the card they sit in (the system's
+/// segmented control keeps its own width and sat small in a wide card).
+struct SettingsSegments: View {
+    var items: [(tag: String, title: String)]
+    @Binding var selection: String
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items, id: \.tag) { item in
+                let selected = item.tag == selection
+                Button { selection = item.tag } label: {
+                    Text(item.title)
+                        .font(.callout.weight(selected ? .semibold : .regular))
+                        .foregroundStyle(selected ? Color.primary : Color.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(selected ? Color.primary.opacity(0.12) : Color.clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.title)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
         }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.06)))
     }
 }
 
@@ -255,7 +283,7 @@ struct EmptyGuide<Action: View>: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            IconTile(symbol: symbol, color: color, size: 36)
+            IconTile(symbol: symbol, color: color, size: SettingsSize.pageIcon)
             Text(title).font(.body.weight(.semibold))
             Text(text)
                 .font(.caption)

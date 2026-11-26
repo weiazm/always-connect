@@ -85,7 +85,7 @@
     <th>通用设置</th>
   </tr>
   <tr>
-    <td><img src="docs/images/settings-split.png" width="400" alt="分流设置：窗口顶部七个图标标签，按网站分流状态卡与总开关，分流直连 / 分流代理 / 局域网"></td>
+    <td><img src="docs/images/settings-split.png" width="400" alt="分流设置：窗口顶部七个图标标签，按网站分流与总开关，分流直连 / 分流代理 / 局域网"></td>
     <td><img src="docs/images/settings-general.png" width="400" alt="通用设置：启动与通知、快捷键，关于 AlwaysConnect（版本与更新、说明、卸载）"></td>
   </tr>
   <tr>

@@ -133,13 +133,8 @@ struct UpdateRows: View {
                 }
                 .disabled(updates.installing)
             } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")")
-                    Text(UpdateSteps.what)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                IconLabel(title: "有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")",
+                          subtitle: UpdateSteps.what, symbol: "sparkles", color: SettingsTone.account)
             }
             if startedFromSettings && !updates.installing {
                 Text("正在更新：下载并校验好后会自动退出并打开新版；出了问题会在菜单栏面板里说明。")
