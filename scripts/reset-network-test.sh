@@ -108,6 +108,9 @@ grep -qx '/sbin/route -n delete -net 198.19.128.0/17' "$WORK/direct-calls"
 grep -q 'PROXY_ANCHOR=com.apple/301.AlwaysConnectProxy' "$ROOT/scripts/reset-network.sh"
 grep -q 'pfctl -a "$PROXY_ANCHOR" -F nat' "$ROOT/scripts/reset-network.sh"
 grep -q 'proxy-routes proxy-pf-token' "$ROOT/scripts/reset-network.sh"
+# §69.20: the proxy-only DNS entry is removed too, only ours.
+grep -q 'PROXY_DNS_KEY=State:/Network/Service/AlwaysConnect-Proxy/DNS' "$ROOT/scripts/reset-network.sh"
+grep -qF '"$PROXY_DNS_KEY" | scutil >/dev/null' "$ROOT/scripts/reset-network.sh"
 direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
 # Fail the final metadata write after one deletion completed and one failed.
 # The durable intent must prevent another deletion after a process restart.

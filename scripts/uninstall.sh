@@ -187,6 +187,9 @@ else
     sys pfctl -a "$ANCHOR" -F all
     sys pfctl -a com.apple/301.AlwaysConnectProxy -F nat
     sys pfctl -a com.apple/301.AlwaysConnectProxy -F rules
+    # The proxy-only DNS entry (DESIGN.md §69.20).
+    if [ $TESTING = 1 ] || [ $DRY = 1 ]; then sys scutil remove State:/Network/Service/AlwaysConnect-Proxy/DNS
+    else printf 'open\nremove State:/Network/Service/AlwaysConnect-Proxy/DNS\nclose\n' | scutil >/dev/null 2>&1; fi
 fi
 sys launchctl bootout "system/$LABEL"
 # A service swap left loaded by an update (dev-helper.sh, DESIGN §69.15).

@@ -142,6 +142,12 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Additive structured split status, including visible capacity warnings.
     /// The client asks only an exactly matching service, with a 3-second limit.
     func getSplitStatus(withReply reply: @escaping (String) -> Void)
+    /// Proxies with Cisco off (DESIGN.md §69.20): whether the user wants
+    /// the split's proxies to run when no connection owns them. The service
+    /// starts or stops its proxy-only session to match, and hands over to a
+    /// connection and back. Only sent to a matching service (3-second limit).
+    /// Reply: running now, and why not when it should.
+    func setProxyOnly(_ on: Bool, withReply reply: @escaping (Bool, String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
