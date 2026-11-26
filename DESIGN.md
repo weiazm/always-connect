@@ -4904,7 +4904,7 @@ DNS 得到 198.19.128.x，HTTPS 200，代理日志记录的是域名；未列入
 - Swift 脚本级（`list-rules-test`）：`ProxyLink` 解析（含带逗号端口跳跃）、摘要文案、内存 vault 替身存取与删除、`ProxyLink.display` 隐去密码、Cisco UDP 提示判定、旧设置解码兼容。
 - 卸载与恢复网络脚本断言（`uninstall-test`、`reset-network-test`）：覆盖新二进制、运行目录与进程清理。
 - CI 互通（`scripts/hysteria-interop-test.sh`，Linux job 与本机均跑）：真实官方 `hysteria` 服务端（自签证书 + `pinSHA256`、TCP/UDP ASSOCIATE、`salamander`、Linux 下 `iptables` 端口跳跃、错密码、错指纹、端口不可达）。
-- CI macOS harness（root，`proxy-only-check`）：只开代理 + 受管 Hysteria2。测试进程像 App 一样按名字连：系统解析器给出本项目地址、pf 转到转发层、转发层把名字交给以 nobody 运行的受管客户端、客户端经 QUIC 到本机官方服务端，服务端用 ACL（`direct(suffix:…, *, 127.0.0.1)`，其余 `reject(all)`）把测试名字指到本机回显站点，字节原样回来；停止后零残留。
+- CI macOS harness（root，`proxy-only-check`）：只开代理 + 受管 Hysteria2。测试进程像 App 一样按名字连：系统解析器给出本项目地址、pf 转到转发层、转发层把名字交给以 nobody 运行的受管客户端、客户端经 QUIC 到本机官方服务端，服务端用 ACL（`direct(suffix:…, *, 127.0.0.1)`、`direct(127.0.0.1)`，其余 `reject(all)`）把测试名字指到本机回显站点，字节原样回来；停止后零残留。
 - 界面核对：真实设置视图与编辑窗离屏渲染（示例数据）。
 - 真机待测（`docs/mac-proof-checklist.md` L19–L24）：真实网络 UDP 连通、连 Cisco 且服务器在直连名单、断线保护期间、换 Wi-Fi、带宽参数速度与常驻开销（`footprint` / CPU）。
 

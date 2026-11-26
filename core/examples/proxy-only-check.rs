@@ -191,12 +191,13 @@ mod macos {
         let cfg = work.join("server.json");
         let log = work.join("server.log");
         // The server sends the test name to the local echo site (ACL hijack,
-        // same port) and refuses everything else: nothing leaves the runner.
+        // same port), lets the direct check reach loopback and refuses
+        // everything else: nothing leaves the runner.
         std::fs::write(&cfg, serde_json::json!({
             "listen": format!("127.0.0.1:{port}"),
             "tls": { "cert": crt.to_str().unwrap(), "key": key.to_str().unwrap() },
             "auth": { "type": "password", "password": auth },
-            "acl": { "inline": [format!("direct(suffix:{SITE}, *, 127.0.0.1)"), "reject(all)"] },
+            "acl": { "inline": [format!("direct(suffix:{SITE}, *, 127.0.0.1)"), "direct(127.0.0.1)".to_string(), "reject(all)".to_string()] },
         }).to_string()).map_err(|e| e.to_string())?;
         let log_file = std::fs::File::create(&log).map_err(|e| e.to_string())?;
         let srv = std::process::Command::new(hy_bin)
