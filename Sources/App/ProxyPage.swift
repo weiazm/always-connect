@@ -88,7 +88,7 @@ struct ProxySections: View {
                         .buttonStyle(.borderless)
                 }
             } footer: {
-                Footnote("命中规则的网站经你的 SOCKS5 / HTTP 代理访问；代理不通时直接打不开，不会改走别的路。"
+                Footnote("命中规则的网站经你的 SOCKS5 / HTTP / Hysteria2 代理访问；代理不通时直接打不开，不会改走别的路。"
                          + (routes.count > 1 ? "几个代理都命中同一个网站时，用排在前面的。" : ""))
             }
         }
@@ -112,7 +112,7 @@ struct ProxySections: View {
             ForEach([
                 "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 Cisco 的网站」之前。",
                 "geoip、网段规则：按 DNS 答复的地址判断（连着 Cisco 时问 Cisco 的 DNS，否则问本地网络的）；直接写的网段，连 IP 也走代理。",
-                "TCP 两种代理都转发；UDP（如 QUIC）只经 SOCKS5，HTTP 代理的网站浏览器会自动改用 TCP。",
+                "TCP 全部代理都转发；UDP（如 QUIC / HTTP/3）经 SOCKS5 和 Hysteria2 转发，HTTP 代理的网站浏览器会自动改用 TCP。",
                 "连代理本身按分流名单走：在局域网或「不走 Cisco 的网站」里就走本地网络，否则经 Cisco；Cisco 没连时一律走本地网络。",
                 "Cisco 没连时代理照样生效（只开代理）：命中规则的网站走代理，其余走本地网络。",
                 "代理连不上、拒绝或密码不对：这些网站直接打不开，不会改走直连或 Cisco。",
@@ -125,13 +125,21 @@ struct ProxySections: View {
         .padding(12)
     }
 
+    private func iconSymbol(for kind: ProxyRoute.Kind) -> String {
+        switch kind {
+        case .socks5: return "point.3.connected.trianglepath.dotted"
+        case .http: return "globe"
+        case .hysteria2: return "bolt.fill"
+        }
+    }
+
     private func row(_ route: ProxyRoute, index: Int) -> some View {
         HStack(spacing: 12) {
-            IconTile(symbol: route.kind == .socks5 ? "point.3.connected.trianglepath.dotted" : "globe",
+            IconTile(symbol: iconSymbol(for: route.kind),
                      color: route.enabled ? SettingsTone.proxy : SettingsTone.neutral)
             VStack(alignment: .leading, spacing: 2) {
                 Text(route.name).font(.body.weight(.medium)).lineLimit(1)
-                Text(ProxyLink.display(route).replacingOccurrences(of: "://", with: " · "))
+                Text(route.rowSubtitle)
                     .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
                 ProxyStatusLine(route: route, check: health.checks[route.id], checking: health.checking.contains(route.id))
             }
@@ -209,12 +217,15 @@ struct ProxyEditor: View {
     @State private var result: (key: String, check: ProxyCheck)?
     @State private var checkingNow = false
 
+    private let previewCiscoUdpHint: Bool?
+
     /// `previewCheck`: a check result shown as if just made (screenshots).
-    init(route: ProxyRoute, isNew: Bool, previewCheck: ProxyCheck? = nil,
+    init(route: ProxyRoute, isNew: Bool, previewCheck: ProxyCheck? = nil, previewCiscoUdpHint: Bool? = nil,
          cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
         self.isNew = isNew
         self.cancel = cancel
         self.done = done
+        self.previewCiscoUdpHint = previewCiscoUdpHint
         original = route
         let link = isNew ? "" : ProxyLink.display(route)
         let rules = route.sites.joined(separator: "\n")
@@ -226,17 +237,40 @@ struct ProxyEditor: View {
 
     private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
     private var rulesParsed: ProxyRuleInput { ProxyRuleInput(rules) }
-    /// A saved password is kept when the line names the same user without one.
+    /// A saved password is kept when editing without retyping it.
     private var keepsPassword: Bool {
-        guard let l = parsed.link, l.password == nil, let user = l.username else { return false }
-        return original.passwordStamp != nil && original.username == user
+        guard let l = parsed.link, l.password == nil, original.passwordStamp != nil else { return false }
+        if l.kind == .hysteria2 { return original.kind == .hysteria2 }
+        guard let user = l.username else { return false }
+        return original.username == user
+    }
+    /// A saved Hysteria2 obfs-password is kept when obfs type is unchanged.
+    private var keepsObfsPassword: Bool {
+        guard let l = parsed.link, l.kind == .hysteria2, let obfs = l.obfs, l.obfsPassword == nil else { return false }
+        return original.kind == .hysteria2 && original.obfs == obfs && original.obfsPasswordStamp != nil
+    }
+    private var missingPassword: Bool {
+        guard let l = parsed.link else { return false }
+        if l.kind == .hysteria2 { return l.password == nil && !keepsPassword }
+        return l.username != nil && l.password == nil && !keepsPassword
+    }
+    private var missingObfsPassword: Bool {
+        guard let l = parsed.link, l.kind == .hysteria2, l.obfs != nil else { return false }
+        return l.obfsPassword == nil && !keepsObfsPassword
+    }
+    private var showCiscoUdpHint: Bool {
+        if let forced = previewCiscoUdpHint { return forced }
+        guard let l = parsed.link, l.kind == .hysteria2 else { return false }
+        let manager = HelperClient.shared
+        guard !manager.usesCisco && manager.state != .disconnected else { return false }
+        return ProxyLink.hysteriaNeedsDirectHint(host: l.host, settings: ProfileStore.loadAppSettings())
     }
     private var checkKey: String { link + "\u{0}" + rules }
     /// A failed check shown for what is typed now: 完成 saves anyway.
     private var overriding: Bool { result.map { $0.key == checkKey && $0.check.level != .ok } ?? false }
     private var canSave: Bool {
-        guard let l = parsed.link, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty else { return false }
-        return l.username == nil || l.password != nil || keepsPassword
+        guard parsed.link != nil, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty else { return false }
+        return !missingPassword && !missingObfsPassword
     }
 
     var body: some View {
@@ -245,7 +279,7 @@ struct ProxyEditor: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("代理地址").font(.callout.weight(.medium))
-                TextField("", text: $link, prompt: Text("socks5://用户名:密码@1.2.3.4:1080"))
+                TextField("", text: $link, prompt: Text("socks5://、http:// 或 hysteria2:// 链接"))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                 status
@@ -253,7 +287,9 @@ struct ProxyEditor: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("名称").font(.callout.weight(.medium))
-                TextField("", text: $name, prompt: Text(parsed.link.map { $0.name ?? "\($0.host):\($0.port)" } ?? "可不填"))
+                TextField("", text: $name, prompt: Text(parsed.link.map { l in
+                    l.name ?? (l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)")
+                } ?? "可不填"))
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -261,6 +297,16 @@ struct ProxyEditor: View {
                 Text("经这个代理访问的网站").font(.callout.weight(.medium))
                 EgressRuleText(input: $rules, height: 140)
                 EgressRuleIssues(issues: rulesParsed.issues)
+            }
+
+            if showCiscoUdpHint {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text("Hysteria2 走 UDP，连着 Cisco 时会进单位网络，可能被挡；需要的话把服务器加进分流直连。")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
             checkView
@@ -282,17 +328,38 @@ struct ProxyEditor: View {
     @ViewBuilder private var status: some View {
         switch parsed {
         case .link(let l):
-            let missingPassword = l.username != nil && l.password == nil && !keepsPassword
-            Label(missingPassword ? "\(l.summary)，还缺密码：写成 用户名:密码@地址" : l.summary + (keepsPassword ? "，沿用已存的密码" : ""),
-                  systemImage: missingPassword ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                .font(.caption)
-                .foregroundStyle(missingPassword ? Color.orange : Color.green)
+            let warn = missingPassword || missingObfsPassword
+            let text: String = {
+                if missingPassword {
+                    return l.kind == .hysteria2
+                        ? "\(l.summary)，还缺密码：写成 密码@地址"
+                        : "\(l.summary)，还缺密码：写成 用户名:密码@地址"
+                }
+                if missingObfsPassword {
+                    return "\(l.summary)，还缺混淆密码：加上 obfs-password=密码"
+                }
+                var note = ""
+                if keepsPassword { note += "，沿用已存的密码" }
+                if keepsObfsPassword { note += "，沿用已存的混淆密码" }
+                return l.summary + note
+            }()
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Image(systemName: warn ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                Text(text).fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+            .foregroundStyle(warn ? Color.orange : Color.green)
         case .problem(let problem):
             if link.trimmingCharacters(in: .whitespaces).isEmpty {
-                Text("支持 socks5://、http://、主机:端口，也可粘贴 socks5, 1.2.3.4, 1080, 用户名, 密码 这种逗号写法")
+                Text("支持 socks5://、http://、hysteria2://（hy2://）、主机:端口，也可粘贴逗号写法")
                     .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
-                Label(problem, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(problem).fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.caption).foregroundStyle(.orange)
             }
         }
     }
@@ -302,7 +369,10 @@ struct ProxyEditor: View {
         if checkingNow {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("正在检测：连代理、核对密码、试着经它打开规则里的网站…").font(.caption).foregroundStyle(.secondary)
+                Text(parsed.link?.kind == .hysteria2
+                     ? "正在检测：连上服务器、核对密码与证书、试着经它打开规则里的网站…"
+                     : "正在检测：连代理、核对密码、试着经它打开规则里的网站…")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         } else if let result, result.key == checkKey {
             let check = result.check
@@ -330,8 +400,29 @@ struct ProxyEditor: View {
         saved.port = l.port
         saved.sites = rulesParsed.sites
         let typedName = name.trimmingCharacters(in: .whitespaces)
-        saved.name = !typedName.isEmpty ? typedName : (l.name ?? "\(l.host):\(l.port)")
+        let fallbackName = l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)"
+        saved.name = !typedName.isEmpty ? typedName : (l.name ?? fallbackName)
         saved.username = l.username
+        if l.kind == .hysteria2 {
+            saved.hysteriaPorts = l.ports
+            saved.sni = l.sni
+            saved.pinSHA256 = l.pinSHA256
+            saved.obfs = l.obfs
+            saved.ech = l.ech
+            saved.upMbps = l.upMbps
+            saved.downMbps = l.downMbps
+            saved.hopSeconds = l.hopSeconds
+        } else {
+            saved.hysteriaPorts = nil
+            saved.sni = nil
+            saved.pinSHA256 = nil
+            saved.obfs = nil
+            saved.obfsPasswordStamp = nil
+            saved.ech = nil
+            saved.upMbps = nil
+            saved.downMbps = nil
+            saved.hopSeconds = nil
+        }
         return saved
     }
 
@@ -342,26 +433,38 @@ struct ProxyEditor: View {
         if overriding { commit(l, check: result?.check); return }
         let route = candidate(l)
         let password = l.password ?? (keepsPassword ? ProxyPasswords.password(for: original) : nil)
+        let obfsPassword = l.obfsPassword ?? (keepsObfsPassword ? ProxyPasswords.obfsPassword(for: original) : nil)
         let key = checkKey
         checkingNow = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let check = ProxyCheck.run(route, password: password)
-            DispatchQueue.main.async {
-                checkingNow = false
-                result = (key, check)
-                if check.level == .ok, key == checkKey { commit(l, check: check) }
-            }
+        ProxyCheck.runAsync(route, password: password, obfsPassword: obfsPassword) { check in
+            checkingNow = false
+            result = (key, check)
+            if check.level == .ok, key == checkKey { commit(l, check: check) }
         }
     }
 
     private func commit(_ l: ProxyLink, check: ProxyCheck?) {
         var saved = candidate(l)
-        if l.username == nil {
-            ProxyPasswords.delete(for: saved)
-            saved.passwordStamp = nil
-        } else if let password = l.password {
-            // Only a stamp goes into the settings; the password into the keychain.
-            saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
+        if l.kind == .hysteria2 {
+            if let password = l.password {
+                saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
+            }
+            if l.obfs == nil {
+                ProxyPasswords.deleteObfs(for: saved)
+                saved.obfsPasswordStamp = nil
+            } else if let obfsPassword = l.obfsPassword {
+                saved.obfsPasswordStamp = ProxyPasswords.saveObfs(obfsPassword, for: saved) ? UUID().uuidString : nil
+            }
+        } else {
+            ProxyPasswords.deleteObfs(for: saved)
+            saved.obfsPasswordStamp = nil
+            if l.username == nil {
+                ProxyPasswords.delete(for: saved)
+                saved.passwordStamp = nil
+            } else if let password = l.password {
+                // Only a stamp goes into the settings; the password into the keychain.
+                saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
+            }
         }
         if let check { ProxyHealth.shared.record(check, for: saved.id) }
         done(saved)

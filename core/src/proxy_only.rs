@@ -135,9 +135,15 @@ impl ProxyOnly {
     /// The DNS entry first (the Mac asks its own servers again at once),
     /// then the redirect, routes and forwarder.
     pub fn stop(&mut self) {
+        self.stop_with_handover(false);
+    }
+
+    /// Stops proxy-only; when `handover` is true, keeps managed Hysteria2
+    /// clients alive for the incoming own-connection split session.
+    pub fn stop_with_handover(&mut self, handover: bool) {
         if !self.no_routes && !set_dns(false) { network_guard::log("proxy only: DNS entry removal not confirmed"); }
         let guard = network_guard::shared();
-        redirect::stop(&mut self.session, Some(&self.forwarder), &self.routes, guard.as_deref(), self.no_routes);
+        redirect::stop_with_handover(&mut self.session, Some(&self.forwarder), &self.routes, guard.as_deref(), self.no_routes, handover);
         self.forwarder.stop();
         network_guard::log("proxy only: stopped");
     }

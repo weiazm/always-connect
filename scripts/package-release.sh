@@ -44,9 +44,12 @@ fi
 SIGN_IDENTITY=$IDENTITY "$ROOT/scripts/build-local.sh" --release
 APP="$ROOT/.local-build/AlwaysConnect.app"
 GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
+HYSTERIA="$APP/Contents/Resources/hysteria/bin/hysteria"
 test -x "$APP/Contents/Resources/openconnect/bin/openconnect"
 test -x "$GATE"
+test -x "$HYSTERIA"
 codesign --verify --strict "$GATE"
+codesign --verify --strict "$HYSTERIA"
 if [ "$IDENTITY" != - ]; then
     codesign -d -r- "$APP" 2>&1 | grep -q 'certificate leaf' \
         || { echo "built App is not signed with a fixed certificate" >&2; exit 1; }
@@ -63,6 +66,7 @@ if [ "$IDENTITY" != - ]; then
         exit 1
     }
     codesign --verify --strict -R="certificate leaf = H\"$LEAF\"" "$GATE"
+    codesign --verify --strict -R="certificate leaf = H\"$LEAF\"" "$HYSTERIA"
 fi
 # Scan raw bytes because macOS strings can miss Mach-O debug-map paths.
 # Report only the bundled filename so a blocked release cannot log the path.

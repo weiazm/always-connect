@@ -22,6 +22,7 @@ import Security
 enum ClientRequirement {
     static let appIdentifier = "com.alwaysconnect.app"
     static let egressGatePath = "/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate"
+    static let hysteriaPath = "/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin/hysteria"
 
     /// The requirement for clients of this running process.
     static let forThisProcess: String? = {
@@ -49,20 +50,30 @@ enum ClientRequirement {
 
     /// The gate is a separate executable and must carry our exact leaf certificate.
     static func verifiesEgressGate() -> Bool {
+        verifiesBundledBinary(atPath: egressGatePath)
+    }
+
+    /// The bundled official Hysteria2 client must carry our exact leaf
+    /// certificate (§七十). Called by the core before a client first runs.
+    static func verifiesHysteria(atPath path: String) -> Bool {
+        path == hysteriaPath && verifiesBundledBinary(atPath: path)
+    }
+
+    private static func verifiesBundledBinary(atPath path: String) -> Bool {
         var running: SecCode?
         var helper: SecStaticCode?
-        var gate: SecStaticCode?
+        var target: SecStaticCode?
         var information: CFDictionary?
         guard SecCodeCopySelf([], &running) == errSecSuccess, let running,
               SecCodeCopyStaticCode(running, [], &helper) == errSecSuccess, let helper,
               SecCodeCopySigningInformation(helper, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let values = information as? [String: Any],
               let leaf = (values[kSecCodeInfoCertificates as String] as? [SecCertificate])?.first,
-              SecStaticCodeCreateWithPath(URL(fileURLWithPath: egressGatePath) as CFURL, [], &gate) == errSecSuccess,
-              let gate else { return false }
+              SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &target) == errSecSuccess,
+              let target else { return false }
         let digest = Insecure.SHA1.hash(data: SecCertificateCopyData(leaf) as Data)
             .map { String(format: "%02x", $0) }.joined()
-        return staticCode(gate, satisfies: "certificate leaf = H\"\(digest)\"")
+        return staticCode(target, satisfies: "certificate leaf = H\"\(digest)\"")
     }
 
     static func make(team: String?, leafDER: Data?) -> String? {

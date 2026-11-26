@@ -122,7 +122,12 @@ python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sa
 RES=$REPO/.local-build/AlwaysConnect.app/Contents/Resources
 NOK=1
 for f in THIRD_PARTY_NOTICES.md RESPONSIBLE-USE.md LICENSE.txt third_party/rust-crates.txt third_party/licenses/LGPL-2.1.txt \
-         third_party/licenses/v2fly-domain-list-community.txt; do [ -s "$RES/$f" ] || { echo "  missing $f"; NOK=0; }; done
+         third_party/licenses/v2fly-domain-list-community.txt third_party/licenses/hysteria-MIT.txt; do [ -s "$RES/$f" ] || { echo "  missing $f"; NOK=0; }; done
+if [ -x "$RES/hysteria/bin/hysteria" ]; then
+  codesign --verify --strict "$RES/hysteria/bin/hysteria" || { echo "  hysteria codesign verify failed"; NOK=0; }
+  for f in VERSIONS licenses/hysteria/LICENSE.md; do
+    [ -s "$RES/hysteria/$f" ] || { echo "  missing hysteria/$f"; NOK=0; }; done
+fi
 [ -x "$RES/openconnect/bin/alwaysconnect-gate" ] &&
   codesign --verify --strict "$RES/openconnect/bin/alwaysconnect-gate" &&
   pass egress-gate-bundle || fail egress-gate-bundle

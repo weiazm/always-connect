@@ -1,15 +1,26 @@
 import Foundation
 
-/// A proxy and the sites that go through it (DESIGN.md §六十九). The rules
+@_silgen_name("ac_hysteria_parse_uri")
+private func ac_hysteria_parse_uri(_ uri: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_string_free")
+private func proxy_routes_string_free(_ s: UnsafeMutablePointer<CChar>?)
+
+/// A proxy and the sites that go through it (DESIGN.md §六十九, §七十). The rules
 /// use the split list's syntax and parser (ListRule): names and site lists
 /// pick the proxy before any DNS lookup; geoip and networks pick it from
 /// the VPN DNS answer's address, and written networks are also routed so
 /// connections straight to an address go through it.
 struct ProxyRoute: Codable, Equatable, Identifiable {
     enum Kind: String, Codable, CaseIterable, Identifiable {
-        case socks5, http
+        case socks5, http, hysteria2
         var id: String { rawValue }
-        var label: String { self == .socks5 ? "SOCKS5" : "HTTP" }
+        var label: String {
+            switch self {
+            case .socks5: return "SOCKS5"
+            case .http: return "HTTP"
+            case .hysteria2: return "Hysteria2"
+            }
+        }
     }
 
     var id = UUID()
@@ -19,13 +30,36 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
     var port: Int
     var sites: [String]
     var enabled: Bool = true
-    /// Username for the proxy; the password is in the keychain.
+    /// Username for SOCKS5/HTTP; the password is in the keychain.
     var username: String?
-    /// Changes whenever the password is saved, so the App process reads
-    /// the keychain again (once per run per password, §21.12).
+    /// Changes whenever the password (or Hysteria2 auth) is saved, so the App
+    /// process reads the keychain again (once per run per password, §21.12).
     var passwordStamp: String?
+    /// Hysteria2 port specification (e.g. "443", "443,5000-6000", "20000-50000").
+    var hysteriaPorts: String?
+    var sni: String?
+    var pinSHA256: String?
+    var obfs: String?
+    /// Changes whenever the Hysteria2 obfs-password is saved in the vault.
+    var obfsPasswordStamp: String?
+    var ech: String?
+    var upMbps: Int?
+    var downMbps: Int?
+    var hopSeconds: Int?
 
-    var address: String { host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)" }
+    var effectivePorts: String {
+        if let p = hysteriaPorts, !p.isEmpty { return p }
+        return port > 0 ? "\(port)" : "443"
+    }
+
+    var address: String {
+        if kind == .hysteria2 { return "\(host):\(effectivePorts)" }
+        return host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+    var rowSubtitle: String {
+        if kind == .hysteria2 { return "Hysteria2 · \(host):\(effectivePorts)" }
+        return ProxyLink.display(self).replacingOccurrences(of: "://", with: " · ")
+    }
     var summary: String {
         let login = (username ?? "").isEmpty ? "" : " · 用户 \(username!)"
         return "\(kind.label) · \(address)\(login) · \(sites.count) 条规则"
@@ -42,9 +76,14 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
 
     /// Decoding is lenient so a future field never drops the user's list.
     init(id: UUID = UUID(), name: String, kind: Kind, host: String, port: Int, sites: [String], enabled: Bool = true,
-         username: String? = nil, passwordStamp: String? = nil) {
+         username: String? = nil, passwordStamp: String? = nil, hysteriaPorts: String? = nil, sni: String? = nil,
+         pinSHA256: String? = nil, obfs: String? = nil, obfsPasswordStamp: String? = nil, ech: String? = nil,
+         upMbps: Int? = nil, downMbps: Int? = nil, hopSeconds: Int? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.host = host; self.port = port
         self.sites = sites; self.enabled = enabled; self.username = username; self.passwordStamp = passwordStamp
+        self.hysteriaPorts = hysteriaPorts; self.sni = sni; self.pinSHA256 = pinSHA256; self.obfs = obfs
+        self.obfsPasswordStamp = obfsPasswordStamp; self.ech = ech; self.upMbps = upMbps
+        self.downMbps = downMbps; self.hopSeconds = hopSeconds
     }
 
     init(from decoder: Decoder) throws {
@@ -58,6 +97,15 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         username = try c.decodeIfPresent(String.self, forKey: .username)
         passwordStamp = try c.decodeIfPresent(String.self, forKey: .passwordStamp)
+        hysteriaPorts = try c.decodeIfPresent(String.self, forKey: .hysteriaPorts)
+        sni = try c.decodeIfPresent(String.self, forKey: .sni)
+        pinSHA256 = try c.decodeIfPresent(String.self, forKey: .pinSHA256)
+        obfs = try c.decodeIfPresent(String.self, forKey: .obfs)
+        obfsPasswordStamp = try c.decodeIfPresent(String.self, forKey: .obfsPasswordStamp)
+        ech = try c.decodeIfPresent(String.self, forKey: .ech)
+        upMbps = try c.decodeIfPresent(Int.self, forKey: .upMbps)
+        downMbps = try c.decodeIfPresent(Int.self, forKey: .downMbps)
+        hopSeconds = try c.decodeIfPresent(Int.self, forKey: .hopSeconds)
     }
 }
 
@@ -66,13 +114,17 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
 enum ProxyPasswords {
     private static let lock = NSLock()
     private static var cache: [String: String] = [:]
-    /// Stand-in for the keychain (tests).
+    /// Stand-ins for the keychain (tests).
     static var read: (ProxyRoute) -> String? = { route in
         KeychainStore.read(server: route.keychainServer, username: "proxy")
     }
+    static var readObfs: (ProxyRoute) -> String? = { route in
+        KeychainStore.read(server: route.keychainServer, username: "proxy-obfs")
+    }
 
     static func password(for route: ProxyRoute) -> String? {
-        guard let stamp = route.passwordStamp, !(route.username ?? "").isEmpty else { return nil }
+        guard let stamp = route.passwordStamp else { return nil }
+        if route.kind != .hysteria2, (route.username ?? "").isEmpty { return nil }
         let key = "\(route.id.uuidString)|\(stamp)"
         lock.lock(); defer { lock.unlock() }
         if let known = cache[key] { return known }
@@ -81,12 +133,31 @@ enum ProxyPasswords {
         return value
     }
 
+    static func obfsPassword(for route: ProxyRoute) -> String? {
+        guard route.kind == .hysteria2, let stamp = route.obfsPasswordStamp, !(route.obfs ?? "").isEmpty else { return nil }
+        let key = "\(route.id.uuidString)|obfs|\(stamp)"
+        lock.lock(); defer { lock.unlock() }
+        if let known = cache[key] { return known }
+        guard let value = readObfs(route), !value.isEmpty else { return nil }
+        cache[key] = value
+        return value
+    }
+
     static func save(_ password: String, for route: ProxyRoute) -> Bool {
         KeychainStore.save(server: route.keychainServer, username: "proxy", password: password)
     }
 
+    static func saveObfs(_ password: String, for route: ProxyRoute) -> Bool {
+        KeychainStore.save(server: route.keychainServer, username: "proxy-obfs", password: password)
+    }
+
+    static func deleteObfs(for route: ProxyRoute) {
+        _ = KeychainStore.delete(server: route.keychainServer, username: "proxy-obfs")
+    }
+
     static func delete(for route: ProxyRoute) {
         _ = KeychainStore.delete(server: route.keychainServer, username: "proxy")
+        _ = KeychainStore.delete(server: route.keychainServer, username: "proxy-obfs")
     }
 }
 
@@ -100,12 +171,29 @@ func proxyFieldEncode(_ value: String) -> String {
 }
 
 extension ProxyRoute {
-    /// "<kind> <host> <port> [<user> <password>]" as the Rust core reads
-    /// it. An invalid address still declares the proxy (it is refused
-    /// there): its sites must not fall back to another path. A missing
-    /// password still sends the username: the proxy's refusal names the
-    /// problem instead of a silent change.
-    func serverLine(password: String?) -> String {
+    /// "<kind> <host> <port> [<user> <password>]" or
+    /// "hysteria2 <host> <ports> auth=<enc> ..." as the Rust core reads it.
+    /// An invalid address still declares the proxy (it is refused there):
+    /// its sites must not fall back to another path.
+    func serverLine(password: String?, obfsPassword: String? = nil) -> String {
+        if kind == .hysteria2 {
+            let safeHost = Self.validHost(host) && !host.contains(":") ? proxyFieldEncode(host) : "invalid"
+            let ports = proxyFieldEncode(effectivePorts)
+            let auth = (password ?? "").isEmpty ? "%00" : proxyFieldEncode(password!)
+            var parts = ["hysteria2", safeHost, ports, "auth=\(auth)"]
+            if let sni, !sni.isEmpty { parts.append("sni=\(proxyFieldEncode(sni))") }
+            if let pinSHA256, !pinSHA256.isEmpty { parts.append("pin=\(proxyFieldEncode(pinSHA256))") }
+            if let obfs, !obfs.isEmpty {
+                parts.append("obfs=\(proxyFieldEncode(obfs))")
+                let opw = (obfsPassword ?? "").isEmpty ? "%00" : proxyFieldEncode(obfsPassword!)
+                parts.append("obfs_password=\(opw)")
+            }
+            if let ech, !ech.isEmpty { parts.append("ech=\(proxyFieldEncode(ech))") }
+            if let upMbps { parts.append("upmbps=\(upMbps)") }
+            if let downMbps { parts.append("downmbps=\(downMbps)") }
+            if let hopSeconds { parts.append("hop=\(hopSeconds)") }
+            return parts.joined(separator: " ")
+        }
         let host = Self.validHost(host) ? host : "invalid"
         let port = Self.validPort(port) ? port : 0
         var line = "\(kind.rawValue) \(host) \(port)"
@@ -128,16 +216,16 @@ extension AppSettings {
     }
 
     /// The proxies as the background service reads them, inside the split
-    /// list: "proxy:<n> <kind> <host> <port> [<user> <password>]", then
-    /// "via:<n>:<rule>" per expanded rule (geoip as "ipcidr:") and
-    /// "vianet:<n>:<cidr>" per written network, in the user's order (the
-    /// first proxy whose rules match takes the site). A service without
-    /// proxies ignores every such line, so those sites stay in the VPN
-    /// there, never direct.
+    /// list: "proxy:<n> <kind> ...", then "via:<n>:<rule>" per expanded rule
+    /// (geoip as "ipcidr:") and "vianet:<n>:<cidr>" per written network, in
+    /// the user's order. An older service ignores unknown lines or types and
+    /// refuses connections to unknown proxies (fail closed).
     var proxyLines: [String] {
         var out: [String] = []
         for (index, route) in activeProxyRoutes.enumerated() {
-            out.append("proxy:\(index) " + route.serverLine(password: ProxyPasswords.password(for: route)))
+            let line = route.serverLine(password: ProxyPasswords.password(for: route),
+                                        obfsPassword: ProxyPasswords.obfsPassword(for: route))
+            out.append("proxy:\(index) " + line)
             let rules = route.sites.compactMap(ListRule.parse)
             for rule in rules {
                 if case .network(let cidr) = rule { out.append("vianet:\(index):\(cidr)") }
@@ -154,9 +242,8 @@ extension AppSettings {
 
 /// A proxy written as one line, the way proxies are usually shared:
 /// `socks5://user:pass@1.2.3.4:1080`, `socks5h://…`, `http://host:8080`,
-/// `user:pass@host:port` or `host:port` (SOCKS5), `[::1]:1080`, and the
-/// Surge / Clash style `socks5, host, port[, user, pass]` (an optional
-/// `name =` in front names it).
+/// `hysteria2://…` / `hy2://…`, `user:pass@host:port` or `host:port` (SOCKS5),
+/// `[::1]:1080`, and the Surge / Clash style `socks5, host, port[, user, pass]`.
 struct ProxyLink: Equatable {
     var kind: ProxyRoute.Kind
     var host: String
@@ -166,6 +253,17 @@ struct ProxyLink: Equatable {
     var name: String?
     /// The type was not written: SOCKS5 was assumed (shown to the user).
     var assumedKind = false
+    /// Hysteria2 fields (parsed by the Rust core).
+    var ports: String? = nil
+    var sni: String? = nil
+    var pinSHA256: String? = nil
+    var obfs: String? = nil
+    var obfsPassword: String? = nil
+    var ech: String? = nil
+    var upMbps: Int? = nil
+    var downMbps: Int? = nil
+    var hopSeconds: Int? = nil
+    var hysteriaSummary: String? = nil
 
     enum Parsed: Equatable {
         case link(ProxyLink)
@@ -175,22 +273,59 @@ struct ProxyLink: Equatable {
     }
 
     var summary: String {
+        if kind == .hysteria2, let hysteriaSummary { return hysteriaSummary }
         let address = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
         var text = "\(kind.label)\(assumedKind ? "（未写类型，按 SOCKS5）" : "") · \(address)"
         if let username { text += " · 用户 \(username)\(password == nil ? "" : "，带密码")" }
         return text
     }
 
-    /// The line to show when editing: never the password.
+    /// The line to show when editing: never the password or obfs-password.
     static func display(_ route: ProxyRoute) -> String {
+        if route.kind == .hysteria2 {
+            var params: [String] = []
+            if let sni = route.sni, !sni.isEmpty { params.append("sni=\(proxyFieldEncode(sni))") }
+            if let pin = route.pinSHA256, !pin.isEmpty { params.append("pinSHA256=\(proxyFieldEncode(pin))") }
+            if let obfs = route.obfs, !obfs.isEmpty { params.append("obfs=\(proxyFieldEncode(obfs))") }
+            if let ech = route.ech, !ech.isEmpty { params.append("ech=\(proxyFieldEncode(ech))") }
+            if let u = route.upMbps { params.append("upmbps=\(u)") }
+            if let d = route.downMbps { params.append("downmbps=\(d)") }
+            if let h = route.hopSeconds { params.append("hop=\(h)") }
+            let query = params.isEmpty ? "" : "/?" + params.joined(separator: "&")
+            return "hysteria2://\(route.host):\(route.effectivePorts)\(query)"
+        }
         let host = route.host.contains(":") ? "[\(route.host)]" : route.host
         let user = (route.username ?? "").isEmpty ? "" : proxyFieldEncode(route.username!) + "@"
         return "\(route.kind.rawValue)://\(user)\(host):\(route.port)"
     }
 
+    /// Whether a Hysteria2 host is NOT covered by the direct list or LAN
+    /// (for the orange hint in ProxyEditor when Cisco own-connection is on).
+    static func hysteriaNeedsDirectHint(host: String, settings: AppSettings) -> Bool {
+        let isIP = isValidIPv4Address(host)
+        if DirectSites.covering(DirectSites.sites(settings), host: isIP ? nil : host, address: isIP ? host : "") != nil {
+            return false
+        }
+        if isIP {
+            // Check private/loopback ranges and configured allow networks (LAN).
+            let lanAndPrivate = settings.effectiveAllowNetworks + ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+            let asDirect = lanAndPrivate.map { DirectSite(name: $0, domains: [$0]) }
+            if DirectSites.covering(asDirect, host: nil, address: host) != nil {
+                return false
+            }
+        }
+        return true
+    }
+
     static func parse(_ input: String) -> Parsed {
         var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return .problem("填一个代理地址，例如 socks5://1.2.3.4:1080") }
+        guard !text.isEmpty else { return .problem("填一个代理地址，例如 socks5://1.2.3.4:1080 或 hy2://密码@主机:443") }
+        let lower = text.lowercased()
+        if lower.hasPrefix("hysteria2://") || lower.hasPrefix("hy2://")
+            || lower.hasPrefix("hysteria2+realm://") || lower.hasPrefix("hy2+realm://")
+            || lower.hasPrefix("hysteria2+realm+http://") || lower.hasPrefix("hy2+realm+http://") {
+            return parseHysteria(text)
+        }
         if text.contains(",") { return parseList(text) }
         var kind = ProxyRoute.Kind.socks5
         var assumed = true
@@ -200,7 +335,7 @@ struct ProxyLink: Equatable {
             case "http": kind = .http
             case "https": return .problem("暂不支持 HTTPS（加密）代理，请用 http:// 或 socks5://")
             case "socks4", "socks4a": return .problem("不支持 SOCKS4，请用 SOCKS5")
-            default: return .problem("认不出代理类型，支持 socks5:// 和 http://")
+            default: return .problem("认不出代理类型，支持 socks5://、http:// 和 hysteria2://（hy2://）")
             }
             assumed = false
             text = String(text[range.upperBound...])
@@ -237,6 +372,57 @@ struct ProxyLink: Equatable {
             portText = text[text.index(after: colon)...]
         }
         return build(kind: kind, assumed: assumed, host: host, port: String(portText), username: username, password: password, name: name)
+    }
+
+    private static func parseHysteria(_ input: String) -> Parsed {
+        guard let raw = ac_hysteria_parse_uri(input) else { return .problem("无法解析 Hysteria2 链接") }
+        defer { proxy_routes_string_free(raw) }
+        struct WireURI: Decodable {
+            var host: String
+            var ports: String
+            var firstPort: Int
+            var auth: String?
+            var sni: String?
+            var pinSha256: String?
+            var obfs: String?
+            var obfsPassword: String?
+            var ech: String?
+            var upMbps: Int?
+            var downMbps: Int?
+            var hopSecs: Int?
+            var name: String?
+            var summary: String
+        }
+        struct Envelope: Decodable {
+            var ok: Bool
+            var uri: WireURI?
+            var error: String?
+        }
+        guard let out = try? JSONDecoder().decode(Envelope.self, from: Data(String(cString: raw).utf8)) else {
+            return .problem("无法解析 Hysteria2 链接")
+        }
+        guard out.ok, let u = out.uri else {
+            return .problem(out.error ?? "Hysteria2 链接格式不对")
+        }
+        return .link(ProxyLink(
+            kind: .hysteria2,
+            host: u.host,
+            port: u.firstPort,
+            username: nil,
+            password: u.auth,
+            name: u.name,
+            assumedKind: false,
+            ports: u.ports,
+            sni: u.sni,
+            pinSHA256: u.pinSha256,
+            obfs: u.obfs,
+            obfsPassword: u.obfsPassword,
+            ech: u.ech,
+            upMbps: u.upMbps,
+            downMbps: u.downMbps,
+            hopSeconds: u.hopSecs,
+            hysteriaSummary: u.summary
+        ))
     }
 
     /// `[name =] socks5|http, host, port[, user, pass][, key=value…]`.

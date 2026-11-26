@@ -31,8 +31,13 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
         return true;
     }
     // Networks inside the Mac's own LAN stay local, like the direct list's.
-    let networks = direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks());
+    // A proxy's own server inside a written network is cut out of it: its
+    // connection would otherwise come back here and go to the proxy again.
+    let networks = without_addresses(
+        direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks()),
+        &table.server_addresses());
     let udp = table.carries_udp();
+    let hysteria_specs = table.hysteria_specs();
     match session {
         Some(s) => s.routing.set_table(table),
         None => *session = Some(RedirectSession { routing: Routing::new(table), listener: None, loaded: None }),
@@ -42,9 +47,11 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
     // A proxy on this Mac resolves through us too: its own connections get
     // real addresses by the ordinary split.
     let inner = Arc::downgrade(forwarder.inner());
-    s.routing.set_resolver(Some(Arc::new(move |name: &str| {
+    let resolver: super::Resolver = Arc::new(move |name: &str| {
         inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
-    })));
+    });
+    s.routing.set_resolver(Some(resolver.clone()));
+    super::hysteria::shared().sync(hysteria_specs, s.routing.clone(), Some(resolver));
     if no_routes { return true; }
     if s.listener.is_none() {
         match super::pf_original_destination().and_then(|original| Listener::start(s.routing.clone(), original)) {
@@ -76,6 +83,18 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
 /// Takes the redirect, routes and listener out (answers stop first).
 pub fn stop(session: &mut Option<RedirectSession>, forwarder: Option<&Forwarder>, routes: &DirectRoutes,
             guard: Option<&Guard>, no_routes: bool) {
+    stop_with_handover(session, forwarder, routes, guard, no_routes, false);
+}
+
+/// Like `stop`, but when `handover` is true keeps managed Hysteria2 children
+/// alive across the brief handover between proxy-only and own-connection.
+pub fn stop_with_handover(session: &mut Option<RedirectSession>, forwarder: Option<&Forwarder>, routes: &DirectRoutes,
+                          guard: Option<&Guard>, no_routes: bool, handover: bool) {
+    if handover {
+        super::hysteria::shared().begin_handover();
+    } else {
+        super::hysteria::shared().stop_all();
+    }
     let Some(mut s) = session.take() else { return };
     if let Some(f) = forwarder { f.set_proxy(None); }
     if !no_routes {
@@ -85,4 +104,75 @@ pub fn stop(session: &mut Option<RedirectSession>, forwarder: Option<&Forwarder>
         if !routes.remove_all() { network_guard::log("split proxy: loopback route removal not confirmed"); }
     }
     if let Some(listener) = s.listener.as_mut() { listener.stop(); }
+}
+
+/// `networks` with each of `addresses` cut out: a network holding one is
+/// replaced by the at most 32 networks that cover the rest of it.
+pub fn without_addresses(networks: Vec<String>, addresses: &[std::net::Ipv4Addr]) -> Vec<String> {
+    let mut out = networks;
+    for address in addresses {
+        let ip = u32::from(*address);
+        out = out.into_iter().flat_map(|cidr| {
+            let written = if cidr.contains('/') { cidr.clone() } else { format!("{cidr}/32") };
+            let Some((lo, hi)) = crate::dns_forwarder::cidr_range(&written) else { return vec![cidr] };
+            if ip < lo || ip > hi { return vec![cidr]; }
+            let Some(mut len) = written.split_once('/').and_then(|(_, bits)| bits.parse::<u32>().ok()) else { return vec![cidr] };
+            let mut base = lo;
+            let mut pieces = Vec::new();
+            while len < 32 {
+                len += 1;
+                let half = 1u32 << (32 - len);
+                if ip - base >= half {
+                    pieces.push(format!("{}/{len}", std::net::Ipv4Addr::from(base)));
+                    base += half;
+                } else {
+                    pieces.push(format!("{}/{len}", std::net::Ipv4Addr::from(base + half)));
+                }
+            }
+            pieces
+        }).collect();
+    }
+    let mut seen = HashSet::new();
+    out.retain(|cidr| seen.insert(cidr.clone()));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_addresses;
+    use std::net::Ipv4Addr;
+
+    fn covers(pieces: &[String], ip: Ipv4Addr) -> bool {
+        pieces.iter().any(|c| crate::dns_forwarder::cidr_range(c).is_some_and(|(lo, hi)| (lo..=hi).contains(&u32::from(ip))))
+    }
+
+    #[test]
+    fn a_proxy_server_inside_a_written_network_is_cut_out() {
+        let server = Ipv4Addr::new(203, 0, 113, 77);
+        let pieces = without_addresses(vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()], &[server]);
+        assert!(!covers(&pieces, server));
+        assert!(pieces.contains(&"198.51.100.0/24".to_string()), "{pieces:?}");
+        // Every other address of the /24 is still routed, by 8 pieces.
+        for last in (0..=255u8).filter(|n| *n != 77) {
+            assert!(covers(&pieces, Ipv4Addr::new(203, 0, 113, last)), "{last} {pieces:?}");
+        }
+        assert_eq!(pieces.len(), 1 + 8);
+    }
+
+    #[test]
+    fn wide_networks_single_addresses_and_untouched_lists() {
+        let server = Ipv4Addr::new(198, 51, 100, 7);
+        let wide = without_addresses(vec!["198.0.0.0/8".into()], &[server]);
+        assert_eq!(wide.len(), 24);
+        assert!(!covers(&wide, server));
+        assert!(covers(&wide, Ipv4Addr::new(198, 51, 100, 6)) && covers(&wide, Ipv4Addr::new(198, 255, 0, 1)));
+        assert!(without_addresses(vec!["198.51.100.7/32".into()], &[server]).is_empty());
+        assert!(without_addresses(vec!["198.51.100.7".into()], &[server]).is_empty());
+        let other = vec!["10.9.0.0/16".to_string()];
+        assert_eq!(without_addresses(other.clone(), &[server]), other);
+        // Two servers in one network.
+        let two = without_addresses(vec!["203.0.113.0/24".into()], &[Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 200)]);
+        assert!(!covers(&two, Ipv4Addr::new(203, 0, 113, 1)) && !covers(&two, Ipv4Addr::new(203, 0, 113, 200)));
+        assert!(covers(&two, Ipv4Addr::new(203, 0, 113, 2)) && covers(&two, Ipv4Addr::new(203, 0, 113, 199)));
+    }
 }

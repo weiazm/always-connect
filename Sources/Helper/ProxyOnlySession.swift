@@ -33,13 +33,13 @@ final class ProxyOnlySession {
     func networkChanged() { if let handle { ac_proxy_only_update_network(handle, Self.network()) } }
     var statusJSON: String { handle.flatMap { NetworkGuard.take(ac_proxy_only_status($0)) } ?? "{}" }
 
-    func stop() {
+    func stop(handover: Bool = false) {
         guard let handle else { return }
         self.handle = nil
-        ac_proxy_only_stop(handle)
+        ac_proxy_only_stop_handover(handle, handover)
     }
 
-    deinit { stop() }
+    deinit { stop(handover: false) }
 
     static func shouldRun(wanted: Bool, engineActive: Bool, ciscoActive: Bool) -> Bool {
         ac_proxy_only_should_run(wanted, engineActive, ciscoActive)
@@ -58,8 +58,8 @@ private func ac_proxy_only_update_rules(_ handle: OpaquePointer, _ rules: Unsafe
 private func ac_proxy_only_update_network(_ handle: OpaquePointer, _ network: UnsafePointer<CChar>)
 @_silgen_name("ac_proxy_only_status")
 private func ac_proxy_only_status(_ handle: OpaquePointer) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("ac_proxy_only_stop")
-private func ac_proxy_only_stop(_ handle: OpaquePointer)
+@_silgen_name("ac_proxy_only_stop_handover")
+private func ac_proxy_only_stop_handover(_ handle: OpaquePointer, _ handover: Bool)
 @_silgen_name("ac_proxy_only_should_run")
 private func ac_proxy_only_should_run(_ wanted: Bool, _ engineActive: Bool, _ ciscoActive: Bool) -> Bool
 @_silgen_name("ac_proxy_only_remove_leftover")

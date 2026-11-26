@@ -148,6 +148,14 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// connection and back. Only sent to a matching service (3-second limit).
     /// Reply: running now, and why not when it should.
     func setProxyOnly(_ on: Bool, withReply reply: @escaping (Bool, String) -> Void)
+    /// Hysteria2 pre-save / settings check (DESIGN.md §七十): starts a
+    /// background probe in the service for a candidate `hysteria2 ...` line
+    /// and returns a ticket immediately (0 + error on refusal). Only sent to
+    /// an exactly matching service (3-second App-side timeout).
+    func startProxyProbe(_ serverLine: String, rules: String, withReply reply: @escaping (UInt64, String) -> Void)
+    /// Polls a probe ticket started by `startProxyProbe`: `(done, json)`.
+    /// Only sent to an exactly matching service (3-second App-side timeout).
+    func getProxyProbeResult(_ ticket: UInt64, withReply reply: @escaping (Bool, String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)

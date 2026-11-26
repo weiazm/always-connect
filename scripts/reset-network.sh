@@ -221,6 +221,9 @@ done
 for p in $(pgrep -f "^/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate( |$)"); do
     say "stop our tunnel gate (pid $p)"; run kill -9 "$p"
 done
+for p in $(pgrep -f "^/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin/hysteria( |$)"); do
+    say "stop our hysteria client (pid $p)"; run kill -9 "$p"
+done
 for p in $(pgrep -f "^[^ ]*mihomo .*AlwaysConnect/core"); do
     say "stop our routing core (pid $p)"; run kill -9 "$p"
 done
@@ -284,6 +287,10 @@ for f in guard.json pf-state.json route-state manual-disconnect direct-routes pr
     fi
     [ -e "$SUPPORT/$f" ] && { say "forget held state $f"; run rm -f "$SUPPORT/$f"; }
 done
+if [ -d "/Library/Application Support/AlwaysConnect-hysteria" ]; then
+    say "clear hysteria runtime config dir"
+    run rm -rf "/Library/Application Support/AlwaysConnect-hysteria"
+fi
 
 # 3 routes
 for net in 0/1 128.0/1; do

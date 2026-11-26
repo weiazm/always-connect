@@ -197,7 +197,7 @@ pub fn redact(line: &str) -> String {
         out.replace_range(open_end..open_end + j, "***");
         from = open_end + 3;
     }
-    out
+    crate::split_proxy::hysteria::redact_uris(&out)
 }
 
 /// The CSTP CONNECT's `Cookie: webvpn=<value>`; never "<elided>".
@@ -1289,8 +1289,10 @@ impl Shared {
     }
 
     fn stop_proxy(&self, c: &mut Core) {
-        crate::split_proxy::redirect::stop(&mut c.proxy, c.forwarder.as_ref(), &self.proxy_routes,
-                                           Some(&self.guard), c.config.no_routes);
+        // Handover grace: if proxy-only starts right after Cisco disconnects,
+        // unchanged Hysteria2 processes stay alive; otherwise HelperDaemon stops them.
+        crate::split_proxy::redirect::stop_with_handover(&mut c.proxy, c.forwarder.as_ref(), &self.proxy_routes,
+                                                         Some(&self.guard), c.config.no_routes, true);
         if c.last_error.as_deref() == Some(PROXY_START_ERROR) { c.last_error = None; }
     }
 

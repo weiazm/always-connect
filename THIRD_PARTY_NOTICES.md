@@ -36,7 +36,15 @@ AlwaysConnect 本身按 [LICENSE](LICENSE)（MIT）发布。App 安装包里还�
   `README-LGPL.txt`（替换后 `codesign --force --sign -` 重签，再在 App 里点"安装/更新后台服务"）。
   App 不校验这些文件的哈希，不阻止替换。
 
-## 2. 链接进 App 与后台服务的 Rust 库
+## 2. Hysteria2 客户端（MIT）
+
+位置：`AlwaysConnect.app/Contents/Resources/hysteria/`（安装后台服务时复制到
+`/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/`）。由 `scripts/bundle-hysteria.sh`
+下载官方 [HyNetworks/hysteria](https://github.com/HyNetworks/hysteria) 固定发布版本（`app/v2.14.0`）并校验
+SHA-256，使用与 App 同一证书签名，仅在启用 Hysteria2 分流代理时由后台服务以普通权限（`nobody`）运行。
+许可证：MIT License（`third_party/licenses/hysteria-MIT.txt`、`hysteria/licenses/hysteria/LICENSE.md`）。
+
+## 3. 链接进 App 与后台服务的 Rust 库
 
 `libalwaysconnect_core.a`（`core/`）静态链接了下列 crate，均按其 MIT 选项使用：
 itoa、libc、memchr、regex-lite、serde、serde_core、serde_json、socket2、zmij。
@@ -45,7 +53,7 @@ itoa、libc、memchr、regex-lite、serde、serde_core、serde_json、socket2、
 Apache-2.0 正文在 `third_party/licenses/Apache-2.0.txt`。只在编译期运行的 crate（serde_derive、syn、quote、
 proc-macro2、unicode-ident）不进入产物，不在此列。
 
-## 3. 分流名单数据
+## 4. 分流名单数据
 
 - 网站清单（`geosite:`）：不随 App 打包。App 首次启动时从 [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)
   的发布下载 `dlc.dat`，转成本机文件并按日更新（DESIGN §66.30）。MIT License，Copyright (c) 2018-2019 V2Ray；
@@ -56,13 +64,13 @@ proc-macro2、unicode-ident）不进入产物，不在此列。
 
 生成方式与日期见 `Sources/App/GeoData/README.md`。
 
-## 4. 系统组件（不随 App 分发）
+## 5. 系统组件（不随 App 分发）
 
 App 只调用 macOS 自带的框架（AppKit、SwiftUI、Security、Network 等）和系统库（libxml2、zlib 等），
 不带任何第三方 Swift 包。经 Cisco 连接时调用用户机器上**已经安装**的 Cisco Secure Client 命令行，
 App 不包含、不分发、不修改 Cisco 的任何文件。
 
-## 5. 商标
+## 6. 商标
 
 Cisco、Cisco Secure Client、AnyConnect 是 Cisco Systems, Inc. 及/或其关联公司的商标或注册商标。
 OpenConnect 是其各自作者的项目名称。AlwaysConnect 是独立的个人项目，与 Cisco 没有任何关联，

@@ -111,6 +111,9 @@ grep -q 'proxy-routes proxy-pf-token' "$ROOT/scripts/reset-network.sh"
 # §69.20: the proxy-only DNS entry is removed too, only ours.
 grep -q 'PROXY_DNS_KEY=State:/Network/Service/AlwaysConnect-Proxy/DNS' "$ROOT/scripts/reset-network.sh"
 grep -qF '"$PROXY_DNS_KEY" | scutil >/dev/null' "$ROOT/scripts/reset-network.sh"
+# §七十: managed Hysteria2 child and its runtime config dir are cleaned too.
+grep -q 'AlwaysConnect-hysteria/bin/hysteria' "$ROOT/scripts/reset-network.sh"
+grep -q 'AlwaysConnect-hysteria' "$ROOT/scripts/reset-network.sh"
 direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
 # Fail the final metadata write after one deletion completed and one failed.
 # The durable intent must prevent another deletion after a process restart.

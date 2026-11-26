@@ -145,6 +145,141 @@ mod macos {
         if anchor.contains("rdr") { return Err(format!("anchor still has rules: {anchor}")); }
         if routes.lines().any(|l| l.starts_with("198.19.128/17")) { return Err("route still present".into()); }
         println!("stopped: no DNS entry, no route, empty anchor, the name is the network's again");
+
+        // Optional Hysteria2 end-to-end root check (§七十): when AC_HY2_BIN is set,
+        // start a local Hysteria2 server, run ProxyOnly with a managed Hysteria2 proxy,
+        // and connect as an app does: the system resolver gives our address, pf
+        // sends the connection to our relay, the relay hands the name to the
+        // managed client (as nobody), the client to the server, and the server's
+        // ACL points the test name at the local echo site. Then stop, no leftovers.
+        if let Ok(hy_bin) = std::env::var("AC_HY2_BIN") {
+            if !hy_bin.is_empty() {
+                run_hysteria_check(&hy_bin, site)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_hysteria_check(hy_bin: &str, site: SocketAddr) -> Result<(), String> {
+        stage("hysteria2 proxy-only start");
+        let work = std::env::temp_dir().join(format!("ac-proxy-only-hy2-{}", std::process::id()));
+        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        // Make cert + key + pin
+        let crt = work.join("server.crt");
+        let key = work.join("server.key");
+        let status = std::process::Command::new("/usr/bin/openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", key.to_str().unwrap(), "-out", crt.to_str().unwrap(),
+                "-days", "2", "-nodes", "-subj", "/CN=localhost",
+                "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map_err(|e| format!("openssl: {e}"))?;
+        if !status.success() { return Err("openssl cert gen failed".into()); }
+        let der = std::process::Command::new("/usr/bin/openssl")
+            .args(["x509", "-in", crt.to_str().unwrap(), "-outform", "DER"])
+            .output().map_err(|e| format!("openssl der: {e}"))?.stdout;
+        let mut sha = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().map_err(|e| format!("shasum: {e}"))?;
+        sha.stdin.take().unwrap().write_all(&der).map_err(|e| e.to_string())?;
+        let pin = String::from_utf8_lossy(&sha.wait_with_output().map_err(|e| e.to_string())?.stdout)
+            .split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let port = 29443u16;
+        let auth = "root-check-auth";
+        let cfg = work.join("server.json");
+        let log = work.join("server.log");
+        // The server sends the test name to the local echo site (ACL hijack,
+        // same port), lets the direct check reach loopback and refuses
+        // everything else: nothing leaves the runner.
+        std::fs::write(&cfg, serde_json::json!({
+            "listen": format!("127.0.0.1:{port}"),
+            "tls": { "cert": crt.to_str().unwrap(), "key": key.to_str().unwrap() },
+            "auth": { "type": "password", "password": auth },
+            "acl": { "inline": [format!("direct(suffix:{SITE}, *, 127.0.0.1)"), "direct(127.0.0.1)".to_string(), "reject(all)".to_string()] },
+        }).to_string()).map_err(|e| e.to_string())?;
+        let log_file = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+        let srv = std::process::Command::new(hy_bin)
+            .args(["server", "-c", cfg.to_str().unwrap(), "--disable-update-check", "--log-format", "json"])
+            .stdout(std::process::Stdio::null()).stderr(log_file)
+            .spawn().map_err(|e| format!("spawn hysteria server: {e}"))?;
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let _srv_guard = KillOnDrop(srv);
+        let ready = (0..40).any(|_| {
+            if std::fs::read_to_string(&log).unwrap_or_default().contains("server up and running") { return true; }
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        });
+        if !ready {
+            let detail = std::fs::read_to_string(&log).unwrap_or_default();
+            return Err(format!("hysteria server did not start: {}", detail.trim()));
+        }
+
+        split_proxy::hysteria::configure_binary(std::path::PathBuf::from(hy_bin), None, true);
+        let net = network()?;
+        let lines = vec![
+            format!("proxy:0 hysteria2 127.0.0.1 {port} auth={auth} sni=localhost pin={pin}"),
+            "vianet:0:203.0.113.0/24".into(),
+            format!("via:0:domain:{SITE}"),
+        ];
+        let mut session = ProxyOnly::start(lines, net, &work, "check-hy2".into(), 53, false).map_err(str::to_owned)?;
+        let spec = split_proxy::HysteriaSpec {
+            host: "127.0.0.1".into(), ports: port.to_string(), auth: auth.into(),
+            sni: Some("localhost".into()), pin_sha256: Some(pin), obfs: None, obfs_password: None,
+            ech: None, up_mbps: None, down_mbps: None, hop_secs: None,
+        };
+        let wait_ready = std::time::Instant::now() + Duration::from_secs(10);
+        while split_proxy::hysteria::shared().running_socks_for(&spec).is_none() {
+            if std::time::Instant::now() >= wait_ready {
+                session.stop();
+                return Err("managed hysteria client did not become ready".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        stage("hysteria2 proxy-only traffic");
+        flush();
+        let proxied = resolve(&format!("www.{SITE}"));
+        let traffic_res = (|| -> Result<(), String> {
+            if !(proxied.len() == 1 && split_proxy::is_fake(proxied[0])) {
+                return Err(format!("hysteria2: system resolver did not give fake ip: {proxied:?}"));
+            }
+            // Also verify direct-to-echo through the managed Hysteria2 client's local SOCKS5
+            let local_socks = split_proxy::hysteria::shared().running_socks_for(&spec).ok_or("managed socks missing")?;
+            let (mut s, _) = split_proxy::open_through(&local_socks, &split_proxy::Target::Ip(Ipv4Addr::LOCALHOST), site.port())?;
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(b"hy2-root-ok").map_err(|e| e.to_string())?;
+            let mut got = [0u8; 11];
+            s.read_exact(&mut got).map_err(|e| format!("read back: {e}"))?;
+            if &got != b"hy2-root-ok" { return Err("wrong bytes back through hysteria2".into()); }
+            println!("hysteria2: the managed client's local SOCKS5 reaches the echo site");
+            // As an app: our address from the system resolver, pf, our relay,
+            // the managed client, the server, the echo site.
+            let mut app = TcpStream::connect_timeout(&SocketAddr::from((proxied[0], site.port())), Duration::from_secs(5))
+                .map_err(|e| format!("hysteria2: app connect: {e}"))?;
+            app.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+            app.write_all(b"hy2-app-ok!").map_err(|e| e.to_string())?;
+            let mut back = [0u8; 11];
+            app.read_exact(&mut back).map_err(|e| format!("hysteria2: app read back: {e}"))?;
+            if &back != b"hy2-app-ok!" { return Err("hysteria2: wrong bytes back on the app path".into()); }
+            println!("hysteria2: an app's connection by name went system resolver -> pf -> relay -> managed client -> server");
+            Ok(())
+        })();
+        stage("hysteria2 proxy-only stop");
+        session.stop();
+        flush();
+        let anchor = command("/sbin/pfctl", &["-a", alwaysconnect_core::pf::PROXY_ANCHOR, "-s", "nat"]);
+        let routes = command("/usr/sbin/netstat", &["-rn", "-f", "inet"]);
+        let _ = std::fs::remove_dir_all(&work);
+        traffic_res?;
+        if split_proxy::hysteria::shared().running_socks_for(&spec).is_some() {
+            return Err("managed hysteria client still registered after stop".into());
+        }
+        if entry_present() { return Err("hysteria2: DNS entry still there after stop".into()); }
+        if anchor.contains("rdr") { return Err(format!("hysteria2: anchor still has rules: {anchor}")); }
+        if routes.lines().any(|l| l.starts_with("198.19.128/17")) { return Err("hysteria2: route still present".into()); }
+        println!("hysteria2 proxy-only: verified end-to-end and cleanly stopped");
         Ok(())
     }
 

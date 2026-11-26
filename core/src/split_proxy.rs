@@ -35,11 +35,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+pub mod hysteria;
 mod owner;
 mod probe;
 mod protocol;
 pub mod redirect;
 mod relay;
+pub use hysteria::HysteriaSpec;
 pub use probe::{probe, site_from_rules, Level, Probe};
 pub use redirect::RedirectSession;
 pub use protocol::{http_connect, open_through, socks5_connect, udp_associate, udp_unwrap, udp_wrap};
@@ -154,8 +156,11 @@ fn proxy_index(text: &str) -> Option<usize> {
 /// rules match takes the site.
 #[derive(Default, Debug)]
 pub struct Table {
-    /// None: declared badly or not at all. Its sites are refused.
+    /// None: declared badly, not at all, or managed externally (Hysteria2).
+    /// Its sites are refused unless a managed local backend is registered.
     servers: Vec<Option<Server>>,
+    /// Managed Hysteria2 proxies, keyed by the App's proxy index (§七十).
+    hysteria: BTreeMap<usize, HysteriaSpec>,
     groups: Vec<(usize, SplitRules)>,
     /// Networks the user wrote, routed here for connections by address.
     networks: Vec<(usize, String, (u32, u32))>,
@@ -164,13 +169,22 @@ pub struct Table {
 impl Table {
     pub fn parse<S: AsRef<str>>(list: &[S]) -> Table {
         let mut servers: BTreeMap<usize, Option<Server>> = BTreeMap::new();
+        let mut hysteria: BTreeMap<usize, HysteriaSpec> = BTreeMap::new();
         let mut rules: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         let mut networks = Vec::new();
         for raw in list {
             let line = raw.as_ref().trim();
             if let Some(rest) = line.strip_prefix("proxy:") {
                 let (index, server) = rest.split_once(' ').unwrap_or((rest, ""));
-                if let Some(n) = proxy_index(index) { servers.insert(n, Server::parse(server)); }
+                if let Some(n) = proxy_index(index) {
+                    if let Some(hy) = HysteriaSpec::parse_rule_line(server) {
+                        servers.insert(n, None);
+                        hysteria.insert(n, hy);
+                    } else {
+                        hysteria.remove(&n);
+                        servers.insert(n, Server::parse(server));
+                    }
+                }
             } else if let Some(rest) = line.strip_prefix("vianet:") {
                 if let Some((n, cidr)) = rest.split_once(':').and_then(|(i, c)| Some((proxy_index(i)?, c))) {
                     if let Some(range) = crate::direct_routes::is_network(cidr).then(|| cidr_range(cidr)).flatten() {
@@ -185,10 +199,14 @@ impl Table {
             }
         }
         let size = servers.keys().chain(rules.keys()).max().map_or(0, |n| n + 1);
-        let mut table = Table { servers: vec![None; size], groups: Vec::new(), networks };
+        let mut table = Table { servers: vec![None; size], hysteria, groups: Vec::new(), networks };
         for (n, server) in servers { table.servers[n] = server; }
         table.groups = rules.into_iter().map(|(n, list)| (n, SplitRules::new(&list))).collect();
         table
+    }
+
+    pub fn hysteria_specs(&self) -> BTreeMap<usize, HysteriaSpec> {
+        self.hysteria.clone()
     }
 
     pub fn is_empty(&self) -> bool { self.groups.is_empty() }
@@ -221,6 +239,18 @@ impl Table {
         out
     }
 
+    /// The proxies' own servers written as IPv4 addresses (SOCKS5, HTTP,
+    /// Hysteria2): never routed back here, even inside a written network.
+    pub fn server_addresses(&self) -> Vec<Ipv4Addr> {
+        let mut out: Vec<Ipv4Addr> = self.servers.iter().flatten().map(|s| s.host.as_str())
+            .chain(self.hysteria.values().map(|h| h.host.as_str()))
+            .filter_map(|host| host.parse().ok())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Ports of proxies running on this Mac: their own connections come
     /// back here and must not be sent to them again.
     fn local_ports(&self) -> Vec<u16> {
@@ -232,9 +262,9 @@ impl Table {
         out
     }
 
-    /// UDP is redirected only when some proxy can carry it (SOCKS5).
+    /// UDP is redirected only when some proxy can carry it (SOCKS5 or Hysteria2).
     pub fn carries_udp(&self) -> bool {
-        self.servers.iter().flatten().any(|s| s.kind == Kind::Socks5)
+        self.servers.iter().flatten().any(|s| s.kind == Kind::Socks5) || !self.hysteria.is_empty()
     }
 }
 
@@ -294,10 +324,18 @@ pub type Resolver = Arc<dyn Fn(&str) -> Vec<Ipv4Addr> + Send + Sync>;
 /// How long the processes behind local proxies' ports are remembered.
 const LOCAL_PIDS_FOR: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
+enum ManagedProxy {
+    Ready { server: Server, server_ip: Ipv4Addr, ports: String },
+    Unavailable(String),
+}
+
 /// Shared by the DNS forwarder (answers) and the listener (connections).
 #[derive(Default)]
 pub struct Routing {
     table: RwLock<Arc<Table>>,
+    /// Runtime backends for managed Hysteria2 proxies (local SOCKS5 + remote IP).
+    managed: Mutex<HashMap<usize, ManagedProxy>>,
     resolver: RwLock<Option<Resolver>>,
     /// Processes listening on local proxies' ports, and when looked up.
     local_pids: Mutex<Option<(Instant, Vec<u16>, Vec<i32>)>>,
@@ -347,7 +385,29 @@ impl Routing {
     }
 
     pub fn set_table(&self, table: Table) {
+        let active: std::collections::HashSet<usize> = table.hysteria.keys().copied().collect();
+        self.managed.lock().unwrap().retain(|k, _| active.contains(k));
         *self.table.write().unwrap() = Arc::new(table);
+    }
+
+    /// Registers a running managed Hysteria2 backend for proxy `n`.
+    pub fn set_managed_ready(&self, n: usize, server: Server, server_ip: Ipv4Addr, ports: String) {
+        self.managed.lock().unwrap().insert(n, ManagedProxy::Ready { server, server_ip, ports });
+    }
+
+    /// Marks managed Hysteria2 proxy `n` unavailable with a plain-Chinese reason (fail closed).
+    pub fn set_managed_unavailable(&self, n: usize, reason: String) {
+        self.managed.lock().unwrap().insert(n, ManagedProxy::Unavailable(reason));
+    }
+
+    /// The road for counting proxied bytes (§69.17, §七十): for a managed
+    /// Hysteria2 proxy (whose local SOCKS5 sits on 127.0.0.1), attribute traffic
+    /// to the road to the actual Hysteria2 server IP instead of `Leg::Local`.
+    pub(crate) fn leg_for(&self, n: usize, peer: std::net::IpAddr) -> Leg {
+        if let Some(ManagedProxy::Ready { server_ip, .. }) = self.managed.lock().unwrap().get(&n) {
+            return Leg::of(std::net::IpAddr::V4(*server_ip));
+        }
+        Leg::of(peer)
     }
 
     pub fn table(&self) -> Arc<Table> { self.table.read().unwrap().clone() }
@@ -440,8 +500,19 @@ impl Routing {
         if upstreams.len() < 64 || upstreams.contains_key(&peer) { upstreams.insert(peer, (n, Instant::now())); }
     }
 
-    /// The proxy whose server sits at `ip:port`, when this relay talks to it.
+    /// The proxy whose server sits at `ip:port`, when this relay talks to it
+    /// (including a managed Hysteria2 child's UDP socket to its remote server).
     pub fn upstream_proxy(&self, ip: Ipv4Addr, port: u16) -> Option<usize> {
+        {
+            let managed = self.managed.lock().unwrap();
+            for (&n, entry) in managed.iter() {
+                if let ManagedProxy::Ready { server_ip, ports, .. } = entry {
+                    if *server_ip == ip && hysteria::port_in_spec(ports, port) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
         let upstreams = self.upstreams.lock().unwrap();
         upstreams.get(&std::net::SocketAddr::from((ip, port))).filter(|(_, at)| at.elapsed() < HEALTH_FOR).map(|(n, _)| *n)
     }
@@ -466,6 +537,12 @@ impl Routing {
             let n = table.route_ip(ip).ok_or_else(|| (ip.to_string(), "这个地址已不在代理规则里".to_owned()))?;
             (Target::Ip(ip), n)
         };
+        if let Some(entry) = self.managed.lock().unwrap().get(&n).cloned() {
+            return match entry {
+                ManagedProxy::Ready { server, .. } => Ok((target, server, n)),
+                ManagedProxy::Unavailable(reason) => Err((target.label(), reason)),
+            };
+        }
         match table.server(n) {
             Some(server) => Ok((target, server.clone(), n)),
             None => Err((target.label(), "规则指向的代理不存在或地址无效".to_owned())),

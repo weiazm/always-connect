@@ -31,6 +31,8 @@ LABEL=com.alwaysconnect.app.helper
 BIN=/Library/PrivilegedHelperTools/$LABEL
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 OCDIR=/Library/PrivilegedHelperTools/AlwaysConnect-openconnect
+HYDIR=/Library/PrivilegedHelperTools/AlwaysConnect-hysteria
+HYRUN="/Library/Application Support/AlwaysConnect-hysteria"
 LOGDIR=/Library/Logs/AlwaysConnect
 SUPPORT="/Library/Application Support/AlwaysConnect"
 ANCHOR=com.apple/300.AlwaysConnect
@@ -183,6 +185,17 @@ install)
         chmod -R go-w "$OCDIR"
         echo "openconnect: $(head -2 "$OCDIR/VERSIONS" | tail -1)"
     fi
+    # The App's own pinned Hysteria2 client (DESIGN.md §七十), root-owned
+    # and readable/executable by nobody (never world-writable).
+    hy="$(cd "$(dirname "$src")/../.." && pwd)/Resources/hysteria"
+    if [ -x "$hy/bin/hysteria" ]; then
+        rm -rf "$HYDIR"
+        cp -R "$hy" "$HYDIR"
+        chown -R root:wheel "$HYDIR"
+        chmod -R go-w "$HYDIR"
+        chmod 755 "$HYDIR" "$HYDIR/bin" "$HYDIR/bin/hysteria"
+        echo "hysteria: $(head -1 "$HYDIR/VERSIONS" 2>/dev/null || echo installed)"
+    fi
     # The engine's redacted openconnect output in helper.log is opt-in
     # (DESIGN.md §36.3): it still names the server and the user. Run
     # `sudo ALWAYSCONNECT_DEBUG_CHILD_OUTPUT=1 scripts/dev-helper.sh install`
@@ -264,7 +277,7 @@ uninstall)
     stop_service
     launchctl bootout "system/$SWAP_LABEL" 2>/dev/null || true
     rm -f "$PLIST" "$BIN" "$SWAP_PLIST" "$SWAP_SCRIPT"
-    rm -rf "$OCDIR"
+    rm -rf "$OCDIR" "$HYDIR" "$HYRUN"
     echo "uninstalled (log kept in $LOGDIR)"
     ;;
 recover)

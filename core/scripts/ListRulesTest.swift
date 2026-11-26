@@ -203,6 +203,66 @@ struct ListRulesTest {
         let sparse = try! JSONDecoder().decode(ProxyRoute.self, from: Data(#"{"name":"x","host":"h","port":1}"#.utf8))
         check("a proxy saved without newer fields still reads", sparse.kind == .socks5 && sparse.enabled && sparse.sites.isEmpty)
 
+        // Hysteria2 proxy links, display, serverLine, vault stand-in and direct hint (§七十).
+        let pin = String(repeating: "ab", count: 32)
+        let hy = link("hy2://sec%40ret@203.0.113.10:443,20000-50000/?sni=edge.example.com&pinSHA256=\(pin)&obfs=salamander&obfs-password=ob%20pw&upmbps=50&downmbps=200&hop=20#%E7%A4%BA%E4%BE%8B")
+        check("hysteria2 URI parses all fields including comma port hopping",
+              hy?.kind == .hysteria2 && hy?.host == "203.0.113.10" && hy?.ports == "443,20000-50000"
+              && hy?.password == "sec@ret" && hy?.sni == "edge.example.com" && hy?.pinSHA256 == pin
+              && hy?.obfs == "salamander" && hy?.obfsPassword == "ob pw"
+              && hy?.upMbps == 50 && hy?.downMbps == 200 && hy?.hopSeconds == 20 && hy?.name == "示例")
+        check("hysteria2 summary names type, hop, pin, obfs, bandwidth",
+              hy?.summary.contains("Hysteria2") == true && hy?.summary.contains("端口跳跃") == true
+              && hy?.summary.contains("证书指纹已固定") == true && hy?.summary.contains("salamander 混淆") == true
+              && hy?.summary.contains("上 50 / 下 200 Mbps") == true)
+        check("hysteria2 refuses insecure=1, IPv6, IP without sni/pin, realm and unknown params",
+              ProxyLink.parse("hy2://pw@proxy.example.com/?insecure=1").problem?.contains("pinSHA256") == true
+              && ProxyLink.parse("hy2://pw@[2001:db8::1]:443").problem?.contains("IPv6") == true
+              && ProxyLink.parse("hy2://pw@203.0.113.10:443").problem?.contains("pinSHA256") == true
+              && ProxyLink.parse("hysteria2+realm://t@r.example.com/room?auth=pw").problem?.contains("不支持") == true
+              && ProxyLink.parse("hy2://pw@proxy.example.com/?ca=/tmp/a").problem?.contains("不支持") == true)
+
+        // In-memory SecretVault stand-in (never touches real keychain)
+        var memVault: [String: String] = [:]
+        SecretVault.load = { .found(memVault) }
+        SecretVault.save = { all, _ in memVault = all; return true }
+        SecretVault.names = { Array(memVault.keys) }
+        SecretVault.readLegacy = { _, _ in nil }
+        SecretVault.hasLegacy = { _, _ in false }
+        let hyRoute = ProxyRoute(name: "示例", kind: .hysteria2, host: "203.0.113.10", port: 443, sites: ["example.com"],
+                                 passwordStamp: "s1", hysteriaPorts: "443,20000-50000", sni: "edge.example.com",
+                                 pinSHA256: pin, obfs: "salamander", obfsPasswordStamp: "o1", upMbps: 50, downMbps: 200, hopSeconds: 20)
+        check("hysteria2 vault stores auth and obfs-password under expected keys",
+              ProxyPasswords.save("sec@ret", for: hyRoute) && ProxyPasswords.saveObfs("ob pw", for: hyRoute)
+              && memVault["proxy@proxy-\(hyRoute.id.uuidString)"] == "sec@ret"
+              && memVault["proxy-obfs@proxy-\(hyRoute.id.uuidString)"] == "ob pw")
+        ProxyPasswords.read = { KeychainStore.read(server: $0.keychainServer, username: "proxy") }
+        ProxyPasswords.readObfs = { KeychainStore.read(server: $0.keychainServer, username: "proxy-obfs") }
+        let hyLine = hyRoute.serverLine(password: ProxyPasswords.password(for: hyRoute),
+                                        obfsPassword: ProxyPasswords.obfsPassword(for: hyRoute))
+        check("hysteria2 serverLine encodes fields and secrets",
+              hyLine.hasPrefix("hysteria2 203.0.113.10 443%2C20000-50000 auth=sec%40ret ")
+              && hyLine.contains("sni=edge.example.com") && hyLine.contains("pin=\(pin)")
+              && hyLine.contains("obfs=salamander") && hyLine.contains("obfs_password=ob%20pw")
+              && hyLine.contains("upmbps=50") && hyLine.contains("downmbps=200") && hyLine.contains("hop=20"))
+        let hyDisplay = ProxyLink.display(hyRoute)
+        check("hysteria2 editing line hides auth and obfs-password",
+              hyDisplay.hasPrefix("hysteria2://203.0.113.10:443,20000-50000/?")
+              && !hyDisplay.contains("sec@ret") && !hyDisplay.contains("ob pw")
+              && hyDisplay.contains("obfs=salamander") && hyDisplay.contains("pinSHA256=\(pin)"))
+        check("hysteria2 rowSubtitle shows Hysteria2 type label", hyRoute.rowSubtitle == "Hysteria2 · 203.0.113.10:443,20000-50000")
+        var hintSettings = AppSettings()
+        hintSettings.autoLAN = false
+        hintSettings.directSites = [DirectSite(name: "direct.example.com", domains: ["direct.example.com"])]
+        check("Cisco UDP hint fires when server is outside direct list and LAN",
+              ProxyLink.hysteriaNeedsDirectHint(host: "203.0.113.10", settings: hintSettings)
+              && !ProxyLink.hysteriaNeedsDirectHint(host: "sub.direct.example.com", settings: hintSettings)
+              && !ProxyLink.hysteriaNeedsDirectHint(host: "192.168.1.5", settings: hintSettings))
+        ProxyPasswords.delete(for: hyRoute)
+        check("deleting hysteria2 route removes both vault entries",
+              memVault["proxy@proxy-\(hyRoute.id.uuidString)"] == nil
+              && memVault["proxy-obfs@proxy-\(hyRoute.id.uuidString)"] == nil)
+
         print("list-rules FAILS=\(fails)")
         exit(fails == 0 ? 0 : 1)
     }

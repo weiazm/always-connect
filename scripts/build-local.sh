@@ -110,6 +110,15 @@ IDENTITY=${SIGN_IDENTITY:--}
 if ! "$ROOT/scripts/bundle-openconnect.sh" "$APP/Contents/Resources/openconnect" "$IDENTITY" >/tmp/ac-bundle-oc.log 2>&1; then
     echo "warning: openconnect not bundled (see /tmp/ac-bundle-oc.log)" >&2
 fi
+# The App's own pinned official Hysteria2 client (DESIGN.md §七十).
+if ! "$ROOT/scripts/bundle-hysteria.sh" "$APP/Contents/Resources/hysteria" "$IDENTITY" >/tmp/ac-bundle-hy2.log 2>&1; then
+    if [ "${1:-}" = "--release" ]; then
+        cat /tmp/ac-bundle-hy2.log >&2
+        echo "error: hysteria not bundled for release" >&2
+        exit 1
+    fi
+    echo "warning: hysteria not bundled (see /tmp/ac-bundle-hy2.log)" >&2
+fi
 GATE="$APP/Contents/Resources/openconnect/bin/alwaysconnect-gate"
 mkdir -p "$(dirname "$GATE")"
 install -m 755 "$ROOT/core/target/release/alwaysconnect-gate" "$GATE"
