@@ -566,3 +566,18 @@ fn a_reused_result_reaches_the_gate_young_even_after_a_slow_probe() {
     // dropped such connections on the real Mac.
     assert!(age < 500, "reused evidence is {age} ms old");
 }
+
+#[test]
+fn record_start_times_survive_json_exactly() {
+    // An approval names its block record by `started`, read back from the
+    // status JSON; one bit off and the approval finds no record.
+    let base = now();
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..200_000 {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let t = base + (seed % 10_000_000) as f64 / 1_000_000.0;
+        let text = serde_json::to_string(&json!({"started": t})).unwrap();
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["started"].as_f64().unwrap().to_bits(), t.to_bits(), "{text}");
+    }
+}
