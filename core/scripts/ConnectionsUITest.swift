@@ -140,6 +140,13 @@ struct ConnectionsUITest {
         settle()
         check(findTable(in: root) === table && table.numberOfRows == 1,
               "returning to a tab retains its view and current filter")
+        // Proxied connections (§69.12): their own way, by proxy, before VPN.
+        var proxied = Fixture.row(3)
+        proxied.via = "proxy"; proxied.reason = "分流代理"; proxied.proxy = 0
+        let grouped = ConnectionsPage.group([Fixture.row(2), proxied, proxied])
+        check(grouped.first?.via == "proxy" && grouped.first?.proxy == 0 && grouped.first?.count == 2
+              && ConnectionsPage.wayName("proxy") == "代理" && ConnectionsPage.Filter.allCases.map(\.rawValue).contains("走代理"),
+              "proxied connections group by proxy and show as 代理")
         print("PASS connection table scrolls both ways, tracks resizing and keeps position across row updates")
         print("PASS tab navigation hides detached pages and keeps their view state")
     }

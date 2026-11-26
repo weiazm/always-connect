@@ -27,6 +27,8 @@ struct ConnectionsPage: View {
         var protocolName: String
         var via: String
         var reason: String
+        /// The proxy's index among the proxies in use (§69.12).
+        var proxy: Int? = nil
         var count: Int
         /// Bytes per second since the previous refresh (§四十五).
         var down: Int = 0
@@ -34,11 +36,11 @@ struct ConnectionsPage: View {
         var speed: Int { down + up }
         /// The sort key: the first click on 速度 puts the busiest first.
         var busiest: Int { -speed }
-        var id: String { process + "|" + address + "|" + protocolName + "|" + via + "|" + reason }
+        var id: String { process + "|" + address + "|" + protocolName + "|" + via + "|" + reason + "|" + (proxy.map(String.init) ?? "") }
     }
 
     enum Filter: String, CaseIterable, Identifiable {
-        case all = "全部", vpn = "走 VPN", direct = "直连"
+        case all = "全部", vpn = "走 VPN", proxy = "走代理", direct = "直连"
         var id: String { rawValue }
     }
 
@@ -53,6 +55,8 @@ struct ConnectionsPage: View {
     @ObservedObject private var settingsWindow = SettingsWindow.shared
     /// The "不走 VPN" list, read on appear and after each change here.
     @State private var sites: [DirectSite] = []
+    /// The names of the proxies in use, by the index the service reports.
+    @State private var proxyNames: [String] = []
     @State private var notice: Notice?
     @State private var egressAddition: EgressAddition?
     @State private var egressNotice: EgressAction?
@@ -106,7 +110,7 @@ struct ConnectionsPage: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 220)
+                .frame(width: 290)
                 Spacer(minLength: 0)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -154,8 +158,7 @@ struct ConnectionsPage: View {
                 }
                 .width(92)
                 TableColumn("走向") { row in
-                    Text(row.via == "vpn" ? "VPN" : row.via == "local" ? "本机" : "直连")
-                        .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
+                    Text(Self.wayName(row.via)).foregroundStyle(Self.wayColor(row.via))
                 }
                 .width(34)
                 // The action sits at the end of the reason cell: a column
@@ -169,7 +172,7 @@ struct ConnectionsPage: View {
                         action(row)
                     }
                 }
-                .width(110)
+                .width(min: 110, ideal: 130)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .layoutPriority(1)
@@ -212,7 +215,7 @@ struct ConnectionsPage: View {
                     Button("撤销") { undoEgress(egressNotice) }
                 }
             }
-            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
+            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。「走代理」是按分流代理经你的代理出去的连接，原因里写是哪个代理。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
                  + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
                     : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
                     : "打开按网站分流后，这里可以一键加直连。"))
@@ -225,7 +228,11 @@ struct ConnectionsPage: View {
         .onAppear {
             egressVisible = true
             consumeVPNFilter()
-            if preview == nil { sites = DirectSites.sites(ProfileStore.loadAppSettings()) }
+            if preview == nil {
+                let settings = ProfileStore.loadAppSettings()
+                sites = DirectSites.sites(settings)
+                proxyNames = settings.activeProxyRoutes.map(\.name)
+            }
             refreshEgressState()
             refresh()
         }
@@ -275,6 +282,11 @@ struct ConnectionsPage: View {
     /// allowlist. A network the user put on the list is the list's doing
     /// (user, 2026-11-12: an added server address showed as 局域网).
     private func reason(_ row: Row) -> String {
+        if let index = row.proxy {
+            let name = proxyNames.indices.contains(index) ? proxyNames[index] : nil
+            if row.via == "proxy" { return name.map { "经「\($0)」" } ?? "分流代理" }
+            if row.reason == "代理本身" { return name.map { "代理「\($0)」本身" } ?? "代理本身" }
+        }
         if row.reason == "局域网", DirectSites.covering(sites, host: nil, address: row.remote) != nil {
             return "名单直连"
         }
@@ -445,6 +457,7 @@ struct ConnectionsPage: View {
             switch filter {
             case .all: return true
             case .vpn: return row.via == "vpn"
+            case .proxy: return row.via == "proxy"
             case .direct: return row.via == "direct"
             }
         }.filter { row in
@@ -458,10 +471,37 @@ struct ConnectionsPage: View {
         let vpn = rows.filter { $0.via == "vpn" }.reduce(0) { $0 + $1.count }
         let direct = rows.filter { $0.via == "direct" }.reduce(0) { $0 + $1.count }
         let local = rows.filter { $0.via == "local" }.reduce(0) { $0 + $1.count }
+        let proxied = rows.filter { $0.via == "proxy" }
+        let proxy = proxied.reduce(0) { $0 + $1.count }
         guard updated != nil else { return "读取中…" }
-        guard let totals else { return "走 VPN \(vpn) 条 · 直连 \(direct) 条 · 本机内部 \(local) 条" }
+        // The proxied rows' own speeds add up here (they cross the
+        // loopback, not the VPN or the local network).
+        let proxyRate = (proxied.reduce(0) { $0 + $1.down }, proxied.reduce(0) { $0 + $1.up })
+        let proxyText = proxy == 0 ? "" : "走代理 \(proxy) 条" + (totals == nil ? "" : "  ↓" + Self.rate(proxyRate.0) + "/s ↑" + Self.rate(proxyRate.1) + "/s")
+        guard let totals else {
+            return (["走 VPN \(vpn) 条", proxyText, "直连 \(direct) 条", "本机内部 \(local) 条"]).filter { !$0.isEmpty }.joined(separator: " · ")
+        }
         func pair(_ v: [Int]) -> String { "↓" + Self.rate(v[0]) + "/s ↑" + Self.rate(v[1]) + "/s" }
-        return "走 VPN \(vpn) 条  \(pair(totals.vpn))   ·   直连 \(direct) 条  \(pair(totals.direct))   ·   本机内部 \(local) 条"
+        return (["走 VPN \(vpn) 条  \(pair(totals.vpn))", proxyText, "直连 \(direct) 条  \(pair(totals.direct))", "本机内部 \(local) 条"])
+            .filter { !$0.isEmpty }.joined(separator: "   ·   ")
+    }
+
+    static func wayName(_ via: String) -> String {
+        switch via {
+        case "vpn": return "VPN"
+        case "proxy": return "代理"
+        case "local": return "本机"
+        default: return "直连"
+        }
+    }
+
+    static func wayColor(_ via: String) -> Color {
+        switch via {
+        case "vpn": return .green
+        case "proxy": return .purple
+        case "local": return .secondary
+        default: return .orange
+        }
     }
 
     private func refresh() {
@@ -520,7 +560,7 @@ struct ConnectionsPage: View {
             // browser's parallel connections into many lines.
             let address = c.host.map { "\($0) (\(c.remote))" } ?? c.remote
             let proto = protocolName(c.proto, c.port)
-            let key = c.process + "|" + address + "|" + proto + "|" + c.via + "|" + c.reason
+            let key = c.process + "|" + address + "|" + proto + "|" + c.via + "|" + c.reason + "|" + (c.proxy.map(String.init) ?? "")
             if var row = grouped[key] {
                 row.count += 1
                 row.down += rate[0]
@@ -528,12 +568,12 @@ struct ConnectionsPage: View {
                 grouped[key] = row
             } else {
                 grouped[key] = Row(process: c.process, address: address, host: c.host, remote: c.remote,
-                                   protocolName: proto, via: c.via, reason: c.reason, count: 1,
+                                   protocolName: proto, via: c.via, reason: c.reason, proxy: c.proxy, count: 1,
                                    down: rate[0], up: rate[1])
             }
         }
-        // VPN-less first is what people look for: direct, then VPN, then local.
-        let order = ["direct": 0, "vpn": 1, "local": 2]
+        // VPN-less first is what people look for: direct, proxied, then VPN, then local.
+        let order = ["direct": 0, "proxy": 1, "vpn": 2, "local": 3]
         return grouped.values.sorted {
             (order[$0.via] ?? 3, $0.process.lowercased(), $0.address) < (order[$1.via] ?? 3, $1.process.lowercased(), $1.address)
         }

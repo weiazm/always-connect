@@ -308,6 +308,9 @@ pub struct Routing {
     /// Per proxy (the App's index): the last connection that opened
     /// through it, and the last that did not, with why.
     health: Mutex<HashMap<usize, Health>>,
+    /// The proxy servers' addresses this relay connected to, per proxy,
+    /// and when: the connections page marks those connections (§69.12).
+    upstreams: Mutex<HashMap<std::net::SocketAddr, (usize, Instant)>>,
 }
 
 #[derive(Default, Clone)]
@@ -391,6 +394,36 @@ impl Routing {
     /// The name already goes through a proxy: its other record types
     /// (HTTPS address hints above all) must not point around it.
     pub fn knows(&self, name: &str) -> bool { self.pool.lock().unwrap().knows(&clean(name)) }
+
+    /// Which proxy a connection to `ip` goes through now, for the
+    /// connections page (§69.12): the same rules as `target`, without
+    /// refreshing the answer's lifetime.
+    pub fn proxy_for(&self, ip: Ipv4Addr) -> Option<usize> {
+        let table = self.table();
+        if is_fake(ip) {
+            let (name, addresses) = {
+                let pool = self.pool.lock().unwrap();
+                let entry = pool.by_offset.get(&(u32::from(ip) - FAKE_BASE))?;
+                (entry.name.clone(), entry.addresses.clone())
+            };
+            return table.route_name(&name).or_else(|| table.route_addresses(&addresses));
+        }
+        table.route_ip(ip)
+    }
+
+    /// This relay reached proxy `n` at `peer`. A few entries, each kept
+    /// for the health window.
+    pub(crate) fn connected_to(&self, n: usize, peer: std::net::SocketAddr) {
+        let mut upstreams = self.upstreams.lock().unwrap();
+        upstreams.retain(|_, (_, at)| at.elapsed() < HEALTH_FOR);
+        if upstreams.len() < 64 || upstreams.contains_key(&peer) { upstreams.insert(peer, (n, Instant::now())); }
+    }
+
+    /// The proxy whose server sits at `ip:port`, when this relay talks to it.
+    pub fn upstream_proxy(&self, ip: Ipv4Addr, port: u16) -> Option<usize> {
+        let upstreams = self.upstreams.lock().unwrap();
+        upstreams.get(&std::net::SocketAddr::from((ip, port))).filter(|(_, at)| at.elapsed() < HEALTH_FOR).map(|(n, _)| *n)
+    }
 
     /// The name behind one of our addresses (the connections panel).
     pub fn name_for(&self, ip: Ipv4Addr) -> Option<String> {

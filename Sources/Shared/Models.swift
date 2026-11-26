@@ -155,10 +155,13 @@ struct ConnectionRow: Codable, Hashable {
     var port: Int
     /// The name it was looked up under, when the split forwarder saw it.
     var host: String?
-    /// "vpn", "direct" or "local".
+    /// "vpn", "direct", "proxy" or "local".
     var via: String
     var interface: String
     var reason: String
+    /// The proxy (index among the proxies in use) a "proxy" row goes
+    /// through, or whose server a "代理本身" row talks to (§69.12).
+    var proxy: Int? = nil
 }
 
 struct LeakCheckItem: Codable {
