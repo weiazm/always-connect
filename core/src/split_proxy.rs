@@ -239,6 +239,18 @@ impl Table {
         out
     }
 
+    /// The proxies' own servers written as IPv4 addresses (SOCKS5, HTTP,
+    /// Hysteria2): never routed back here, even inside a written network.
+    pub fn server_addresses(&self) -> Vec<Ipv4Addr> {
+        let mut out: Vec<Ipv4Addr> = self.servers.iter().flatten().map(|s| s.host.as_str())
+            .chain(self.hysteria.values().map(|h| h.host.as_str()))
+            .filter_map(|host| host.parse().ok())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Ports of proxies running on this Mac: their own connections come
     /// back here and must not be sent to them again.
     fn local_ports(&self) -> Vec<u16> {
