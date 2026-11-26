@@ -167,7 +167,7 @@ mod macos {
         let key = work.join("server.key");
         let status = std::process::Command::new("/usr/bin/openssl")
             .args([
-                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "req", "-x509", "-newkey", "rsa:2048",
                 "-keyout", key.to_str().unwrap(), "-out", crt.to_str().unwrap(),
                 "-days", "2", "-nodes", "-subj", "/CN=localhost",
                 "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
@@ -207,7 +207,10 @@ mod macos {
             std::thread::sleep(Duration::from_millis(100));
             false
         });
-        if !ready { return Err("hysteria server did not start".into()); }
+        if !ready {
+            let detail = std::fs::read_to_string(&log).unwrap_or_default();
+            return Err(format!("hysteria server did not start: {}", detail.trim()));
+        }
 
         split_proxy::hysteria::configure_binary(std::path::PathBuf::from(hy_bin), true, true);
         let net = network()?;
