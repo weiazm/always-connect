@@ -472,12 +472,95 @@ impl Controller {
         false
     }
 }
+/// A login that has closed the network for itself must reach the engine
+/// (§69.18; user, 2026-11-26: "更新完成后，这里卡了老半天"): after an
+/// update the first login placed its hold, prepared the certificate
+/// relay and then never started OpenConnect, with no error and no
+/// timeout, until the user switched it off. Every step that moves the
+/// login on re-arms a short watch; a step that fails, or a watch that
+/// runs out with the engine still idle, starts the login again from the
+/// top with the hold kept (never a direct-network gap), twice; then the
+/// App says why it stopped.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoginWatch {
+    /// Identity of the current watch; a timer for an older one is stale.
+    pub token: u64,
+    pub armed: bool,
+    /// Fresh starts made by the watch for this login.
+    pub retries: u32,
+}
+
+/// Seconds without any step before the login counts as stuck. The slowest
+/// normal step (asking the Mac's Cisco for its state) may take 8 s.
+pub const LOGIN_STEP_SECONDS: u64 = 15;
+/// Fresh starts before the App gives up and says why.
+pub const LOGIN_RETRIES: u32 = 2;
+
+impl LoginWatch {
+    fn arm(&mut self, actions: &mut Vec<Value>) {
+        self.token = self.token.wrapping_add(1);
+        self.armed = true;
+        actions.push(json!({"kind":"arm", "token":self.token, "seconds":LOGIN_STEP_SECONDS}));
+    }
+    fn disarm(&mut self) {
+        self.token = self.token.wrapping_add(1);
+        self.armed = false;
+    }
+    /// A fresh start is watched too: one that never gets as far as its
+    /// hold (the service does not answer) still counts.
+    fn stuck(&mut self, actions: &mut Vec<Value>) {
+        self.disarm();
+        if self.retries < LOGIN_RETRIES {
+            self.retries += 1;
+            actions.push(json!({"kind":"retry", "attempt":self.retries}));
+            self.arm(actions);
+        } else {
+            self.retries = 0;
+            actions.push(json!({"kind":"give_up"}));
+        }
+    }
+    pub fn event(&mut self, event: &Value, actions: &mut Vec<Value>) -> bool {
+        match event["kind"].as_str().unwrap_or("") {
+            // The hold is in place and the login goes on to the engine; a
+            // start the watch itself made keeps counting.
+            "held" => {
+                if !flag(event, "retry") {
+                    self.retries = 0;
+                }
+                self.arm(actions);
+            }
+            "progress" if self.armed => self.arm(actions),
+            "failed" if self.armed => self.stuck(actions),
+            "due" if self.armed && event["token"].as_u64() == Some(self.token) => {
+                if flag(event, "waiting") {
+                    self.stuck(actions);
+                } else {
+                    self.disarm();
+                }
+            }
+            // The engine moved, or the login ended (stop, quit, restore).
+            "started" | "stopped" => {
+                self.disarm();
+                self.retries = 0;
+            }
+            _ => (),
+        }
+        false
+    }
+}
+
 /// The common FFI envelope: opaque state + event + physical context -> state/actions.
 pub fn step(request: Value) -> Value {
     let mut actions = Vec::new();
     let event = &request["event"];
     if request["kind"] == "disconnect" {
         let mut state: Disconnect =
+            serde_json::from_value(request["state"].clone()).unwrap_or_default();
+        let allowed = state.event(event, &mut actions);
+        json!({"state":state,"actions":actions,"allowed":allowed})
+    } else if request["kind"] == "login_watch" {
+        let mut state: LoginWatch =
             serde_json::from_value(request["state"].clone()).unwrap_or_default();
         let allowed = state.event(event, &mut actions);
         json!({"state":state,"actions":actions,"allowed":allowed})
@@ -1105,5 +1188,90 @@ mod protection_tests {
         );
         assert!(request(&mut state, 1).is_null());
         assert!(!request(&mut state, 0).is_null());
+    }
+}
+
+#[cfg(test)]
+mod login_watch_tests {
+    use super::*;
+
+    fn send(w: &mut LoginWatch, event: Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        w.event(&event, &mut out);
+        out
+    }
+    fn kinds(out: &[Value]) -> Vec<&str> {
+        out.iter().map(|a| a["kind"].as_str().unwrap()).collect()
+    }
+    fn token(out: &[Value]) -> u64 {
+        out.iter().find(|a| a["kind"] == "arm").unwrap()["token"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_login_stuck_after_its_hold_starts_again_twice_then_gives_up() {
+        // §69.18: the 2026-11-26 update — hold placed, relay ready, then
+        // nothing for 90 s.
+        let mut w = LoginWatch::default();
+        let out = send(&mut w, json!({"kind":"held"}));
+        assert_eq!(kinds(&out), ["arm"]);
+        assert_eq!(out[0]["seconds"], LOGIN_STEP_SECONDS);
+        let t = token(&send(&mut w, json!({"kind":"progress"})));
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"due","token":t,"waiting":true}))), ["retry", "arm"]);
+        // The fresh start places its hold again: the count goes on.
+        let t = token(&send(&mut w, json!({"kind":"held","retry":true})));
+        let out = send(&mut w, json!({"kind":"due","token":t,"waiting":true}));
+        assert_eq!(kinds(&out), ["retry", "arm"]);
+        // This one never gets its hold (no answer): its own watch runs out.
+        let t = token(&out);
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"due","token":t,"waiting":true}))), ["give_up"]);
+        assert!(!w.armed);
+        // A new login by the user starts with a full count.
+        let t = token(&send(&mut w, json!({"kind":"held"})));
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"due","token":t,"waiting":true}))), ["retry", "arm"]);
+    }
+
+    #[test]
+    fn every_step_moves_the_deadline_and_an_old_timer_does_nothing() {
+        let mut w = LoginWatch::default();
+        let first = token(&send(&mut w, json!({"kind":"held"})));
+        let second = token(&send(&mut w, json!({"kind":"progress"})));
+        assert!(send(&mut w, json!({"kind":"due","token":first,"waiting":true})).is_empty());
+        assert!(w.armed, "the stale timer leaves the current watch alone");
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"due","token":second,"waiting":true}))), ["retry", "arm"]);
+    }
+
+    #[test]
+    fn a_failed_step_starts_again_at_once() {
+        // The service refused exit protection or the connect: no reason to
+        // wait out the watch with the network closed.
+        let mut w = LoginWatch::default();
+        send(&mut w, json!({"kind":"held"}));
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"failed"}))), ["retry", "arm"]);
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"failed"}))), ["retry", "arm"]);
+        assert_eq!(kinds(&send(&mut w, json!({"kind":"failed"}))), ["give_up"]);
+        assert!(send(&mut w, json!({"kind":"failed"})).is_empty(), "nothing armed: a late failure is ignored");
+    }
+
+    #[test]
+    fn an_engine_that_moves_or_a_stop_ends_the_watch() {
+        let mut w = LoginWatch::default();
+        let t = token(&send(&mut w, json!({"kind":"held"})));
+        send(&mut w, json!({"kind":"started"}));
+        assert!(send(&mut w, json!({"kind":"due","token":t,"waiting":true})).is_empty());
+        assert!(send(&mut w, json!({"kind":"progress"})).is_empty());
+        let t = token(&send(&mut w, json!({"kind":"held"})));
+        send(&mut w, json!({"kind":"stopped"}));
+        assert!(send(&mut w, json!({"kind":"due","token":t,"waiting":true})).is_empty());
+        // Due but no longer waiting (the App saw the engine move first).
+        let t = token(&send(&mut w, json!({"kind":"held"})));
+        assert!(send(&mut w, json!({"kind":"due","token":t,"waiting":false})).is_empty());
+        assert!(!w.armed);
+    }
+
+    #[test]
+    fn the_watch_goes_through_the_common_envelope() {
+        let reply = step(json!({"kind":"login_watch","state":{},"event":{"kind":"held"}}));
+        assert_eq!(reply["actions"][0]["kind"], "arm");
+        assert_eq!(reply["state"]["armed"], true);
     }
 }

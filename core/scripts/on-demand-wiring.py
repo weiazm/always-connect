@@ -35,7 +35,8 @@ methods = [
     'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode(',
     'private var mayPrepareLoginGateway:', 'private func resetGatewayPreparation(', 'func expireGatewayPreparation()',
     'func prepareGatewayForConnection(',
-    'func prepareGatewayWhileDirect(', 'private func isGatewayPreparationCurrent(', 'private func prepareUncachedGateway('
+    'func prepareGatewayWhileDirect(', 'private func isGatewayPreparationCurrent(', 'private func prepareUncachedGateway(',
+    'private func watchLogin(', 'private var loginAwaitsEngine:', 'private func loginStepFailed('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
 # The ordering fixtures use a synthetic engine start. Entry fixtures opt in to the complete production method.
@@ -72,6 +73,7 @@ final class Queue {
     func asyncAfter(deadline: DispatchTime, execute: @escaping () -> Void) { timers.append(execute) }
 }
 struct AppRole { static let isSettings = false }
+enum RelayLog { static var lines: [String] = []; static func write(_ line: String) { lines.append(line) } }
 final class SettingsLink { static let shared = SettingsLink(); func send(_ action: String) {} }
 struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]?; var isDropProtectionOn = true; var connectionMode = "cisco" }
 struct Profile { var server = "vpn-a.example" }
@@ -227,6 +229,9 @@ final class Client {
     var protectedLoginRetries = 0
     var protectedLoginRetryPending = false
     static let protectedLoginRetryLimit = 2
+    let loginWatch = OnDemandMachine("login_watch")
+    var loginWatchRetrying = false
+    var loginStepFailure: String?
     var splitWarning: String?
     var awaitingCiscoStart = false
     var loginIntentActive = false
@@ -713,6 +718,53 @@ final class ViewLifecycle {
         silent.rpcSilent = false
         _ = silent.connectWithStoredCredentials(manual: true)
         check(silent.starts == 1 && silent.networkHeld, "turning it on again logs in once the service answers")
+        // §69.18: a login that holds the network but whose engine never
+        // starts (after the 2026-11-26 update) is started again with the
+        // hold kept; after two fresh starts it stops and says why.
+        let stuck = Client()
+        stuck.exerciseCommonLogin = true
+        stuck.onDemand.configure(enabled: false, rules: [])
+        DispatchQueue.main.timers = []
+        RelayLog.lines = []
+        _ = stuck.connectWithStoredCredentials(manual: true)
+        check(stuck.starts == 1 && stuck.networkHeld && DispatchQueue.main.timers.count == 1
+              && RelayLog.lines == ["login: network held, preparing the relay"],
+              "a login that holds the network is watched and logged")
+        for round in 1...2 {
+            let due = DispatchQueue.main.timers
+            DispatchQueue.main.timers = []
+            due.forEach { $0() }
+            check(stuck.starts == round + 1 && stuck.networkHeld && stuck.loginProtectionNotice == "网络已拦截，正在连接 VPN",
+                  "a stuck login starts again with the network still held (\(round))")
+        }
+        let last = DispatchQueue.main.timers
+        DispatchQueue.main.timers = []
+        last.forEach { $0() }
+        check(stuck.starts == 3 && stuck.networkHeld && stuck.loginProtectionNotice?.hasPrefix("没能开始登录") == true
+              && DispatchQueue.main.timers.isEmpty,
+              "after two fresh starts the login stops, still held, and says why")
+        let failing = Client()
+        failing.exerciseCommonLogin = true
+        failing.onDemand.configure(enabled: false, rules: [])
+        DispatchQueue.main.timers = []
+        _ = failing.connectWithStoredCredentials(manual: true)
+        failing.loginStepFailed("后台服务没有接受连接请求")
+        check(failing.starts == 2 && failing.networkHeld, "a failed step starts again at once")
+        failing.disconnect()
+        let after = DispatchQueue.main.timers
+        DispatchQueue.main.timers = []
+        after.forEach { $0() }
+        check(failing.starts == 2, "a stop ends the watch: no start after it")
+        let moved = Client()
+        moved.exerciseCommonLogin = true
+        moved.onDemand.configure(enabled: false, rules: [])
+        DispatchQueue.main.timers = []
+        _ = moved.connectWithStoredCredentials(manual: true)
+        moved.loginIntentActive = false
+        let quiet = DispatchQueue.main.timers
+        DispatchQueue.main.timers = []
+        quiet.forEach { $0() }
+        check(moved.starts == 1 && DispatchQueue.main.timers.isEmpty, "a login no longer waiting is left alone")
         let restored = Client()
         restored.exerciseCommonLogin = true
         restored.proxy.cachedGateway = false
