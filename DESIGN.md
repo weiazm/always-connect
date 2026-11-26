@@ -4875,3 +4875,35 @@ DNS 得到 198.19.128.x，HTTPS 200，代理日志记录的是域名；未列入
   - 停止后 DNS 设置、路由、重定向都没了，名字回到网络本来的解析。
 - 本机检查：恢复网络与卸载脚本会删这一项（桩命令），App 与后台服务编译、现有各项检查全过。
 - 需实测（L18）：真 Mac 上 Cisco 关时开代理、和 Cisco 之间来回切、换 Wi-Fi、崩溃后的恢复、经 Cisco 客户端的模式。
+
+## 七十、分流代理支持 Hysteria2（2026-11-26，用户同意方案后交接落地）
+
+用户（2026-11-26）：「感觉就是我们在分流代理里面新增一种除了socks5、http之外的一种新的类型就行吧，其余的逻辑都能复用」「Hysteria2服务器本身，要不要走单位vpn，这个取决于服务器有没有在直连白名单啊」「可以的，你准备下设计跟注意事项，然后交接给agy去开发落地」。计划与决策见 `docs/hysteria2-plan.md`。
+
+### 70.1 选型与可行性
+- 随 App 打包官方 Hysteria2 客户端（`HyNetworks/hysteria`，Go 实现，MIT 许可，固定发布版本 `app/v2.14.0` + 精确 SHA-256 校验），安装后台服务时复制到 `/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin/hysteria`，用与 App 同一张证书签名。
+- 不另起协议栈：官方客户端仅在 `127.0.0.1:<随机端口>` 开放带随机用户名和密码的 SOCKS5 入口（启用 UDP），后台服务在内部把对应代理改写为该本地 SOCKS5，复用现有的规则匹配、合成地址池、回环路由、pf 锚点 301 重定向、TCP/UDP ASSOCIATE 转发和故障关闭。
+- 项目内关掉 QUIC 的两处（出口保护、HTTP 代理）只作用于浏览器的网页流量，不拦截 Hysteria2 自己连服务器的 UDP/QUIC；命中 Hysteria2 代理的网站支持 TCP 与 UDP（含 HTTP/3）。
+- 服务器路由严格沿用现有分流直连名单与局域网规则（不做自动直连、不提供一键加直连按钮）；连着自建 Cisco 且服务器未覆盖时，编辑窗给一行橙色提示。
+
+### 70.2 链接、规则与钥匙串
+- URI 解析写在 Rust（`core/src/split_proxy/hysteria.rs`，经 `ac_hysteria_parse_uri` 供 Swift 复用）：支持 `hysteria2://` 与 `hy2://`，默认端口 `443`，支持端口跳跃（`443,5000-6000`、`20000-50000`）、`sni`、`pinSHA256`、`obfs`（`salamander` / `gecko`，已核对 `app/v2.14.0` 源码支持两者与 `ech`）、`obfs-password`、`ech`、`upmbps`、`downmbps`、`hop`（≥ 5 秒，默认 30 秒）、`#名称`。
+- 安全底线：拒绝 `insecure=1` / `insecure=true`（提示改用 `pinSHA256`）；服务器为 IPv4 且未填 `sni` 时必须带 `pinSHA256`；拒绝 IPv6 字面量、`hysteria2+realm://`、`ca`、mTLS 及任何未支持的查询参数（不静默丢弃）。注意：官方客户端基于 Go `crypto/tls`，仅在配置了 `pinSHA256` 时客户端配置 JSON 设 `tls.insecure: true`，使自签证书能够进入 `VerifyPeerCertificate` 严格校验 64 位 SHA-256 指纹（已由互通测试锁住错指纹必拒）；未配 `pinSHA256` 时 `tls.insecure` 恒为 `false`。
+- 分流规则行：`proxy:<n> hysteria2 <host> <ports> auth=<enc> [sni=…] [pin=…] [obfs=…] [obfs_password=…] [ech=…] [upmbps=…] [downmbps=…] [hop=…]`（百分号编码）。旧版后台服务的 `Server::parse` 拒绝未知类型，命中的网站按代理不存在拒绝连接（故障关闭，不回退直连或 Cisco）。
+- 钥匙串 vault（§69.19）：`auth` 存 `proxy@proxy-<id>`，`obfs-password` 存 `proxy-obfs@proxy-<id>`；删除代理时两者一并删除；编辑窗显示链接时隐藏两者，未重填且混淆类型未变时沿用已存密码。日志与诊断导出对 `hysteria2://`、`hy2://` 与凭据打码。
+
+### 70.3 后台进程监管、特权边界与统计去重
+- 监管逻辑全部在 Rust（`core/src/split_proxy/hysteria.rs`）：单代理一进程；规则与解析 IP 未变时在「只开代理 ↔ 自建 Cisco」交接期间保留进程（15 秒宽限期）；异常退出按 `1/2/5/10/20/30` 秒退避重启，期间故障关闭并汇报大白话原因；无 Hysteria2 条目、代理关闭、服务退出或空闲退出时立即停止。
+- 特权与配置隔离：后台服务启动时由 `ClientRequirement.verifiesHysteria()` 按本服务叶证书校验 `/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin/hysteria`，Rust 侧再次核对 `root` 属主、无组/他写、无符号链接。官方客户端 v2.14.0 使用 viper 读文件（不支持 stdin），因此运行时作为 `nobody` 启动，临时配置写在 `0711 root:wheel` 目录 `/Library/Application Support/AlwaysConnect-hysteria` 下 128 位随机名 `0700 nobody` 子目录中的 `0400 nobody` `config.json`，看到 `"SOCKS5 server listening"` 后即删除配置文件，进程结束删除整个子目录；启动时加 `--disable-update-check --log-format json`。
+- DNS 解析与统计去重：后台服务经转发器的 `resolve_plain` 解析服务器 IPv4 并写入 `server`，`tls.sni` 保留原主机名或显式 `sni`，客户端自身不查 DNS。转发层用 `Routing::leg_for` 按服务器实际 IPv4 的路由归属记入 `Leg::Direct` 或 `Leg::Vpn`（不再计为 `Leg::Local`），避免面板网速重复计数；流量页通过 `Routing::upstream_proxy` 按服务器 IP 与端口范围把客户端的 UDP 连接标为「代理本身」。
+- 失败原因与保存前检测：Rust 纯函数把官方客户端 JSON 日志映射为「密码不对」「证书对不上」「UDP 出不去」「服务器没回应」（忽略 `quic-go` 接收缓冲告警）。新增 XPC 方法 `startProxyProbe` / `getProxyProbeResult`（仅发给同版本后台服务，每次 XPC 调用 3 秒超时、异步轮询结果）：若已有同配置受管进程直接复用其本地 SOCKS5，否则起临时非特权客户端测试握手与规则内网站。
+- 打包、卸载与恢复网络：`scripts/bundle-hysteria.sh` 负责固定版本下载、SHA-256 校验与签名，不向 `install.sh` 新增下载源；`package-release.sh` 校验其签名与无构建机路径；`dev-helper.sh`、`uninstall.sh`、`reset-network.sh` 同步清理 `/Library/PrivilegedHelperTools/AlwaysConnect-hysteria`、`/Library/Application Support/AlwaysConnect-hysteria` 及遗留进程。
+
+### 70.4 验证级别
+- Rust 单测（`cargo test`）：URI 全参数与拒绝用例、`Server::parse` 对旧服务的故障关闭、规则行往返、JSON 配置生成（IP 与 SNI 分离、不打密码）、日志错误映射与打码、监管状态机（启停、交接保留、退避重启）、托管未就绪故障关闭与 `Leg` 去重。
+- Swift 脚本级（`list-rules-test`）：`ProxyLink` 解析（含带逗号端口跳跃）、摘要文案、内存 vault 替身存取与删除、`ProxyLink.display` 隐去密码、Cisco UDP 提示判定、旧设置解码兼容。
+- 卸载与恢复网络脚本断言（`uninstall-test`、`reset-network-test`）：覆盖新二进制、运行目录与进程清理。
+- CI 互通（`scripts/hysteria-interop-test.sh`，Linux job 与本机均跑）：真实官方 `hysteria` 服务端（自签证书 + `pinSHA256`、TCP/UDP ASSOCIATE、`salamander`、Linux 下 `iptables` 端口跳跃、错密码、错指纹、端口不可达）。
+- CI macOS harness（root，`proxy-only-check`）：只开代理 + 受管 Hysteria2 经系统解析器与 pf 端到端转发，停止后零残留。
+- 界面核对：真实设置视图与编辑窗离屏渲染（示例数据）。
+- 真机待测（`docs/mac-proof-checklist.md` L19–L24）：真实网络 UDP 连通、连 Cisco 且服务器在直连名单、断线保护期间、换 Wi-Fi、带宽参数速度与常驻开销（`footprint` / CPU）。

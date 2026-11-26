@@ -23,7 +23,8 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
   - 「更新」会装回一天前记下的旧版，现在先重查一次再装；
   - 后台服务自更新时，旧服务还没退完就加载新服务，被系统拒绝，现在会等旧服务退完并重试；
   - 连接页单独标出走代理的连接。
-  下一步：Hysteria2 作为分流代理的第三种类型。设计与注意事项见 docs/hysteria2-plan.md（2026-11-26 用户同意，交给 agy 开发）。
+- **2026-11-26 分流代理支持 Hysteria2（DESIGN §七十）**：作为分流代理的第三种类型，粘贴 `hysteria2://` / `hy2://` 链接即可（拒绝 `insecure=1`，自签用 `pinSHA256`）；服务器走本地网络还是 Cisco 按现有分流直连名单决定。随 App 打包官方客户端（`HyNetworks/hysteria` 固定版本 `app/v2.14.0`，SHA-256 校验，MIT 许可），仅在启用 Hysteria2 代理时由后台服务以 `nobody` 运行本地 SOCKS5 并复用既有 TCP/UDP 转发与故障关闭，监管/解析/去重/错误映射均在 Rust（`core/src/split_proxy/hysteria.rs`）。
+  - **Hysteria2 客户端版本与更新办法**：固定在 `scripts/bundle-hysteria.sh` 与 `scripts/hysteria-interop-test.sh` 的 `HYSTERIA_TAG="app/v2.14.0"` 及各平台 SHA-256（来自上游 release `hashes.txt`）；升级时核对新版本发布说明、更新脚本内版本号与 SHA-256 及 `THIRD_PARTY_NOTICES.md`，重跑 `scripts/hysteria-interop-test.sh` 与 `scripts/build-local.sh --tests`。真机待测见 L19–L24。
   0.4.0（构建号 20）：只开代理，即 Cisco 关着时分流代理照样生效。系统 DNS 经本项目单独登记的一项 DNS 设置指到转发器，停止、恢复网络、卸载、后台服务重启时都会删掉。面板改为设计 C：一张卡里上行 Cisco、下行分流代理，各一个开关，其余三项收成列表。界面上指这条连接的"VPN"改叫 Cisco（DESIGN §69.20，CI 上 root 实测只开代理，真机待 L18）。
   0.3.7（构建号 19）：两次"更新后登录卡住"的根因修掉了。原因是新后台服务还没换上，App 就开始登录，准备做在了旧服务上，新服务拒绝启动引擎；现在要等到换了一个服务进程回应才算更新好。所有密码放进一个钥匙串条目，每次更新只问一次。这是自签名的限制，不能用指纹；要用指纹或完全不问，需要开发者团队签名（DESIGN §69.19，真机待 L17）。
   0.3.6（构建号 18）：更新后登录卡在"网络已拦截，正在连接 VPN"，现在会自己重来，拦截保持不变；重来两次仍不行，就写明停在哪一步。每一步都记进 relay.log。面板网速卡打开时就定好栏数，三栏的数同时出现（DESIGN §69.18，真机待 L16）。
