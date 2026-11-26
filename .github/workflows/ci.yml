@@ -75,6 +75,9 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends dante-server
           sudo systemctl stop danted 2>/dev/null || true
           scripts/socks5-interop-test.sh
+      - name: Hysteria2 interop with official server (pinSHA256, TCP/UDP, salamander, port hopping; DESIGN §七十)
+        timeout-minutes: 5
+        run: scripts/hysteria-interop-test.sh
       - name: Stop test gateway
         if: always()
         run: sudo core/scripts/ocserv-test.sh stop
@@ -372,8 +375,9 @@ jobs:
         # Then proxies with Cisco off (§69.20): our DNS entry in configd,
         # the system resolver, a connection by name through SOCKS5, the stop.
         run: |
+          scripts/bundle-hysteria.sh /tmp/hy2-bundle
           (cd core && cargo build --example proxy-redirect-check --example proxy-only-check)
-          sudo scripts/proxy-redirect-test.sh core/target/debug/examples/proxy-redirect-check core/target/debug/examples/proxy-only-check
+          sudo AC_HY2_BIN=/tmp/hy2-bundle/bin/hysteria scripts/proxy-redirect-test.sh core/target/debug/examples/proxy-redirect-check core/target/debug/examples/proxy-only-check
       - name: Cisco engine harness (fake Cisco CLI)
         # Sources/App/CiscoEngine.swift against core/scripts/
         # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,

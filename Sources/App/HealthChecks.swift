@@ -29,19 +29,39 @@ struct ProxyCheck: Equatable {
         }
     }
 
-    /// Blocks up to ~20 s: never on the main thread.
-    static func run(_ route: ProxyRoute, password: String?) -> ProxyCheck {
-        let line = route.serverLine(password: password)
+    static func decode(json: String) -> ProxyCheck {
+        struct Out: Decodable { var level: String; var text: String; var millis: Int }
+        guard let out = try? JSONDecoder().decode(Out.self, from: Data(json.utf8)) else {
+            return ProxyCheck(level: .fail, text: "检测没有结果", at: Date())
+        }
+        return ProxyCheck(level: Level(rawValue: out.level) ?? .fail, text: out.text, millis: out.millis, at: Date())
+    }
+
+    /// Blocks up to ~20 s: never on the main thread. For SOCKS5/HTTP only.
+    static func run(_ route: ProxyRoute, password: String?, obfsPassword: String? = nil) -> ProxyCheck {
+        let line = route.serverLine(password: password, obfsPassword: obfsPassword)
         let rules = route.sites.joined(separator: "\n")
         guard let raw = ac_proxy_probe(line, rules) else {
             return ProxyCheck(level: .fail, text: "代理地址无效", at: Date())
         }
         defer { probe_string_free(raw) }
-        struct Out: Decodable { var level: String; var text: String; var millis: Int }
-        guard let out = try? JSONDecoder().decode(Out.self, from: Data(String(cString: raw).utf8)) else {
-            return ProxyCheck(level: .fail, text: "检测没有结果", at: Date())
+        return decode(json: String(cString: raw))
+    }
+
+    /// Async check for any proxy kind: SOCKS5/HTTP run in-process (Rust);
+    /// Hysteria2 delegates to the background service over XPC (§七十).
+    static func runAsync(_ route: ProxyRoute, password: String?, obfsPassword: String? = nil,
+                         completion: @escaping (ProxyCheck) -> Void) {
+        if route.kind == .hysteria2 {
+            let line = route.serverLine(password: password, obfsPassword: obfsPassword)
+            let rules = route.sites.joined(separator: "\n")
+            HelperClient.shared.probeHysteriaProxy(serverLine: line, rules: rules, completion: completion)
+            return
         }
-        return ProxyCheck(level: Level(rawValue: out.level) ?? .fail, text: out.text, millis: out.millis, at: Date())
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = run(route, password: password, obfsPassword: obfsPassword)
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 }
 
@@ -62,20 +82,26 @@ final class ProxyHealth: ObservableObject {
     @Published private(set) var checks: [UUID: ProxyCheck] = [:]
     @Published private(set) var checking: Set<UUID> = []
     static let gap: TimeInterval = 2
+    /// Hysteria2 probes go through the background service; throttle to avoid
+    /// unnecessary work while the panel stays open.
+    static let hysteriaGap: TimeInterval = 30
 
     /// Fixed results (offscreen screenshots).
     func preview(_ checks: [UUID: ProxyCheck]) { self.checks = checks }
 
     func check(_ routes: [ProxyRoute], force: Bool = false) {
         for route in routes where route.enabled && !checking.contains(route.id) {
-            if !force, let last = checks[route.id], !last.fromTraffic, Date().timeIntervalSince(last.at) < Self.gap { continue }
+            let minGap = route.kind == .hysteria2 ? Self.hysteriaGap : Self.gap
+            if !force, let last = checks[route.id] {
+                if route.kind == .hysteria2, Date().timeIntervalSince(last.at) < minGap { continue }
+                if route.kind != .hysteria2, !last.fromTraffic, Date().timeIntervalSince(last.at) < minGap { continue }
+            }
             checking.insert(route.id)
-            DispatchQueue.global(qos: .utility).async {
-                let result = ProxyCheck.run(route, password: ProxyPasswords.password(for: route))
-                DispatchQueue.main.async {
-                    self.checking.remove(route.id)
-                    self.checks[route.id] = result
-                }
+            let pw = ProxyPasswords.password(for: route)
+            let obfsPw = ProxyPasswords.obfsPassword(for: route)
+            ProxyCheck.runAsync(route, password: pw, obfsPassword: obfsPw) { result in
+                self.checking.remove(route.id)
+                self.checks[route.id] = result
             }
         }
     }

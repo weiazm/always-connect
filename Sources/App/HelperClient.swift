@@ -1084,6 +1084,74 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
+    /// Hysteria2 pre-save / settings check (§七十): asks a matching background
+    /// service to start an async probe and polls its ticket until done. Every
+    /// XPC call carries a 3-second timeout and is sent only when
+    /// `installedHelperMatchesBundle` holds.
+    func probeHysteriaProxy(serverLine: String, rules: String, completion: @escaping (ProxyCheck) -> Void) {
+        guard HelperInstaller.installedHelperMatchesBundle else {
+            DispatchQueue.main.async {
+                completion(ProxyCheck(level: .fail, text: "需要先安装或更新后台服务才能检测 Hysteria2 代理", at: Date()))
+            }
+            return
+        }
+        var done = false
+        let finish: (ProxyCheck) -> Void = { check in
+            DispatchQueue.main.async {
+                guard !done else { return }
+                done = true
+                completion(check)
+            }
+        }
+        ensureConnection { proxy in
+            var started = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                guard !started else { return }
+                started = true
+                finish(ProxyCheck(level: .fail, text: "后台服务没有回应，请检查后台服务状态", at: Date()))
+            }
+            proxy.startProxyProbe(serverLine, rules: rules) { ticket, errorText in
+                DispatchQueue.main.async {
+                    guard !started else { return }
+                    started = true
+                    guard ticket != 0 else {
+                        finish(ProxyCheck(level: .fail, text: errorText.isEmpty ? "无法启动检测" : errorText, at: Date()))
+                        return
+                    }
+                    self.pollProxyProbe(ticket: ticket, deadline: Date().addingTimeInterval(18), finish: finish)
+                }
+            }
+        }
+    }
+
+    private func pollProxyProbe(ticket: UInt64, deadline: Date, finish: @escaping (ProxyCheck) -> Void) {
+        guard Date() < deadline else {
+            finish(ProxyCheck(level: .fail, text: "UDP 出不去", at: Date()))
+            return
+        }
+        ensureConnection { proxy in
+            var answered = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                guard !answered else { return }
+                answered = true
+                finish(ProxyCheck(level: .fail, text: "后台服务没有回应", at: Date()))
+            }
+            proxy.getProxyProbeResult(ticket) { ready, json in
+                DispatchQueue.main.async {
+                    guard !answered else { return }
+                    answered = true
+                    if !ready {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            self.pollProxyProbe(ticket: ticket, deadline: deadline, finish: finish)
+                        }
+                        return
+                    }
+                    finish(ProxyCheck.decode(json: json))
+                }
+            }
+        }
+    }
+
     /// What the split did in this session (§26.12), refreshed by the
     /// open panel: list entries looked up and addresses sent direct.
     @Published private(set) var splitActivity: (entries: [String], addresses: Int)?
