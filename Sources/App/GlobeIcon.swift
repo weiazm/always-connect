@@ -9,7 +9,9 @@ import AppKit
 /// the globe uses label colours, which resolve per appearance at draw
 /// time (light/dark menu bar).
 enum GlobeIcon {
-    enum Badge { case none, lock, busy, alert }
+    /// `proxy`: Cisco off, the proxies running by themselves (§69.20): the
+    /// globe at full strength, no badge, unlike "everything off".
+    enum Badge { case none, lock, busy, alert, proxy }
 
     static func badge(for state: HelperClient.State, held: Bool, certificateRejected: Bool = false) -> Badge {
         if certificateRejected { return .alert }
@@ -46,7 +48,7 @@ enum GlobeIcon {
         GlobeGeometry.drawGlobe(center: NSPoint(x: 450, y: 560), radius: 390, width: 1.7,
                                 outline: ink, sweep: ink.withAlphaComponent(0.85),
                                 arc: badge == .lock ? GlobeGeometry.green : ink)
-        if badge != .none {
+        if badge != .none && badge != .proxy {
             NSGraphicsContext.current?.compositingOperation = .clear
             NSBezierPath(ovalIn: NSRect(x: 560, y: -40, width: 510, height: 510)).fill()
             NSGraphicsContext.current?.compositingOperation = .sourceOver
@@ -72,7 +74,7 @@ enum GlobeIcon {
             NSBezierPath(roundedRect: NSRect(x: b.midX - 32, y: b.minY + 150, width: 64, height: 190),
                          xRadius: 30, yRadius: 30).fill()
             NSBezierPath(ovalIn: NSRect(x: b.midX - 36, y: b.minY + 50, width: 72, height: 72)).fill()
-        case .none:
+        case .none, .proxy:
             break
         }
     }

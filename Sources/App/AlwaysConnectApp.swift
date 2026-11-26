@@ -76,6 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if state == .connected && !rejected { MemoryRelief.soon(after: 10) }
             }
             .store(in: &cancellables)
+        // Proxies running by themselves show on the icon too (§69.20).
+        HelperClient.shared.$proxyOnlyRunning
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
         // Attach to the Helper first: a session it kept running while
         // the App was closed must show up even without auto-connect.
         HelperClient.shared.refreshStatus()

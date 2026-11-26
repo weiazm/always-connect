@@ -54,6 +54,9 @@ final class PanelSpeed: ObservableObject {
         }
     }
 
+    /// Sample numbers for the README picture.
+    func showPreview(_ sample: Totals) { totals = sample }
+
     func stop() {
         guard let timer else { return }
         timer.invalidate()

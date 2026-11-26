@@ -51,6 +51,7 @@ final class HelperClient {
     var usesCisco = false
     var dropRetryCount = 0
     var networkHeld = false
+    var proxyOnlyRunning = false
     var protectsDrops = true
     var loginProtectionNotice: String?
     var gatewayTrustFailed = false

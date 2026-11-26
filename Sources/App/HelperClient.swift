@@ -127,12 +127,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Keychain holds a password for it. The panel reads this on open
     /// (the popover view is rebuilt on every toggle).
     var hasCredentials: Bool {
+        if let preview = Self.previewCredentials { return preview }
         guard let username = ProfileStore.loadUsername(), !username.isEmpty else {
             return false
         }
         return KeychainStore.exists(server: KeychainStore.accountKey, username: username)
             || KeychainStore.exists(server: ProfileStore.loadProfile().server, username: username)
     }
+
+    /// The README picture: credentials "stored" without asking the keychain.
+    static var previewCredentials: Bool?
 
     /// Localized details shared by the panel and the menu tooltip.
     var ownLoginProgressText: String? {
@@ -828,6 +832,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pfWarning = nil
         splitActivity = nil
         prepareGatewayWhileDirect()
+        syncProxyOnly()
     }
 
     /// 按网站分流 (DESIGN.md §26.12): one switch for the user; on = the
@@ -1019,6 +1024,49 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func finishLaunchConnection(_ automatic: Bool) {
         onDemand.launchFinished(automatic)
+        syncProxyOnly()
+    }
+
+    // MARK: - Proxies with Cisco off (DESIGN.md §69.20)
+
+    /// The service runs the proxies by themselves (no connection owns them).
+    @Published private(set) var proxyOnlyRunning = false
+    /// Why it does not, when it should.
+    @Published private(set) var proxyOnlyError: String?
+
+    /// Proxies on and set, and not Cisco's own client connected (its filter
+    /// decides where traffic goes then). The own connection's split takes
+    /// the proxies over by itself and hands them back when it ends.
+    var proxyOnlyWanted: Bool {
+        guard !endingApp, !resettingNetwork, !ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty else { return false }
+        return !usesCisco || state == .disconnected
+    }
+
+    /// The rules, then whether the proxies run by themselves.
+    func syncProxyOnly() { pushDirectDomains() }
+
+    /// After the rules: XPC keeps the order. Only to a service built from
+    /// this App (an unknown method drops the connection, §26.14).
+    private func sendProxyOnly() {
+        guard !AppRole.isSettings else { return }
+        guard HelperInstaller.installedHelperMatchesBundle else {
+            proxyOnlyRunning = false
+            proxyOnlyError = ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty ? nil : "要先更新后台服务"
+            return
+        }
+        let on = proxyOnlyWanted
+        ensureConnection { proxy in
+            var finished = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
+            proxy.setProxyOnly(on) { running, error in
+                DispatchQueue.main.async {
+                    guard !finished else { return }
+                    finished = true
+                    self.proxyOnlyRunning = running
+                    self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
+                }
+            }
+        }
     }
 
     /// True while installHelper waits for a login to finish.
@@ -1049,7 +1097,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// the panel's speed card reads right after it, with fresh proxied
     /// totals (§69.18).
     func refreshSplitActivity(then done: (() -> Void)? = nil) {
-        guard !usesCisco, state == .connected else {
+        guard (!usesCisco && state == .connected) || proxyOnlyRunning else {
             splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
         }
         // An older background service does not know this method, and a
@@ -1075,7 +1123,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
                         defer { finish() }
-                        guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
+                        guard !finished, self.connectedSince == sessionStarted,
+                              (self.state == .connected && !self.usesCisco) || self.proxyOnlyRunning else { return }
                         finished = true
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
@@ -1083,12 +1132,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                             var proxyHealth: [ProxyTraffic]?
                             struct Bytes: Codable { var direct: [UInt64]; var vpn: [UInt64]; var local: [UInt64] }
                             var proxyBytes: Bytes?
+                            var proxyOnly: Bool?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         if let rows = status?.proxyHealth, !rows.isEmpty {
                             ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
                         }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        if let status, self.state == .disconnected { self.proxyOnlyRunning = status.proxyOnly == true }
                         self.proxyBytes = status?.proxyBytes.flatMap { bytes in
                             let reading: [String: Any] = ["at": Date().timeIntervalSince1970,
                                                           "direct": bytes.direct, "vpn": bytes.vpn, "local": bytes.local]
@@ -1153,6 +1204,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func prepareForNetworkReset() {
         resettingNetwork = true
+        // 恢复网络 turns off everything of ours, the proxies too (§69.20):
+        // the switch shows it, the user turns them on again.
+        var stored = ProfileStore.loadAppSettings()
+        if !stored.activeProxyRoutes.isEmpty {
+            stored.proxiesPaused = true
+            ProfileStore.saveAppSettings(stored)
+        }
+        sendProxyOnly()
         resetGatewayPreparation()
         if loginIntentActive || switchIsOn || networkHeld { disconnect() }
     }
@@ -1177,6 +1236,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     func shutdownForQuit(completion: @escaping () -> Void) {
         endingApp = true
         watchLogin("stopped")
+        // Quit = nothing of ours keeps running, the proxies included (§69.20).
+        sendProxyOnly()
         protection.invalidate(.manualStop)
         resetGatewayPreparation()
         if let record = dropTracker.finishForQuit() {
@@ -2027,6 +2088,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         state = parsed
         if parsed != .disconnected && old == .disconnected { watchLogin("started") }
+        // Cisco on or off: the proxies run by themselves or not (§69.20).
+        if (parsed == .disconnected) != (old == .disconnected), !AppRole.isSettings { syncProxyOnly() }
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
         if parsed == .connected && old != .connected && !AppRole.isSettings {
@@ -2477,10 +2540,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let settings = ProfileStore.loadAppSettings()
         // Without Cisco on this Mac the own connection runs either way;
-        // only the switch decides whether the list applies.
-        let text = settings.splitOn ? settings.directRuleText : ""
+        // only the switch decides whether the list applies. Through Cisco's
+        // client only the proxies go, for while Cisco is off (§69.20).
+        let text = settings.splitOn ? settings.directRuleText : settings.proxyLines.joined(separator: "\n")
         // A background service built before §66.30 only knows the list form.
         let legacy = HelperInstaller.installedHelperOutdated
+        defer { sendProxyOnly() }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -2696,6 +2761,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             "ownConnection": ownConnection, "splitSwitchPending": splitSwitchPending,
             "onDemandPaused": onDemandPaused, "onDemandRuleName": onDemandRuleName ?? "",
             "helperUpdatePending": helperUpdatePending, "drops": dropHistory.count,
+            "proxyOnlyRunning": proxyOnlyRunning,
             "lastDropId": lastDrop?.id.uuidString ?? "", "lastDropSignature": Self.dropSignature(lastDrop),
         ]
         json["gatewayTrustFailed"] = gatewayTrustFailed
@@ -2724,6 +2790,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         ownConnection = json["ownConnection"] as? Bool ?? ownConnection
         splitSwitchPending = json["splitSwitchPending"] as? Bool ?? false
         helperUpdatePending = json["helperUpdatePending"] as? Bool ?? false
+        proxyOnlyRunning = json["proxyOnlyRunning"] as? Bool ?? false
         splitWarning = json["splitWarning"] as? String
         gatewayTrustFailed = json["gatewayTrustFailed"] as? Bool ?? false
         loginProtectionNotice = json["loginProtectionNotice"] as? String

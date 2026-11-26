@@ -40,7 +40,8 @@ struct StatusLook {
     }
 
     static func updateMenuButton(_ button: NSButton, client: HelperClient) {
-        let badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
+        var badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
+        if badge == .none, client.proxyOnlyRunning { badge = .proxy }
         button.image = GlobeIcon.image(badge)
         button.contentTintColor = nil
         button.toolTip = "AlwaysConnect：\(client.stateLine)"

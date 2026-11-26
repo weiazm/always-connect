@@ -147,6 +147,7 @@ final class Service {
     var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
     let queue = ServiceQueue()
     var userReleased = true
+    func reconcileProxyOnly() {}
     SERVER_PROTECTION_BODY
 }
 final class Resource {
@@ -303,6 +304,7 @@ final class Client {
         return true
     }
     func showGatewayRejection() { gatewayTrustFailed = true }
+    func syncProxyOnly() {}
     func continueStoredConnection(_ profile: Profile, username: String, server: String, addresses: [String]?, session: UInt64) -> Bool {
         cisco?.isManaging = true
         starts += 1

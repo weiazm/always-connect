@@ -128,6 +128,9 @@ final class ProxyHealth: ObservableObject {
 final class LinkCheck: ObservableObject {
     enum State: Equatable { case unknown, ok(Int), slow(Int), down }
     private static var recent: (state: State, at: Date)?
+    /// A sample answer for the README picture.
+    func showPreview(_ sample: State) { state = sample }
+
     @Published private(set) var state: State = LinkCheck.recent.flatMap {
         Date().timeIntervalSince($0.at) < 60 ? $0.state : nil
     } ?? .unknown {
