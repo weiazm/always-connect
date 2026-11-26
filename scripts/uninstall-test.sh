@@ -29,6 +29,8 @@ setup() {
     H="$R/Users/someone"
     S="$R/Library/Application Support/AlwaysConnect"
     mkdir -p "$R/Library/LaunchDaemons" "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin" \
+        "$R/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin" \
+        "$R/Library/Application Support/AlwaysConnect-hysteria/run-abc" \
         "$S/relay" "$R/Library/Logs/AlwaysConnect" \
         "$H/Library/Logs/AlwaysConnect" "$H/Library/Application Support/AlwaysConnect/GeoData" \
         "$H/Library/Caches/com.alwaysconnect.app" "$H/Library/Preferences" "$H/Desktop" \
@@ -39,6 +41,8 @@ setup() {
         "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/alwaysconnect-gate" "$S/egress.sock" \
+        "$R/Library/PrivilegedHelperTools/AlwaysConnect-hysteria/bin/hysteria" \
+        "$R/Library/Application Support/AlwaysConnect-hysteria/run-abc/config.json" \
         "$S/login-gateway-cache.json" "$S/.login-gateway-cache.interrupted" \
         "$S/direct-routes.pending.crash" "$S/direct-routes.retire-crash" "$S/guard.json" "$S/route-state" "$S/session.json" "$S/relay/client.key" \
         "$R/Library/Logs/AlwaysConnect/helper.log" \
@@ -66,6 +70,8 @@ system_and_user_files_gone() {
     gone "$R/Library/LaunchDaemons/com.alwaysconnect.app.helper.plist"
     gone "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper"
     gone "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
+    gone "$R/Library/PrivilegedHelperTools/AlwaysConnect-hysteria"
+    gone "$R/Library/Application Support/AlwaysConnect-hysteria"
     gone "$S/login-gateway-cache.json"
     gone "$S/.login-gateway-cache.interrupted"
     gone "$R/Library/Application Support/AlwaysConnect"

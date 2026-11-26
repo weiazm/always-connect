@@ -34,13 +34,20 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
 
     func shutdown() {
         session.shutdown()
+        ac_hysteria_stop_all()
         Self.endOwnProcesses()
     }
 
     func start() {
-        // A crashed predecessor's openconnect (F6): the
-        // engine that ran them is gone, nothing will ever stop them.
+        // A crashed predecessor's openconnect (F6) or managed hysteria client:
+        // the engine that ran them is gone, nothing will ever stop them.
         Self.endOwnProcesses(includeChildren: false)
+        ac_hysteria_clean_runtime()
+        if TestSeam.isActive, let testHy = ProcessInfo.processInfo.environment["ALWAYSCONNECT_TEST_HYSTERIA"], !testHy.isEmpty {
+            ac_hysteria_set_binary(testHy, true, true)
+        } else {
+            ac_hysteria_set_binary(ClientRequirement.hysteriaPath, ClientRequirement.verifiesHysteria(), false)
+        }
         // The network gate (DESIGN.md §25.2): adopt a hold from this
         // boot (blocking set, grace clock running until an App is
         // back), drop one from an earlier boot. A hold that outlives
@@ -129,6 +136,7 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
 
     private func exitIdle() {
         HelperSession.log("idle, exiting")
+        ac_hysteria_stop_all()
         Self.endOwnProcesses()
         exit(0)
     }
@@ -163,11 +171,13 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
         let dir = CLIOrchestrator.defaultSupportDir
         let script = dir.appendingPathComponent("alwaysconnect-vpnc.sh").path
         let gate = ClientRequirement.egressGatePath
+        let hysteria = ClientRequirement.hysteriaPath
         let quotedScript = CLIOrchestrator.shellQuoted(script)
         return [
             ("openconnect", "--script=" + quotedScript),
             ("openconnect", "--script=" + CLIOrchestrator.shellQuoted(gate) + " " + quotedScript),
             (gate, gate + " " + script),
+            (hysteria, hysteria + " client"),
         ]
     }
 
@@ -256,6 +266,9 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var proxyOnlyNetwork: PhysicalNetworkChanges?
     private var proxyOnlyOrphan: DispatchWorkItem?
     private var proxyOnlyError: String?
+    /// Bounded in-memory table of async Hysteria2 pre-save probes (§七十).
+    private var nextProbeTicket: UInt64 = 1
+    private var proxyProbes: [UInt64: (done: Bool, json: String, at: Date)] = [:]
 
     /// One timestamped line to the daemon's stderr (launchd's
     /// StandardErrorPath when configured). Engine details only:
@@ -397,18 +410,59 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 }
             }
         } else if !run {
-            stopProxyOnly()
+            stopProxyOnly(handover: false)
+            if !engineActive { ac_hysteria_stop_all() }
         }
     }
 
     /// On `queue`.
-    private func stopProxyOnly() {
+    private func stopProxyOnly(handover: Bool = false) {
         guard let session = proxyOnly else { return }
         proxyOnly = nil
         proxyOnlyError = nil
         proxyOnlyNetwork?.cancel()
         proxyOnlyNetwork = nil
-        session.stop()
+        session.stop(handover: handover)
+    }
+
+    func startProxyProbe(_ serverLine: String, rules: String, withReply reply: @escaping (UInt64, String) -> Void) {
+        queue.async {
+            let now = Date()
+            self.proxyProbes = self.proxyProbes.filter { now.timeIntervalSince($0.value.at) < 60 }
+            if self.proxyProbes.count >= 16 {
+                reply(0, "正在进行的检测太多，请稍后再试")
+                return
+            }
+            let ticket = self.nextProbeTicket
+            self.nextProbeTicket &+= 1
+            if self.nextProbeTicket == 0 { self.nextProbeTicket = 1 }
+            self.proxyProbes[ticket] = (done: false, json: "", at: now)
+            reply(ticket, "")
+            DispatchQueue.global(qos: .userInitiated).async {
+                let json = NetworkGuard.take(ac_hysteria_probe(serverLine, rules))
+                    ?? #"{"level":"fail","text":"检测没有结果","millis":0}"#
+                self.queue.async {
+                    if self.proxyProbes[ticket] != nil {
+                        self.proxyProbes[ticket] = (done: true, json: json, at: Date())
+                    }
+                }
+            }
+        }
+    }
+
+    func getProxyProbeResult(_ ticket: UInt64, withReply reply: @escaping (Bool, String) -> Void) {
+        queue.async {
+            guard let entry = self.proxyProbes[ticket] else {
+                reply(true, #"{"level":"fail","text":"检测任务已过期","millis":0}"#)
+                return
+            }
+            if entry.done {
+                self.proxyProbes.removeValue(forKey: ticket)
+                reply(true, entry.json)
+            } else {
+                reply(false, "")
+            }
+        }
     }
 
     /// Set by the user's release, cleared by the next connect or arm.
@@ -452,7 +506,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         // redirect before the engine's forwarder needs them.
         if proxyOnly != nil {
             Self.log("proxy only: handed over to the connection")
-            stopProxyOnly()
+            stopProxyOnly(handover: true)
         }
         startGeneration += 1
         userReleased = false
@@ -631,7 +685,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         // ours keeps running, the proxies included (§69.20).
         if reason == NetworkGuard.Reason.appGone {
             proxyOnlyWanted = false
-            stopProxyOnly()
+            stopProxyOnly(handover: false)
+            ac_hysteria_stop_all()
         }
         pendingLogin = nil
         startGeneration += 1 // a replacement waiting to start never does
@@ -1195,3 +1250,7 @@ private final class GatewayLookupLease: @unchecked Sendable {
 @_silgen_name("ac_gateway_free") func ac_gateway_free(_ lease: OpaquePointer)
 
 @_silgen_name("ac_login_direct_interface") private func ac_login_direct_interface() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_hysteria_set_binary") private func ac_hysteria_set_binary(_ path: UnsafePointer<CChar>, _ verified: Bool, _ testMode: Bool)
+@_silgen_name("ac_hysteria_stop_all") private func ac_hysteria_stop_all()
+@_silgen_name("ac_hysteria_clean_runtime") private func ac_hysteria_clean_runtime()
+@_silgen_name("ac_hysteria_probe") private func ac_hysteria_probe(_ server: UnsafePointer<CChar>, _ rules: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

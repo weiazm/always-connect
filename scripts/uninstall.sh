@@ -200,6 +200,9 @@ remove "$R/Library/LaunchDaemons/$LABEL.plist"
 remove "$R/Library/PrivilegedHelperTools/$LABEL"
 # Includes the signed tunnel gate and its root-private controller socket.
 remove "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect"
+# Bundled Hysteria2 client and its per-run config directory (§七十).
+remove "$R/Library/PrivilegedHelperTools/AlwaysConnect-hysteria"
+remove "$R/Library/Application Support/AlwaysConnect-hysteria"
 remove "$R/Library/Application Support/AlwaysConnect"
 remove "$R/Library/Logs/AlwaysConnect"
 
