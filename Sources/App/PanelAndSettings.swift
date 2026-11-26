@@ -260,8 +260,8 @@ struct PanelView: View {
         .toggleStyle(.always)
         .onAppear {
             manager.prepareGatewayWhileDirect()
+            // Also refreshes the split status (正在直连, proxied totals).
             speed.start()
-            manager.refreshSplitActivity()
             manager.refreshEgress()
             checkHealth()
             let active = manager.state != .disconnected
@@ -273,10 +273,7 @@ struct PanelView: View {
                 DispatchQueue.main.async { neighbors = found }
             }
         }
-        .onReceive(activityTimer) { _ in
-            manager.refreshSplitActivity()
-            manager.expireGatewayPreparation()
-        }
+        .onReceive(activityTimer) { _ in manager.expireGatewayPreparation() }
         .onReceive(healthTimer) { _ in checkHealth() }
         .onChange(of: manager.showsConnected) { _ in link.reset(); checkHealth() }
         .onDisappear { speed.stop() }
@@ -285,16 +282,19 @@ struct PanelView: View {
     /// 网速 (DESIGN.md §45.4): the VPN and the direct part side by side,
     /// only while connected; "连接详情" opens the per-connection page.
     private var speedCard: some View {
-        Button { onOpenSettings("traffic") } label: {
+        let totals = speed.totals
+        return Button { onOpenSettings("traffic") } label: {
             HStack(spacing: 10) {
-                speedColumn("走 VPN", color: .green, speed.totals?.vpn)
+                speedColumn("走 VPN", color: .green, totals?.vpn)
                 Divider().frame(height: 36)
-                // §69.17: shown while proxies carry traffic in this session.
-                if let proxy = speed.totals?.proxy {
-                    speedColumn("代理", color: .purple, proxy)
+                // §69.17, §69.18: the columns are known when the panel
+                // opens, from the settings, not from the first numbers
+                // (user, 2026-11-26: "两个跳变成3个，这是什么鬼交互啊").
+                if proxyColumnShown {
+                    speedColumn("代理", color: .purple, totals.map { $0.proxy ?? [0, 0] })
                     Divider().frame(height: 36)
                 }
-                speedColumn("直连", color: .orange, speed.totals?.direct)
+                speedColumn("直连", color: .orange, totals?.direct)
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.tertiary)
@@ -305,6 +305,13 @@ struct PanelView: View {
         .help("网速；点开看每条连接")
         .padding(.horizontal, 12).padding(.vertical, 9)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
+    }
+
+    /// The 代理 column: proxies are on for this connection, or (a change
+    /// the service has not applied yet) proxied bytes are still moving.
+    private var proxyColumnShown: Bool {
+        (manager.ownConnection && !settings.activeProxyRoutes.isEmpty)
+            || (speed.totals?.proxy.map { $0 != [0, 0] } ?? false)
     }
 
     private func speedColumn(_ title: String, color: Color, _ rate: [Int]?) -> some View {

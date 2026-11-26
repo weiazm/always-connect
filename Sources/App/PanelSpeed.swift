@@ -11,9 +11,11 @@ private func speed_string_free(_ s: UnsafeMutablePointer<CChar>?)
 /// menu bar all the time, only when the panel is opened). Lives with the
 /// panel's SwiftUI tree: `start` on appear, `stop` on disappear (the
 /// panel is released when it closes, §32.1). While open, every 2 s with
-/// tolerance, the Rust core reads the interface counters once (one
-/// sysctl, about 0.4 ms, no process) and returns the totals, with the
-/// proxied part from the background service's counts (§69.17).
+/// tolerance, it asks the background service for the split status (the
+/// panel's 正在直连 and the proxied totals, §69.17) and, once that is in,
+/// the Rust core reads the interface counters once (one sysctl, about
+/// 0.4 ms, no process) and returns the totals: every column's numbers
+/// come from the same moment and appear together (§69.18).
 final class PanelSpeed: ObservableObject {
     struct Totals: Decodable, Equatable {
         var ready: Bool
@@ -24,23 +26,32 @@ final class PanelSpeed: ObservableObject {
         var proxy: [Int]?
     }
 
-    /// Nil until the second reading (a speed needs two).
+    /// Nil until the second reading (a speed needs two), and while the
+    /// proxied part still needs its second one.
     @Published private(set) var totals: Totals?
     private var timer: Timer?
 
     func start() {
         guard timer == nil else { return }
-        read()
+        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.3
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        tick()
         // The first numbers after half a second, then every 2 s (user,
         // 2026-11-26: "界面上的一些延迟数据 刷新太慢了").
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.timer != nil else { return }
+            self.tick()
+        }
+    }
+
+    /// The service's answer first, then the reading.
+    private func tick() {
+        HelperClient.shared.refreshSplitActivity { [weak self] in
+            guard let self, self.timer != nil else { return }
             self.read()
         }
-        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.read() }
-        t.tolerance = 0.3
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
     }
 
     func stop() {
@@ -59,8 +70,6 @@ final class PanelSpeed: ObservableObject {
     }
 
     private func read() {
-        // The service's proxied-byte totals arrive with the split status,
-        // which the panel asks for every 2 s too.
         let proxy = HelperClient.shared.proxyBytes
         guard let raw = proxy.map({ $0.withCString { ac_speed_totals($0) } }) ?? ac_speed_totals(nil) else { return }
         defer { speed_string_free(raw) }

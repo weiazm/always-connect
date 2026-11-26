@@ -64,6 +64,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private var protectedLoginRetries = 0
     private var protectedLoginRetryPending = false
     static let protectedLoginRetryLimit = 2
+    /// §69.18: a login that holds the network must reach the engine. Rust
+    /// (LoginWatch) decides when it is stuck and when to start it again.
+    private let loginWatch = OnDemandMachine("login_watch")
+    /// The next protected login is a fresh start made by the watch.
+    private var loginWatchRetrying = false
+    /// What the stuck login's last failed step said, for the give-up line.
+    private var loginStepFailure: String?
     private var endingApp = false
     private let connectionCheck = ConnectionCheck()
     @Published private(set) var helperAvailable = false
@@ -489,7 +496,53 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             && loginProtectionNotice != nil && loginProtectionNotice != ProtectedLoginNotice.preparingGateway
     }
 
-    private func connect(server: String, group: String, username: String, password: String, session: UInt64, onAccepted: (() -> Void)? = nil) {
+    /// §69.18: one event for the login watch, and what its decisions do.
+    private func watchLogin(_ kind: String, _ extra: [String: Any] = [:]) {
+        guard !AppRole.isSettings else { return }
+        // A fresh start that never got its hold must not mark the user's next login as one.
+        if kind == "started" || kind == "stopped" { loginWatchRetrying = false }
+        var event = extra
+        event["kind"] = kind
+        loginWatch.send(event) { [weak self] action in
+            guard let self else { return }
+            switch action["kind"] as? String {
+            case "arm":
+                let token = action["token"] ?? 0
+                let seconds = action["seconds"] as? Double ?? 15
+                DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                    guard let self else { return }
+                    self.watchLogin("due", ["token": token, "waiting": self.loginAwaitsEngine])
+                }
+            case "retry":
+                RelayLog.write("login: the engine did not start, starting the login again (\(action["attempt"] ?? 1))")
+                // The hold stays: a fresh start, never a direct-network gap.
+                loginWatchRetrying = true
+                pendingProtectedStart = nil
+                _ = startStoredConnection()
+            case "give_up":
+                RelayLog.write("login: the engine did not start after fresh starts, stopped")
+                loginWatchRetrying = false
+                loginProtectionNotice = "没能开始登录" + (loginStepFailure.map { "：" + $0 } ?? "：后台服务没有启动 VPN")
+                    + "。网络仍处拦截，可点「断开 VPN，恢复直连网络」，或关掉开关再打开重试"
+            default: break
+            }
+        }
+    }
+
+    /// A login with the network closed for it, still waiting for the engine.
+    private var loginAwaitsEngine: Bool {
+        state == .disconnected && loginIntentActive && networkHeld && pendingProtectedStart == nil
+            && !endingApp && !resettingNetwork && !gatewayTrustFailed && !usesCisco
+    }
+
+    private func loginStepFailed(_ reason: String) {
+        loginStepFailure = reason
+        RelayLog.write("login: step failed: " + reason)
+        watchLogin("failed")
+    }
+
+    private func connect(server: String, group: String, username: String, password: String, session: UInt64,
+                         onAccepted: (() -> Void)? = nil, onRefused: (() -> Void)? = nil) {
         guard onDemand.permitsConnection() else { return }
         guard protection.isSessionCurrent(session) else { return }
         autoStopNotice = nil
@@ -502,6 +555,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     guard self?.protection.isSessionCurrent(session) == true else { return }
                     if !accepted {
                         self?.lastError = "Helper 未接受连接请求"
+                        onRefused?()
                     } else {
                         onAccepted?()
                     }
@@ -602,6 +656,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// connect again" — that turned the VPN back on right after the
     /// user asked for the network back (§30.4).
     func prepareForForcedRestore() {
+        watchLogin("stopped")
         protection.invalidate(.forcedRestore)
         dropTracker.noteUserStop()
         resettingNetwork = true
@@ -644,6 +699,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         onLocalStopped: (() -> Void)? = nil,
         isCurrent: @escaping () -> Bool = { true }
     ) {
+        watchLogin("stopped")
         pendingProtectedStart = nil
         loginIntentActive = false
         resetGatewayPreparation()
@@ -978,17 +1034,27 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var splitWarning: String?
     @Published private(set) var dnsNotice: String?
 
-    func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
+    /// `then` runs on main once the answer is in (or did not come in 3 s):
+    /// the panel's speed card reads right after it, with fresh proxied
+    /// totals (§69.18).
+    func refreshSplitActivity(then done: (() -> Void)? = nil) {
+        guard !usesCisco, state == .connected else {
+            splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
+        }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else {
+            splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
+        }
         let sessionStarted = connectedSince
+        var answered = false
+        let finish = { guard !answered else { return }; answered = true; done?() }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                defer { finish() }
                 guard !finished, self.connectedSince == sessionStarted else { return }
                 finished = true
                 self.splitWarning = nil
@@ -997,6 +1063,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if HelperInstaller.installedHelperMatchesBundle {
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
+                        defer { finish() }
                         guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                         finished = true
                         struct Status: Decodable {
@@ -1025,6 +1092,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             proxy.getSplitActivity { entries, addresses, running in
                 DispatchQueue.main.async {
+                    defer { finish() }
                     guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                     finished = true
                     self.dnsNotice = nil
@@ -1097,6 +1165,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Helper, with nothing left to do, exits on its own.
     func shutdownForQuit(completion: @escaping () -> Void) {
         endingApp = true
+        watchLogin("stopped")
         protection.invalidate(.manualStop)
         resetGatewayPreparation()
         if let record = dropTracker.finishForQuit() {
@@ -1276,6 +1345,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             networkHeld = true
             loginProtectionNotice = "网络已拦截，正在连接 VPN"
+            if !native {
+                if !loginWatchRetrying { loginStepFailure = nil }
+                RelayLog.write("login: network held, preparing the relay")
+                watchLogin("held", ["retry": loginWatchRetrying])
+            }
+            loginWatchRetrying = false
             _ = continueStoredConnection(profile, username: username, server: server, addresses: peers, session: session)
         }
 
@@ -1340,8 +1415,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if let error {
                 self.lastError = error
                 self.detail = error
+                self.loginStepFailed(error)
                 return
             }
+            RelayLog.write("login: relay ready")
+            self.watchLogin("progress")
             // The split's list and 断线保护 go first; XPC keeps the
             // order (§26.5, §26.19).
             if !self.usesCisco {
@@ -1353,11 +1431,17 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             let begin = {
                 guard self.protection.isSessionCurrent(session) else { return }
+                RelayLog.write("login: asking the service to start the engine")
+                self.watchLogin("progress")
                 self.connect(server: server, group: profile.group,
-                             username: username, password: password, session: session) {
+                             username: username, password: password, session: session, onAccepted: {
                     // The connect reply means the engine exists and can take the LAN list.
                     HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
-                }
+                    RelayLog.write("login: the service took the connect")
+                    self.watchLogin("progress")
+                }, onRefused: {
+                    self.loginStepFailed("后台服务没有接受连接请求")
+                })
             }
             let settings = ProfileStore.loadAppSettings()
             let egress = settings.egressProtection ?? EgressProtection()
@@ -1369,6 +1453,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     else {
                         self.lastError = "后台服务未接受出口保护设置。请更新后台服务后再连接。"
                         self.detail = self.lastError ?? ""
+                        self.loginStepFailed("后台服务没有及时接受出口保护设置")
                     }
                 }
             } else if !self.usesCisco, settings.isDropProtectionOn, settings.egressProtection != nil {
@@ -1930,6 +2015,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             loginProtectionNotice = nil
         }
         state = parsed
+        if parsed != .disconnected && old == .disconnected { watchLogin("started") }
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
         if parsed == .connected && old != .connected && !AppRole.isSettings {
