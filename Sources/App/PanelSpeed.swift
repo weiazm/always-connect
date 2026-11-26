@@ -28,13 +28,14 @@ final class PanelSpeed: ObservableObject {
     func start() {
         guard timer == nil else { return }
         read()
-        // The first numbers after 1 s, then every 3 s.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+        // The first numbers after half a second, then every 2 s (user,
+        // 2026-11-26: "界面上的一些延迟数据 刷新太慢了").
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.timer != nil else { return }
             self.read()
         }
-        let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.read() }
-        t.tolerance = 0.5
+        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.read() }
+        t.tolerance = 0.3
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }

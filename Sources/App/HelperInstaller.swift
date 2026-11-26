@@ -71,6 +71,7 @@ enum HelperInstaller {
     /// user never has to open a terminal.
     static let installPrompt = "AlwaysConnect 要安装后台服务（断线时封网用）。"
     static let updatePrompt = "AlwaysConnect 已更新，要同时更新后台服务（断线时封网用）。"
+    static let retryPrompt = "后台服务的自动更新没有完成，再授权一次就能装好（断线时封网用）。"
 
     private static func installWithAdminPassword(
         prompt: String,
@@ -100,7 +101,9 @@ enum HelperInstaller {
         return environment["ALWAYSCONNECT_SERVICE_UPDATE"] == "1"
     }
 
-    enum ServiceUpdateOutcome { case updated, cancelled, failed(String), notTaken }
+    /// `didNotReturn`: the service took the update but no new one answered
+    /// (§69.15): never left like that, the password install follows.
+    enum ServiceUpdateOutcome { case updated, cancelled, failed(String), didNotReturn(String), notTaken }
 
     /// The user's approval for ServiceUpdateRight, kept by `authorization`
     /// until the service has checked it. Blocks on the system dialog.
@@ -164,10 +167,10 @@ enum HelperInstaller {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             if installedHelperMatchesBundle {
                 HelperClient.shared.waitUntilServiceAnswers(deadline: deadline) { answered in
-                    completion(answered ? .updated : .failed("新的后台服务没有回应"))
+                    completion(answered ? .updated : .didNotReturn("新的后台服务没有回应"))
                 }
             } else if Date() >= deadline {
-                completion(.failed("后台服务没有在一分钟内完成更新"))
+                completion(.didNotReturn("后台服务没有在一分钟内完成更新"))
             } else {
                 waitForUpdatedService(deadline: deadline, completion: completion)
             }
@@ -244,6 +247,9 @@ enum HelperInstaller {
                 case .updated: completion(.success(()))
                 case .cancelled: completion(.failure(InstallError.cancelled))
                 case .failed(let reason): completion(.failure(InstallError.scriptFailed(reason)))
+                // The safety net: an update that started but left no
+                // working service is finished the way that always works.
+                case .didNotReturn: installWithAdminPassword(prompt: retryPrompt, completion: completion)
                 case .notTaken: installWithAdminPassword(prompt: prompt, completion: completion)
                 }
             }

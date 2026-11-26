@@ -54,13 +54,14 @@ struct ProxyTraffic: Decodable, Equatable {
 }
 
 /// The checks, kept for this run of the App only (in memory, a few
-/// entries). Checks run when a page or the panel showing proxies opens,
-/// at most once per 30 s per proxy, and when real traffic failed.
+/// entries). Checks run only while the panel or a page showing proxies is
+/// open: at once on opening, then at most every 2 s per proxy (user,
+/// 2026-11-26: "只有打开面板做就行啊", and fast), and when real traffic failed.
 final class ProxyHealth: ObservableObject {
     static let shared = ProxyHealth()
     @Published private(set) var checks: [UUID: ProxyCheck] = [:]
     @Published private(set) var checking: Set<UUID> = []
-    static let gap: TimeInterval = 30
+    static let gap: TimeInterval = 2
 
     /// Fixed results (offscreen screenshots).
     func preview(_ checks: [UUID: ProxyCheck]) { self.checks = checks }
@@ -121,10 +122,17 @@ final class ProxyHealth: ObservableObject {
 
 /// Whether the network works right now through the VPN, while the panel
 /// shows it (UI-DESIGN.md 面板): a HEAD request to a few well-known
-/// addresses every 10 s, the fastest answer counts. Released with the panel.
+/// addresses every 2 s, the fastest answer counts. Released with the panel;
+/// the last answer (one value) is kept for a minute, so a reopened panel
+/// shows it at once while the next one runs (user, 2026-11-26: "刷新太慢了").
 final class LinkCheck: ObservableObject {
     enum State: Equatable { case unknown, ok(Int), slow(Int), down }
-    @Published private(set) var state: State = .unknown
+    private static var recent: (state: State, at: Date)?
+    @Published private(set) var state: State = LinkCheck.recent.flatMap {
+        Date().timeIntervalSince($0.at) < 60 ? $0.state : nil
+    } ?? .unknown {
+        didSet { if state != .unknown { LinkCheck.recent = (state, Date()) } }
+    }
     private var running = false
     private var last = Date.distantPast
     private var failures = 0
@@ -139,10 +147,10 @@ final class LinkCheck: ObservableObject {
 
     deinit { session.invalidateAndCancel() }
 
-    func reset() { state = .unknown; failures = 0; last = .distantPast }
+    func reset() { LinkCheck.recent = nil; state = .unknown; failures = 0; last = .distantPast }
 
     func checkIfDue() {
-        guard !running, Date().timeIntervalSince(last) >= 10 else { return }
+        guard !running, Date().timeIntervalSince(last) >= 2 else { return }
         running = true
         last = Date()
         let group = DispatchGroup()

@@ -189,6 +189,8 @@ else
     sys pfctl -a com.apple/301.AlwaysConnectProxy -F rules
 fi
 sys launchctl bootout "system/$LABEL"
+# A service swap left loaded by an update (dev-helper.sh, DESIGN §69.15).
+sys launchctl bootout "system/com.alwaysconnect.app.service-swap"
 
 # ---- 3 system files
 remove "$R/Library/LaunchDaemons/$LABEL.plist"

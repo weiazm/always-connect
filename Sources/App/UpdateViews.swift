@@ -167,11 +167,11 @@ struct UpdateRows: View {
 
     /// When it looks (no notification, no switch: user's choice, §33).
     private var schedule: String {
-        guard let last = updates.lastSuccess else { return "每天自动检查一次" }
+        guard let last = updates.lastSuccess else { return "打开菜单栏面板时自动检查" }
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
         f.dateFormat = "M月d日 HH:mm"
-        return "每天自动检查一次 · 上次 \(f.string(from: last))"
+        return "打开菜单栏面板时自动检查 · 上次 \(f.string(from: last))"
     }
 
     private func checkNow() {
