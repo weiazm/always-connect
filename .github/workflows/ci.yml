@@ -369,9 +369,11 @@ jobs:
         # listener carry connections to proxied names through local SOCKS5
         # and HTTP CONNECT proxies; UDP and a stopped listener are refused;
         # everything is taken out. Touches only 198.19.128.0/17 and lo0.
+        # Then proxies with Cisco off (§69.20): our DNS entry in configd,
+        # the system resolver, a connection by name through SOCKS5, the stop.
         run: |
-          (cd core && cargo build --example proxy-redirect-check)
-          sudo scripts/proxy-redirect-test.sh core/target/debug/examples/proxy-redirect-check
+          (cd core && cargo build --example proxy-redirect-check --example proxy-only-check)
+          sudo scripts/proxy-redirect-test.sh core/target/debug/examples/proxy-redirect-check core/target/debug/examples/proxy-only-check
       - name: Cisco engine harness (fake Cisco CLI)
         # Sources/App/CiscoEngine.swift against core/scripts/
         # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,

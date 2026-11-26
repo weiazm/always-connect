@@ -2118,3 +2118,77 @@ pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engin
 pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
     unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
 }
+
+// MARK: - Proxies with Cisco off (§69.20)
+
+/// The proxy-only session behind an opaque handle.
+pub struct ProxyOnlyHandle(std::sync::Mutex<crate::proxy_only::ProxyOnly>);
+
+fn proxy_network(json: Option<String>) -> crate::proxy_only::Network {
+    #[derive(serde::Deserialize, Default)]
+    struct Wire { interface: Option<String>, dns: Vec<String> }
+    let wire: Wire = json.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    crate::proxy_only::Network { interface: wire.interface, dns: wire.dns }
+}
+
+fn rule_lines(text: Option<String>) -> Vec<String> {
+    text.unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+}
+
+/// Starts the proxy-only session: `rules` the split list text with the
+/// proxies in it, `network` {"interface":"en0","dns":["192.0.2.1"]}.
+/// Null on failure, with the reason in `*error` (free with ac_string_free).
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_start(rules: *const c_char, network: *const c_char, support: *const c_char,
+                                      boot: *const c_char, no_routes: bool, error: *mut *mut c_char) -> *mut ProxyOnlyHandle {
+    let support = c_str(support).unwrap_or_default();
+    let result = crate::proxy_only::ProxyOnly::start(rule_lines(c_str(rules)), proxy_network(c_str(network)),
+                                                     std::path::Path::new(&support), c_str(boot).unwrap_or_default(),
+                                                     if no_routes { 25353 } else { 53 }, no_routes);
+    match result {
+        Ok(session) => Box::into_raw(Box::new(ProxyOnlyHandle(std::sync::Mutex::new(session)))),
+        Err(reason) => {
+            if !error.is_null() { unsafe { *error = owned(reason.to_owned()) }; }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_update_rules(handle: *mut ProxyOnlyHandle, rules: *const c_char) {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return };
+    handle.0.lock().unwrap().update_rules(rule_lines(c_str(rules)));
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_update_network(handle: *mut ProxyOnlyHandle, network: *const c_char) {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return };
+    handle.0.lock().unwrap().update_network(proxy_network(c_str(network)));
+}
+
+/// The panel's split status for this session (same keys as the engine's).
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_status(handle: *mut ProxyOnlyHandle) -> *mut c_char {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return owned("{}".into()) };
+    owned(handle.0.lock().unwrap().status_json())
+}
+
+/// Stops the session (DNS entry first) and frees the handle.
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_stop(handle: *mut ProxyOnlyHandle) {
+    if handle.is_null() { return; }
+    let handle = unsafe { Box::from_raw(handle) };
+    handle.0.lock().unwrap().stop();
+}
+
+/// Whether it should run now (§69.20): the decision is the core's.
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_should_run(wanted: bool, engine_active: bool, cisco_active: bool) -> bool {
+    crate::proxy_only::should_run(wanted, engine_active, cisco_active)
+}
+
+/// A crashed service's DNS entry, removed at the next start.
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_remove_leftover() {
+    crate::proxy_only::remove_leftover();
+}

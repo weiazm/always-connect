@@ -31,4 +31,12 @@ if ! printf '%s\n' "$RULES" | grep -q 'anchor "com.apple/\*"'; then
     [ -z "$RULES" ] || { echo "non-default pf rules present: refusing to replace them" >&2; exit 1; }
     /sbin/pfctl -f /etc/pf.conf >/dev/null 2>&1
 fi
-"$CHECK"
+"$CHECK" || exit 1
+# Proxies with Cisco off (§69.20): our DNS entry, the system resolver,
+# the redirect, and the stop. Its own cleanup on every path; the entry is
+# removed here too in case the check died.
+ONLY="${2:-}"
+if [ -n "$ONLY" ]; then
+    trap 'cleanup; printf "open\nremove State:/Network/Service/AlwaysConnect-Proxy/DNS\nclose\n" | /usr/sbin/scutil >/dev/null 2>&1' EXIT
+    "$ONLY"
+fi

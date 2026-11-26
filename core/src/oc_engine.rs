@@ -390,13 +390,6 @@ pub struct Info {
     pub tail: Vec<String>,
 }
 
-/// The proxied sites of one split session (§69).
-struct ProxySession {
-    routing: Arc<crate::split_proxy::Routing>,
-    listener: Option<crate::split_proxy::Listener>,
-    /// The pf text now loaded in the proxy anchor.
-    loaded: Option<String>,
-}
 
 struct Child {
     pid: i32,
@@ -468,7 +461,7 @@ struct Core {
     pf_needs_load: bool,
     forwarder: Option<Forwarder>,
     /// Proxied sites (§69) while the split runs with proxy rules.
-    proxy: Option<ProxySession>,
+    proxy: Option<crate::split_proxy::RedirectSession>,
     physical_gateway: Option<String>,
     local_dns: Vec<String>,
     routed_networks: HashSet<String>,
@@ -1284,53 +1277,9 @@ impl Shared {
     /// cannot be reached at all, never reached another way.
     fn sync_proxy(&self, c: &mut Core) {
         let table = crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default());
-        if c.forwarder.is_none() || table.is_empty() { self.stop_proxy(c); return; }
-        // Networks inside the Mac's own LAN stay local, like the direct list's.
-        let networks = direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks());
-        let udp = table.carries_udp();
-        match &c.proxy {
-            Some(session) => session.routing.set_table(table),
-            None => c.proxy = Some(ProxySession {
-                routing: crate::split_proxy::Routing::new(table), listener: None, loaded: None,
-            }),
-        }
-        let session = c.proxy.as_mut().expect("just set");
-        if let Some(f) = &c.forwarder {
-            f.set_proxy(Some(session.routing.clone()));
-            // A proxy on this Mac resolves through us too: its own
-            // connections get real addresses by the ordinary split.
-            let inner = Arc::downgrade(f.inner());
-            session.routing.set_resolver(Some(Arc::new(move |name: &str| {
-                inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
-            })));
-        }
-        // Tests and the session harness have no pf: answers only.
-        if c.config.no_routes { return; }
-        if session.listener.is_none() {
-            match crate::split_proxy::pf_original_destination()
-                .and_then(|original| crate::split_proxy::Listener::start(session.routing.clone(), original)) {
-                Ok(listener) => session.listener = Some(listener),
-                Err(e) => network_guard::log(&format!("split proxy: listener did not start: {e}")),
-            }
-        }
-        let wanted: HashSet<String> = std::iter::once(crate::split_proxy::FAKE_NETWORK.to_owned()).chain(networks.iter().cloned()).collect();
-        let actual: HashSet<String> = self.proxy_routes.managed_addresses().into_iter().collect();
-        let gone: Vec<_> = actual.difference(&wanted).cloned().collect();
-        let new: Vec<_> = wanted.difference(&actual).cloned().collect();
-        let removed = self.proxy_routes.remove(&gone);
-        let added = self.proxy_routes.add(&new, "127.0.0.1");
-        let routed: HashSet<String> = self.proxy_routes.addresses().into_iter().collect();
-        if !removed || !added || routed != wanted { network_guard::log("split proxy: loopback routes not confirmed"); }
-        let tcp = session.listener.as_ref().map(|l| l.port());
-        let udp_port = session.listener.as_ref().filter(|_| udp).map(|l| l.udp_port());
-        let text = crate::pf::proxy_redirect(tcp, udp_port, &networks);
-        if session.loaded.as_deref() != Some(text.as_str()) {
-            match self.guard.proxy_redirect(Some(&text)) {
-                Ok(()) => session.loaded = Some(text.clone()),
-                Err(e) => { session.loaded = None; network_guard::log(&format!("split proxy: pf redirect failed: {e}")); }
-            }
-        }
-        let redirected = tcp.is_some() && routed == wanted && session.loaded.as_deref() == Some(text.as_str());
+        let Some(forwarder) = c.forwarder.as_ref() else { self.stop_proxy(c); return; };
+        let redirected = crate::split_proxy::redirect::sync(&mut c.proxy, table, forwarder, &self.proxy_routes,
+                                                            Some(&self.guard), c.config.no_routes);
         if !redirected {
             c.last_error = Some(PROXY_START_ERROR.into());
             self.report(c, PROXY_START_ERROR);
@@ -1340,13 +1289,8 @@ impl Shared {
     }
 
     fn stop_proxy(&self, c: &mut Core) {
-        let Some(mut session) = c.proxy.take() else { return };
-        if let Some(f) = &c.forwarder { f.set_proxy(None); }
-        if !c.config.no_routes {
-            if let Err(e) = self.guard.proxy_redirect(None) { network_guard::log(&format!("split proxy: pf redirect not removed: {e}")); }
-            if !self.proxy_routes.remove_all() { network_guard::log("split proxy: loopback route removal not confirmed"); }
-        }
-        if let Some(listener) = session.listener.as_mut() { listener.stop(); }
+        crate::split_proxy::redirect::stop(&mut c.proxy, c.forwarder.as_ref(), &self.proxy_routes,
+                                           Some(&self.guard), c.config.no_routes);
         if c.last_error.as_deref() == Some(PROXY_START_ERROR) { c.last_error = None; }
     }
 
