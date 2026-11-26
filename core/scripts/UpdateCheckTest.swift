@@ -72,6 +72,31 @@ struct UpdateCheckTest {
             expect(u.version == "0.3.0" && !u.prerelease, "later-release-shows")
         } else { expect(false, "later-release-shows") }
 
+        // "更新" looks once more and installs the newest, not the find
+        // shown (§69.12): a stand-in script reports the tag it was given.
+        let stub = NSTemporaryDirectory() + "update-tag-\(getpid()).sh"
+        try? "echo \"错误：TAG=$2\"; exit 1\n".write(toFile: stub, atomically: true, encoding: .utf8)
+        UpdateChecker.installScript = stub
+        UpdateChecker.store.removeObject(forKey: "updateSkippedVersion")
+        let shown = UpdateChecker.Available(version: "0.2.0-beta.1", tag: "v0.2.0-beta.1",
+                                            url: URL(string: "https://github.com/o/r/releases/tag/v0.2.0-beta.1")!,
+                                            prerelease: true)
+        setenv("ALWAYSCONNECT_UPDATE_URL", base + "later.json", 1)
+        UpdateChecker.shared.install(shown)
+        let installDeadline = Date().addingTimeInterval(20)
+        while UpdateChecker.shared.installing && Date() < installDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        expect(UpdateChecker.shared.installError == "TAG=v0.3.0", "update-installs-the-newest-release")
+        // Offline: the release shown.
+        setenv("ALWAYSCONNECT_UPDATE_URL", closed, 1)
+        UpdateChecker.shared.install(shown)
+        while UpdateChecker.shared.installing && Date() < installDeadline.addingTimeInterval(20) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        expect(UpdateChecker.shared.installError == "TAG=v0.2.0-beta.1", "offline-update-installs-the-shown-release")
+        try? FileManager.default.removeItem(atPath: stub)
+
         // Once this version is installed, the stored find no longer shows.
         UpdateChecker.currentVersion = "0.3.0"
         UpdateChecker.shared.checkIfDue()

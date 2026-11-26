@@ -2,11 +2,13 @@ import SwiftUI
 
 /// The update notice in the menu-bar panel (UI-DESIGN.md §四, DESIGN.md
 /// §三十三): only while a newer release is known; nothing otherwise.
+/// One click on 更新 starts it (user, 2026-11-26: "我点了更新为什么下面
+/// 还要再点一遍"); what happens is said before the click, in the tooltip
+/// and the line under it.
 struct UpdateBanner: View {
     @ObservedObject var updates = UpdateChecker.shared
     /// Close the panel (the browser takes the focus anyway).
     var onOpen: () -> Void = {}
-    @State private var confirming = false
 
     var body: some View {
         if let update = updates.available {
@@ -29,28 +31,22 @@ struct UpdateBanner: View {
                         .buttonStyle(.borderless)
                         .font(.caption)
                         .help("在浏览器里打开这个版本的发布页")
-                        if !confirming {
-                            Button("更新") { confirming = true }
-                                .font(.caption)
-                                .help("下载、校验并换上新版，然后自动重新打开")
-                        }
+                        Button("更新") { updates.install(update) }
+                            .font(.caption)
+                            .help(UpdateSteps.what)
                     }
                 }
-                UpdateProgress(update: update, confirming: $confirming) {
-                    updates.install(update)
-                }
+                UpdateProgress(update: update)
             }
         }
     }
 }
 
-/// The line under "有新版本": the confirmation, the download, or why it
-/// stopped. Shared by the panel and Settings.
+/// The line under "有新版本": the download, or why it stopped. Shared by
+/// the panel and Settings.
 struct UpdateProgress: View {
     @ObservedObject var updates = UpdateChecker.shared
     let update: UpdateChecker.Available
-    @Binding var confirming: Bool
-    let start: () -> Void
 
     var body: some View {
         if updates.installing {
@@ -66,24 +62,6 @@ struct UpdateProgress: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        } else if confirming {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(UpdateSteps.confirm)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 8) {
-                    Spacer()
-                    Button("取消") { confirming = false }
-                        .font(.caption)
-                    Button("继续更新") {
-                        confirming = false
-                        start()
-                    }
-                    .font(.caption)
-                    .keyboardShortcut(.defaultAction)
                 }
             }
         } else if let error = updates.installError {
@@ -115,19 +93,15 @@ extension UpdateProgress {
 }
 
 enum UpdateSteps {
-    static let confirm = "更新会退出并重新打开 AlwaysConnect：VPN 断开一下后自动重新连接，可能要在手机上再确认一次登录。"
-        + "后台服务也要更新时，新版打开后会请你输一次电脑密码。"
-    static let full = "点\u{201C}立即更新\u{201D}会下载并校验新版，然后自动退出、换上新版并重新打开。"
-        + "也可以在终端执行下面的命令，效果相同（以后装新版也用它）。"
+    /// Said before the click, so the click itself needs no confirmation.
+    static let what = "下载并校验新版，然后自动退出、换上新版并重新打开；VPN 断开几秒后自动重连。"
 }
 
 /// Settings → General → 版本 (UI-DESIGN.md §六): this version, a button
-/// that checks now, and what it found.
+/// that checks now, and what it found; 更新 starts at once.
 struct UpdateSection: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @State private var message: String?
-    @State private var copied = false
-    @State private var confirming = false
     @State private var startedFromSettings = false
 
     var body: some View {
@@ -137,52 +111,41 @@ struct UpdateSection: View {
                     Text(UpdateChecker.currentVersion)
                         .foregroundStyle(.secondary)
                     Button(updates.checking ? "正在检查…" : "检查更新") { checkNow() }
-                        .disabled(updates.checking)
+                        .disabled(updates.checking || updates.installing)
                 }
             }
             if let update = updates.available {
-                LabeledContent("有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")") {
+                LabeledContent {
                     HStack(spacing: 8) {
-                        Button("跳过这个版本") {
-                            updates.skip(update)
-                            message = "已跳过 \(update.version)，更新的版本出来时会再提示"
+                        Menu("更多") {
+                            Button("跳过这个版本") {
+                                updates.skip(update)
+                                message = "已跳过 \(update.version)，更新的版本出来时会再提示"
+                            }
+                            Button("打开发布页") { updates.openReleasePage(update) }
                         }
-                        Button("打开发布页") { updates.openReleasePage(update) }
-                        Button("立即更新") { confirming = true }
-                            .disabled(confirming || updates.installing || startedFromSettings)
+                        .fixedSize()
+                        Button("更新到 \(update.version)") { start(update) }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(updates.installing || startedFromSettings)
                     }
                     .disabled(updates.installing)
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("有新版本 \(update.version)\(update.prerelease ? "（预发布）" : "")")
+                        Text(UpdateSteps.what)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-                if startedFromSettings {
-                    Text("已开始更新：新版下载并校验好后，AlwaysConnect 会自动退出并打开新版；出了问题会在菜单栏面板里说明。")
+                if startedFromSettings && !updates.installing {
+                    Text("正在更新：下载并校验好后会自动退出并打开新版；出了问题会在菜单栏面板里说明。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    UpdateProgress(update: update, confirming: $confirming) {
-                        // The menu-bar App does it: it is the one that quits
-                        // and its panel shows a failure (§32.15).
-                        if AppRole.isSettings {
-                            SettingsLink.shared.send("installUpdate")
-                            startedFromSettings = true
-                        } else {
-                            updates.install(update)
-                        }
-                    }
-                }
-                Text(UpdateSteps.full)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                LabeledContent {
-                    Button(copied ? "已复制" : "复制") {
-                        UpdateChecker.copyInstallCommand()
-                        copied = true
-                    }
-                } label: {
-                    Text(UpdateChecker.installCommand)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
+                    UpdateProgress(update: update)
                 }
             }
             if let message {
@@ -201,8 +164,20 @@ struct UpdateSection: View {
         }
     }
 
+    /// The menu-bar App does it: it is the one that quits and its panel
+    /// shows a failure (§32.15).
+    private func start(_ update: UpdateChecker.Available) {
+        message = nil
+        if AppRole.isSettings {
+            SettingsLink.shared.send("installUpdate")
+            startedFromSettings = true
+        } else {
+            updates.install(update)
+        }
+    }
+
     private var footer: String {
-        var text = "每天自动查一次 GitHub 上的发布（含预发布），有新版只在菜单栏面板里提示，你点\u{201C}更新\u{201D}才会下载安装。"
+        var text = "每天自动查一次 GitHub 上的发布（含预发布）；有新版时这里和菜单栏面板都会提示，点「更新」才下载安装。"
         if let last = updates.lastSuccess {
             let f = DateFormatter()
             f.locale = Locale(identifier: "zh_CN")
@@ -216,7 +191,7 @@ struct UpdateSection: View {
         message = nil
         updates.check { outcome in
             switch outcome {
-            case .newer(let update): message = "有新版本 \(update.version)"
+            case .newer: message = nil  // the row above says it
             case .skipped(let version): message = "最新的是 \(version)，你之前选了跳过它"
             case .current: message = "已是最新版本"
             case .unreadable: message = "暂时无法检查：发布页不可访问（仓库未公开或访问次数受限），过一会儿再试"
