@@ -84,6 +84,13 @@ final class UpdateChecker: ObservableObject {
         static let lastFailed = "updateLastFailed"
         static let found = "updateFound"          // [tag, url, prerelease] of the last newer one
         static let skipped = "updateSkippedVersion"
+        /// The releases list's ETag: an unchanged list answers 304, which
+        /// GitHub does not count against its hourly limit.
+        static let etag = "updateETag"
+        /// What that list was decided as, and for which version and skip:
+        /// a 304 repeats it only while both are the same.
+        static let etagContext = "updateETagContext"
+        static let lastOutcome = "updateLastOutcome"
     }
 
     static let dayInterval: TimeInterval = 24 * 3600
@@ -112,6 +119,20 @@ final class UpdateChecker: ObservableObject {
         if now - attempt >= wait { check { _ in } }
     }
 
+    /// Every time the panel opens (user, 2026-11-26: "每次打开这个面板都顺带
+    /// 检查一下有没有新版本app，有就显示更新按钮啊"), at most every 30 s.
+    /// A conditional request: an unchanged list costs nothing.
+    func checkOnPanelOpen() {
+        reload()
+        let attempt = defaults.double(forKey: Key.lastAttempt)
+        if Date().timeIntervalSince1970 - attempt >= Self.panelInterval { check { _ in } }
+    }
+
+    static let panelInterval: TimeInterval = 30
+
+    /// This App's version and the skipped one: a stored answer holds only for both.
+    private static var etagContext: String { currentVersion + "|" + (store.string(forKey: Key.skipped) ?? "") }
+
     /// One request now (the "检查更新" button, or a due check).
     func check(done: @escaping (Outcome) -> Void) {
         guard !checking else { return }
@@ -125,6 +146,9 @@ final class UpdateChecker: ObservableObject {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         request.setValue("AlwaysConnect/\(Self.currentVersion)", forHTTPHeaderField: "User-Agent")
+        if let etag = defaults.string(forKey: Key.etag), defaults.string(forKey: Key.etagContext) == Self.etagContext {
+            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        }
         // Ephemeral and torn down after the one answer (§32.1): no
         // cache, cookies or connection pool stays behind.
         let configuration = URLSessionConfiguration.ephemeral
@@ -133,13 +157,43 @@ final class UpdateChecker: ObservableObject {
         let session = URLSession(configuration: configuration)
         session.dataTask(with: request) { [weak self] data, response, _ in
             session.finishTasksAndInvalidate()
+            let http = response as? HTTPURLResponse
+            if http?.statusCode == 304 {
+                // Same list as last time: what it said then still holds,
+                // decided again for this version and the skip.
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.checking = false
+                    self.defaults.set(false, forKey: Key.lastFailed)
+                    self.defaults.set(Date().timeIntervalSince1970, forKey: Key.lastSuccess)
+                    self.reload()
+                    let last = self.defaults.string(forKey: Key.lastOutcome) ?? ""
+                    let outcome: Outcome = self.available.map(Outcome.newer)
+                        ?? (last.hasPrefix("skipped:") ? .skipped(String(last.dropFirst(8))) : .current)
+                    done(outcome)
+                }
+                return
+            }
             let outcome: Outcome
             if let data, response != nil {
                 outcome = Self.decide(body: String(decoding: data, as: UTF8.self))
             } else {
                 outcome = .failed
             }
+            let etag = http?.statusCode == 200 ? http?.value(forHTTPHeaderField: "ETag") : nil
             DispatchQueue.main.async {
+                // A list that was read: remember its ETag; otherwise ask in full next time.
+                let read: Bool
+                switch outcome {
+                case .newer, .current, .skipped: read = true
+                case .unreadable, .failed: read = false
+                }
+                if read, let etag {
+                    Self.store.set(etag, forKey: Key.etag)
+                    Self.store.set(Self.etagContext, forKey: Key.etagContext)
+                } else {
+                    Self.store.removeObject(forKey: Key.etag)
+                }
                 self?.finish(outcome)
                 done(outcome)
             }
@@ -361,6 +415,12 @@ final class UpdateChecker: ObservableObject {
     private func finish(_ outcome: Outcome) {
         checking = false
         defaults.set(outcome == .failed || outcome == .unreadable, forKey: Key.lastFailed)
+        switch outcome {
+        case .newer: defaults.set("newer", forKey: Key.lastOutcome)
+        case .skipped(let version): defaults.set("skipped:" + version, forKey: Key.lastOutcome)
+        case .current: defaults.set("current", forKey: Key.lastOutcome)
+        case .unreadable, .failed: break
+        }
         switch outcome {
         case .newer(let update):
             defaults.set(Date().timeIntervalSince1970, forKey: Key.lastSuccess)

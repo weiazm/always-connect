@@ -103,6 +103,31 @@ struct UpdateCheckTest {
         expect(UpdateChecker.shared.available == nil, "installed-version-hides")
         expect(check(base, "later.json") == .current, "current")
 
+        // Several newer releases: the newest at once (user, 2026-11-26:
+        // "直接检查到最新版本，不是一个一个版本升").
+        if case .newer(let u) = check(base, "several.json") {
+            expect(u.version == "0.9.0", "several-newer-offers-the-newest")
+        } else { expect(false, "several-newer-offers-the-newest") }
+        // Asked again unchanged: a 304, which keeps the find (and costs
+        // nothing against GitHub's limit).
+        let log = ProcessInfo.processInfo.environment["AC_REQUEST_LOG"] ?? ""
+        let before = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+        if case .newer(let u) = check(base, "several.json") {
+            expect(u.version == "0.9.0" && UpdateChecker.shared.available?.version == "0.9.0", "unchanged-list-keeps-the-find")
+        } else { expect(false, "unchanged-list-keeps-the-find") }
+        let after = (try? String(contentsOfFile: log, encoding: .utf8)) ?? ""
+        expect(after.dropFirst(before.count).contains("/several.json 304"), "unchanged-list-answers-304")
+        // The panel asks on every opening, at most every 30 s.
+        UpdateChecker.shared.checkOnPanelOpen()
+        expect(!UpdateChecker.shared.checking, "panel-open-right-after-a-check-asks-nothing")
+        UpdateChecker.store.set(Date().timeIntervalSince1970 - 31, forKey: "updateLastAttempt")
+        UpdateChecker.shared.checkOnPanelOpen()
+        expect(UpdateChecker.shared.checking, "panel-open-after-30-s-asks-again")
+        let openDeadline = Date().addingTimeInterval(20)
+        while UpdateChecker.shared.checking && Date() < openDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+
         UserDefaults().removePersistentDomain(forName: suite)
         print(failures == 0 ? "update-check: all passed" : "update-check: \(failures) failed")
         exit(failures == 0 ? 0 : 1)
