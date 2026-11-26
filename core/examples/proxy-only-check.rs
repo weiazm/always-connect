@@ -148,8 +148,10 @@ mod macos {
 
         // Optional Hysteria2 end-to-end root check (§七十): when AC_HY2_BIN is set,
         // start a local Hysteria2 server, run ProxyOnly with a managed Hysteria2 proxy,
-        // connect by domain through system resolver -> pf -> managed hysteria -> server -> echo site,
-        // then stop and verify zero leftovers.
+        // and connect as an app does: the system resolver gives our address, pf
+        // sends the connection to our relay, the relay hands the name to the
+        // managed client (as nobody), the client to the server, and the server's
+        // ACL points the test name at the local echo site. Then stop, no leftovers.
         if let Ok(hy_bin) = std::env::var("AC_HY2_BIN") {
             if !hy_bin.is_empty() {
                 run_hysteria_check(&hy_bin, site)?;
@@ -188,11 +190,13 @@ mod macos {
         let auth = "root-check-auth";
         let cfg = work.join("server.json");
         let log = work.join("server.log");
-        // Route all TCP from the Hysteria2 server to our local echo site via direct outbound + loopback
+        // The server sends the test name to the local echo site (ACL hijack,
+        // same port) and refuses everything else: nothing leaves the runner.
         std::fs::write(&cfg, serde_json::json!({
             "listen": format!("127.0.0.1:{port}"),
             "tls": { "cert": crt.to_str().unwrap(), "key": key.to_str().unwrap() },
             "auth": { "type": "password", "password": auth },
+            "acl": { "inline": [format!("direct(suffix:{SITE}, *, 127.0.0.1)"), "reject(all)"] },
         }).to_string()).map_err(|e| e.to_string())?;
         let log_file = std::fs::File::create(&log).map_err(|e| e.to_string())?;
         let srv = std::process::Command::new(hy_bin)
@@ -248,6 +252,17 @@ mod macos {
             let mut got = [0u8; 11];
             s.read_exact(&mut got).map_err(|e| format!("read back: {e}"))?;
             if &got != b"hy2-root-ok" { return Err("wrong bytes back through hysteria2".into()); }
+            println!("hysteria2: the managed client's local SOCKS5 reaches the echo site");
+            // As an app: our address from the system resolver, pf, our relay,
+            // the managed client, the server, the echo site.
+            let mut app = TcpStream::connect_timeout(&SocketAddr::from((proxied[0], site.port())), Duration::from_secs(5))
+                .map_err(|e| format!("hysteria2: app connect: {e}"))?;
+            app.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+            app.write_all(b"hy2-app-ok!").map_err(|e| e.to_string())?;
+            let mut back = [0u8; 11];
+            app.read_exact(&mut back).map_err(|e| format!("hysteria2: app read back: {e}"))?;
+            if &back != b"hy2-app-ok!" { return Err("hysteria2: wrong bytes back on the app path".into()); }
+            println!("hysteria2: an app's connection by name went system resolver -> pf -> relay -> managed client -> server");
             Ok(())
         })();
         stage("hysteria2 proxy-only stop");
