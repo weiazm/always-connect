@@ -84,6 +84,7 @@ system_and_user_files_gone() {
     gone "$R/Applications/AlwaysConnect.app"
     logged "reset-network --keep-unloaded"
     logged "launchctl bootout system/com.alwaysconnect.app.helper"
+    logged "launchctl bootout system/com.alwaysconnect.app.service-swap"
 }
 
 cisco_untouched() {

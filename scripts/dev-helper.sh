@@ -63,6 +63,75 @@ start_service() {
     done
     launchctl bootstrap system "$PLIST"
 }
+
+# The swap of the service as a launchd job of its own (DESIGN.md §69.15).
+# When the service updates itself after the user's approval, it starts
+# this script, and launchd ends everything a service started once that
+# service exits: on 2026-11-26 the script died right after stopping the
+# old service and the new one was never loaded. The files are installed
+# first, with the old service still running; then this job, which no
+# service owns, stops the old one and loads the new.
+SWAP_LABEL=com.alwaysconnect.app.service-swap
+SWAP_PLIST="$SUPPORT/service-swap.plist"
+SWAP_SCRIPT="$SUPPORT/service-swap.sh"
+
+inside_service() {
+    local pid=$$ i command
+    for i in 1 2 3 4 5 6 7 8; do
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null || return 1
+        command=$(ps -o command= -p "$pid" 2>/dev/null)
+        case "$command" in "$BIN"|"$BIN "*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Root-private copies only (SUPPORT is root's, 0700): root never runs
+# anything from a place others can write.
+start_swap_job() {
+    launchctl bootout "system/$SWAP_LABEL" 2>/dev/null || true
+    cp "$0" "$SWAP_SCRIPT"
+    chown root:wheel "$SWAP_SCRIPT"
+    chmod 700 "$SWAP_SCRIPT"
+    cat > "$SWAP_PLIST" <<SWAPJOB
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$SWAP_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$SWAP_SCRIPT</string>
+    <string>swap</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOGDIR/service-update.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOGDIR/service-update.log</string>
+</dict>
+</plist>
+SWAPJOB
+    chown root:wheel "$SWAP_PLIST"
+    chmod 644 "$SWAP_PLIST"
+    launchctl bootstrap system "$SWAP_PLIST"
+}
+
+swap_service() {
+    stop_service
+    # An older daemon did not take its openconnect down on SIGTERM. HUP:
+    # leave without logging the session off, so the App's reconnect can
+    # reuse the cookie (DESIGN.md §26.17).
+    pkill -HUP -f "^[^ ]*/openconnect .*alwaysconnect-vpnc\.sh" 2>/dev/null || true
+    start_service
+    # Start it now (no RunAtLoad, DESIGN.md §25.6): a hold the replaced
+    # daemon left is adopted and, with no App attached, released after
+    # the grace period instead of waiting for the next App launch.
+    launchctl kickstart "system/$LABEL" 2>/dev/null || true
+}
 # <<< service-swap
 
 recover() {
@@ -92,11 +161,14 @@ install)
     need_root
     src=${2:-"$ROOT/.local-build/AlwaysConnect.app/Contents/Library/LaunchDaemons/AlwaysConnectHelper"}
     [ -x "$src" ] || { echo "build first: scripts/build-local.sh" >&2; exit 1; }
-    stop_service
-    # An older daemon did not take its openconnect down on SIGTERM. HUP:
-    # leave without logging the session off, so the App's reconnect can
-    # reuse the cookie (DESIGN.md §26.17).
-    pkill -HUP -f "^[^ ]*/openconnect .*alwaysconnect-vpnc\.sh" 2>/dev/null || true
+    # Started by the service itself: install the files now and leave the
+    # swap to a job of its own, which outlives the old service.
+    from_service=0
+    inside_service && from_service=1
+    if [ $from_service = 0 ]; then
+        stop_service
+        pkill -HUP -f "^[^ ]*/openconnect .*alwaysconnect-vpnc\.sh" 2>/dev/null || true
+    fi
     mkdir -p /Library/PrivilegedHelperTools "$LOGDIR"
     chmod 700 "$LOGDIR"
     install -o root -g wheel -m 755 "$src" "$BIN"
@@ -168,18 +240,30 @@ EOF
     chown root:wheel "$PLIST"
     chmod 644 "$PLIST"
     plutil -lint -s "$PLIST"
-    start_service
-    # Start it now (no RunAtLoad, DESIGN.md §25.6): a hold the replaced
-    # daemon left is adopted and, with no App attached, released after
-    # the grace period instead of waiting for the next App launch.
-    launchctl kickstart "system/$LABEL" 2>/dev/null || true
-    echo "installed; log: sudo tail -f $LOGDIR/helper.log"
+    if [ $from_service = 1 ]; then
+        start_swap_job
+        echo "installed; a separate job swaps the service in a moment"
+    else
+        start_service
+        launchctl kickstart "system/$LABEL" 2>/dev/null || true
+        echo "installed; log: sudo tail -f $LOGDIR/helper.log"
+    fi
+    ;;
+swap)
+    # The job started by an update from the service (start_swap_job).
+    need_root
+    echo "$(date '+%F %T') swapping the service"
+    swap_service || echo "the new service did not load" >&2
+    rm -f "$SWAP_PLIST" "$SWAP_SCRIPT"
+    # Last: removing this job ends this script.
+    launchctl bootout "system/$SWAP_LABEL" 2>/dev/null || true
     ;;
 uninstall)
     need_root
     recover
     stop_service
-    rm -f "$PLIST" "$BIN"
+    launchctl bootout "system/$SWAP_LABEL" 2>/dev/null || true
+    rm -f "$PLIST" "$BIN" "$SWAP_PLIST" "$SWAP_SCRIPT"
     rm -rf "$OCDIR"
     echo "uninstalled (log kept in $LOGDIR)"
     ;;
