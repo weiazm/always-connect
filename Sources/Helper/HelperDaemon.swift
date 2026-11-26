@@ -44,9 +44,14 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
         Self.endOwnProcesses(includeChildren: false)
         ac_hysteria_clean_runtime()
         if TestSeam.isActive, let testHy = ProcessInfo.processInfo.environment["ALWAYSCONNECT_TEST_HYSTERIA"], !testHy.isEmpty {
-            ac_hysteria_set_binary(testHy, true, true)
+            ac_hysteria_set_binary(testHy, nil, true)
         } else {
-            ac_hysteria_set_binary(ClientRequirement.hysteriaPath, ClientRequirement.verifiesHysteria(), false)
+            // The signature is checked when a client is first about to run
+            // (and again if the file changes), not on every service start.
+            ac_hysteria_set_binary(ClientRequirement.hysteriaPath, { path in
+                guard let path else { return false }
+                return ClientRequirement.verifiesHysteria(atPath: String(cString: path))
+            }, false)
         }
         // The network gate (DESIGN.md §25.2): adopt a hold from this
         // boot (blocking set, grace clock running until an App is
@@ -1250,7 +1255,7 @@ private final class GatewayLookupLease: @unchecked Sendable {
 @_silgen_name("ac_gateway_free") func ac_gateway_free(_ lease: OpaquePointer)
 
 @_silgen_name("ac_login_direct_interface") private func ac_login_direct_interface() -> UnsafeMutablePointer<CChar>?
-@_silgen_name("ac_hysteria_set_binary") private func ac_hysteria_set_binary(_ path: UnsafePointer<CChar>, _ verified: Bool, _ testMode: Bool)
+@_silgen_name("ac_hysteria_set_binary") private func ac_hysteria_set_binary(_ path: UnsafePointer<CChar>, _ verifier: (@convention(c) (UnsafePointer<CChar>?) -> Bool)?, _ testMode: Bool)
 @_silgen_name("ac_hysteria_stop_all") private func ac_hysteria_stop_all()
 @_silgen_name("ac_hysteria_clean_runtime") private func ac_hysteria_clean_runtime()
 @_silgen_name("ac_hysteria_probe") private func ac_hysteria_probe(_ server: UnsafePointer<CChar>, _ rules: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

@@ -2201,12 +2201,15 @@ pub extern "C" fn ac_hysteria_parse_uri(uri: *const c_char) -> *mut c_char {
     CString::new(json.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 
-/// Configures the bundled Hysteria2 binary path and whether the platform shell
-/// verified its code signature against this service's leaf certificate.
+/// The bundled Hysteria2 client's path and the platform shell's signature
+/// check (this service's leaf certificate), run before a client first runs
+/// and again whenever the file changes. `test_mode`: harnesses only.
 #[no_mangle]
-pub extern "C" fn ac_hysteria_set_binary(path: *const c_char, verified: bool, test_mode: bool) {
+pub extern "C" fn ac_hysteria_set_binary(path: *const c_char,
+                                         verifier: Option<crate::split_proxy::hysteria::Verifier>,
+                                         test_mode: bool) {
     if let Some(p) = c_str(path) {
-        crate::split_proxy::hysteria::configure_binary(std::path::PathBuf::from(p), verified, test_mode);
+        crate::split_proxy::hysteria::configure_binary(std::path::PathBuf::from(p), verifier, test_mode);
     }
 }
 

@@ -785,7 +785,7 @@ fn interop_with_a_reference_hysteria2_server() {
     let obfs_pw = std::env::var("AC_HY2_OBFS_PASS").ok().filter(|s| !s.is_empty());
     let (host, ports) = server.split_once(':').expect("host:ports");
 
-    hysteria::configure_binary(std::path::PathBuf::from(&bin), true, true);
+    hysteria::configure_binary(std::path::PathBuf::from(&bin), None, true);
 
     let spec = HysteriaSpec {
         host: host.to_owned(),

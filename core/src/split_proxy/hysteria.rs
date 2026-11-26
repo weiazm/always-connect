@@ -1013,10 +1013,39 @@ fn free_loopback_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Checks the bundled client's code signature against this service's own
+/// certificate (the platform shell does it: Security.framework).
+pub type Verifier = extern "C" fn(*const std::os::raw::c_char) -> bool;
+
+/// What a verified file looked like: a replaced or rewritten file is checked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BinaryConfig {
     path: PathBuf,
-    verified: bool,
+    verifier: Option<Verifier>,
+    /// The file as it was when its signature last checked out.
+    verified: Option<FileIdentity>,
     test_mode: bool,
 }
 
@@ -1024,51 +1053,68 @@ static BINARY_CONFIG: OnceLock<Mutex<BinaryConfig>> = OnceLock::new();
 
 fn binary_config() -> &'static Mutex<BinaryConfig> {
     BINARY_CONFIG.get_or_init(|| {
-        Mutex::new(BinaryConfig {
-            path: PathBuf::from(BUNDLED_BIN),
-            verified: false,
-            test_mode: false,
-        })
+        Mutex::new(BinaryConfig { path: PathBuf::from(BUNDLED_BIN), verifier: None, verified: None, test_mode: false })
     })
 }
 
-/// Called by the Helper after `ClientRequirement.verifiesHysteria()` succeeds,
-/// or by tests to configure a stand-in binary.
-pub fn configure_binary(path: PathBuf, verified: bool, test_mode: bool) {
+/// Set by the service at start: where the client is and how to check its
+/// signature. The check itself waits until a client is about to run, so a
+/// service start without Hysteria2 proxies never reads the 20-odd MB file.
+/// `test_mode` (non-root harnesses and examples): any existing file runs.
+pub fn configure_binary(path: PathBuf, verifier: Option<Verifier>, test_mode: bool) {
     let mut cfg = binary_config().lock().unwrap();
-    cfg.path = path;
-    cfg.verified = verified;
-    cfg.test_mode = test_mode;
+    *cfg = BinaryConfig { path, verifier, verified: None, test_mode };
 }
 
-/// Checks that the configured binary is safe to execute (root-private, not
-/// group/world-writable, no symlinks, and signature-verified when running as root
-/// outside test mode).
+/// Every directory from `path`'s parent up to `/`: a real directory, owned
+/// by root, writable by nobody else.
+fn root_private_ancestors(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    path.ancestors().skip(1).filter(|p| !p.as_os_str().is_empty()).all(|dir| {
+        std::fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.file_type().is_dir() && m.uid() == 0 && (m.mode() & 0o022) == 0)
+    })
+}
+
+/// The client to run, as root only a root-private file whose signature
+/// carries our certificate (checked once per file version, before its
+/// first run; DESIGN §七十, AGENTS 提权与进程边界).
 fn resolve_verified_binary() -> Result<PathBuf, &'static str> {
     use std::os::unix::fs::MetadataExt;
-    let cfg = binary_config().lock().unwrap().clone();
+    let mut cfg = binary_config().lock().unwrap();
     let is_root = unsafe { libc::geteuid() } == 0;
     if is_root && !cfg.test_mode {
-        if !cfg.verified {
-            return Err("未找到已验证签名的 Hysteria2 组件，请重新安装或更新后台服务");
-        }
         let meta = std::fs::symlink_metadata(&cfg.path)
             .map_err(|_| "未找到 Hysteria2 组件，请重新安装或更新后台服务")?;
         if !meta.file_type().is_file() || meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
             return Err("Hysteria2 组件权限异常，已拒绝启动");
         }
-        // Check ancestor directories up to /Library/PrivilegedHelperTools are not symlinks or world-writable.
-        if let Some(parent) = cfg.path.parent() {
-            let pmeta = std::fs::symlink_metadata(parent)
-                .map_err(|_| "Hysteria2 组件目录不可访问")?;
-            if !pmeta.file_type().is_dir() || pmeta.uid() != 0 || (pmeta.mode() & 0o022) != 0 {
-                return Err("Hysteria2 组件目录权限异常，已拒绝启动");
-            }
+        if !root_private_ancestors(&cfg.path) {
+            return Err("Hysteria2 组件目录权限异常，已拒绝启动");
         }
-        return Ok(cfg.path);
+        let identity = FileIdentity::of(&meta);
+        if cfg.verified != Some(identity) {
+            cfg.verified = None;
+            let Some(verifier) = cfg.verifier else {
+                return Err("未找到已验证签名的 Hysteria2 组件，请重新安装或更新后台服务");
+            };
+            let Ok(c_path) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(cfg.path.as_os_str())) else {
+                return Err("Hysteria2 组件路径无效");
+            };
+            if !verifier(c_path.as_ptr()) {
+                return Err("Hysteria2 组件签名不对，已拒绝启动，请重新安装或更新后台服务");
+            }
+            // Unchanged while it was being checked: this is the file that runs.
+            let after = std::fs::symlink_metadata(&cfg.path).map(|m| FileIdentity::of(&m));
+            if after.ok() != Some(identity) {
+                return Err("Hysteria2 组件在检查时被改动，已拒绝启动");
+            }
+            cfg.verified = Some(identity);
+        }
+        return Ok(cfg.path.clone());
     }
     if cfg.path.is_file() {
-        return Ok(cfg.path);
+        return Ok(cfg.path.clone());
     }
     if let Ok(env_path) = std::env::var("ALWAYSCONNECT_TEST_HYSTERIA") {
         let p = PathBuf::from(env_path);
@@ -1278,7 +1324,10 @@ pub fn shared() -> &'static HysteriaManager {
 
 impl HysteriaManager {
     /// Brings running Hysteria2 processes in line with `specs` for `routing`.
-    /// Unchanged entries stay running and are immediately re-bound into `routing`.
+    /// Unchanged entries stay running and are immediately re-bound into
+    /// `routing`. Never waits for DNS: a server named by a domain is looked
+    /// up again on a background thread, and its client is restarted only if
+    /// the address changed (a network switch, a dynamic-DNS server).
     pub fn sync(
         &self,
         specs: BTreeMap<usize, HysteriaSpec>,
@@ -1287,6 +1336,7 @@ impl HysteriaManager {
     ) {
         let mut to_stop = Vec::new();
         let mut to_start = Vec::new();
+        let mut recheck = Vec::new();
         {
             let mut st = self.inner.lock().unwrap();
             st.handover_token = st.handover_token.wrapping_add(1);
@@ -1296,18 +1346,7 @@ impl HysteriaManager {
 
             let existing: Vec<usize> = st.live.keys().copied().collect();
             for idx in existing {
-                let keep = specs.get(&idx).is_some_and(|want| {
-                    let proc = &st.live[&idx];
-                    if proc.spec != *want {
-                        return false;
-                    }
-                    // Also check if resolved IP changed (e.g. network switch)
-                    if let Some(ip) = resolve_host_ipv4(&want.host, resolver.as_ref()) {
-                        ip == proc.resolved_ip
-                    } else {
-                        true
-                    }
-                });
+                let keep = specs.get(&idx).is_some_and(|want| st.live[&idx].spec == *want);
                 if !keep {
                     if let Some(proc) = st.live.remove(&idx) {
                         to_stop.push(proc);
@@ -1315,6 +1354,9 @@ impl HysteriaManager {
                     st.backoff_steps.remove(&idx);
                 } else {
                     let proc = &st.live[&idx];
+                    if proc.spec.host.parse::<Ipv4Addr>().is_err() {
+                        recheck.push((idx, proc.spec.clone(), proc.resolved_ip, proc.generation));
+                    }
                     if proc.ready.load(Ordering::Acquire) {
                         routing.set_managed_ready(idx, proc.local_server.clone(), proc.resolved_ip, proc.spec.ports.clone());
                     } else if let Some(reason) = proc.last_reason.lock().unwrap().clone() {
@@ -1339,6 +1381,44 @@ impl HysteriaManager {
         }
         for (idx, spec, gen) in to_start {
             self.launch_slot(idx, spec, gen, routing.clone(), resolver.clone());
+        }
+        if !recheck.is_empty() {
+            let inner = self.inner.clone();
+            std::thread::Builder::new()
+                .name("ac-hy2-recheck".into())
+                .spawn(move || Self::recheck_addresses(inner, recheck, resolver))
+                .ok();
+        }
+    }
+
+    /// Restarts a running client whose server name now resolves to another
+    /// address; the same process, untouched in the meantime, only.
+    fn recheck_addresses(
+        inner: Arc<Mutex<ManagerInner>>,
+        running: Vec<(usize, HysteriaSpec, Ipv4Addr, u64)>,
+        resolver: Option<HostResolver>,
+    ) {
+        for (idx, spec, old_ip, gen) in running {
+            let Some(ip) = resolve_host_ipv4(&spec.host, resolver.as_ref()) else { continue };
+            if ip == old_ip {
+                continue;
+            }
+            let (stale, routing, resolver) = {
+                let mut st = inner.lock().unwrap();
+                if st.specs.get(&idx) != Some(&spec) || !st.live.get(&idx).is_some_and(|p| p.generation == gen) {
+                    continue;
+                }
+                let Some(routing) = st.routing.clone() else { continue };
+                st.backoff_steps.remove(&idx);
+                (st.live.remove(&idx), routing, st.resolver.clone())
+            };
+            network_guard::log(&format!("hysteria2[{idx}]: server address changed, restarting the client"));
+            if let Some(stale) = stale {
+                stale.terminate();
+            }
+            routing.set_managed_unavailable(idx, "正在连接 Hysteria2 代理".into());
+            let gen = shared().next_gen.fetch_add(1, Ordering::Relaxed);
+            shared().launch_slot(idx, spec, gen, routing, resolver);
         }
     }
 
@@ -1504,7 +1584,10 @@ impl HysteriaManager {
                 let child_slot = Arc::new(Mutex::new(Some(child)));
                 {
                     let mut st = inner.lock().unwrap();
-                    if st.specs.get(&idx) != Some(&spec) {
+                    // Gone from the wanted list, or another launch for this
+                    // slot (a retry racing a sync) got there first: one
+                    // client per slot, never an orphan.
+                    if st.specs.get(&idx) != Some(&spec) || st.live.contains_key(&idx) {
                         drop(st);
                         if let Some(mut c) = child_slot.lock().unwrap().take() {
                             terminate_child(&mut c);

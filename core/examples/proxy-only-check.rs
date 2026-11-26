@@ -212,7 +212,7 @@ mod macos {
             return Err(format!("hysteria server did not start: {}", detail.trim()));
         }
 
-        split_proxy::hysteria::configure_binary(std::path::PathBuf::from(hy_bin), true, true);
+        split_proxy::hysteria::configure_binary(std::path::PathBuf::from(hy_bin), None, true);
         let net = network()?;
         let lines = vec![
             format!("proxy:0 hysteria2 127.0.0.1 {port} auth={auth} sni=localhost pin={pin}"),

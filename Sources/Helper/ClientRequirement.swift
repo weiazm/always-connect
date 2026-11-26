@@ -53,9 +53,10 @@ enum ClientRequirement {
         verifiesBundledBinary(atPath: egressGatePath)
     }
 
-    /// The bundled official Hysteria2 client must carry our exact leaf certificate (§七十).
-    static func verifiesHysteria() -> Bool {
-        verifiesBundledBinary(atPath: hysteriaPath)
+    /// The bundled official Hysteria2 client must carry our exact leaf
+    /// certificate (§七十). Called by the core before a client first runs.
+    static func verifiesHysteria(atPath path: String) -> Bool {
+        path == hysteriaPath && verifiesBundledBinary(atPath: path)
     }
 
     private static func verifiesBundledBinary(atPath path: String) -> Bool {
