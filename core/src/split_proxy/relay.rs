@@ -259,7 +259,7 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
         routing.record(n, None);
         if let Ok(peer) = upstream.peer_addr() {
             routing.connected_to(n, peer);
-            leg = Some(Leg::of(peer.ip()));
+            leg = Some(routing.leg_for(n, peer.ip()));
         }
     }
     routing.opened();
@@ -374,7 +374,7 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         }
         let relay = Arc::new(relay);
         let _ = relay.set_read_timeout(Some(UDP_CHECK));
-        let leg = if raw { None } else { relay.peer_addr().ok().map(|peer| Leg::of(peer.ip())) };
+        let leg = if raw { None } else { relay.peer_addr().ok().map(|peer| routing.leg_for(n, peer.ip())) };
         {
             let mut table = flows.lock().unwrap();
             let Some(flow) = table.get_mut(&key) else { return };

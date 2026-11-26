@@ -33,6 +33,7 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
     // Networks inside the Mac's own LAN stay local, like the direct list's.
     let networks = direct_routes::networks_to_route(&table.networks(), &direct_routes::attached_networks());
     let udp = table.carries_udp();
+    let hysteria_specs = table.hysteria_specs();
     match session {
         Some(s) => s.routing.set_table(table),
         None => *session = Some(RedirectSession { routing: Routing::new(table), listener: None, loaded: None }),
@@ -42,9 +43,11 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
     // A proxy on this Mac resolves through us too: its own connections get
     // real addresses by the ordinary split.
     let inner = Arc::downgrade(forwarder.inner());
-    s.routing.set_resolver(Some(Arc::new(move |name: &str| {
+    let resolver: super::Resolver = Arc::new(move |name: &str| {
         inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
-    })));
+    });
+    s.routing.set_resolver(Some(resolver.clone()));
+    super::hysteria::shared().sync(hysteria_specs, s.routing.clone(), Some(resolver));
     if no_routes { return true; }
     if s.listener.is_none() {
         match super::pf_original_destination().and_then(|original| Listener::start(s.routing.clone(), original)) {
@@ -76,6 +79,18 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
 /// Takes the redirect, routes and listener out (answers stop first).
 pub fn stop(session: &mut Option<RedirectSession>, forwarder: Option<&Forwarder>, routes: &DirectRoutes,
             guard: Option<&Guard>, no_routes: bool) {
+    stop_with_handover(session, forwarder, routes, guard, no_routes, false);
+}
+
+/// Like `stop`, but when `handover` is true keeps managed Hysteria2 children
+/// alive across the brief handover between proxy-only and own-connection.
+pub fn stop_with_handover(session: &mut Option<RedirectSession>, forwarder: Option<&Forwarder>, routes: &DirectRoutes,
+                          guard: Option<&Guard>, no_routes: bool, handover: bool) {
+    if handover {
+        super::hysteria::shared().begin_handover();
+    } else {
+        super::hysteria::shared().stop_all();
+    }
     let Some(mut s) = session.take() else { return };
     if let Some(f) = forwarder { f.set_proxy(None); }
     if !no_routes {

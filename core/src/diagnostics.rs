@@ -99,7 +99,7 @@ mod tests {
     use super::*;
     #[test]
     fn unknown_fields_cannot_echo_arbitrary_payloads() {
-        let raw = "RAW_CANARY_7 USER_CANARY_7 203.0.113.73 backup-canary.example GROUP_CANARY_7";
+        let raw = "RAW_CANARY_7 USER_CANARY_7 203.0.113.73 backup-canary.example GROUP_CANARY_7 hysteria2://SECRET_AUTH@203.0.113.10:443/?obfs-password=SECRET_OBFS hy2://SECRET2@proxy.example.com";
         for kind in [
             "state",
             "detail",

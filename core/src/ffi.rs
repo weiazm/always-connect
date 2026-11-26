@@ -2176,9 +2176,75 @@ pub extern "C" fn ac_proxy_only_status(handle: *mut ProxyOnlyHandle) -> *mut c_c
 /// Stops the session (DNS entry first) and frees the handle.
 #[no_mangle]
 pub extern "C" fn ac_proxy_only_stop(handle: *mut ProxyOnlyHandle) {
+    ac_proxy_only_stop_handover(handle, false);
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_stop_handover(handle: *mut ProxyOnlyHandle, handover: bool) {
     if handle.is_null() { return; }
     let handle = unsafe { Box::from_raw(handle) };
-    handle.0.lock().unwrap().stop();
+    handle.0.lock().unwrap().stop_with_handover(handover);
+}
+
+// MARK: - Hysteria2 managed proxy (§七十)
+
+/// Parses a `hysteria2://` or `hy2://` share URI. Returns JSON:
+/// `{"ok": true, "uri": {...}}` or `{"ok": false, "error": "..."}`.
+/// Free with `ac_string_free`.
+#[no_mangle]
+pub extern "C" fn ac_hysteria_parse_uri(uri: *const c_char) -> *mut c_char {
+    let Some(raw) = c_str(uri) else { return std::ptr::null_mut() };
+    let json = match crate::split_proxy::hysteria::parse_uri(&raw) {
+        Ok(parsed) => serde_json::json!({ "ok": true, "uri": parsed }),
+        Err(msg) => serde_json::json!({ "ok": false, "error": msg }),
+    };
+    CString::new(json.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+
+/// Configures the bundled Hysteria2 binary path and whether the platform shell
+/// verified its code signature against this service's leaf certificate.
+#[no_mangle]
+pub extern "C" fn ac_hysteria_set_binary(path: *const c_char, verified: bool, test_mode: bool) {
+    if let Some(p) = c_str(path) {
+        crate::split_proxy::hysteria::configure_binary(std::path::PathBuf::from(p), verified, test_mode);
+    }
+}
+
+/// Immediately stops all managed Hysteria2 client processes.
+#[no_mangle]
+pub extern "C" fn ac_hysteria_stop_all() {
+    crate::split_proxy::hysteria::shared().stop_all();
+}
+
+/// Removes stale per-run Hysteria2 config directories left by a crashed service.
+#[no_mangle]
+pub extern "C" fn ac_hysteria_clean_runtime() {
+    crate::split_proxy::hysteria::clean_runtime_dir();
+}
+
+/// Probes one Hysteria2 candidate proxy in the background service (§七十):
+/// `server` is `"hysteria2 <host> <ports> auth=... ..."`, `rules` one per line.
+/// Returns `{"level":"ok|warn|fail","text":…,"millis":…,"site":…}` for `ac_string_free`.
+#[no_mangle]
+pub extern "C" fn ac_hysteria_probe(server: *const c_char, rules: *const c_char) -> *mut c_char {
+    let Some(line) = c_str(server) else { return std::ptr::null_mut() };
+    let rules: Vec<String> = c_str(rules).unwrap_or_default().lines().map(str::to_owned).collect();
+    let site = crate::split_proxy::site_from_rules(&rules);
+    let result = match crate::split_proxy::HysteriaSpec::parse_rule_line(&line) {
+        Some(spec) => crate::split_proxy::hysteria::probe_hysteria(&spec, site.as_deref(), None),
+        None => crate::split_proxy::Probe {
+            level: crate::split_proxy::Level::Fail,
+            text: "代理地址无效".into(),
+            millis: 0,
+        },
+    };
+    let json = serde_json::json!({
+        "level": result.level.word(),
+        "text": result.text,
+        "millis": result.millis,
+        "site": site,
+    });
+    CString::new(json.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 
 /// Whether it should run now (§69.20): the decision is the core's.

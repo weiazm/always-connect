@@ -718,3 +718,162 @@ fn each_proxy_reports_its_last_success_and_failure() {
     assert!(rows[1]["okAgo"].is_null() && rows[1]["failedAgo"].is_u64(), "{health}");
     assert!(rows[1]["reason"].as_str().unwrap().contains("拒绝连接"), "{health}");
 }
+
+#[test]
+fn managed_hysteria_fails_closed_until_ready_and_attributes_leg_to_server_ip() {
+    let pin = "ab".repeat(32);
+    let table = Table::parse(&[
+        &format!("proxy:0 hysteria2 203.0.113.10 20000-20010 auth=pw pin={pin}"),
+        "via:0:full:hy2.example",
+    ]);
+    assert!(table.carries_udp(), "Hysteria2 carries UDP");
+    assert!(table.server(0).is_none(), "unmanaged hysteria slot has no raw server");
+
+    // Fail closed while unmanaged/unavailable
+    let r = rig(&[
+        format!("proxy:0 hysteria2 203.0.113.10 20000-20010 auth=pw pin={pin}"),
+        "via:0:full:hy2.example".into(),
+    ]);
+    refused(r.open("hy2.example", 443));
+    r.routing.set_managed_unavailable(0, "UDP 出不去".into());
+    refused(r.open("hy2.example", 443));
+    assert!(r.routing.recent_notice().unwrap_or_default().contains("UDP 出不去"));
+
+    // Once managed backend is ready on 127.0.0.1, traffic succeeds and counts
+    // on the remote server's road (NOT Leg::Local).
+    let site = origin();
+    let local_socks = socks_proxy(site.address, Behaviour::default());
+    r.routing.set_managed_ready(
+        0,
+        Server { kind: Kind::Socks5, host: "127.0.0.1".into(), port: local_socks.port, auth: None },
+        Ipv4Addr::new(203, 0, 113, 10),
+        "20000-20010".into(),
+    );
+    assert_eq!(r.routing.upstream_proxy(Ipv4Addr::new(203, 0, 113, 10), 20005), Some(0));
+    assert_eq!(r.routing.upstream_proxy(Ipv4Addr::new(203, 0, 113, 10), 443), None);
+
+    let mut stream = r.open("hy2.example", 443);
+    round_trip(&mut stream, "");
+    let expected_leg = Leg::of(std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+    assert_ne!(expected_leg, Leg::Local, "remote IP must not count as local");
+    let key = match expected_leg { Leg::Direct => "direct", Leg::Vpn => "vpn", Leg::Local => "local" };
+    let sent = "ping through the proxy".len() as u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let traffic = r.routing.traffic_json();
+        if traffic[key][0].as_u64() == Some(sent) && traffic[key][1].as_u64() == Some(sent) {
+            assert_eq!(traffic["local"], serde_json::json!([0, 0]), "managed hysteria must not count as local");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{traffic}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Real official Hysteria2 server + managed client interop (run by
+/// `scripts/hysteria-interop-test.sh` in CI and locally).
+/// Env: AC_HY2_BIN, AC_HY2_SERVER (127.0.0.1:<port>), AC_HY2_PIN (64-hex),
+///      AC_HY2_AUTH, optional AC_HY2_OBFS / AC_HY2_OBFS_PASS.
+#[test]
+#[ignore]
+fn interop_with_a_reference_hysteria2_server() {
+    let bin = std::env::var("AC_HY2_BIN").expect("AC_HY2_BIN");
+    let server = std::env::var("AC_HY2_SERVER").expect("AC_HY2_SERVER");
+    let pin = std::env::var("AC_HY2_PIN").expect("AC_HY2_PIN");
+    let auth = std::env::var("AC_HY2_AUTH").expect("AC_HY2_AUTH");
+    let obfs = std::env::var("AC_HY2_OBFS").ok().filter(|s| !s.is_empty());
+    let obfs_pw = std::env::var("AC_HY2_OBFS_PASS").ok().filter(|s| !s.is_empty());
+    let (host, ports) = server.split_once(':').expect("host:ports");
+
+    hysteria::configure_binary(std::path::PathBuf::from(&bin), true, true);
+
+    let spec = HysteriaSpec {
+        host: host.to_owned(),
+        ports: ports.to_owned(),
+        auth: auth.clone(),
+        sni: Some("localhost".into()),
+        pin_sha256: Some(pin.clone()),
+        obfs: obfs.clone(),
+        obfs_password: obfs_pw.clone(),
+        ech: None,
+        up_mbps: Some(20),
+        down_mbps: Some(50),
+        hop_secs: None,
+    };
+
+    // 1. Pre-save probe succeeds with valid config
+    let ok_probe = hysteria::probe_hysteria(&spec, None, None);
+    assert_eq!(ok_probe.level, Level::Ok, "probe ok failed: {ok_probe:?}");
+
+    // 2. Wrong password fails with "密码不对"
+    let mut bad_auth = spec.clone();
+    bad_auth.auth = "wrong-password-123".into();
+    let auth_probe = hysteria::probe_hysteria(&bad_auth, None, None);
+    assert_eq!(auth_probe.level, Level::Fail, "wrong auth should fail: {auth_probe:?}");
+    assert_eq!(auth_probe.text, "密码不对", "unexpected auth reason: {auth_probe:?}");
+
+    // 3. Wrong certificate pin fails with "证书对不上"
+    let mut bad_pin = spec.clone();
+    bad_pin.pin_sha256 = Some("0".repeat(64));
+    let pin_probe = hysteria::probe_hysteria(&bad_pin, None, None);
+    assert_eq!(pin_probe.level, Level::Fail, "wrong pin should fail: {pin_probe:?}");
+    assert_eq!(pin_probe.text, "证书对不上", "unexpected pin reason: {pin_probe:?}");
+
+    // 4. Unreachable port fails (UDP timeout or connection refused)
+    let dead_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead_udp.local_addr().unwrap().port();
+    drop(dead_udp);
+    let mut dead_spec = spec.clone();
+    dead_spec.ports = dead_port.to_string();
+    let dead_probe = hysteria::probe_hysteria(&dead_spec, None, None);
+    assert_eq!(dead_probe.level, Level::Fail, "dead server should fail: {dead_probe:?}");
+    assert!(
+        dead_probe.text == "UDP 出不去" || dead_probe.text == "服务器没回应",
+        "unexpected dead reason: {dead_probe:?}"
+    );
+
+    // 5. Full managed client + existing SOCKS5 TCP & UDP relay round-trip
+    let tcp_origin = origin();
+    let udp_echo_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_origin = udp_echo_sock.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = udp_echo_sock.recv_from(&mut buf) {
+            let _ = udp_echo_sock.send_to(&buf[..n], from);
+        }
+    });
+    let line = format!("proxy:0 {}", spec.to_rule_line());
+    let table = Table::parse(&[&line, "via:0:full:hy2-tcp.example", "vianet:0:127.0.0.0/8"]);
+    let routing = Routing::new(table);
+    let mut specs = std::collections::BTreeMap::new();
+    specs.insert(0, spec.clone());
+    hysteria::shared().sync(specs, routing.clone(), None);
+
+    // Wait for managed client to become ready
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let local_socks = loop {
+        if let Some(s) = hysteria::shared().running_socks_for(&spec) {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "managed hysteria client did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // TCP through managed Hysteria2 client's SOCKS5
+    let (mut tcp_stream, _) = open_through(&local_socks, &Target::Ip(Ipv4Addr::LOCALHOST), tcp_origin.address.port())
+        .expect("TCP via managed hysteria2");
+    round_trip(&mut tcp_stream, "");
+
+    // UDP ASSOCIATE through managed Hysteria2 client's SOCKS5
+    let (_ctrl, udp_sock) = udp_associate(&local_socks).expect("UDP ASSOCIATE via managed hysteria2");
+    udp_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let wrapped = udp_wrap(&Target::Ip(Ipv4Addr::LOCALHOST), udp_origin.port(), b"hy2-udp-ping").unwrap();
+    udp_sock.send(&wrapped).expect("udp send");
+    let mut buf = [0u8; 2048];
+    let n = udp_sock.recv(&mut buf).expect("udp recv");
+    assert_eq!(udp_unwrap(&buf[..n]), Some(&b"hy2-udp-ping"[..]));
+
+    // Stop cleanly
+    hysteria::shared().stop_all();
+    assert!(hysteria::shared().running_socks_for(&spec).is_none());
+}
