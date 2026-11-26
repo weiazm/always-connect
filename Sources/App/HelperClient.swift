@@ -987,12 +987,18 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// After the service was replaced: true once the new one answers
     /// (getStatus), false at `deadline`. Logging in before it is ready
     /// left the first protected login unanswered (§69.10).
-    func waitUntilServiceAnswers(deadline: Date, completion: @escaping (Bool) -> Void) {
+    /// `replacing`: the process of the service being replaced (§69.19).
+    /// Its answers do not count: during a self-update the new binary is on
+    /// disk a few seconds before the swap job ends the old service, and a
+    /// login prepared in that gap was lost with it (the new service then
+    /// refused the connect: 2026-11-26, twice).
+    func waitUntilServiceAnswers(deadline: Date, replacing old: ServiceMark? = nil, completion: @escaping (Bool) -> Void) {
         var answered = false
         ensureConnection { proxy in
             proxy.getStatus { _, _ in
                 DispatchQueue.main.async {
                     guard !answered else { return }
+                    if let old, !self.serviceMark.replaced(old) { return }  // the old one: ask again
                     answered = true
                     completion(true)
                 }
@@ -1002,9 +1008,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             guard let self, !answered else { return }
             answered = true
             if Date() >= deadline { completion(false); return }
-            self.waitUntilServiceAnswers(deadline: deadline, completion: completion)
+            self.waitUntilServiceAnswers(deadline: deadline, replacing: old, completion: completion)
         }
     }
+
+    /// Which background service this App is talking to: the process it
+    /// last heard from (0 before any answer) and how many times the
+    /// connection to the service was lost.
+    struct ServiceMark {
+        var process: pid_t
+        var losses: Int
+        /// Another process answered, or the old one went away since.
+        func replaced(_ old: ServiceMark) -> Bool {
+            losses > old.losses || (process != 0 && old.process != 0 && process != old.process)
+        }
+    }
+    private var serviceLosses = 0
+    var serviceMark: ServiceMark { ServiceMark(process: connection?.processIdentifier ?? 0, losses: serviceLosses) }
 
     private func finishLaunchConnection(_ automatic: Bool) {
         onDemand.launchFinished(automatic)
@@ -2759,7 +2779,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         connection.exportedObject = self
         connection.interruptionHandler = { [weak self, weak connection] in
             DispatchQueue.main.async {
-                guard let self, self.connection === connection, !AppRole.isSettings else { return }
+                guard let self, self.connection === connection else { return }
+                self.serviceLosses += 1
+                guard !AppRole.isSettings else { return }
                 // The panel's "后台服务未运行" row already says it;
                 // no second red line.
                 self.helperAvailable = false
@@ -2771,6 +2793,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         connection.invalidationHandler = { [weak self, weak connection] in
             DispatchQueue.main.async {
                 guard let self, self.connection === connection else { return }
+                self.serviceLosses += 1
                 self.connection = nil
                 if !AppRole.isSettings {
                     self.helperAvailable = false

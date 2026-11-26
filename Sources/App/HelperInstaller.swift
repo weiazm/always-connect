@@ -141,6 +141,10 @@ enum HelperInstaller {
     }
 
     private static func updateThroughService(prompt: String, completion: @escaping (ServiceUpdateOutcome) -> Void) {
+        // The service that takes the update; only another one counts as
+        // updated (§69.19). Unknown before any answer: then as before.
+        let mark = HelperClient.shared.serviceMark
+        let old = mark.process == 0 ? nil : mark
         DispatchQueue.global(qos: .userInitiated).async {
             guard let (authorization, form) = approval(prompt: prompt) else {
                 DispatchQueue.main.async { completion(.notTaken) }
@@ -155,24 +159,27 @@ enum HelperInstaller {
                     AuthorizationFree(authorization, [.destroyRights])
                     guard let started else { completion(.notTaken); return }
                     guard started else { completion(.failed(reason)); return }
-                    waitForUpdatedService(deadline: Date().addingTimeInterval(60), completion: completion)
+                    waitForUpdatedService(deadline: Date().addingTimeInterval(60), replacing: old, completion: completion)
                 }
             }
         }
     }
 
     /// The replaced service is ours once its code matches this App's and
-    /// it answers again.
-    private static func waitForUpdatedService(deadline: Date, completion: @escaping (ServiceUpdateOutcome) -> Void) {
+    /// a service process other than the old one answers: the new binary
+    /// is installed before the swap job ends the old service (§69.15,
+    /// §69.19).
+    private static func waitForUpdatedService(deadline: Date, replacing old: HelperClient.ServiceMark?,
+                                              completion: @escaping (ServiceUpdateOutcome) -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             if installedHelperMatchesBundle {
-                HelperClient.shared.waitUntilServiceAnswers(deadline: deadline) { answered in
+                HelperClient.shared.waitUntilServiceAnswers(deadline: deadline, replacing: old) { answered in
                     completion(answered ? .updated : .didNotReturn("新的后台服务没有回应"))
                 }
             } else if Date() >= deadline {
                 completion(.didNotReturn("后台服务没有在一分钟内完成更新"))
             } else {
-                waitForUpdatedService(deadline: deadline, completion: completion)
+                waitForUpdatedService(deadline: deadline, replacing: old, completion: completion)
             }
         }
     }
