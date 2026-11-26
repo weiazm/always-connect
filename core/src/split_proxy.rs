@@ -311,6 +311,25 @@ pub struct Routing {
     /// The proxy servers' addresses this relay connected to, per proxy,
     /// and when: the connections page marks those connections (§69.12).
     upstreams: Mutex<HashMap<std::net::SocketAddr, (usize, Instant)>>,
+    /// Bytes forwarded through proxies so far, by the road the proxy is
+    /// reached on (§69.17): [to the apps, to the proxies] for each.
+    traffic: [[AtomicU64; 2]; 3],
+}
+
+/// The road to a proxy server: the panel takes proxied bytes out of the
+/// speed of that road, so nothing counts twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Leg { Direct = 0, Vpn = 1, Local = 2 }
+
+impl Leg {
+    pub(crate) fn of(peer: std::net::IpAddr) -> Leg {
+        if peer.is_loopback() { return Leg::Local; }
+        match crate::connections::route_interface(&peer.to_string()) {
+            Some(name) if name == "lo0" => Leg::Local,
+            Some(name) if name.starts_with("utun") || name.starts_with("ipsec") || name.starts_with("ppp") => Leg::Vpn,
+            _ => Leg::Direct,
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -505,6 +524,20 @@ impl Routing {
 
     /// Connections and UDP flows opened through a proxy so far.
     pub fn connections(&self) -> u64 { self.connections.load(Ordering::Relaxed) }
+
+    /// `n` bytes forwarded on `leg`, toward the app or toward the proxy.
+    pub(crate) fn count(&self, leg: Leg, to_app: bool, n: usize) {
+        self.traffic[leg as usize][usize::from(!to_app)].fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// The running totals for the panel's 代理 speed: per road, [in, out].
+    pub fn traffic_json(&self) -> serde_json::Value {
+        let leg = |l: Leg| {
+            let c = &self.traffic[l as usize];
+            serde_json::json!([c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed)])
+        };
+        serde_json::json!({ "direct": leg(Leg::Direct), "vpn": leg(Leg::Vpn), "local": leg(Leg::Local) })
+    }
 
     pub(crate) fn opened(&self) { self.connections.fetch_add(1, Ordering::Relaxed); }
 }

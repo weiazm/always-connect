@@ -215,6 +215,59 @@ pub struct Totals {
     pub total: [u64; 2],
     pub vpn: [u64; 2],
     pub direct: [u64; 2],
+    /// Through the split's proxies (§69.17); None when no proxy carries
+    /// traffic in this session or before two readings.
+    pub proxy: Option<[u64; 2]>,
+}
+
+/// The background service's running totals of proxied bytes, by the road
+/// to the proxy ([in, out] each), and when the App received them
+/// (seconds, any epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize)]
+pub struct ProxyBytes {
+    pub at: f64,
+    pub direct: [u64; 2],
+    pub vpn: [u64; 2],
+    pub local: [u64; 2],
+}
+
+/// Proxied speed per road between two readings of the service's totals
+/// (they arrive with the split status, on their own clock): kept until
+/// the next new reading, so the panel's 2-second ticks see steady numbers.
+#[derive(Debug, Default)]
+pub struct ProxyRates {
+    last: Option<ProxyBytes>,
+    rates: Option<[[u64; 2]; 3]>,
+}
+
+impl ProxyRates {
+    pub fn update(&mut self, now: Option<ProxyBytes>) -> Option<[[u64; 2]; 3]> {
+        let Some(now) = now else { *self = ProxyRates::default(); return None };
+        match self.last {
+            Some(last) if now.at > last.at => {
+                let seconds = (now.at - last.at).max(0.5);
+                let grow = |new: u64, old: u64| if new >= old { new - old } else { new };
+                let rate = |a: [u64; 2], b: [u64; 2]| [per_second(grow(a[0], b[0]), seconds), per_second(grow(a[1], b[1]), seconds)];
+                self.rates = Some([rate(now.direct, last.direct), rate(now.vpn, last.vpn), rate(now.local, last.local)]);
+                self.last = Some(now);
+            }
+            Some(_) => {}
+            None => self.last = Some(now),
+        }
+        self.rates
+    }
+}
+
+/// The panel's three ways (§69.17): proxied bytes leave the road the
+/// proxy is reached on, so nothing counts twice. A proxy on this Mac
+/// sends its own traffic out by the ordinary split, which cannot be told
+/// apart: its bytes stay in that road too.
+pub fn with_proxy(mut t: Totals, rates: Option<[[u64; 2]; 3]>) -> Totals {
+    let Some([direct, vpn, local]) = rates.filter(|_| t.ready) else { return t };
+    t.direct = [t.direct[0].saturating_sub(direct[0]), t.direct[1].saturating_sub(direct[1])];
+    t.vpn = [t.vpn[0].saturating_sub(vpn[0]), t.vpn[1].saturating_sub(vpn[1])];
+    t.proxy = Some([direct[0] + vpn[0] + local[0], direct[1] + vpn[1] + local[1]]);
+    t
 }
 
 /// Bytes a tunnelled packet costs on the wire beyond its own size: IP
@@ -236,7 +289,7 @@ fn is_tunnel(name: &str) -> bool {
 /// per-packet overhead), never below zero.
 pub fn totals(before: Option<&HashMap<String, IfCount>>, now: &HashMap<String, IfCount>, seconds: f64) -> Totals {
     let Some(before) = before else {
-        return Totals { ready: false, total: [0, 0], vpn: [0, 0], direct: [0, 0] };
+        return Totals { ready: false, total: [0, 0], vpn: [0, 0], direct: [0, 0], proxy: None };
     };
     let seconds = seconds.max(0.5);
     let grow = |new: u64, old: u64| if new >= old { new - old } else { new };
@@ -258,10 +311,19 @@ pub fn totals(before: Option<&HashMap<String, IfCount>>, now: &HashMap<String, I
         total: rate(physical),
         vpn: rate(tunnel),
         direct: rate([physical[0].saturating_sub(carrier[0]), physical[1].saturating_sub(carrier[1])]),
+        proxy: None,
     }
 }
 
 static PREVIOUS_TOTALS: Mutex<Option<(Instant, HashMap<String, IfCount>)>> = Mutex::new(None);
+static PROXY_RATES: Mutex<ProxyRates> = Mutex::new(ProxyRates { last: None, rates: None });
+
+/// The panel's totals with the proxied part (the service's latest totals,
+/// or None when there are none).
+pub fn sample_totals_with(proxy: Option<ProxyBytes>) -> Totals {
+    let rates = PROXY_RATES.lock().unwrap().update(proxy);
+    with_proxy(sample_totals(), rates)
+}
 
 /// The panel's totals since its previous call (no process, one sysctl).
 pub fn sample_totals() -> Totals {
@@ -278,6 +340,7 @@ pub fn sample_totals() -> Totals {
 /// The panel closed: the snapshot goes.
 pub fn stop_totals() {
     *PREVIOUS_TOTALS.lock().unwrap() = None;
+    *PROXY_RATES.lock().unwrap() = ProxyRates::default();
 }
 
 static PREVIOUS: Mutex<Option<Snapshot>> = Mutex::new(None);
@@ -452,6 +515,29 @@ mod tests {
         let only_tunnel = HashMap::from([("en0".to_string(), IfCount { bytes_in: 1_000, ..Default::default() }),
             ("utun4".to_string(), IfCount { bytes_in: 1_000, packets_in: 10, ..Default::default() })]);
         assert_eq!(totals(Some(&HashMap::new()), &only_tunnel, 1.0).direct, [0, 0]);
+    }
+
+    #[test]
+    fn proxied_bytes_leave_their_road_and_show_as_their_own() {
+        // §69.17: a proxy reached directly moved 3000/500 a second, one
+        // through the VPN 1000/100, one on this Mac 200/20.
+        let mut rates = ProxyRates::default();
+        let first = ProxyBytes { at: 10.0, direct: [0, 0], vpn: [0, 0], local: [0, 0] };
+        assert_eq!(rates.update(Some(first)), None, "two readings make a speed");
+        let second = ProxyBytes { at: 12.0, direct: [6_000, 1_000], vpn: [2_000, 200], local: [400, 40] };
+        let got = rates.update(Some(second)).unwrap();
+        assert_eq!(got, [[3_000, 500], [1_000, 100], [200, 20]]);
+        assert_eq!(rates.update(Some(second)), Some(got), "the same reading keeps its speed between ticks");
+        let base = Totals { ready: true, total: [10_000, 2_000], vpn: [4_000, 400], direct: [5_000, 1_000], proxy: None };
+        let t = with_proxy(base.clone(), Some(got));
+        assert_eq!(t.direct, [2_000, 500]);
+        assert_eq!(t.vpn, [3_000, 300]);
+        assert_eq!(t.proxy, Some([4_200, 620]));
+        let small = Totals { direct: [100, 10], ..base.clone() };
+        assert_eq!(with_proxy(small, Some(got)).direct, [0, 0], "never below zero");
+        assert_eq!(with_proxy(base.clone(), None), base, "no proxies: unchanged");
+        assert_eq!(rates.update(None), None);
+        assert_eq!(rates.update(Some(second)), None, "no proxies resets: two readings again");
     }
 
     /// On a real Mac: `cargo test live_totals -- --ignored --nocapture`.
