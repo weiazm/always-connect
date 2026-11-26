@@ -69,6 +69,106 @@ class GateTests(unittest.TestCase):
                 release.validate_jobs(jobs)
 
 
+def pr(**changes):
+    return dict({"id": 5, "head_sha": "h" * 40, "event": "pull_request", "head_branch": "feature",
+                 "status": "completed", "conclusion": "success"}, **changes)
+
+
+class SameCodeTests(unittest.TestCase):
+    """§47.4: a release may use its pull request's CI only for the same code."""
+
+    def same(self, runs, trees=None, holds=True):
+        trees = trees or {SHA: "t", "h" * 40: "t"}
+        return release.same_code_pr_run(runs, SHA, trees.get, lambda head: holds)
+
+    def test_the_pull_request_run_of_the_same_code_counts(self):
+        self.assertEqual(self.same([pr()]), 5)
+
+    def test_other_code_failures_unfinished_runs_and_pushes_never_count(self):
+        self.assertIsNone(self.same([pr()], trees={SHA: "t", "h" * 40: "other"}))
+        self.assertIsNone(self.same([pr()], holds=False))
+        self.assertIsNone(self.same([pr(conclusion="failure")]))
+        self.assertIsNone(self.same([pr(status="in_progress", conclusion=None)]))
+        self.assertIsNone(self.same([pr(event="push")]))
+        self.assertIsNone(self.same([pr()], trees={"h" * 40: "t"}))  # the tag's tree unknown
+
+    def test_the_latest_run_of_a_head_decides(self):
+        self.assertIsNone(self.same([pr(), pr(id=6, conclusion="failure")]))
+        self.assertEqual(self.same([pr(conclusion="failure"), pr(id=6)]), 6)
+
+    def test_only_a_merge_of_a_head_that_already_held_main(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            def git(*args):
+                return subprocess.check_output(["git", "-C", scratch, *args], text=True).strip()
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "test@example.com")
+            git("config", "user.name", "Test")
+            def commit(name):
+                Path(scratch, name).write_text(name)
+                git("add", name)
+                git("commit", "-q", "-m", name)
+                return git("rev-parse", "HEAD")
+            commit("a")
+            git("checkout", "-q", "-b", "feature")
+            head = commit("b")
+            git("checkout", "-q", "main")
+            git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+            merge = git("rev-parse", "HEAD")
+            commit("c")  # main moves on; a later merge of a stale head
+            git("checkout", "-q", "-b", "stale", head)
+            stale = commit("d")
+            git("checkout", "-q", "main")
+            git("merge", "-q", "--no-ff", "-m", "merge stale", "stale")
+            stale_merge = git("rev-parse", "HEAD")
+            previous = Path.cwd()
+            try:
+                os.chdir(scratch)
+                self.assertTrue(release.holds_main(merge, head))
+                self.assertTrue(release.holds_main(head, head))
+                self.assertFalse(release.holds_main(stale_merge, stale))
+                self.assertFalse(release.holds_main(merge, stale))
+                self.assertEqual(release.tree_of(merge), release.tree_of(head))
+                self.assertIsNone(release.tree_of("f" * 40))
+            finally:
+                os.chdir(previous)
+
+    def test_gate_passes_at_once_on_the_same_code_and_waits_otherwise(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            previous = Path.cwd()
+            try:
+                os.chdir(scratch)
+                Path("Sources/App").mkdir(parents=True)
+                Path("Sources/App/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.2.7"}))
+                jobs = [{"name": n, "conclusion": "success"} for n in ("rust-linux", "macos", "macos-harness", "macos-openconnect")]
+                def remote(path, *args):
+                    if path.endswith("/commits/v0.2.7"):
+                        return {"sha": SHA}
+                    if "event=pull_request" in path:
+                        return {"workflow_runs": [pr()]}
+                    if "/jobs" in path:
+                        return {"jobs": jobs}
+                    if path.endswith("/pulls"):
+                        return [{"base": {"ref": "main"}}]
+                    return {"workflow_runs": []}
+                with patch.object(release, "run", return_value=SHA + "\n"), \
+                        patch.object(release, "api", side_effect=remote), \
+                        patch.object(release.subprocess, "run"), \
+                        patch.object(release, "tree_of", return_value="t"), \
+                        patch.object(release, "holds_main", return_value=True), \
+                        patch.object(release.time, "sleep", side_effect=AssertionError("waited")):
+                    release.check("example/app", SHA, "v0.2.7")
+                with patch.object(release, "run", return_value=SHA + "\n"), \
+                        patch.object(release, "api", side_effect=remote), \
+                        patch.object(release.subprocess, "run"), \
+                        patch.object(release, "tree_of", side_effect=lambda c: c), \
+                        patch.object(release, "holds_main", return_value=True), \
+                        patch.object(release.time, "sleep", side_effect=RuntimeError("waiting")), \
+                        self.assertRaises(RuntimeError):
+                    release.check("example/app", SHA, "v0.2.7")  # different code: waits for main
+            finally:
+                os.chdir(previous)
+
+
 class PublishTests(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory()

@@ -41,6 +41,49 @@ def validate_ci(runs, sha):
     return latest["id"]
 
 
+def same_code_pr_run(runs, sha, tree_of, holds_main):
+    """A finished pull request CI run that tested exactly the tagged code
+    (DESIGN §47.4): its head has the tag's tree and already held main as it
+    was before the merge, so the run's merge ref was that same tree. The
+    latest run for each head decides; push runs never count here."""
+    target = tree_of(sha)
+    latest = {}
+    for item in runs:
+        if item["event"] != "pull_request":
+            continue
+        known = latest.get(item["head_sha"])
+        if known is None or item["id"] > known["id"]:
+            latest[item["head_sha"]] = item
+    for head, item in sorted(latest.items(), key=lambda pair: -pair[1]["id"]):
+        if item["status"] != "completed" or item["conclusion"] != "success":
+            continue
+        if target is not None and tree_of(head) == target and holds_main(head):
+            return item["id"]
+    return None
+
+
+def tree_of(commit):
+    try:
+        return run("git", "rev-parse", "--verify", "--quiet", commit + "^{tree}").strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def holds_main(sha, head):
+    """The tag is that head itself (main fast-forwarded onto it), or the
+    merge of that head into main where the head already held main."""
+    if head == sha:
+        return True
+    parents = run("git", "rev-list", "--parents", "-n", "1", sha).split()[1:]
+    if len(parents) != 2 or parents[1] != head:
+        return False
+    return subprocess.run(["git", "merge-base", "--is-ancestor", parents[0], head]).returncode == 0
+
+
+def targets_main(repo, head):
+    return any(pr["base"]["ref"] == "main" for pr in api(f"repos/{repo}/commits/{head}/pulls"))
+
+
 def validate_jobs(jobs):
     for name in ("rust-linux", "macos", "macos-harness", "macos-openconnect"):
         found = [j for j in jobs if j["name"] == name]
@@ -58,6 +101,18 @@ def check(repo, sha, tag):
     if api(f"repos/{repo}/commits/{tag}")["sha"] != sha:
         raise ValueError("Release tag no longer points to this commit")
     subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], check=True)
+    # The merge of an up-to-date pull request is the code its CI already
+    # passed: no need to wait about 7 minutes for main to run it again.
+    pr_runs = api(f"repos/{repo}/actions/workflows/ci.yml/runs?event=pull_request&per_page=100")["workflow_runs"]
+    run_id = same_code_pr_run(pr_runs, sha, tree_of,
+                              lambda head: holds_main(sha, head) and targets_main(repo, head))
+    if run_id is not None:
+        try:
+            validate_jobs(api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")["jobs"])
+            print("The tagged code already passed every required CI job on its pull request")
+            return
+        except ValueError:
+            pass  # not every job ran there: wait for main's own run
     deadline = time.monotonic() + 2100
     while time.monotonic() < deadline:
         runs = api(f"repos/{repo}/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha={sha}&per_page=100")
