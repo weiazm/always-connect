@@ -33,7 +33,9 @@ struct PanelView: View {
     @State private var siteCount = DirectSites.sites(ProfileStore.loadAppSettings()).count
     /// Other VPNs / proxies seen at panel open (§27.2).
     @State private var neighbors: [NeighborNotice] = []
-    private let activityTimer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    private let activityTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    /// Latencies only while the panel shows them: at once, then every 2 s.
+    private let healthTimer = Timer.publish(every: 1, tolerance: 0.2, on: .main, in: .common).autoconnect()
     @State private var showConfirmReset = false
     @State private var resettingNetwork = false
     @State private var resetMessage: String?
@@ -274,8 +276,8 @@ struct PanelView: View {
         .onReceive(activityTimer) { _ in
             manager.refreshSplitActivity()
             manager.expireGatewayPreparation()
-            checkHealth()
         }
+        .onReceive(healthTimer) { _ in checkHealth() }
         .onChange(of: manager.showsConnected) { _ in link.reset(); checkHealth() }
         .onDisappear { speed.stop() }
     }
@@ -575,8 +577,8 @@ struct PanelView: View {
         } open: { onOpenSettings("connect") }
     }
 
-    /// While the panel is open: the VPN's answer time, and each proxy at
-    /// most every 30 s (§69.8). Nothing runs once it closes.
+    /// While the panel is open: the VPN's answer time and each proxy's, at
+    /// once and then every 2 s (§69.8, §69.16). Nothing runs once it closes.
     private func checkHealth() {
         if manager.showsConnected { link.checkIfDue() }
         if manager.showsConnected, manager.ownConnection, settings.proxiesOn {
@@ -851,7 +853,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         // Re-attach too: re-registers for pushes after a Helper
         // restart and corrects availability.
         manager.refreshStatus()
-        UpdateChecker.shared.checkIfDue()
+        UpdateChecker.shared.checkOnPanelOpen()
         GeoUpdater.shared.checkIfDue()
         let view = PanelView(
             manager: manager,
