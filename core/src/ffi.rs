@@ -1023,6 +1023,7 @@ pub extern "C" fn ac_connections_json(
         direct_addresses: c_list(direct_addresses, ','),
         direct_networks: c_list(direct_networks, ','),
         names: unsafe { names.as_ref() },
+        proxy: None,
     };
     let json = crate::connections::to_json(&crate::connections::list(&context));
     CString::new(json).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
@@ -1835,6 +1836,7 @@ pub extern "C" fn ac_oc_connections_json(e: *const oc_engine::Engine, fallback_g
             direct_addresses: Vec::new(),
             direct_networks: Vec::new(),
             names: None,
+            proxy: None,
         })),
     };
     owned(json)

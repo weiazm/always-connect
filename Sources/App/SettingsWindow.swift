@@ -18,6 +18,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
     static let shared = SettingsWindow()
     static let size = NSSize(width: 1040, height: 640)
     static let minimumSize = NSSize(width: 900, height: 560)
+    /// Where the window's size and place are kept between openings.
+    static let frameName = "AlwaysConnectSettings"
 
     private var window: NSWindow?
     @Published var egressRuleToOpen: UInt32?
@@ -25,7 +27,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
 
     func showVPNConnections() {
         vpnConnectionsRequested = true
-        show(tab: "connections")
+        show(tab: "traffic")
     }
 
     private override init() {}
@@ -73,19 +75,48 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
             window.orderFrontRegardless()
             return
         }
-        let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: Self.size),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false)
-        window.isReleasedWhenClosed = false
+        let window = Self.makeWindow(SettingsView())
         window.delegate = self
-        window.contentViewController = NSHostingController(rootView: SettingsView())
-        window.contentMinSize = Self.minimumSize
-        window.title = "AlwaysConnect 设置"
-        window.center()
+        // Same size and place as last time (user, 2026-11-26).
+        if !window.setFrameUsingName(Self.frameName) { window.center() }
+        window.setFrameAutosaveName(Self.frameName)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         self.window = window
     }
+
+    /// The window without its title line (user, 2026-11-26: "设置页的页面顶部
+    /// 的窗口能隐藏吗？美观一些啊"): the title bar is see-through and the
+    /// page's tab row sits in it, beside the window's buttons. The title
+    /// stays for the Window menu and VoiceOver.
+    static func makeWindow<Content: View>(_ content: Content) -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        window.title = "AlwaysConnect 设置"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        // An empty toolbar only makes the title bar as tall as the tab
+        // row, with the window's buttons centred on it (§69.14).
+        let toolbar = NSToolbar(identifier: frameName)
+        toolbar.delegate = EmptyToolbar.shared
+        toolbar.allowsUserCustomization = false
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.contentViewController = NSHostingController(rootView: content)
+        window.contentMinSize = minimumSize
+        window.setContentSize(size)
+        return window
+    }
+}
+
+/// No items: the toolbar is there for its height only.
+private final class EmptyToolbar: NSObject, NSToolbarDelegate {
+    static let shared = EmptyToolbar()
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [] }
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [] }
 }

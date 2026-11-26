@@ -788,6 +788,7 @@ impl Engine {
             direct_addresses: self.shared.routes.addresses(),
             direct_networks: c.direct_networks(),
             names: c.forwarder.as_ref(),
+            proxy: c.proxy.as_ref().map(|session| session.routing.as_ref()),
         };
         crate::connections::to_json(&crate::connections::list(&context))
     }

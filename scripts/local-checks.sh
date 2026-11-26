@@ -100,6 +100,7 @@ python3 "$REPO/core/scripts/connectivity-sample-test.py" && pass connectivity-sa
 "$REPO/scripts/connections-ui-test.sh" && pass connections-ui || fail connections-ui
 "$REPO/scripts/uninstall-test.sh" > /tmp/ac-uninstall.log 2>&1 && pass uninstall || { fail uninstall; grep FAIL /tmp/ac-uninstall.log || true; }
 "$REPO/scripts/privileged-bundle-test.sh" && pass privileged-bundle || fail privileged-bundle
+"$REPO/scripts/service-swap-test.sh" > /tmp/ac-service-swap.log 2>&1 && pass service-swap || { fail service-swap; grep FAIL /tmp/ac-service-swap.log || true; }
 "$REPO/scripts/connection-check-test.sh" > /tmp/ac-connection-check.log 2>&1 && pass connection-check || { fail connection-check; grep FAIL /tmp/ac-connection-check.log || true; }
 "$REPO/scripts/quit-test.sh" > /tmp/ac-quit.log 2>&1 && pass quit || { fail quit; grep FAIL /tmp/ac-quit.log || true; }
 "$REPO/scripts/settings-transport-test.sh" && pass settings-transport || fail settings-transport

@@ -2,11 +2,13 @@ import AppKit
 import ServiceManagement
 import SwiftUI
 
-// Settings window, redesigned 2026-11-03 after the owner called the
-// first version crude (controls floating mid-window, misaligned labels,
-// long loose captions). Every page is a grouped Form in the style of
-// macOS System Settings: rounded cards, label left / control right,
-// one short footer per card (UI-DESIGN.md §五, DESIGN.md §21.11).
+// Settings window. Every page is a grouped Form in the style of macOS
+// System Settings (2026-11-03, after the owner called the first version
+// crude): rounded cards, label left / control right, one short footer per
+// card. Since 2026-11-26 the pages share one design language
+// (SettingsDesign.swift; UI-DESIGN.md 设置, DESIGN.md §69.14): seven tabs
+// in the see-through title bar, a status card at the top of each page,
+// coloured icons by meaning.
 
 struct SettingsView: View {
     @AppStorage("settingsTab") private var tab = "general"
@@ -14,61 +16,45 @@ struct SettingsView: View {
     var connectionPreview: [ConnectionRow]? = nil
     var splitPreview: SplitPagePreview? = nil
 
-    /// The pages in order (UI-DESIGN.md 设置, layout A, 2026-11-25).
-    static let pages: [(tag: String, title: String, symbol: String)] = [
-        ("general", "通用", "gearshape"),
-        ("credentials", "账号", "person.crop.circle"),
-        ("split", "分流", "arrow.triangle.branch"),
-        ("egress", "出口保护", "checkmark.shield"),
-        ("connections", "连接", "point.3.filled.connected.trianglepath.dotted"),
-        ("diagnostics", "诊断", "stethoscope"),
-    ]
-
     var body: some View {
-        // 分流代理 is a part of 分流 (§69.9): "proxy" opens it there.
-        let current = Self.pages.firstIndex { $0.tag == (tab == "proxy" ? "split" : tab) } ?? 0
+        let current = SettingsPages.all.firstIndex { $0.tag == SettingsPages.resolve(tab) } ?? 0
         VStack(spacing: 0) {
-            // Icon above name, like System Settings' toolbars (the user's
-            // chosen design); the system TabView draws a text-only pill.
-            HStack(spacing: 4) {
-                ForEach(Self.pages, id: \.tag) { page in
-                    SettingsTabButton(title: page.title, symbol: page.symbol, selected: page.tag == Self.pages[current].tag) {
-                        tab = page.tag
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(Color.primary.opacity(0.04))
+            SettingsTabBar(tab: $tab)
             Divider()
-            SettingsPageContainer(selection: current, pages: Self.pages.map { page in
+            SettingsPageContainer(selection: current, pages: SettingsPages.all.map { page in
                 AnyView(content(for: page.tag)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .toggleStyle(.always))
+                    .toggleStyle(.always)
+                    // The tab row above already keeps the title bar clear.
+                    .ignoresSafeArea(.container, edges: .top))
             })
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // The tab row goes up into the see-through title bar.
+        .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: SettingsWindow.minimumSize.width, maxWidth: .infinity,
                minHeight: SettingsWindow.minimumSize.height, maxHeight: .infinity)
-        .onAppear(perform: openProxyPart)
-        .onChange(of: tab) { _ in openProxyPart() }
+        .onAppear(perform: openLegacyTab)
+        .onChange(of: tab) { _ in openLegacyTab() }
     }
 
     @ViewBuilder private func content(for tag: String) -> some View {
         switch tag {
-        case "credentials": CredentialsPage()
+        case "credentials": CredentialsPage(preview: splitPreview != nil)
+        case "connect": ConnectPage()
         case "split": SplitPage(preview: splitPreview, section: $splitSection)
         case "egress": EgressProtectionPage()
-        case "connections": ConnectionSettingsPage(preview: connectionPreview)
+        case "traffic": ConnectionsPage(preview: connectionPreview)
         case "diagnostics": DiagnosticsPage()
         default: GeneralPage()
         }
     }
 
-    private func openProxyPart() {
-        guard tab == "proxy" else { return }
-        splitSection = "proxy"
-        tab = "split"
+    /// "proxy" opens 分流代理 inside 分流; "connections" is now 流量.
+    private func openLegacyTab() {
+        if tab == "proxy" { splitSection = "proxy" }
+        let resolved = SettingsPages.resolve(tab)
+        if resolved != tab { tab = resolved }
     }
 }
 
@@ -100,37 +86,8 @@ private struct SettingsPageContainer: NSViewControllerRepresentable {
     }
 }
 
-/// One page in the settings window's tab row: icon over name, the
-/// selected one tinted with a soft background.
-struct SettingsTabButton: View {
-    var title: String
-    var symbol: String
-    var selected: Bool
-    var action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 3) {
-                Image(systemName: symbol).font(.system(size: 17))
-                    .frame(height: 20)
-                Text(title).font(.system(size: 11))
-            }
-            .frame(width: 66, height: 50)
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-            .background(RoundedRectangle(cornerRadius: 7)
-                .fill(Color.primary.opacity(selected ? 0.08 : (hovering ? 0.04 : 0))))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .accessibilityLabel(title)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-}
-
 /// A card footer: one or two short lines, secondary.
-private struct Footnote: View {
+struct Footnote: View {
     var text: String
     init(_ text: String) { self.text = text }
     var body: some View {
@@ -170,49 +127,20 @@ struct HoverHelp<Content: View>: View {
 
 // MARK: - General
 
+/// 通用 (§69.14): starting up and notifications, the shortcut, and one
+/// card about the App itself (version and update, notices, uninstall).
+/// Connecting and drop protection moved to 连接.
 struct GeneralPage: View {
-    @ObservedObject private var manager = HelperClient.shared
-    @State private var profile = ProfileStore.loadProfile()
+    @ObservedObject private var updates = UpdateChecker.shared
     @State private var settings = ProfileStore.loadAppSettings()
     @State private var loginItemOn = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
     @State private var recording = false
-    @State private var egressDisabledWithDrop = false
 
     var body: some View {
         Form {
             Section {
-                Toggle("打开 App 时自动连接", isOn: $profile.autoConnectOnLaunch)
-                    .onChange(of: profile.autoConnectOnLaunch) { _ in
-                        ProfileStore.saveProfile(profile)
-                    }
-                // Both connection ways (DESIGN.md §26.19): the Cisco
-                // engine's kill switch (§21.6) and the own connection's
-                // pf set and held routes.
-                Toggle("断线保护", isOn: Binding(
-                    get: { settings.isDropProtectionOn },
-                    set: { on in
-                        var latest = ProfileStore.loadAppSettings()
-                        latest.dropProtection = on
-                        egressDisabledWithDrop = !on && latest.egressProtection?.enabled == true
-                        if !on { latest.egressProtection?.enabled = false }
-                        settings = latest
-                        ProfileStore.saveAppSettings(settings, updatingEgress: !on)
-                        HelperClient.shared.dropProtectionChanged()
-                    }))
-            } header: {
-                Text("连接")
-            } footer: {
-                Footnote(settings.isDropProtectionOn
-                         ? (HelperClient.shared.usesCisco
-                            ? "断线保护开：VPN 断开时暂停上网，直到重新连上或你手动断开，公司流量不会走本地网络。"
-                            : "断线保护开：VPN 断开时暂停上网（名单里的网站照常），直到重新连上或你手动断开，公司流量不会走本地网络。")
-                         : "断线保护关：VPN 断开后直接用本地网络上网，后台照常重连。"
-                           + (egressDisabledWithDrop ? "出口保护已关闭。自建连接需要重新连接一次才能生效。" : ""))
-            }
-
-            Section("启动与通知") {
-                Toggle("开机时自动打开", isOn: Binding(
+                Toggle(isOn: Binding(
                     get: { loginItemOn },
                     set: { on in
                         do {
@@ -226,35 +154,48 @@ struct GeneralPage: View {
                         } catch {
                             loginError = "设置失败：\(error.localizedDescription)"
                         }
-                    }))
-                Toggle("掉线和恢复时发通知", isOn: $settings.notificationAggregation)
-                    .onChange(of: settings.notificationAggregation) { _ in
-                        ProfileStore.saveAppSettings(settings)
-                    }
-                Toggle("等手机批准时在菜单栏下提醒", isOn: Binding(
+                    })) {
+                    IconLabel(title: "开机时自动打开", symbol: "power", color: SettingsTone.neutral)
+                }
+                Toggle(isOn: $settings.notificationAggregation) {
+                    IconLabel(title: "掉线和恢复时发通知", symbol: "bell.fill", color: .red)
+                }
+                .onChange(of: settings.notificationAggregation) { _ in
+                    ProfileStore.saveAppSettings(settings)
+                }
+                Toggle(isOn: Binding(
                     get: { settings.isApprovalCardOn },
                     set: { on in
                         settings.approvalCard = on
                         ProfileStore.saveAppSettings(settings)
                         ApprovalPrompt.shared.settingsChanged()
-                    }))
+                    })) {
+                    IconLabel(title: "等手机批准时在菜单栏下提醒", symbol: "iphone", color: SettingsTone.account)
+                }
                 if let loginError {
                     Text(loginError).foregroundStyle(.red)
                 }
+            } header: {
+                PageHeader(symbol: "gearshape.fill", color: SettingsTone.neutral, title: "通用",
+                         status: versionLine, dot: updates.available == nil ? nil : .accentColor)
             }
 
             Section {
-                Toggle("全局快捷键", isOn: $settings.globalHotkeyEnabled)
-                    .onChange(of: settings.globalHotkeyEnabled) { _ in
-                        ProfileStore.saveAppSettings(settings)
-                        HotkeyManager.shared.apply(settings)
-                    }
-                LabeledContent("连接 / 断开") {
+                Toggle(isOn: $settings.globalHotkeyEnabled) {
+                    IconLabel(title: "全局快捷键", symbol: "command", color: .indigo)
+                }
+                .onChange(of: settings.globalHotkeyEnabled) { _ in
+                    ProfileStore.saveAppSettings(settings)
+                    HotkeyManager.shared.apply(settings)
+                }
+                LabeledContent {
                     HStack(spacing: 8) {
                         Text(HotkeyManager.describe(settings: settings))
                             .foregroundStyle(.secondary)
                         Button(recording ? "请按下组合键…" : "录制") { toggleRecording() }
                     }
+                } label: {
+                    IconLabel(title: "连接 / 断开", symbol: "keyboard", color: .indigo)
                 }
                 .disabled(!settings.globalHotkeyEnabled)
             } header: {
@@ -263,13 +204,15 @@ struct GeneralPage: View {
                 Footnote("需在「系统设置 → 隐私与安全性 → 辅助功能」里允许 AlwaysConnect；只接受带 ⌘/⌥/⌃ 的组合。")
             }
 
-            UpdateSection()
-
             AboutSection()
-            UninstallSection()
         }
         .formStyle(.grouped)
         .onDisappear { HotkeyManager.shared.stopRecording() }
+    }
+
+    private var versionLine: String {
+        if let update = updates.available { return "AlwaysConnect \(UpdateChecker.currentVersion) · 有新版本 \(update.version)，在下面更新" }
+        return "AlwaysConnect \(UpdateChecker.currentVersion)"
     }
 
     private func toggleRecording() {
@@ -291,20 +234,25 @@ struct GeneralPage: View {
     }
 }
 
-/// The responsible-use notice and the licences that travel with the App
-/// (DESIGN.md §34; the version is on the update card above): files in Resources, opened in the default
-/// viewer; nothing is kept in memory.
+/// One card about the App (§69.14, was three: 版本, 关于, 卸载): the
+/// version and its update (UpdateRows), the notices that travel with the
+/// App (DESIGN.md §34; files in Resources, opened in the default viewer),
+/// and the clean uninstall (§31).
 struct AboutSection: View {
     var body: some View {
         Section {
-            LabeledContent("说明") {
+            UpdateRows()
+            LabeledContent {
                 HStack(spacing: 8) {
                     Button("使用须知") { open("RESPONSIBLE-USE", "md") }
                     Button("许可证与第三方声明") { open("THIRD_PARTY_NOTICES", "md") }
                 }
+            } label: {
+                IconLabel(title: "说明", symbol: "doc.text.fill", color: SettingsTone.neutral)
             }
+            UninstallRows()
         } header: {
-            Text("关于")
+            Text("关于 AlwaysConnect")
         } footer: {
             Footnote("只用于连接你所在单位授权你使用的 VPN。Cisco、Cisco Secure Client、AnyConnect 是 Cisco Systems, Inc. 的商标；AlwaysConnect 是独立的个人项目，与 Cisco 没有关联，也未获其认可。")
         }
@@ -316,10 +264,10 @@ struct AboutSection: View {
     }
 }
 
-/// Clean uninstall (DESIGN.md §31): a button that opens an inline
+/// Clean uninstall (DESIGN.md §31): a row that opens an inline
 /// confirmation with two "keep" choices, both off — the default leaves
 /// nothing behind.
-struct UninstallSection: View {
+struct UninstallRows: View {
     @State private var confirming = false
     @State private var keepPassword = false
     @State private var keepSettings = false
@@ -327,43 +275,39 @@ struct UninstallSection: View {
     @State private var message: String?
 
     var body: some View {
-        Section {
-            if confirming {
-                Text("会断开 VPN、恢复直连，然后删除后台服务、随附的 openconnect、日志、桌面上的恢复网络脚本和 App 本身。需要输入一次这台电脑的开机密码。Cisco Secure Client 不受影响。")
-                    .fixedSize(horizontal: false, vertical: true)
-                Toggle("保留账号密码（钥匙串里）", isOn: $keepPassword)
-                Toggle("保留设置（服务器、分流名单等）", isOn: $keepSettings)
-                HStack {
-                    Spacer()
-                    Button("取消") {
-                        confirming = false
-                        message = nil
-                    }
+        if confirming {
+            Text("会断开 VPN、恢复直连，然后删除后台服务、随附的 openconnect、日志、桌面上的恢复网络脚本和 App 本身。需要输入一次这台电脑的开机密码。Cisco Secure Client 不受影响。默认什么都不留；勾了保留的，以后重新安装会自动带回来。")
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("保留账号密码（钥匙串里）", isOn: $keepPassword)
+            Toggle("保留设置（服务器、分流名单等）", isOn: $keepSettings)
+            HStack {
+                Spacer()
+                Button("取消") {
+                    confirming = false
+                    message = nil
+                }
+                .disabled(running)
+                Button(running ? "正在卸载…" : "卸载") { uninstall() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
                     .disabled(running)
-                    Button(running ? "正在卸载…" : "卸载") { uninstall() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
-                        .disabled(running)
-                }
-            } else {
-                LabeledContent("从这台 Mac 上移除 AlwaysConnect") {
-                    Button("卸载…") {
-                        keepPassword = false
-                        keepSettings = false
-                        message = nil
-                        confirming = true
-                    }
-                }
             }
-            if let message {
-                Text(message)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+        } else {
+            LabeledContent {
+                Button("卸载…") {
+                    keepPassword = false
+                    keepSettings = false
+                    message = nil
+                    confirming = true
+                }
+            } label: {
+                IconLabel(title: "从这台 Mac 上移除 AlwaysConnect", symbol: "trash.fill", color: .red)
             }
-        } header: {
-            Text("卸载")
-        } footer: {
-            Footnote("默认什么都不留。勾了保留的，以后重新安装会自动带回来。")
+        }
+        if let message {
+            Text(message)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -598,6 +542,7 @@ struct ServerListSection: View {
 struct CredentialForm: View {
     var onSaved: (() -> Void)?
     var showsStatus = false
+    var certificatePreview = false
 
     @ObservedObject private var manager = HelperClient.shared
     @State private var server = ProfileStore.loadProfile().server
@@ -611,19 +556,15 @@ struct CredentialForm: View {
 
     var body: some View {
         Form {
-            ServerListSection(selected: $server)
-
-            Section {
-                TextField("用户名", text: $username)
-                SecureField("密码", text: $password, prompt: Text(passwordPrompt))
-                TextField("Group", text: $group, prompt: Text("一般留空"))
-            } header: {
-                Text("登录")
-            } footer: {
-                Text("密码存在钥匙串里，所有服务器共用，只能改不能看。登录时如果公司要求，请在手机上确认。"
-                     + "Group 是网关上的登录组，留空就用网关默认的组；只有单位让你选别的组时才填。经 Cisco 连接时用的是 Cisco 自己的设置。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if showsStatus {
+                // Settings → 账号 (§69.14): who logs in first, then where,
+                // then the certificate it shows.
+                loginSection(hero: true)
+                ServerListSection(selected: $server)
+                LoginCertificateSection(preview: certificatePreview)
+            } else {
+                ServerListSection(selected: $server)
+                loginSection(hero: false)
             }
 
             Section {
@@ -650,6 +591,37 @@ struct CredentialForm: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func loginSection(hero: Bool) -> some View {
+        Section {
+            TextField("用户名", text: $username)
+            SecureField("密码", text: $password, prompt: Text(passwordPrompt))
+            TextField("Group", text: $group, prompt: Text("一般留空"))
+        } header: {
+            if hero {
+                let name = username.trimmingCharacters(in: .whitespaces)
+                PageHeader(symbol: "person.fill", color: SettingsTone.account,
+                         title: name.isEmpty ? "还没有填账号" : name,
+                         status: accountLine,
+                         dot: manager.hasCredentials ? .green : .orange,
+                         letter: name.first.map { String($0).uppercased() } ?? "?")
+            } else {
+                Text("登录")
+            }
+        } footer: {
+            Text("密码存在钥匙串里，所有服务器共用，只能改不能看。登录时如果公司要求，请在手机上确认。"
+                 + "Group 是网关上的登录组，留空就用网关默认的组；只有单位让你选别的组时才填。经 Cisco 连接时用的是 Cisco 自己的设置。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The server in use and whether the password is kept.
+    private var accountLine: String {
+        let servers = ProfileStore.loadProfile().servers
+        let name = servers.first { $0.target == server }?.name ?? (server.isEmpty ? "还没选服务器" : server)
+        return name + " · " + (manager.hasCredentials ? "密码已存在钥匙串里" : "还没保存密码")
     }
 
     private var passwordPrompt: String {
@@ -685,9 +657,122 @@ struct CredentialForm: View {
     }
 }
 
-struct CredentialsPage: View {
+/// The login certificate (DESIGN.md §23.10), in 账号 since 2026-11-26
+/// (user: "证书那个挪走"; it was on 分流 because only the own connection
+/// uses it). One line, automatic by default; the choice is only offered
+/// on demand, login certificates only.
+struct LoginCertificateSection: View {
+    var preview = false
+    @ObservedObject private var manager = HelperClient.shared
+    @State private var settings = ProfileStore.loadAppSettings()
+    @State private var certificates: [CertificateRelay.ClientIdentity] = []
+    private var own: Bool { preview || manager.ownConnection }
+
     var body: some View {
-        CredentialForm(showsStatus: true)
+        Section {
+            LabeledContent {
+                HStack(spacing: 8) {
+                    Text(preview ? "自动：示例证书（到期 2027-06-30）"
+                         : LoginCertificate.summary(settings.clientCertificate, certificates))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Menu("更改") {
+                        Button("自动选择") { set(nil) }
+                        Divider()
+                        ForEach(certificates, id: \.digest) { item in
+                            Button(LoginCertificate.label(item)) { set(item.digest) }
+                        }
+                        Divider()
+                        Button("不使用证书") { set("none") }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            } label: {
+                Text("登录证书")
+            }
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Footnote(own
+                    ? "按网站分流开着时，AlwaysConnect 自己连 VPN，登录时出示这张证书；私钥不离开钥匙串。"
+                    : "只在按网站分流开着时用；现在经 Cisco 连接，证书由 Cisco 出示。")
+                if own, !preview, let problem = LoginCertificate.problem(settings.clientCertificate, certificates) {
+                    Text(problem).font(.caption).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .onAppear {
+            guard !preview else { return }
+            settings = ProfileStore.loadAppSettings()
+            certificates = CertificateRelay.loginCandidates()
+        }
+    }
+
+    private func set(_ value: String?) {
+        guard !preview else { return }
+        var stored = ProfileStore.loadAppSettings()
+        stored.clientCertificate = value
+        ProfileStore.saveAppSettings(stored)
+        settings = stored
+    }
+}
+
+/// What the account and 分流 pages say about the login certificate.
+enum LoginCertificate {
+    /// The automatic pick, the manual one, or that none is used.
+    static func summary(_ choice: String?, _ certificates: [CertificateRelay.ClientIdentity]) -> String {
+        switch choice {
+        case nil:
+            guard let pick = certificates.first else { return "自动（未找到）" }
+            return "自动：" + label(pick, short: true)
+        case "none":
+            return "不使用"
+        case let digest?:
+            guard let pick = certificates.first(where: { $0.digest == digest }) else {
+                return "所选证书已不在钥匙串"
+            }
+            return "手动：" + label(pick, short: true)
+        }
+    }
+
+    /// Renewed certificates share a name: tell them apart by expiry and
+    /// the start of their fingerprint.
+    static func label(_ item: CertificateRelay.ClientIdentity, short: Bool = false) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let expiry = item.expires.map { "到期 " + formatter.string(from: $0) } ?? ""
+        if short { return "\(item.name)（\(expiry)）" }
+        return "\(item.name)（\(expiry)，\(item.digest.prefix(4))…）"
+    }
+
+    /// What the own connection still needs on this Mac, if anything.
+    static func problem(_ choice: String?, _ certificates: [CertificateRelay.ClientIdentity]) -> String? {
+        if #unavailable(macOS 15.0), choice != "none" {
+            return "证书转接需要 macOS 15 或更新。"
+        }
+        // The App ships openconnect (§27.3); the installer puts it next
+        // to the background service. Homebrew's is a developer fallback.
+        let paths = ["/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect",
+                     "/opt/homebrew/bin/openconnect", "/usr/local/bin/openconnect"]
+        if !paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return "后台服务还没装上自带的连接组件：点面板上的「更新」或「安装后台服务」。"
+        }
+        if choice == nil, certificates.isEmpty {
+            return "钥匙串里没有找到公司发的证书。用 Cisco 能连上的话，证书一般就在钥匙串里；也可以在「账号」页手动选择。"
+        }
+        if let digest = choice, digest != "none", !certificates.contains(where: { $0.digest == digest }) {
+            return "设置里选的证书已经不在钥匙串里，请在「账号」页改回自动选择。"
+        }
+        return nil
+    }
+}
+
+struct CredentialsPage: View {
+    /// Sample data only (offscreen pictures): no keychain certificates.
+    var preview = false
+    var body: some View {
+        CredentialForm(showsStatus: true, certificatePreview: preview)
     }
 }
 
@@ -798,32 +883,9 @@ struct SplitPage: View {
 
     var body: some View {
         Form {
-            // The master switch as one card (layout A): what on and off mean,
-            // in the card itself.
+            // The master switch in the page's status card (§69.14): what on
+            // and off mean, in the card itself.
             Section {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.system(size: 20))
-                        .foregroundStyle(own ? Color.accentColor : Color.secondary)
-                        .frame(width: 28)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("按网站分流").font(.headline)
-                        Text("开：按名单直连或走代理，其余走 VPN。关：经 Cisco 连接，按公司的规则分流。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 12)
-                    AlwaysSwitchTrack(isOn: Binding(
-                        get: { own },
-                        set: { on in
-                            guard preview == nil else { return }
-                            if manager.switchIsOn { confirmSwitch = on } else { manager.setSplit(on: on) }
-                        }))
-                        .disabled(manager.splitSwitchPending)
-                        .accessibilityLabel("按网站分流")
-                }
-                .padding(.vertical, 4)
                 if let on = confirmSwitch {
                     HStack {
                         Text(on ? "要用证书重新连接一次，手机需要再批准。" : "要改回经 Cisco 重新连接一次。")
@@ -836,33 +898,32 @@ struct SplitPage: View {
                         }
                     }
                 }
-                if own {
-                    certificateRow
-                }
-            } footer: {
-                if own {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Footnote("登录时出示钥匙串里公司发的证书，私钥不离开钥匙串。VPN 掉线时分流直连的网站照常能打开，其余暂停上网。")
-                        if preview == nil, let problem = ownConnectionProblem {
-                            Text(problem).font(.caption).foregroundStyle(.red)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                if own, preview == nil,
+                   let problem = LoginCertificate.problem(settings.clientCertificate, certificates) {
+                    EgressCallout(icon: "exclamationmark.triangle.fill", tint: .red, text: problem) {
+                        Button("去「账号」") { UserDefaults.standard.set("credentials", forKey: "settingsTab") }
                     }
                 }
-            }
-
-            Section {
-                Picker("", selection: $section) {
-                    Text("分流直连 · \(sites.count) 条").tag("direct")
-                    Text("分流代理 · \(proxyCount) 个").tag("proxy")
-                    Text("局域网").tag("lan")
+                SettingsSegments(items: [("direct", "分流直连 · \(sites.count) 条"),
+                                         ("proxy", "分流代理 · \(proxyCount) 个"),
+                                         ("lan", "局域网")], selection: $section)
+            } header: {
+                PageHeader(symbol: "arrow.triangle.branch", color: SettingsTone.direct, title: "按网站分流",
+                         status: own
+                            ? "开 · \(sites.count) 条直连，\(proxyCount) 个代理，其余走 VPN"
+                            : "关 · 经 Cisco 连接，按公司的规则分流",
+                         dot: own ? .green : nil) {
+                    AlwaysSwitchTrack(isOn: Binding(
+                        get: { own },
+                        set: { on in
+                            guard preview == nil else { return }
+                            if manager.switchIsOn { confirmSwitch = on } else { manager.setSplit(on: on) }
+                        }))
+                        .disabled(manager.splitSwitchPending)
+                        .accessibilityLabel("按网站分流")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: .infinity)
-                .listRowBackground(Color.clear)
             } footer: {
-                Footnote("同一网站命中多处时：出口保护 > 分流代理 > 分流直连 > 其余走 VPN。")
+                SplitOrderStrip()
             }
 
             switch section {
@@ -879,13 +940,10 @@ struct SplitPage: View {
                         settings = stored
                         pushNetworks()
                     })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("本地局域网直连")
-                        Text(localNetworks.isEmpty ? "自动识别你当前连着的网段（现在没有）"
-                             : "自动识别，现在是 " + localNetworks.joined(separator: "、"))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    IconLabel(title: "本地局域网直连",
+                              subtitle: localNetworks.isEmpty ? "自动识别你当前连着的网段（现在没有）"
+                                : "自动识别，现在是 " + localNetworks.joined(separator: "、"),
+                              symbol: "house.fill", color: SettingsTone.direct)
                 }
                 } footer: {
                     Footnote("你现在连着的局域网（家里的 NAS、打印机）不走 VPN；VPN 掉线时也照常可用。")
@@ -907,12 +965,14 @@ struct SplitPage: View {
                 }
                 Section {
                 if sites.isEmpty {
-                    Text("名单是空的。在下面输入；不知道怎么写，鼠标停在问号上看示例。")
-                        .foregroundStyle(.secondary)
+                    EmptyGuide(symbol: "arrow.uturn.right", color: SettingsTone.direct, title: "还没有不走 VPN 的网站",
+                               text: "在下面输入一个网站、网段或清单名，例如 example.com、10.1.0.0/16、geosite:apple。") {
+                        EmptyView()
+                    }
                 }
                 ForEach(sites) { site in
-                    HStack {
-                        Image(systemName: icon(site)).foregroundStyle(.secondary).frame(width: 18)
+                    HStack(spacing: 10) {
+                        IconTile(symbol: icon(site), color: SettingsTone.direct)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(site.name)
                             Text(caption(site))
@@ -994,8 +1054,8 @@ struct SplitPage: View {
         switch rule {
         case .domain, .full: return "globe"
         case .keyword, .regexp: return "text.magnifyingglass"
-        case .geosite: return "list.bullet.rectangle"
-        case .geoip: return "flag"
+        case .geosite: return "list.bullet"
+        case .geoip: return "flag.fill"
         case .network: return "point.3.connected.trianglepath.dotted"
         }
     }
@@ -1029,86 +1089,6 @@ struct SplitPage: View {
 
     private func saveSites() {
         settings = DirectList.save(sites) { note in siteNote = note }
-    }
-
-    /// One line, automatic by default (DESIGN.md §23.10); the choice is
-    /// only offered on demand, login certificates only.
-    private var certificateRow: some View {
-        LabeledContent("登录证书") {
-            HStack(spacing: 8) {
-                Text(certificateSummary)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Menu("更改") {
-                    Button("自动选择") { setCertificate(nil) }
-                    Divider()
-                    ForEach(certificates, id: \.digest) { item in
-                        Button(Self.certificateLabel(item)) { setCertificate(item.digest) }
-                    }
-                    Divider()
-                    Button("不使用证书") { setCertificate("none") }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-            }
-        }
-    }
-
-    private func setCertificate(_ value: String?) {
-        var stored = ProfileStore.loadAppSettings()
-        stored.clientCertificate = value
-        ProfileStore.saveAppSettings(stored)
-        settings = stored
-    }
-
-    /// What the certificate row says: the automatic pick, the manual
-    /// one, or that none is used.
-    private var certificateSummary: String {
-        if preview != nil { return "自动：示例证书（到期 2027-06-30）" }
-        switch settings.clientCertificate {
-        case nil:
-            guard let pick = certificates.first else { return "自动（未找到）" }
-            return "自动：" + Self.certificateLabel(pick, short: true)
-        case "none":
-            return "不使用"
-        case let digest?:
-            guard let pick = certificates.first(where: { $0.digest == digest }) else {
-                return "所选证书已不在钥匙串"
-            }
-            return "手动：" + Self.certificateLabel(pick, short: true)
-        }
-    }
-
-    /// Renewed certificates share a name: tell them apart by expiry and
-    /// the start of their fingerprint.
-    static func certificateLabel(_ item: CertificateRelay.ClientIdentity, short: Bool = false) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        let expiry = item.expires.map { "到期 " + formatter.string(from: $0) } ?? ""
-        if short { return "\(item.name)（\(expiry)）" }
-        return "\(item.name)（\(expiry)，\(item.digest.prefix(4))…）"
-    }
-
-    /// What the own connection still needs on this Mac, if anything.
-    private var ownConnectionProblem: String? {
-        if #unavailable(macOS 15.0), settings.clientCertificate != "none" {
-            return "证书转接需要 macOS 15 或更新。"
-        }
-        // The App ships openconnect (§27.3); the installer puts it next
-        // to the background service. Homebrew's is a developer fallback.
-        let paths = ["/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect",
-                     "/opt/homebrew/bin/openconnect", "/usr/local/bin/openconnect"]
-        if !paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            return "后台服务还没装上自带的连接组件：点面板上的「更新」或「安装后台服务」。"
-        }
-        if settings.clientCertificate == nil, certificates.isEmpty {
-            return "钥匙串里没有找到公司发的证书。用 Cisco 能连上的话，证书一般就在钥匙串里；也可以点「更改」手动选择。"
-        }
-        if let digest = settings.clientCertificate, digest != "none",
-           !certificates.contains(where: { $0.digest == digest }) {
-            return "设置里选的证书已经不在钥匙串里，请点「更改」改回自动选择。"
-        }
-        return nil
     }
 
 }
@@ -1199,6 +1179,9 @@ struct DiagnosticsPage: View {
     @State private var lanRunning = false
     @State private var confirmClearDrops = false
     @State private var neighbors: [NeighborNotice]?
+    @State private var leakRunning = false
+    /// "一键体检" was pressed while this page was open.
+    @State private var checkupRan = false
 
     private func checkNeighbors() {
         let manager = HelperClient.shared
@@ -1214,31 +1197,59 @@ struct DiagnosticsPage: View {
 
     var body: some View {
         Form {
+            // One click checks everything that can be checked here (§69.14,
+            // was three buttons in three places).
             Section {
-                if let neighbors {
-                    if neighbors.isEmpty {
-                        Label("没有发现其他 VPN 或代理", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                checkRow("其他 VPN 与代理", symbol: "rectangle.connected.to.line.below", color: .purple,
+                         state: neighbors == nil ? .running : (neighbors!.contains { $0.level == .warning } ? .warning : .passed)) {
+                    if let neighbors {
+                        if neighbors.isEmpty {
+                            Text("没有发现").font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(neighbors, id: \.text) { notice in
+                            Text(notice.text).font(.caption)
+                                .foregroundStyle(notice.level == .warning ? Color.orange : Color.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
-                    ForEach(neighbors, id: \.text) { notice in
-                        Label(notice.text, systemImage: notice.level == .warning ? "exclamationmark.triangle.fill" : "info.circle")
-                            .foregroundStyle(notice.level == .warning ? Color.orange : Color.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                }
+                checkRow("泄漏自检", symbol: "drop.fill", color: .blue, state: leakState) {
+                    if let leakMessage {
+                        Text(leakMessage).font(.caption).foregroundStyle(manager.showsConnected ? Color.red : Color.secondary)
                     }
-                } else {
-                    Text("检查中…").foregroundStyle(.secondary)
+                    ForEach(leakItems ?? [], id: \.item) { item in
+                        Label {
+                            Text("\(item.item)：\(item.detail)").font(.caption)
+                        } icon: {
+                            Image(systemName: item.informational ? "info.circle"
+                                  : (item.passed ? "checkmark.circle.fill" : "xmark.circle.fill"))
+                                .foregroundStyle(item.informational ? Color.secondary
+                                                 : (item.passed ? Color.green : Color.red))
+                        }
+                    }
+                }
+                checkRow("访问本地路由器", symbol: "wifi.router.fill", color: SettingsTone.direct,
+                         state: lanRunning ? .running : (lanResult == nil ? .idle : .done)) {
+                    if let lanResult {
+                        Text(lanResult).font(.caption).textSelection(.enabled)
+                    }
                 }
             } header: {
-                Text("其他 VPN 与代理")
+                PageHeader(symbol: "stethoscope", color: SettingsTone.diagnostics, title: "诊断",
+                         status: dropLine, dot: lastDropColor) {
+                    Button(checking ? "正在体检…" : "一键体检") { runCheckup() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(checking)
+                }
             } footer: {
-                Footnote("Clash、sing-box 等只开系统代理时可以和 VPN 共存；开 TUN/增强模式会互相抢网络，连 VPN 前请关掉。")
+                Footnote("Clash、sing-box 等只开系统代理时可以和 VPN 共存，开 TUN/增强模式会抢网络。连着 VPN 却打不开家里的设备时，把体检结果截图发给维护者。")
             }
             .onAppear { checkNeighbors() }
             // Our own tunnel and DNS forwarder must never read as someone
             // else's: look again when the session's state changes.
             .onChange(of: HelperClient.shared.state) { _ in checkNeighbors() }
 
-            Section("当前连接") {
+            Section("本次连接") {
                 LabeledContent("状态") { Text(manager.stateLine).foregroundStyle(manager.gatewayTrustFailed ? Color.red : Color.secondary) }
                 LabeledContent("连接时长") {
                     if manager.showsConnected, let since = manager.connectedSince {
@@ -1309,7 +1320,7 @@ struct DiagnosticsPage: View {
                 }
             } header: {
                 HStack {
-                    Text("掉线记录（已存 \(manager.dropHistory.count) 次，最多存 \(ProfileStore.dropHistoryLimit) 次）")
+                    Text("掉线记录（\(manager.dropHistory.count) 次，最多存 \(ProfileStore.dropHistoryLimit) 次）")
                     Spacer()
                     Button("清空") { confirmClearDrops = true }
                         .buttonStyle(.borderless)
@@ -1321,51 +1332,16 @@ struct DiagnosticsPage: View {
                         }
                 }
             } footer: {
-                Footnote("每条写明断了多久、重新登录了几次、最后恢复没有；电脑一次睡眠中的断线合成一条。超过 \(ProfileStore.dropHistoryLimit) 次时自动删掉最早的一条；删除记录不影响连接。")
+                Footnote("每条写明断了多久、重新登录了几次、最后恢复没有；一次睡眠中的断线合成一条。")
             }
 
             Section {
-                HStack {
-                    Text("泄漏自检")
-                    Spacer()
-                    Button("运行") { runLeakCheck() }
-                        .disabled(!manager.showsConnected)
-                }
-                if let leakMessage {
-                    Text(leakMessage).foregroundStyle(.red)
-                }
-                ForEach(leakItems ?? [], id: \.item) { item in
-                    Label {
-                        Text("\(item.item)：\(item.detail)").font(.caption)
-                    } icon: {
-                        Image(systemName: item.informational ? "info.circle"
-                              : (item.passed ? "checkmark.circle.fill" : "xmark.circle.fill"))
-                            .foregroundStyle(item.informational ? Color.secondary
-                                             : (item.passed ? Color.green : Color.red))
-                    }
-                }
-                HStack {
-                    Text("访问本地路由器")
-                    Spacer()
-                    Button(lanRunning ? "测试中…" : "测试") { runLanCheck() }
-                        .disabled(lanRunning)
-                }
-                if let lanResult {
-                    Text(lanResult).font(.caption).textSelection(.enabled)
-                }
-            } header: {
-                Text("自检")
-            } footer: {
-                Footnote("连着 VPN 却打不开家里的路由器、NAS 等设备时，点「访问本地路由器 → 测试」，把结果截图发给维护者。")
-            }
-
-            Section {
-                HStack {
-                    Text("诊断包（不含密码与账号）")
-                    Spacer()
+                LabeledContent {
                     Button("导出…") {
                         DiagnosticsExporter.export(manager: manager, profile: ProfileStore.loadProfile())
                     }
+                } label: {
+                    IconLabel(title: "诊断包", subtitle: "日志与状态，不含密码与账号", symbol: "archivebox.fill", color: SettingsTone.neutral)
                 }
             }
         }
@@ -1375,6 +1351,66 @@ struct DiagnosticsPage: View {
             refreshStats()
             leakItems = nil
             leakMessage = nil
+        }
+    }
+
+    private enum CheckState { case idle, running, passed, warning, failed, done }
+
+    /// Only while a check the user started still runs (the automatic look
+    /// for other VPNs on opening the page is not one).
+    private var checking: Bool { lanRunning || leakRunning || (checkupRan && neighbors == nil) }
+
+    private var leakState: CheckState {
+        if leakRunning { return .running }
+        if let items = leakItems {
+            return items.contains { !$0.passed && !$0.informational } ? .failed : .passed
+        }
+        if leakMessage != nil { return checkupRan && !manager.showsConnected ? .idle : .failed }
+        return .idle
+    }
+
+    /// One check: its name and result on the first line, details under it.
+    private func checkRow<Details: View>(_ title: String, symbol: String, color: Color, state: CheckState,
+                                         @ViewBuilder details: () -> Details) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                IconTile(symbol: symbol, color: color)
+                Text(title)
+                Spacer()
+                switch state {
+                case .running: ProgressView().controlSize(.small)
+                case .passed: Label("正常", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.callout)
+                case .warning: Label("留意", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout)
+                case .failed: Label("有问题", systemImage: "xmark.circle.fill").foregroundStyle(.red).font(.callout)
+                case .done: Label("已完成", systemImage: "checkmark.circle").foregroundStyle(.secondary).font(.callout)
+                case .idle: Text("未检查").foregroundStyle(.tertiary).font(.callout)
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) { details() }
+                .padding(.leading, 32)
+        }
+    }
+
+    /// The newest drop, or that there was none.
+    private var dropLine: String {
+        guard let drop = manager.dropHistory.last else { return "还没有掉线记录" }
+        return "上次掉线 \(ConnectPage.when(drop.droppedAt)) · \(drop.outcomeLabel)"
+    }
+
+    private var lastDropColor: Color? {
+        manager.dropHistory.last.map { dropOutcomeColor($0.resolvedOutcome) }
+    }
+
+    private func runCheckup() {
+        checkupRan = true
+        neighbors = nil
+        checkNeighbors()
+        runLanCheck()
+        if manager.showsConnected {
+            runLeakCheck()
+        } else {
+            leakItems = nil
+            leakMessage = "没连 VPN，连上后再查"
         }
     }
 
@@ -1408,7 +1444,9 @@ struct DiagnosticsPage: View {
     private func runLeakCheck() {
         leakMessage = nil
         leakItems = nil
+        leakRunning = true
         HelperClient.shared.runLeakCheck { items in
+            leakRunning = false
             if let items {
                 leakItems = items
             } else {

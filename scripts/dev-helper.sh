@@ -39,6 +39,32 @@ need_root() {
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
 }
 
+# >>> service-swap (scripts/service-swap-test.sh runs these with a stub launchctl)
+# `launchctl bootout` can return while the old service is still exiting:
+# seen when the service itself started this update (DESIGN.md §69.12),
+# it took 2 s more. A bootstrap in that window fails with "Operation
+# already in progress" and leaves no service at all, so wait until
+# launchd has removed it (up to 15 s), and retry the bootstrap.
+stop_service() {
+    launchctl bootout "system/$LABEL" 2>/dev/null || true
+    local i
+    for i in $(seq 1 30); do
+        launchctl print "system/$LABEL" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    echo "the old service is still loaded after 15 s" >&2
+}
+
+start_service() {
+    local i
+    for i in $(seq 1 9); do
+        launchctl bootstrap system "$PLIST" 2>/dev/null && return 0
+        sleep 1
+    done
+    launchctl bootstrap system "$PLIST"
+}
+# <<< service-swap
+
 recover() {
     # Same order as a manual disconnect: routes/DNS, then pf.
     local script="$SUPPORT/alwaysconnect-vpnc.sh"
@@ -66,7 +92,7 @@ install)
     need_root
     src=${2:-"$ROOT/.local-build/AlwaysConnect.app/Contents/Library/LaunchDaemons/AlwaysConnectHelper"}
     [ -x "$src" ] || { echo "build first: scripts/build-local.sh" >&2; exit 1; }
-    launchctl bootout system/$LABEL 2>/dev/null || true
+    stop_service
     # An older daemon did not take its openconnect down on SIGTERM. HUP:
     # leave without logging the session off, so the App's reconnect can
     # reuse the cookie (DESIGN.md §26.17).
@@ -142,7 +168,7 @@ EOF
     chown root:wheel "$PLIST"
     chmod 644 "$PLIST"
     plutil -lint -s "$PLIST"
-    launchctl bootstrap system "$PLIST"
+    start_service
     # Start it now (no RunAtLoad, DESIGN.md §25.6): a hold the replaced
     # daemon left is adopted and, with no App attached, released after
     # the grace period instead of waiting for the next App launch.
@@ -152,7 +178,7 @@ EOF
 uninstall)
     need_root
     recover
-    launchctl bootout system/$LABEL 2>/dev/null || true
+    stop_service
     rm -f "$PLIST" "$BIN"
     rm -rf "$OCDIR"
     echo "uninstalled (log kept in $LOGDIR)"

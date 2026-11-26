@@ -64,6 +64,11 @@ struct ConnectionsUITest {
         guard let table = findTable(in: root), let scroll = table.enclosingScrollView else {
             fail("the connection tab did not create a native scrollable table")
         }
+        // The list was the 连接 tab before it became 流量 (§69.14).
+        check(defaults.string(forKey: "settingsTab") == "traffic", "an old link to the connection list opens 流量")
+        check(SettingsPages.all.map(\.title) == ["通用", "账号", "连接", "分流", "出口保护", "流量", "诊断"]
+              && SettingsPages.resolve("proxy") == "split" && SettingsPages.resolve("nonsense") == "general",
+              "seven pages in order; 分流代理 opens 分流; an unknown name opens 通用")
         check(table.numberOfRows == 180, "180 sample connections reach the table")
         table.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
         check(table.allowsMultipleSelection && table.selectedRowIndexes == IndexSet([0, 1]), "connection table selects multiple rows")
@@ -136,10 +141,17 @@ struct ConnectionsUITest {
         defaults.set("general", forKey: "settingsTab")
         settle()
         check(findTable(in: root) == nil, "a hidden page leaves the settings window")
-        defaults.set("connections", forKey: "settingsTab")
+        defaults.set("traffic", forKey: "settingsTab")
         settle()
         check(findTable(in: root) === table && table.numberOfRows == 1,
               "returning to a tab retains its view and current filter")
+        // Proxied connections (§69.12): their own way, by proxy, before VPN.
+        var proxied = Fixture.row(3)
+        proxied.via = "proxy"; proxied.reason = "分流代理"; proxied.proxy = 0
+        let grouped = ConnectionsPage.group([Fixture.row(2), proxied, proxied])
+        check(grouped.first?.via == "proxy" && grouped.first?.proxy == 0 && grouped.first?.count == 2
+              && ConnectionsPage.wayName("proxy") == "代理" && ConnectionsPage.Filter.allCases.map(\.rawValue).contains("走代理"),
+              "proxied connections group by proxy and show as 代理")
         print("PASS connection table scrolls both ways, tracks resizing and keeps position across row updates")
         print("PASS tab navigation hides detached pages and keeps their view state")
     }

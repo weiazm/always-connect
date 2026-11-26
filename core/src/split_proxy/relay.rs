@@ -250,7 +250,10 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
             return;
         }
     };
-    if !local_proxy { routing.record(n, None); }
+    if !local_proxy {
+        routing.record(n, None);
+        if let Ok(peer) = upstream.peer_addr() { routing.connected_to(n, peer); }
+    }
     routing.opened();
     if let (Some(entry), Ok(copy)) = (open.lock().unwrap().streams.get_mut(&id), upstream.try_clone()) { entry.1 = Some(copy); }
     let _ = client.set_nodelay(true);
@@ -341,7 +344,10 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
                 return;
             }
         };
-        if !raw { routing.record(n, None); }
+        if !raw {
+            routing.record(n, None);
+            if let Some(peer) = control.as_ref().and_then(|c| c.peer_addr().ok()) { routing.connected_to(n, peer); }
+        }
         let relay = Arc::new(relay);
         let _ = relay.set_read_timeout(Some(UDP_CHECK));
         {

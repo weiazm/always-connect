@@ -283,7 +283,7 @@ struct PanelView: View {
     /// 网速 (DESIGN.md §45.4): the VPN and the direct part side by side,
     /// only while connected; "连接详情" opens the per-connection page.
     private var speedCard: some View {
-        Button { onOpenSettings("connections") } label: {
+        Button { onOpenSettings("traffic") } label: {
             HStack(spacing: 10) {
                 speedColumn("走 VPN", color: .green, speed.totals?.vpn)
                 Divider().frame(height: 30)
@@ -572,7 +572,7 @@ struct PanelView: View {
             ProfileStore.saveAppSettings(stored, updatingEgress: !on)
             settings = ProfileStore.loadAppSettings()
             manager.dropProtectionChanged()
-        } open: { onOpenSettings("general") }
+        } open: { onOpenSettings("connect") }
     }
 
     /// While the panel is open: the VPN's answer time, and each proxy at

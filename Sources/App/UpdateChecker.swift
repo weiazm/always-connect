@@ -78,10 +78,6 @@ final class UpdateChecker: ObservableObject {
             .flatMap(URL.init(string:))
     }
 
-    /// The one-line install, which also updates (README, install.sh).
-    static let installCommand =
-        "curl -fsSL https://raw.githubusercontent.com/weiazm/always-connect/main/install.sh | bash"
-
     private enum Key {
         static let lastAttempt = "updateLastAttempt"
         static let lastSuccess = "updateLastSuccess"
@@ -160,11 +156,6 @@ final class UpdateChecker: ObservableObject {
         NSWorkspace.shared.open(update.url)
     }
 
-    static func copyInstallCommand() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(installCommand, forType: .string)
-    }
-
     // MARK: - One-click update (DESIGN.md §35.4)
 
     /// The bundled install.sh; settable for a harness.
@@ -193,15 +184,36 @@ final class UpdateChecker: ObservableObject {
         install(update)
     }
 
+    /// The find shown can be a day old (one check a day): "更新" looks at
+    /// the releases list once more and installs the newest, so it never
+    /// puts back a version older than the latest (DESIGN.md §69.12; on
+    /// 2026-11-26 it installed 0.3.0 while 0.3.1 was out). No answer:
+    /// the release shown, as before.
     func install(_ update: Available) {
         guard !installing else { return }
-        guard let script = Self.installScript else {
+        guard Self.installScript != nil else {
             installError = "这份 App 里缺少更新脚本，请打开发布页手动下载"
             return
         }
         installing = true
         installError = nil
         installStep = .finding
+        guard !checking else { installFound(update); return }
+        check { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .newer(let newest): self.installFound(newest)
+            case .current:
+                // Already the newest after all: nothing to install.
+                self.installing = false
+                self.installStep = nil
+            case .skipped, .unreadable, .failed: self.installFound(update)
+            }
+        }
+    }
+
+    private func installFound(_ update: Available) {
+        guard let script = Self.installScript else { return }
         // A quarantined App opened from Downloads runs from a read-only
         // translocated copy: install to "应用程序" then.
         let here = Self.installTarget ?? Bundle.main.bundlePath

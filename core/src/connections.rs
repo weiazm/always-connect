@@ -18,6 +18,8 @@ pub struct Context<'a> {
     pub direct_addresses: Vec<String>,
     pub direct_networks: Vec<String>,
     pub names: Option<&'a Forwarder>,
+    /// The split's proxies (§69.12): their sites, and their servers.
+    pub proxy: Option<&'a crate::split_proxy::Routing>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +31,13 @@ pub struct Row {
     pub port: u16,
     /// The name it was looked up under, when the split forwarder saw it.
     pub host: Option<String>,
-    /// "vpn", "direct" or "local".
+    /// "vpn", "direct", "proxy" or "local".
     pub via: &'static str,
     pub interface: String,
     pub reason: &'static str,
+    /// The proxy (the App's index) a "proxy" row goes through, or whose
+    /// server a "代理本身" row talks to.
+    pub proxy: Option<usize>,
 }
 
 /// (pid, command, protocol, remote address, remote port) from
@@ -256,9 +261,21 @@ pub fn rows(lsof_output: &str, c: &Context) -> Vec<Row> {
         .map(|(pid, process, proto, remote, port)| {
             let iface = route_interface(&remote).unwrap_or_else(|| "?".into());
             let net = *attached.entry(iface.clone()).or_insert_with(|| attached_network(&iface));
-            let (via, reason) = classify(&remote, &iface, c, net);
-            let host = c.names.and_then(|f| Ipv4Addr::from_str(&remote).ok().and_then(|ip| f.name_for(ip)));
-            Row { process, pid, proto, remote, port, host, via, interface: iface, reason }
+            let ip = Ipv4Addr::from_str(&remote).ok();
+            // A proxied site reaches the relay over the loopback (§69.12):
+            // name it by the proxy, not "本机".
+            let proxied = c.proxy.zip(ip).and_then(|(p, ip)| p.proxy_for(ip));
+            let upstream = c.proxy.zip(ip).and_then(|(p, ip)| p.upstream_proxy(ip, port));
+            let (via, reason) = match (proxied, upstream) {
+                (Some(_), _) => ("proxy", "分流代理"),
+                (None, Some(_)) => match classify(&remote, &iface, c, net) {
+                    ("local", reason) => ("local", reason),
+                    (via, _) => (via, "代理本身"),
+                },
+                _ => classify(&remote, &iface, c, net),
+            };
+            let host = c.names.and_then(|f| ip.and_then(|ip| f.name_for(ip)));
+            Row { process, pid, proto, remote, port, host, via, interface: iface, reason, proxy: proxied.or(upstream) }
         })
         .collect()
 }
@@ -307,6 +324,9 @@ pub fn to_json(rows: &[Row]) -> String {
         json_string(&r.interface, &mut out);
         out.push_str(",\"reason\":");
         json_string(r.reason, &mut out);
+        if let Some(n) = r.proxy {
+            out.push_str(&format!(",\"proxy\":{n}"));
+        }
         out.push('}');
     }
     out.push(']');
@@ -323,6 +343,7 @@ mod tests {
             direct_addresses: vec!["203.0.113.9".into()],
             direct_networks: vec!["192.168.0.0/16".into()],
             names: None,
+            proxy: None,
         }
     }
 
@@ -348,10 +369,36 @@ mod tests {
         ]);
         let json = to_json(&[Row {
             process: "a\"b".into(), pid: 1, proto: "TCP".into(), remote: "1.2.3.4".into(), port: 443,
-            host: Some("x.example".into()), via: "direct", interface: "en0".into(), reason: "直连",
+            host: Some("x.example".into()), via: "direct", interface: "en0".into(), reason: "直连", proxy: None,
         }]);
         assert_eq!(json, "[{\"process\":\"a\\\"b\",\"pid\":1,\"proto\":\"TCP\",\"remote\":\"1.2.3.4\",\"port\":443,\
 \"host\":\"x.example\",\"via\":\"direct\",\"interface\":\"en0\",\"reason\":\"直连\"}]");
+    }
+
+    /// §69.12: a proxied site is named by its proxy, not "本机"; the
+    /// relay's own connection to the proxy server is "代理本身".
+    #[test]
+    fn proxied_sites_and_the_proxy_server() {
+        let table = crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 192.0.2.10 1080", "via:0:example.com", "vianet:0:203.0.113.0/24",
+        ]);
+        let routing = crate::split_proxy::Routing::new(table);
+        let fake = routing.answer("www.example.com").unwrap();
+        routing.connected_to(0, std::net::SocketAddr::from(([192, 0, 2, 10], 1080)));
+        let mut c = ctx();
+        c.proxy = Some(&routing);
+        let out = format!("p1\ncBrowser\nPTCP\nn10.0.0.2:5000->{fake}:443\nn10.0.0.2:5001->203.0.113.4:443\n\
+p2\ncrelay\nPTCP\nn10.0.0.2:6000->192.0.2.10:1080\nn10.0.0.2:6001->192.0.2.10:22\n");
+        let r = rows(&out, &c);
+        assert_eq!((r[0].via, r[0].reason, r[0].proxy), ("proxy", "分流代理", Some(0)));
+        assert_eq!((r[1].via, r[1].reason, r[1].proxy), ("proxy", "分流代理", Some(0)));
+        assert_eq!((r[2].reason, r[2].proxy), ("代理本身", Some(0)));
+        assert_ne!(r[3].reason, "代理本身");
+        assert_eq!(r[3].proxy, None);
+        assert!(to_json(&r[..1]).ends_with(",\"reason\":\"分流代理\",\"proxy\":0}]"));
+        // Without the split's proxies, nothing changes.
+        c.proxy = None;
+        assert_eq!(rows(&out, &c)[2].proxy, None);
     }
 
     #[cfg(target_os = "macos")]
