@@ -45,9 +45,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private var awaitingCiscoStart = false
     var showsConnected: Bool { state == .connected && !gatewayTrustFailed }
     var certificateProtectionText: String {
-        if !protectsDrops { return "断线保护已关闭。请联系 VPN 管理员。" }
+        if !protectsDrops { return "断线保护已关闭。请联系 IT 管理员。" }
         if rejectedLoginHeld { return "网络已拦截。可点「恢复网络」回到直连。" }
-        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 IT 管理员。"
     }
     @Published private(set) var loginProtectionNotice: String?
     @Published private(set) var loginGatewayReadiness: LoginGatewayReadiness = .idle
@@ -127,6 +127,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Keychain holds a password for it. The panel reads this on open
     /// (the popover view is rebuilt on every toggle).
     var hasCredentials: Bool {
+        if let preview = Self.previewCredentials { return preview }
         guard let username = ProfileStore.loadUsername(), !username.isEmpty else {
             return false
         }
@@ -134,12 +135,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             || KeychainStore.exists(server: ProfileStore.loadProfile().server, username: username)
     }
 
+    /// The README picture: credentials "stored" without asking the keychain.
+    static var previewCredentials: Bool?
+
     /// Localized details shared by the panel and the menu tooltip.
     var ownLoginProgressText: String? {
         guard !usesCisco, state == .authenticating || state == .awaitingApproval else { return nil }
         switch ApprovalPromptTracker.ownLoginSignal(detail) {
         case .gatewayReply: return "网关已回应，等待连接结果"
-        case .configuring: return "隧道协商完成，正在配置 VPN 网络"
+        case .configuring: return "隧道协商完成，正在配置 Cisco 网络"
         default: return nil
         }
     }
@@ -513,8 +517,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             case "give_up":
                 RelayLog.write("login: the engine did not start after fresh starts, stopped")
                 loginWatchRetrying = false
-                loginProtectionNotice = "没能开始登录" + (loginStepFailure.map { "：" + $0 } ?? "：后台服务没有启动 VPN")
-                    + "。网络仍处拦截，可点「断开 VPN，恢复直连网络」，或关掉开关再打开重试"
+                loginProtectionNotice = "没能开始登录" + (loginStepFailure.map { "：" + $0 } ?? "：后台服务没有启动 Cisco")
+                    + "。网络仍处拦截，可点「断开 Cisco，恢复直连网络」，或关掉开关再打开重试"
             default: break
             }
         }
@@ -828,6 +832,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pfWarning = nil
         splitActivity = nil
         prepareGatewayWhileDirect()
+        syncProxyOnly()
     }
 
     /// 按网站分流 (DESIGN.md §26.12): one switch for the user; on = the
@@ -1019,6 +1024,49 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func finishLaunchConnection(_ automatic: Bool) {
         onDemand.launchFinished(automatic)
+        syncProxyOnly()
+    }
+
+    // MARK: - Proxies with Cisco off (DESIGN.md §69.20)
+
+    /// The service runs the proxies by themselves (no connection owns them).
+    @Published private(set) var proxyOnlyRunning = false
+    /// Why it does not, when it should.
+    @Published private(set) var proxyOnlyError: String?
+
+    /// Proxies on and set, and not Cisco's own client connected (its filter
+    /// decides where traffic goes then). The own connection's split takes
+    /// the proxies over by itself and hands them back when it ends.
+    var proxyOnlyWanted: Bool {
+        guard !endingApp, !resettingNetwork, !ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty else { return false }
+        return !usesCisco || state == .disconnected
+    }
+
+    /// The rules, then whether the proxies run by themselves.
+    func syncProxyOnly() { pushDirectDomains() }
+
+    /// After the rules: XPC keeps the order. Only to a service built from
+    /// this App (an unknown method drops the connection, §26.14).
+    private func sendProxyOnly() {
+        guard !AppRole.isSettings else { return }
+        guard HelperInstaller.installedHelperMatchesBundle else {
+            proxyOnlyRunning = false
+            proxyOnlyError = ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty ? nil : "要先更新后台服务"
+            return
+        }
+        let on = proxyOnlyWanted
+        ensureConnection { proxy in
+            var finished = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
+            proxy.setProxyOnly(on) { running, error in
+                DispatchQueue.main.async {
+                    guard !finished else { return }
+                    finished = true
+                    self.proxyOnlyRunning = running
+                    self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
+                }
+            }
+        }
     }
 
     /// True while installHelper waits for a login to finish.
@@ -1049,7 +1097,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// the panel's speed card reads right after it, with fresh proxied
     /// totals (§69.18).
     func refreshSplitActivity(then done: (() -> Void)? = nil) {
-        guard !usesCisco, state == .connected else {
+        guard (!usesCisco && state == .connected) || proxyOnlyRunning else {
             splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
         }
         // An older background service does not know this method, and a
@@ -1075,7 +1123,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
                         defer { finish() }
-                        guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
+                        guard !finished, self.connectedSince == sessionStarted,
+                              (self.state == .connected && !self.usesCisco) || self.proxyOnlyRunning else { return }
                         finished = true
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
@@ -1083,12 +1132,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                             var proxyHealth: [ProxyTraffic]?
                             struct Bytes: Codable { var direct: [UInt64]; var vpn: [UInt64]; var local: [UInt64] }
                             var proxyBytes: Bytes?
+                            var proxyOnly: Bool?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         if let rows = status?.proxyHealth, !rows.isEmpty {
                             ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
                         }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        if let status, self.state == .disconnected { self.proxyOnlyRunning = status.proxyOnly == true }
                         self.proxyBytes = status?.proxyBytes.flatMap { bytes in
                             let reading: [String: Any] = ["at": Date().timeIntervalSince1970,
                                                           "direct": bytes.direct, "vpn": bytes.vpn, "local": bytes.local]
@@ -1153,6 +1204,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func prepareForNetworkReset() {
         resettingNetwork = true
+        // 恢复网络 turns off everything of ours, the proxies too (§69.20):
+        // the switch shows it, the user turns them on again.
+        var stored = ProfileStore.loadAppSettings()
+        if !stored.activeProxyRoutes.isEmpty {
+            stored.proxiesPaused = true
+            ProfileStore.saveAppSettings(stored)
+        }
+        sendProxyOnly()
         resetGatewayPreparation()
         if loginIntentActive || switchIsOn || networkHeld { disconnect() }
     }
@@ -1177,6 +1236,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     func shutdownForQuit(completion: @escaping () -> Void) {
         endingApp = true
         watchLogin("stopped")
+        // Quit = nothing of ours keeps running, the proxies included (§69.20).
+        sendProxyOnly()
         protection.invalidate(.manualStop)
         resetGatewayPreparation()
         if let record = dropTracker.finishForQuit() {
@@ -1343,9 +1404,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     case .timedOut:
                         loginProtectionNotice = ProtectedLoginNotice.preparationTimedOut
                     case .unavailable:
-                        loginProtectionNotice = "没有取得可用的 VPN 服务器地址。网络已拦截，请恢复直连后重试。"
+                        loginProtectionNotice = "没有取得可用的 Cisco 服务器地址。网络已拦截，请恢复直连后重试。"
                     case .dnsFailed:
-                        loginProtectionNotice = "无法解析 VPN 服务器的名称。网络已拦截，请恢复直连后重试。"
+                        loginProtectionNotice = "无法解析 Cisco 服务器的名称。网络已拦截，请恢复直连后重试。"
                     case .networkUnknown:
                         loginProtectionNotice = ProtectedLoginNotice.preparationUnavailable
                     default: break
@@ -1355,7 +1416,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 return
             }
             networkHeld = true
-            loginProtectionNotice = "网络已拦截，正在连接 VPN"
+            loginProtectionNotice = "网络已拦截，正在连接 Cisco"
             if !native {
                 if !loginWatchRetrying { loginStepFailure = nil }
                 RelayLog.write("login: network held, preparing the relay")
@@ -2018,7 +2079,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // the drop (it read as 断了 2 秒，没恢复, §30.4).
             return
         }
-        let rejectedWithHold = detail == "VPN 网关证书校验失败，网络已拦截"
+        let rejectedWithHold = detail == "Cisco 网关证书校验失败，网络已拦截"
         if !usesCisco && relay == nil && (detail == StatusLook.certificateHeadline || rejectedWithHold) {
             showGatewayRejection()
             rejectedLoginHeld = rejectedWithHold && protectsDrops
@@ -2027,6 +2088,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         state = parsed
         if parsed != .disconnected && old == .disconnected { watchLogin("started") }
+        // Cisco on or off: the proxies run by themselves or not (§69.20).
+        if (parsed == .disconnected) != (old == .disconnected), !AppRole.isSettings { syncProxyOnly() }
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
         if parsed == .connected && old != .connected && !AppRole.isSettings {
@@ -2477,10 +2540,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let settings = ProfileStore.loadAppSettings()
         // Without Cisco on this Mac the own connection runs either way;
-        // only the switch decides whether the list applies.
-        let text = settings.splitOn ? settings.directRuleText : ""
+        // only the switch decides whether the list applies. Through Cisco's
+        // client only the proxies go, for while Cisco is off (§69.20).
+        let text = settings.splitOn ? settings.directRuleText : settings.proxyLines.joined(separator: "\n")
         // A background service built before §66.30 only knows the list form.
         let legacy = HelperInstaller.installedHelperOutdated
+        defer { sendProxyOnly() }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -2696,6 +2761,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             "ownConnection": ownConnection, "splitSwitchPending": splitSwitchPending,
             "onDemandPaused": onDemandPaused, "onDemandRuleName": onDemandRuleName ?? "",
             "helperUpdatePending": helperUpdatePending, "drops": dropHistory.count,
+            "proxyOnlyRunning": proxyOnlyRunning,
             "lastDropId": lastDrop?.id.uuidString ?? "", "lastDropSignature": Self.dropSignature(lastDrop),
         ]
         json["gatewayTrustFailed"] = gatewayTrustFailed
@@ -2724,6 +2790,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         ownConnection = json["ownConnection"] as? Bool ?? ownConnection
         splitSwitchPending = json["splitSwitchPending"] as? Bool ?? false
         helperUpdatePending = json["helperUpdatePending"] as? Bool ?? false
+        proxyOnlyRunning = json["proxyOnlyRunning"] as? Bool ?? false
         splitWarning = json["splitWarning"] as? String
         gatewayTrustFailed = json["gatewayTrustFailed"] as? Bool ?? false
         loginProtectionNotice = json["loginProtectionNotice"] as? String

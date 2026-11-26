@@ -63,7 +63,7 @@ private struct EgressRecentSites: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if !recent.isEmpty {
-                Text("最近经 VPN 访问过的网站，点一下加入").font(.caption).foregroundStyle(.secondary)
+                Text("最近经 Cisco 访问过的网站，点一下加入").font(.caption).foregroundStyle(.secondary)
                 FlowChips(items: recent) { site in
                     Button { add(site) } label: { Label(site, systemImage: "plus").font(.callout) }
                         .buttonStyle(.borderless)

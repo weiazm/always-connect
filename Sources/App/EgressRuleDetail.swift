@@ -104,7 +104,7 @@ struct EgressRuleDetail: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     if let steered = state?.steered, !steered.isEmpty, connected {
-                        Text("已为 \(steered.prefix(3).joined(separator: "、"))\(steered.count > 3 ? " 等 \(steered.count) 个" : "") 换到出口正确的入口（同一 CDN，仍走 VPN）。")
+                        Text("已为 \(steered.prefix(3).joined(separator: "、"))\(steered.count > 3 ? " 等 \(steered.count) 个" : "") 换到出口正确的入口（同一 CDN，仍走 Cisco）。")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -212,7 +212,7 @@ struct EgressRuleDetail: View {
         if rule.enabled, let problem = badge.problem { return problem }
         let countries = "只从 " + egressCountriesLabel(rule.expect) + " 出去"
         guard rule.enabled else { return countries + " · 暂停期间不核对" }
-        guard connected else { return countries + " · VPN 连上后开始检查" }
+        guard connected else { return countries + " · Cisco 连上后开始检查" }
         if let state, state.lastCheck.isFinite, state.lastCheck > 0 {
             let time = Date(timeIntervalSince1970: state.lastCheck).formatted(date: .omitted, time: .shortened)
             return countries + " · \(time) 核实过"

@@ -9,7 +9,7 @@ struct StatusLook {
     var color: NSColor
     var headline: String
 
-    static let certificateHeadline = "VPN 网关证书校验失败"
+    static let certificateHeadline = "Cisco 网关证书校验失败"
 
     static func of(_ state: HelperClient.State, held: Bool, hasCredentials: Bool, onDemand: Bool = false,
                    certificateRejected: Bool = false, pendingLogin: Bool = false) -> StatusLook {
@@ -17,11 +17,11 @@ struct StatusLook {
             return StatusLook(symbol: "exclamationmark.shield.fill", color: .systemRed, headline: certificateHeadline)
         }
         if pendingLogin && state == .disconnected {
-            return StatusLook(symbol: "shield.lefthalf.fill", color: .systemYellow, headline: "VPN 尚未连接")
+            return StatusLook(symbol: "shield.lefthalf.fill", color: .systemYellow, headline: "Cisco 尚未连接")
         }
         switch state {
         case .connected:
-            return StatusLook(symbol: "checkmark.shield.fill", color: .systemGreen, headline: "VPN 已连接")
+            return StatusLook(symbol: "checkmark.shield.fill", color: .systemGreen, headline: "Cisco 已连接")
         case .connecting, .authenticating:
             return StatusLook(symbol: "shield.lefthalf.fill", color: .systemYellow, headline: "正在连接…")
         case .awaitingApproval:
@@ -29,7 +29,7 @@ struct StatusLook {
                               headline: "请在手机上确认登录")
         case .reconnecting:
             return StatusLook(symbol: "exclamationmark.shield.fill", color: .systemRed,
-                              headline: "VPN 断了，正在重连")
+                              headline: "Cisco 断了，正在重连")
         case .disconnected where held:
             return StatusLook(symbol: "exclamationmark.shield.fill", color: .systemRed,
                               headline: "未连接，网络仍处暂停")
@@ -40,7 +40,8 @@ struct StatusLook {
     }
 
     static func updateMenuButton(_ button: NSButton, client: HelperClient) {
-        let badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
+        var badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
+        if badge == .none, client.proxyOnlyRunning { badge = .proxy }
         button.image = GlobeIcon.image(badge)
         button.contentTintColor = nil
         button.toolTip = "AlwaysConnect：\(client.stateLine)"

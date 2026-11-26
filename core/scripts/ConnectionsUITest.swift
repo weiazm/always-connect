@@ -34,7 +34,7 @@ struct ConnectionsUITest {
         let failed = PanelStatusHeader(client: manager, subtitle: "已连接")
         let menu = NSButton()
         StatusLook.updateMenuButton(menu, client: manager)
-        check(!manager.showsConnected && manager.stateLine == "VPN 网关证书校验失败", "settings copy replaces the old success state")
+        check(!manager.showsConnected && manager.stateLine == "Cisco 网关证书校验失败", "settings copy replaces the old success state")
         check(failed.look.headline == manager.stateLine && failed.badge == .alert
               && !failed.subtitle.contains("已连接") && menu.toolTip?.contains(manager.stateLine) == true,
               "menu, tooltip, panel and settings agree on certificate rejection")

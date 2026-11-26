@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Menu-bar popover: a big coloured status header, four switches as
-/// tiles (VPN, 代理, 出口保护, 断线保护; layout B, user 2026-11-25), the
-/// speed, server and split, last error. The red recovery button stays
+/// Menu-bar popover: one control card with Cisco and the split's proxies,
+/// each with its own switch (design C, user 2026-11-26), Cisco's three
+/// options as a list, the speed, last error. The red recovery button stays
 /// whenever the network is held. The old small switch read the same
 /// on and off inside a popover (user, 2026-11-03), so the state is now
 /// spelled out and the button says what it will do (UI-DESIGN.md §四).
@@ -20,6 +20,9 @@ struct PanelView: View {
     var onOpenSettings: (String?) -> Void = { SettingsWindow.shared.show(tab: $0) }
     /// Close the panel (a link opened in the browser).
     var onClose: () -> Void = {}
+    /// Sample data only (the README picture): nothing of this Mac is read,
+    /// no network, keychain or connection state.
+    var preview: PanelPreview?
     @State private var showConfirmDisconnect = false
     @State private var servers = ProfileStore.loadServers()
     @State private var selectedServer = ProfileStore.loadProfile().server
@@ -53,7 +56,7 @@ struct PanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            vpnCard
+            controlCard
             if !manager.gatewayTrustFailed, manager.state != .disconnected, let notice = manager.loginProtectionNotice {
                 Label(notice, systemImage: "lock.shield").font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
@@ -65,7 +68,7 @@ struct PanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if primaryButtonNeeded { primaryButton }
-            tiles
+            options
             if showConfirmDisconnect {
                 HStack {
                     Text("断开后网络恢复直连")
@@ -81,7 +84,7 @@ struct PanelView: View {
                 }
             }
             egressFollowUps
-            if manager.showsConnected {
+            if manager.showsConnected || manager.proxyOnlyRunning {
                 speedCard
             }
             ForEach(neighbors.filter { $0.level == .warning || manager.state == .disconnected }, id: \.text) { notice in
@@ -152,7 +155,7 @@ struct PanelView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if !manager.helperAvailable {
+            if !manager.helperAvailable, preview == nil {
                 // "Helper" is our word, not the user's: say what it is
                 // for (UI-DESIGN.md §四).
                 HStack {
@@ -228,7 +231,7 @@ struct PanelView: View {
                     showConfirmReset = true
                 }
                 .disabled(resettingNetwork)
-                .help("上不了网、被 AlwaysConnect 卡住时：断开 VPN，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
+                .help("上不了网、被 AlwaysConnect 卡住时：断开 Cisco，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
                 Spacer(minLength: 0)
                 // Quit = VPN off, direct network, nothing of ours left
                 // running (DESIGN.md §21.5); confirm only when that
@@ -240,11 +243,11 @@ struct PanelView: View {
                         AppQuit.request()
                     }
                 }
-                .help("断开 VPN、恢复直连网络，并退出 AlwaysConnect")
+                .help("断开 Cisco、恢复直连网络，并退出 AlwaysConnect")
             }
             if showConfirmQuit {
                 HStack {
-                    Text("退出会断开 VPN，网络恢复直连")
+                    Text("退出会断开 Cisco，网络恢复直连")
                         .font(.callout)
                     Spacer()
                     Button("断开并退出") {
@@ -259,6 +262,11 @@ struct PanelView: View {
         .frame(width: 340)
         .toggleStyle(.always)
         .onAppear {
+            if let preview {
+                speed.showPreview(preview.speed)
+                link.showPreview(preview.link)
+                return
+            }
             manager.prepareGatewayWhileDirect()
             // Also refreshes the split status (正在直连, proxied totals).
             speed.start()
@@ -274,7 +282,7 @@ struct PanelView: View {
             }
         }
         .onReceive(activityTimer) { _ in manager.expireGatewayPreparation() }
-        .onReceive(healthTimer) { _ in checkHealth() }
+        .onReceive(healthTimer) { _ in if preview == nil { checkHealth() } }
         .onChange(of: manager.showsConnected) { _ in link.reset(); checkHealth() }
         .onDisappear { speed.stop() }
     }
@@ -285,8 +293,10 @@ struct PanelView: View {
         let totals = speed.totals
         return Button { onOpenSettings("traffic") } label: {
             HStack(spacing: 10) {
-                speedColumn("走 VPN", color: .green, totals?.vpn)
-                Divider().frame(height: 36)
+                if manager.showsConnected {
+                    speedColumn("Cisco", color: .green, totals?.vpn)
+                    Divider().frame(height: 36)
+                }
                 // §69.17, §69.18: the columns are known when the panel
                 // opens, from the settings, not from the first numbers
                 // (user, 2026-11-26: "两个跳变成3个，这是什么鬼交互啊").
@@ -310,7 +320,7 @@ struct PanelView: View {
     /// The 代理 column: proxies are on for this connection, or (a change
     /// the service has not applied yet) proxied bytes are still moving.
     private var proxyColumnShown: Bool {
-        (manager.ownConnection && !settings.activeProxyRoutes.isEmpty)
+        (!settings.activeProxyRoutes.isEmpty && (manager.ownConnection || manager.proxyOnlyRunning))
             || (speed.totals?.proxy.map { $0 != [0, 0] } ?? false)
     }
 
@@ -346,7 +356,7 @@ struct PanelView: View {
     @ViewBuilder private var networkResetConfirm: some View {
         if showConfirmReset {
             VStack(alignment: .leading, spacing: 6) {
-                Text("会断开 VPN，并清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连。需要输入一次开机密码。")
+                Text("会断开 Cisco，并清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连。需要输入一次开机密码。")
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
@@ -391,49 +401,74 @@ struct PanelView: View {
             || (manager.state == .disconnected && manager.loginProtectionNotice != nil)
     }
 
-    private var tiles: some View {
-        // Two equal columns; a long state line is cut, never widens one.
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                directTile
-                proxyTile
+    /// Cisco's own three (UI-DESIGN.md 面板, design C, user 2026-11-26): one
+    /// list under the control card. While Cisco is off they rest: names
+    /// only, and one line says they come with Cisco.
+    private var options: some View {
+        let ciscoOn = manager.switchIsOn
+        return VStack(alignment: .leading, spacing: 5) {
+            VStack(spacing: 0) {
+                directRow(resting: !ciscoOn)
+                Divider().padding(.leading, 41)
+                egressRow(resting: !ciscoOn)
+                Divider().padding(.leading, 41)
+                dropRow(resting: !ciscoOn)
             }
-            HStack(spacing: 8) {
-                egressTile
-                dropTile
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
+            if !ciscoOn {
+                Text("这三项跟着 Cisco，连上后生效")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .padding(.leading, 4)
             }
         }
     }
 
-    /// VPN and server as one card (user 2026-11-25: "左边服务器，右边vpn开关，
-    /// 合并成一个"): the globe and the server menu on the left, the state
-    /// under the server's name, the VPN switch on the right. The card takes
-    /// the state's colour: green connected, red held or refused, orange on
-    /// the way, neutral off.
-    private var vpnCard: some View {
+    /// Cisco and the split's proxies, one card, two rows, two switches
+    /// (design C, user 2026-11-26: "c"; line version: "线条版"). Neutral
+    /// card; the state lines carry the colour.
+    private var controlCard: some View {
+        VStack(spacing: 0) {
+            ciscoRow
+            Divider().padding(.leading, 57)
+            proxyRow
+        }
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.primary.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(cardAlarm ? Color.red.opacity(0.45) : Color.primary.opacity(0.10), lineWidth: 1))
+    }
+
+    /// Held, dropped or refused: the card's edge says it too.
+    private var cardAlarm: Bool {
+        manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+    }
+
+    /// Cisco: the globe and the server menu on the left, the state under
+    /// the server's name, the switch on the right (§69.9).
+    private var ciscoRow: some View {
         let header = PanelStatusHeader(client: manager, subtitle: subtitle)
-        let red = manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+        let red = cardAlarm
         let (caption, tint): (String, Color) = {
             if manager.showsConnected {
-                let since = manager.connectedSince.map { " · " + Self.duration(Date().timeIntervalSince($0)) } ?? ""
                 switch link.state {
-                case .ok(let ms): return ("已连接\(since) · \(ms) ms", .green)
-                case .slow(let ms): return ("已连接 · 网络慢 \(ms) ms", .orange)
-                case .down: return ("已连接 · 网络不通", .red)
-                case .unknown: return ("已连接\(since)", .green)
+                case .ok(let ms): return ("Cisco 已连接 · \(ms) ms", .green)
+                case .slow(let ms): return ("Cisco 已连接 · 网络慢 \(ms) ms", .orange)
+                case .down: return ("Cisco 已连接 · 网络不通", .red)
+                case .unknown: return ("Cisco 已连接", .green)
                 }
             }
             if manager.loginStopped { return (header.subtitle, .orange) }
             let tint: Color = red ? .red : (manager.state == .disconnected ? .secondary : .orange)
-            if manager.state == .disconnected && !red { return (header.subtitle, tint) }
+            if manager.state == .disconnected && !red {
+                return (manager.hasCredentials ? "Cisco 未连接" : header.subtitle, tint)
+            }
             return (header.look.headline + (header.subtitle.isEmpty ? "" : " · " + header.subtitle), tint)
         }()
-        let neutral = tint == .secondary
-        return HStack(spacing: 12) {
-            Image(nsImage: GlobeIcon.image(header.badge, size: 34))
-                .frame(width: 38, height: 38)
+        let since = manager.connectedSince.map { "已连接 " + Self.duration(Date().timeIntervalSince($0)) }
+        return HStack(spacing: 11) {
+            Image(nsImage: GlobeIcon.image(header.badge, size: 30))
+                .frame(width: 32, height: 32)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Menu {
                     ForEach(servers) { entry in
                         Button {
@@ -462,15 +497,8 @@ struct PanelView: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .help("切换服务器")
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Circle().fill(tint).frame(width: 6, height: 6)
-                    Text(caption)
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(neutral ? Color.secondary : tint)
-                        .lineLimit(manager.gatewayTrustFailed ? 4 : 2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .help("上网检测：面板开着时每 10 秒试着打开几个常用网址，取最快的应答")
+                stateLine(caption, tint, lines: manager.gatewayTrustFailed ? 4 : 2)
+                    .help(manager.showsConnected ? (since ?? "") + "\n上网检测：面板开着时每 2 秒试着打开几个常用网址，取最快的应答" : "")
             }
             Spacer(minLength: 8)
             AlwaysSwitchTrack(isOn: Binding(get: { manager.switchIsOn && !manager.loginStopped }, set: { on in
@@ -482,34 +510,100 @@ struct PanelView: View {
                 } else {
                     showConfirmDisconnect = true
                 }
-            }), width: 46, height: 27)
-            .accessibilityLabel("VPN")
+            }), width: 42, height: 25)
+            .accessibilityLabel("Cisco")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(LinearGradient(colors: [tint.opacity(neutral ? 0.06 : 0.20), tint.opacity(neutral ? 0.03 : 0.05)],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing)))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .stroke(tint.opacity(neutral ? 0.12 : 0.35), lineWidth: 1))
+        .padding(.vertical, 11)
     }
 
-    /// 分流直连: the 不走 VPN list on or resting, live (§69.9).
-    private var directTile: some View {
+    /// The split's proxies, on whether Cisco is connected or not (§69.20).
+    private var proxyRow: some View {
+        let all = (settings.proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
+        let on = settings.proxiesOn && !all.isEmpty
+        let (caption, tint): (String, Color) = {
+            if all.isEmpty { return ((settings.proxyRoutes ?? []).isEmpty ? "未添加，点这里添加" : "未启用", .secondary) }
+            if !settings.proxiesOn { return ("关", .secondary) }
+            if manager.usesCisco && manager.state != .disconnected { return ("Cisco 连着时由 Cisco 管，断开后恢复", .secondary) }
+            if let error = manager.proxyOnlyError { return (error, .orange) }
+            let ownSplit = !manager.usesCisco && manager.showsConnected
+            guard manager.proxyOnlyRunning || ownSplit else {
+                return (manager.state == .disconnected ? "正在启用…" : "Cisco 连上后接着用", .secondary)
+            }
+            let summary = proxyHealth.summary(all)
+            let color: Color = summary.level == .ok ? .green : summary.level == .warn ? .orange : summary.level == .fail ? .red : .secondary
+            return ((all.count > 1 ? "\(all.count) 个代理 · " : "") + summary.text, color)
+        }()
+        return HStack(spacing: 11) {
+            ProxyMark(on: on)
+                .frame(width: 32, height: 32)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Menu {
+                    ForEach(all) { route in
+                        Button("\(route.name)：" + (proxyHealth.checks[route.id].map { $0.level == .ok ? $0.short : $0.text } ?? "未检测")) {
+                            onOpenSettings("proxy")
+                        }
+                    }
+                    if !all.isEmpty { Divider() }
+                    Button("管理代理…") { onOpenSettings("proxy") }
+                } label: {
+                    (Text("分流代理").font(.system(size: 16, weight: .semibold))
+                     + Text("  ") + Text(Image(systemName: "chevron.down"))
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.secondary))
+                        .lineLimit(1)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("哪些网站经代理、每个代理现在怎样")
+                stateLine(caption, tint, lines: 2)
+                    .help(proxyHelp(all))
+            }
+            Spacer(minLength: 8)
+            AlwaysSwitchTrack(isOn: Binding(get: { on }, set: { turnOn in
+                if all.isEmpty { onOpenSettings("proxy"); return }
+                var stored = ProfileStore.loadAppSettings()
+                stored.proxiesPaused = turnOn ? nil : true
+                ProfileStore.saveAppSettings(stored)
+                settings = stored
+                manager.syncProxyOnly()
+                if turnOn { proxyHealth.check(all, force: true) }
+            }), width: 42, height: 25)
+            .accessibilityLabel("分流代理")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+    }
+
+    private func stateLine(_ caption: String, _ tint: Color, lines: Int) -> some View {
+        let neutral = tint == .secondary
+        return HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Circle().fill(neutral ? Color.secondary.opacity(0.6) : tint).frame(width: 6, height: 6)
+            Text(caption)
+                .font(.system(size: 11.5))
+                .foregroundStyle(neutral ? Color.secondary : tint)
+                .lineLimit(lines)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// 分流直连: the 不走 Cisco list on or resting, live (§69.9).
+    private func directRow(resting: Bool) -> some View {
         let own = manager.ownConnection
         let on = own && settings.directOn
         let (caption, tint): (String, Color) = {
             if !own { return ("要开按网站分流", .secondary) }
-            if !settings.directOn { return ("关 · 都走 VPN", .secondary) }
+            if !settings.directOn { return ("关 · 都走 Cisco", .secondary) }
             if siteCount == 0 { return ("名单是空的", .secondary) }
             if manager.showsConnected, let activity = manager.splitActivity, !activity.entries.isEmpty {
                 return ("\(activity.entries.count) 个网站正在直连", .green)
             }
-            return ("\(siteCount) 条不走 VPN", .secondary)
+            return ("\(siteCount) 条不走 Cisco", .secondary)
         }()
-        return PanelTile(symbol: "arrow.turn.up.right", title: "分流直连", caption: caption, tint: tint, isOn: on,
-                         enabled: own, help: splitHelp) { turnOn in
+        return PanelOptionRow(symbol: "arrow.turn.up.right", title: "分流直连", caption: caption, tint: tint, isOn: on,
+                              enabled: own, resting: resting, help: splitHelp) { turnOn in
             var stored = ProfileStore.loadAppSettings()
             stored.directPaused = turnOn ? nil : true
             ProfileStore.saveAppSettings(stored)
@@ -517,30 +611,6 @@ struct PanelView: View {
             DirectList.pushNetworks()
             if !manager.usesCisco { manager.pushDirectDomains() }
         } open: { onOpenSettings("split") }
-    }
-
-    private var proxyTile: some View {
-        let all = (settings.proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
-        let on = settings.proxiesOn && !all.isEmpty
-        let (caption, tint): (String, Color) = {
-            if all.isEmpty { return ((settings.proxyRoutes ?? []).isEmpty ? "未添加" : "未启用", .secondary) }
-            if !settings.proxiesOn { return ("关", .secondary) }
-            if !manager.ownConnection { return ("要开按网站分流", .secondary) }
-            if !manager.showsConnected { return ("连上 VPN 后生效", .secondary) }
-            let summary = proxyHealth.summary(all)
-            let color: Color = summary.level == .ok ? .green : summary.level == .warn ? .orange : summary.level == .fail ? .red : .secondary
-            return (summary.text, color)
-        }()
-        return PanelTile(symbol: "arrow.triangle.swap", title: "分流代理", caption: caption, tint: tint, isOn: on,
-                         help: proxyHelp(all)) { turnOn in
-            if all.isEmpty { onOpenSettings("proxy"); return }
-            var stored = ProfileStore.loadAppSettings()
-            stored.proxiesPaused = turnOn ? nil : true
-            ProfileStore.saveAppSettings(stored)
-            settings = stored
-            if !manager.usesCisco { manager.pushDirectDomains() }
-            if turnOn { proxyHealth.check(all, force: true) }
-        } open: { onOpenSettings("proxy") }
     }
 
     /// Each proxy and its state, on hover.
@@ -551,12 +621,12 @@ struct PanelView: View {
         }.joined(separator: "\n")
     }
 
-    private var egressTile: some View {
+    private func egressRow(resting: Bool) -> some View {
         let config = settings.egressProtection ?? EgressProtection()
         let available = !manager.usesCisco && protectionOn
         let (caption, tint): (String, Color) = {
             if config.groups.isEmpty { return ("未设置", .secondary) }
-            if manager.usesCisco { return ("经 Cisco 时不可用", .secondary) }
+            if manager.usesCisco { return ("经 Cisco 客户端时不可用", .secondary) }
             if !protectionOn { return ("要先开断线保护", .secondary) }
             guard config.isActive else { return ("关", .secondary) }
             guard let line = manager.egressLine, !manager.gatewayTrustFailed else { return ("开", .secondary) }
@@ -566,19 +636,19 @@ struct PanelView: View {
             case .unknown: return (line, .secondary)
             }
         }()
-        return PanelTile(symbol: "checkmark.shield.fill", title: "出口保护", caption: caption, tint: tint,
-                         isOn: config.isActive && available, enabled: available || config.groups.isEmpty,
-                         help: manager.egressLine ?? "") { on in
+        return PanelOptionRow(symbol: "checkmark.shield.fill", title: "出口保护", caption: caption, tint: tint,
+                              isOn: config.isActive && available, enabled: available || config.groups.isEmpty,
+                              resting: resting, help: manager.egressLine ?? "") { on in
             if config.groups.isEmpty { onOpenSettings("egress"); return }
             setEgress(on: on)
         } open: { onOpenSettings("egress") }
     }
 
-    private var dropTile: some View {
-        PanelTile(symbol: protectionOn ? "lock.fill" : "lock.open.fill", title: "断线保护",
-                  caption: protectionOn ? "掉线时暂停上网" : "关 · 掉线走本地网络",
-                  tint: .secondary, isOn: protectionOn,
-                  help: protectionOn ? "掉线时暂停上网，不漏走直连" : "掉线时改走本地网络") { on in
+    private func dropRow(resting: Bool) -> some View {
+        PanelOptionRow(symbol: protectionOn ? "lock.fill" : "lock.open.fill", title: "断线保护",
+                       caption: protectionOn ? "掉线时暂停上网" : "关 · 掉线走本地网络",
+                       tint: .secondary, isOn: protectionOn, resting: resting,
+                       help: protectionOn ? "掉线时暂停上网，不漏走直连" : "掉线时改走本地网络") { on in
             protectionOn = on
             var stored = ProfileStore.loadAppSettings()
             stored.dropProtection = on
@@ -594,7 +664,8 @@ struct PanelView: View {
     /// once and then every 2 s (§69.8, §69.16). Nothing runs once it closes.
     private func checkHealth() {
         if manager.showsConnected { link.checkIfDue() }
-        if manager.showsConnected, manager.ownConnection, settings.proxiesOn {
+        let proxiesActive = manager.proxyOnlyRunning || (manager.showsConnected && manager.ownConnection)
+        if proxiesActive, settings.proxiesOn {
             proxyHealth.check(settings.activeProxyRoutes)
         }
     }
@@ -727,7 +798,7 @@ struct PanelView: View {
         if manager.state == .disconnected, !manager.networkHeld, manager.protectsDrops,
            let preparation = manager.loginGatewayReadiness.caption { return preparation }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
-        if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
+        if manager.state == .disconnected, !manager.networkHeld { return "Cisco 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
         if manager.showsConnected {
             // Which server and for how long (§45.4), not the engine's words.
@@ -755,7 +826,7 @@ struct PanelView: View {
             // Never trapped behind drop protection: one click, no
             // confirm, back to the direct network.
             Button { showConfirmDisconnect = false; onStop() } label: {
-                Text("断开 VPN，恢复直连网络").frame(maxWidth: .infinity)
+                Text("断开 Cisco，恢复直连网络").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
@@ -776,13 +847,13 @@ struct PanelView: View {
                 .buttonStyle(.borderedProminent).controlSize(.large)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
-                Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
+                Text(manager.onDemandPaused ? "仍然连接" : "连接 Cisco").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
         } else {
             Button { showConfirmDisconnect = true } label: {
-                Text(manager.showsConnected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
+                Text(manager.showsConnected ? "断开 Cisco" : "取消连接").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
@@ -961,67 +1032,85 @@ final class PanelController: NSObject, NSWindowDelegate {
     }
 }
 
-/// One of the panel's switches (layout B, user 2026-11-25: low tiles,
-/// no empty right half): icon and name with the switch on the first line,
-/// the state across the whole tile under them. Clicking the words opens
-/// that page of Settings.
-struct PanelTile: View {
+/// What the README picture shows (offscreen render, sample data only).
+struct PanelPreview {
+    var speed: PanelSpeed.Totals
+    var link: LinkCheck.State
+}
+
+/// One of Cisco's options in the panel's list (design C): icon, name, the
+/// state, the switch. Resting (Cisco off): the name only, greyed; the list
+/// says once that these come with Cisco. Clicking the words opens that
+/// page of Settings.
+struct PanelOptionRow: View {
     var symbol: String
     var title: String
     var caption: String
     var tint: Color = .secondary
     var isOn: Bool
     var enabled = true
+    var resting = false
     var help = ""
     var toggle: (Bool) -> Void
     var open: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Button(action: open) {
-                    HStack(spacing: 7) {
-                        ZStack {
-                            Circle().fill(isOn ? Color.accentColor : Color.primary.opacity(0.12))
-                            Image(systemName: symbol)
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(isOn ? Color.white : Color.secondary)
-                        }
-                        .frame(width: 22, height: 22)
-                        Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                            .fixedSize()
-                        Spacer(minLength: 0)
+        let lit = isOn && !resting
+        HStack(spacing: 9) {
+            Button(action: open) {
+                HStack(spacing: 9) {
+                    ZStack {
+                        Circle().fill(lit ? Color.accentColor : Color.primary.opacity(0.10))
+                        Image(systemName: symbol)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(lit ? Color.white : Color.secondary)
                     }
-                    .contentShape(Rectangle())
+                    .frame(width: 22, height: 22)
+                    Text(title).font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(resting ? Color.secondary : Color.primary)
+                        .lineLimit(1).fixedSize()
+                    Spacer(minLength: 6)
+                    if !resting {
+                        HStack(spacing: 4) {
+                            if tint != .secondary { Circle().fill(tint).frame(width: 5, height: 5) }
+                            Text(caption)
+                                .font(.system(size: 11))
+                                .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if !resting {
                 // The App's own switch (§21.14): the system one turns grey
                 // whenever the panel is not the active window.
                 AlwaysSwitchTrack(isOn: Binding(get: { isOn }, set: toggle), width: 32, height: 19)
                     .disabled(!enabled)
                     .accessibilityLabel(title)
             }
-            Button(action: open) {
-                HStack(spacing: 4) {
-                    if tint != .secondary { Circle().fill(tint).frame(width: 5, height: 5) }
-                    Text(caption)
-                        .font(.system(size: 11))
-                        .frame(minWidth: 0, alignment: .leading)
-                        .foregroundStyle(tint == .secondary ? Color.secondary : tint)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(Color.primary.opacity(isOn ? 0.08 : 0.045)))
+        .padding(.vertical, 7)
+        .frame(minHeight: 35)
         .help(help)
+    }
+}
+
+/// The proxies' mark, drawn like the globe (user, 2026-11-26: "线条版"):
+/// label-coloured line art, half strength while off.
+struct ProxyMark: View {
+    var on: Bool
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.primary.opacity(on ? 0.85 : 0.45), lineWidth: 1.6)
+            Image(systemName: "arrow.triangle.swap")
+                .font(.system(size: 12.8, weight: .regular))
+                .foregroundStyle(Color.primary.opacity(on ? 0.9 : 0.45))
+        }
+        .frame(width: 28, height: 28)
     }
 }
 

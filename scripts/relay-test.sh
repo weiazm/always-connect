@@ -119,7 +119,7 @@ OCARG=(); [ -n "${ALWAYSCONNECT_TEST_OPENCONNECT:-}" ] && OCARG=(--openconnect "
 # Direct OpenConnect, using a test CA which did not sign this gateway.
 printf 'testpass\n' | "$HELPER" run-once --server https://localhost:4464 --user testuser ${OCARG[@]+"${OCARG[@]}"} \
     --cafile untrusted.pem --max-attempts 1 --no-routes --cookie-store "$W/rejected.json" --support-dir "$W/direct-rejected" > "$W/rejected.out" 2>&1
-if grep -q '^STATE .*VPN 网关证书校验失败' "$W/rejected.out" && ! grep -q '^STATE connected ' "$W/rejected.out"; then
+if grep -q '^STATE .*Cisco 网关证书校验失败' "$W/rejected.out" && ! grep -q '^STATE connected ' "$W/rejected.out"; then
     pass "direct engine reports the gateway certificate failure before connection"
 else
     fail "direct engine certificate failure status"

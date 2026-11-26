@@ -309,6 +309,15 @@ for k in $KEYS; do
     if [ $DRY = 1 ]; then echo "  [dry-run] scutil remove $k"
     else printf 'open\nremove %s\nclose\n' "$k" | scutil >/dev/null 2>&1; fi
 done
+# The proxy-only DNS entry (DESIGN.md §69.20): ours alone, never another
+# program's; left behind it would point the Mac's DNS at a forwarder that
+# is not there.
+PROXY_DNS_KEY=State:/Network/Service/AlwaysConnect-Proxy/DNS
+if printf 'show %s\nquit\n' "$PROXY_DNS_KEY" | scutil 2>/dev/null | grep -q ServerAddresses; then
+    say "remove proxy-only DNS entry $PROXY_DNS_KEY"
+    if [ $DRY = 1 ]; then echo "  [dry-run] scutil remove $PROXY_DNS_KEY"
+    else printf 'open\nremove %s\nclose\n' "$PROXY_DNS_KEY" | scutil >/dev/null 2>&1; fi
+fi
 [ $DRY = 1 ] || sleep 2
 
 DEF_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')

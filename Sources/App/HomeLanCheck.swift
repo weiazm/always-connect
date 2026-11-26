@@ -38,7 +38,7 @@ enum HomeLanCheck {
     static func describe(_ results: [Result]) -> String {
         guard !results.isEmpty else { return "没找到本地路由器（当前不在有路由器的网络上）。" }
         return results.map { r in
-            let path = r.routeInterface.hasPrefix("utun") ? "走 VPN 隧道（\(r.routeInterface)）" : "走本地网卡 \(r.routeInterface)"
+            let path = r.routeInterface.hasPrefix("utun") ? "走 Cisco 隧道（\(r.routeInterface)）" : "走本地网卡 \(r.routeInterface)"
             return "路由器 \(r.router)：\(path)，\(r.reachable ? "能连通 ✓" : "连不通 ✗")"
         }.joined(separator: "\n")
     }

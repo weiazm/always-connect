@@ -43,7 +43,7 @@ struct OnDemandSettings: View {
                 .id(draft.id)
             } else if rules.isEmpty {
                 EmptyGuide(symbol: "wifi", color: SettingsTone.account, title: "还没有规则",
-                           text: "例如：连着家里的 Wi-Fi 时断开 VPN，到了别处自动连上。") {
+                           text: "例如：连着家里的 Wi-Fi 时断开 Cisco，到了别处自动连上。") {
                     Button("添加第一条规则") { editing = OnDemandRule() }
                 }
             } else {
@@ -66,7 +66,7 @@ struct OnDemandSettings: View {
         } header: {
             Text("按需连接")
         } footer: {
-            Text("按顺序匹配规则；未命中时连接 VPN。")
+            Text("按顺序匹配规则；未命中时连接 Cisco。")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onDisappear {
@@ -149,7 +149,7 @@ struct OnDemandSettings: View {
     }
 }
 private func actionName(_ action: String) -> String {
-    action == "disconnect" ? "断开 VPN，使用本地网络" : action == "ignore" ? "忽略，保持当前状态" : "连接 VPN"
+    action == "disconnect" ? "断开 Cisco，使用本地网络" : action == "ignore" ? "忽略，保持当前状态" : "连接 Cisco"
 }
 
 /// Uses the same grouped Form row metrics and controls as the server and direct lists.
@@ -250,7 +250,7 @@ private struct OnDemandRuleEditor: View {
             if probeKind != "none" {
                 TextField(
                     probeKind == "url" ? "https://intranet.example.com/" : "intranet.example.com", text: $probeTarget)
-                Text("仅经物理网卡，3 秒超时；VPN 或断线保护拦截时视为不命中。")
+                Text("仅经物理网卡，3 秒超时；Cisco 或断线保护拦截时视为不命中。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Picker("命中后", selection: $rule.action) {

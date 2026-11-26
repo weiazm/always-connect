@@ -157,12 +157,12 @@ extension ApprovalPromptTracker.Card {
         switch (stage, kind) {
         case (.expired, _): return "手机批准已超时"
         case (.gatewayReply, _): return "网关已回应"
-        case (.configuring, _): return "正在配置 VPN 网络"
+        case (.configuring, _): return "正在配置 Cisco 网络"
         case (.connected, _): return "已连接"
         case (.establishing, .approval): return "已批准，正在连接…"
         case (.establishing, .ownLogin): return "正在建立连接…"
-        case (.waiting, .approval): return "请在手机上批准 VPN 登录"
-        case (.waiting, .ownLogin): return "正在登录 VPN"
+        case (.waiting, .approval): return "请在手机上批准 Cisco 登录"
+        case (.waiting, .ownLogin): return "正在登录 Cisco"
         }
     }
 

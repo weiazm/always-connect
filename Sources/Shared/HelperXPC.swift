@@ -142,6 +142,12 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Additive structured split status, including visible capacity warnings.
     /// The client asks only an exactly matching service, with a 3-second limit.
     func getSplitStatus(withReply reply: @escaping (String) -> Void)
+    /// Proxies with Cisco off (DESIGN.md §69.20): whether the user wants
+    /// the split's proxies to run when no connection owns them. The service
+    /// starts or stops its proxy-only session to match, and hands over to a
+    /// connection and back. Only sent to a matching service (3-second limit).
+    /// Reply: running now, and why not when it should.
+    func setProxyOnly(_ on: Bool, withReply reply: @escaping (Bool, String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     func setEgressProtection(_ json: String, withReply reply: @escaping (Bool) -> Void)
@@ -201,7 +207,7 @@ enum ServiceUpdateRight {
 }
 
 enum ProtectedLoginNotice {
-    static let preparationTimedOut = "查找 VPN 服务器超时。网络已拦截，请恢复直连后重试。"
+    static let preparationTimedOut = "查找 Cisco 服务器超时。网络已拦截，请恢复直连后重试。"
     static let preparationUnavailable = "网络已拦截。无法确认可用于查找网关的直连网络，请恢复直连后重试。"
     static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
     static let preparingGateway = "首次连接正在查网关，当前仍直连"

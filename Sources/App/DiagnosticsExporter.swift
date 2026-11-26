@@ -54,13 +54,13 @@ enum DiagnosticsExporter {
             "Helper 可用：\(manager.helperAvailable ? "是" : "否")",
             "服务器：\(profile.server.isEmpty ? "未设置" : DiagnosticsRedaction.placeholder)（共 \(profile.servers.count) 个）",
             "Group：\(profile.group.isEmpty ? "未设置" : DiagnosticsRedaction.placeholder)",
-            "默认模式：\(profile.defaultMode == .secure ? "全部走 VPN" : "仅名单走 VPN")",
+            "默认模式：\(profile.defaultMode == .secure ? "全部走 Cisco" : "仅名单走 Cisco")",
             "启动自动连接：\(profile.autoConnectOnLaunch ? "开" : "关")",
             "",
             "规则（\(rules.count) 条，内容不导出）：",
         ]
         for rule in rules {
-            lines.append("- [\(DiagnosticsRedaction.classify(.rule, rule.type.rawValue))] \(DiagnosticsRedaction.placeholder) → \(rule.direction == .viaVPN ? "走 VPN" : "直连")\(rule.isEnabled ? "" : "（停用）")")
+            lines.append("- [\(DiagnosticsRedaction.classify(.rule, rule.type.rawValue))] \(DiagnosticsRedaction.placeholder) → \(rule.direction == .viaVPN ? "走 Cisco" : "直连")\(rule.isEnabled ? "" : "（停用）")")
         }
         lines.append("")
         lines.append("掉线历史（\(manager.dropHistory.count) 次）：")

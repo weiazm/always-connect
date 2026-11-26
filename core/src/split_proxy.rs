@@ -38,8 +38,10 @@ use std::time::{Duration, Instant};
 mod owner;
 mod probe;
 mod protocol;
+pub mod redirect;
 mod relay;
 pub use probe::{probe, site_from_rules, Level, Probe};
+pub use redirect::RedirectSession;
 pub use protocol::{http_connect, open_through, socks5_connect, udp_associate, udp_unwrap, udp_wrap};
 pub use relay::{pf_original_destination, Listener, OriginalDestination, Proto};
 

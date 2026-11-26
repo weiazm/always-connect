@@ -147,6 +147,7 @@ final class Service {
     var preparedLogin: (target: String, gateways: [String], cisco: Bool)?
     let queue = ServiceQueue()
     var userReleased = true
+    func reconcileProxyOnly() {}
     SERVER_PROTECTION_BODY
 }
 final class Resource {
@@ -303,6 +304,7 @@ final class Client {
         return true
     }
     func showGatewayRejection() { gatewayTrustFailed = true }
+    func syncProxyOnly() {}
     func continueStoredConnection(_ profile: Profile, username: String, server: String, addresses: [String]?, session: UInt64) -> Bool {
         cisco?.isManaging = true
         starts += 1
@@ -734,7 +736,7 @@ final class ViewLifecycle {
             let due = DispatchQueue.main.timers
             DispatchQueue.main.timers = []
             due.forEach { $0() }
-            check(stuck.starts == round + 1 && stuck.networkHeld && stuck.loginProtectionNotice == "网络已拦截，正在连接 VPN",
+            check(stuck.starts == round + 1 && stuck.networkHeld && stuck.loginProtectionNotice == "网络已拦截，正在连接 Cisco",
                   "a stuck login starts again with the network still held (\(round))")
         }
         let last = DispatchQueue.main.timers

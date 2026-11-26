@@ -51,7 +51,9 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
             self.startQuickIdleExit()
         }
         NetworkGuard.shared.adoptAtStart()
-        // Routes and DNS entries a dead session left (§26.3, §26.5).
+        // Routes and DNS entries a dead session left (§26.3, §26.5), the
+        // proxy-only DNS entry among them (§69.20).
+        if !TestSeam.isActive { ProxyOnlySession.removeLeftover() }
         let direct = DirectRoutes.undoAtStart(supportDir: CLIOrchestrator.defaultSupportDir,
                                               noRoutes: TestSeam.isActive)
         if direct != "none" { HelperSession.log("direct routes at start: \(direct)") }
@@ -246,6 +248,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// exhausted. Reset on every new connect.
     private var lastReasonCode = 0
     private var lastRetryCount = 0
+    /// Proxies with Cisco off (DESIGN.md §69.20): what the App asked for,
+    /// the running session, its network watch, and the clock that ends it
+    /// when the App went away without saying so and never came back.
+    private var proxyOnlyWanted = false
+    private var proxyOnly: ProxyOnlySession?
+    private var proxyOnlyNetwork: PhysicalNetworkChanges?
+    private var proxyOnlyOrphan: DispatchWorkItem?
+    private var proxyOnlyError: String?
 
     /// One timestamped line to the daemon's stderr (launchd's
     /// StandardErrorPath when configured). Engine details only:
@@ -284,7 +294,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
 
     /// No App attached and no session running or retrying.
     var isIdle: Bool {
-        queue.sync { clients.isEmpty && activeParameters == nil && !NetworkGuard.shared.hasPendingLoginDeadline }
+        queue.sync { clients.isEmpty && activeParameters == nil && !NetworkGuard.shared.hasPendingLoginDeadline && proxyOnly == nil }
     }
 
     func addClient(_ connection: NSXPCConnection) {
@@ -313,6 +323,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func ownerAttached(app: AppRelauncher.App?) {
         if let app { relauncher.remember(app) }
         NetworkGuard.shared.ownerAttached()
+        proxyOnlyOrphan?.cancel()
+        proxyOnlyOrphan = nil
     }
 
     /// Session harness only: an App attaching or vanishing, no XPC.
@@ -339,8 +351,64 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         NetworkGuard.shared.ownerLost(sessionActive: sessionActive)
         if !userReleased, NetworkGuard.shared.isHolding || sessionActive {
             relauncher.relaunch()
+        } else if proxyOnly != nil {
+            // A quit turns the proxies off first: still running means the
+            // App did not quit on purpose. Like the network gate (§25.2):
+            // try to bring it back, end them if it is not back in 2 minutes.
+            relauncher.relaunch()
+            let orphan = DispatchWorkItem { [weak self] in
+                guard let self, self.clients.isEmpty else { return }
+                Self.log("proxy only: the App did not come back, stopped")
+                self.proxyOnlyWanted = false
+                self.reconcileProxyOnly()
+                self.onLastClientGone?()
+            }
+            proxyOnlyOrphan?.cancel()
+            proxyOnlyOrphan = orphan
+            queue.asyncAfter(deadline: .now() + 120, execute: orphan)
         }
         onLastClientGone?()
+    }
+
+    func setProxyOnly(_ on: Bool, withReply reply: @escaping (Bool, String) -> Void) {
+        queue.async {
+            self.proxyOnlyWanted = on
+            self.reconcileProxyOnly()
+            reply(self.proxyOnly != nil, self.proxyOnlyError ?? "")
+        }
+    }
+
+    /// On `queue`. Starts or stops the proxy-only session to match what the
+    /// App wants and who owns the proxies now (the rule is the core's):
+    /// the own connection's split runs them itself, and Cisco's client
+    /// decides while its kill switch is armed.
+    private func reconcileProxyOnly() {
+        let engineActive = engine != nil || stoppingEngine != nil
+        let ciscoActive = !KillSwitch.shared.isOff
+        let run = ProxyOnlySession.shouldRun(wanted: proxyOnlyWanted, engineActive: engineActive, ciscoActive: ciscoActive)
+        if run, proxyOnly == nil {
+            let (session, error) = ProxyOnlySession.start(rules: directRuleText)
+            proxyOnly = session
+            proxyOnlyError = error
+            if let error { Self.log("proxy only: " + error) }
+            if session != nil, proxyOnlyNetwork == nil {
+                proxyOnlyNetwork = PhysicalNetworkChanges { [weak self] in
+                    self?.queue.async { self?.proxyOnly?.networkChanged() }
+                }
+            }
+        } else if !run {
+            stopProxyOnly()
+        }
+    }
+
+    /// On `queue`.
+    private func stopProxyOnly() {
+        guard let session = proxyOnly else { return }
+        proxyOnly = nil
+        proxyOnlyError = nil
+        proxyOnlyNetwork?.cancel()
+        proxyOnlyNetwork = nil
+        session.stop()
     }
 
     /// Set by the user's release, cleared by the next connect or arm.
@@ -379,6 +447,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         server: String, group: String, username: String, password: String,
         parameters: [String], reply: @escaping (Bool) -> Void
     ) {
+        // The connection's split takes the proxies over (§69.20): the
+        // proxy-only session lets go of port 53, the DNS entry and the
+        // redirect before the engine's forwarder needs them.
+        if proxyOnly != nil {
+            Self.log("proxy only: handed over to the connection")
+            stopProxyOnly()
+        }
         startGeneration += 1
         userReleased = false
         let generation = startGeneration
@@ -520,6 +595,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 if reason == .authFailure || reason == .approvalDeclined, let error {
                     self.push(state: self.lastStateCode, detail: error)
                 }
+                // The proxies come back to the proxy-only session (§69.20).
+                self.reconcileProxyOnly()
             }
         }
         self.engine = engine
@@ -550,6 +627,12 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// On `queue`. pf first — the network is direct the moment this
     /// returns — then the parts that take their time.
     private func releaseEverythingLocked(reason: String) {
+        // The App is gone for good (the gate's grace ended): nothing of
+        // ours keeps running, the proxies included (§69.20).
+        if reason == NetworkGuard.Reason.appGone {
+            proxyOnlyWanted = false
+            stopProxyOnly()
+        }
         pendingLogin = nil
         startGeneration += 1 // a replacement waiting to start never does
         preparedLogin = nil
@@ -580,6 +663,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             self.directRuleText = domains.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                 .joined(separator: "\n")
             self.engine?.updateDirectRules(self.directRuleText)
+            self.proxyOnly?.update(rules: self.directRuleText)
             reply(true)
         }
     }
@@ -590,6 +674,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             // what it does not understand (§26.13, §66.30).
             self.directRuleText = text
             self.engine?.updateDirectRules(text)
+            self.proxyOnly?.update(rules: text)
             reply(true)
         }
     }
@@ -727,7 +812,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     }
 
     func getSplitStatus(withReply reply: @escaping (String) -> Void) {
-        queue.async { reply(self.engine?.splitStatusJSON() ?? "{}") }
+        queue.async { reply(self.engine?.splitStatusJSON() ?? self.proxyOnly?.statusJSON ?? "{}") }
     }
 
     func getConnections(withReply reply: @escaping (String) -> Void) {
@@ -782,6 +867,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func shutdown() {
         let current = queue.sync { engine }
         current?.killChild()
+        queue.sync { stopProxyOnly() }
     }
 
     private func activeRelayEngine(_ pin: String) -> CLIOrchestrator? {
@@ -1007,6 +1093,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                     }
                 }
                 reply(ok, message)
+                // Cisco's client owns the traffic while it is armed (§69.20).
+                self.queue.async { self.reconcileProxyOnly() }
             }
         }
     }

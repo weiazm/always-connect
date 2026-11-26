@@ -48,17 +48,17 @@ enum NetworkNeighbors {
         if let tun = o.defaultInterface, tun.hasPrefix("utun"), !o.oursActive, !o.ciscoTunnel {
             let who = names.isEmpty ? "另一个 VPN" : names
             out.append(NeighborNotice(level: .warning,
-                text: "\(who) 正在接管全部流量（\(tun)），和 VPN 会互相抢网络。连接前请先关掉它的 TUN/增强模式。"))
+                text: "\(who) 正在接管全部流量（\(tun)），和 Cisco 会互相抢网络。连接前请先关掉它的 TUN/增强模式。"))
         } else if !names.isEmpty {
             out.append(NeighborNotice(level: .info,
-                text: "检测到 \(names) 在运行：只开系统代理可以共存；TUN/增强模式会和 VPN 抢网络，请关掉。"))
+                text: "检测到 \(names) 在运行：只开系统代理可以共存；TUN/增强模式会和 Cisco 抢网络，请关掉。"))
         }
         if o.port53Busy, o.splitOn, !o.oursActive {
             out.append(NeighborNotice(level: .warning,
-                text: "本机 53 端口被其他程序占用（常见于 Clash 的 DNS）：连上后按网站分流会暂停，其余照常走 VPN。"))
+                text: "本机 53 端口被其他程序占用（常见于 Clash 的 DNS）：连上后按网站分流会暂停，其余照常走 Cisco。"))
         }
         if let proxy = o.systemProxy, names.isEmpty {
-            out.append(NeighborNotice(level: .info, text: "系统代理已开（\(proxy)），一般可以和 VPN 共存。"))
+            out.append(NeighborNotice(level: .info, text: "系统代理已开（\(proxy)），一般可以和 Cisco 共存。"))
         }
         return out
     }

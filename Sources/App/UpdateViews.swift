@@ -79,9 +79,9 @@ extension UpdateProgress {
         func mb(_ bytes: Int64) -> String { String(format: "%.1f", Double(bytes) / 1_000_000) }
         switch step {
         case .downloading(let done, let total) where total > 0:
-            return "正在下载 \(version)：\(mb(min(done, total))) / \(mb(total)) MB（VPN 照常可用）"
+            return "正在下载 \(version)：\(mb(min(done, total))) / \(mb(total)) MB（Cisco 照常可用）"
         case .downloading(let done, _):
-            return "正在下载 \(version)：已下载 \(mb(done)) MB（VPN 照常可用）"
+            return "正在下载 \(version)：已下载 \(mb(done)) MB（Cisco 照常可用）"
         case .checking:
             return "正在校验新版…"
         case .restarting:
@@ -94,7 +94,7 @@ extension UpdateProgress {
 
 enum UpdateSteps {
     /// Said before the click, so the click itself needs no confirmation.
-    static let what = "下载并校验新版，然后自动退出、换上新版并重新打开；VPN 断开几秒后自动重连。"
+    static let what = "下载并校验新版，然后自动退出、换上新版并重新打开；Cisco 断开几秒后自动重连。"
 }
 
 /// Settings → 通用 → 关于 AlwaysConnect (UI-DESIGN.md §六, §69.14): this

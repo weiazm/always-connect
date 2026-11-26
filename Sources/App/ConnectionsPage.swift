@@ -40,7 +40,7 @@ struct ConnectionsPage: View {
     }
 
     enum Filter: String, CaseIterable, Identifiable {
-        case all = "全部", vpn = "走 VPN", proxy = "走代理", direct = "直连"
+        case all = "全部", vpn = "走 Cisco", proxy = "走代理", direct = "直连"
         var id: String { rawValue }
     }
 
@@ -303,7 +303,7 @@ struct ConnectionsPage: View {
         let protectable = row.via == "vpn" && !manager.usesCisco && manager.protectsDrops && (site != nil || owner != nil)
         return Group {
             if row.via == "direct", let bypass, manager.ownConnection {
-                Menu("移除") { Button("从不走 VPN 的名单删除 \(bypass)") { remove(bypass) } }
+                Menu("移除") { Button("从不走 Cisco 的名单删除 \(bypass)") { remove(bypass) } }
             } else if !directChoices.isEmpty || protectable {
                 Menu(protectable ? "操作" : "加直连") {
                     if protectable {
@@ -325,7 +325,7 @@ struct ConnectionsPage: View {
                         }
                     }
                     if !directChoices.isEmpty {
-                        Section("加入不走 VPN 的名单") {
+                        Section("加入不走 Cisco 的名单") {
                             ForEach(directChoices, id: \.rule) { choice in
                                 Button(choice.label) { add(choice.rule) }
                             }
@@ -333,7 +333,7 @@ struct ConnectionsPage: View {
                     }
                 }
             } else if bypass != nil && row.via == "vpn" && manager.ownConnection {
-                Text("已加入").help("已在不走 VPN 的名单里")
+                Text("已加入").help("已在不走 Cisco 的名单里")
             }
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).controlSize(.small).font(.caption).fixedSize()
@@ -422,14 +422,14 @@ struct ConnectionsPage: View {
         let after = DirectSites.adding(rule, to: sites)
         guard after != before else { return }
         let name = ListRule.parse(rule)?.text ?? rule
-        save(after, notice: Notice(text: "已把 \(name) 加入不走 VPN 的名单。新连接马上直连；已开着的等程序重新连接（通常一两分钟内）。",
+        save(after, notice: Notice(text: "已把 \(name) 加入不走 Cisco 的名单。新连接马上直连；已开着的等程序重新连接（通常一两分钟内）。",
                                    before: before))
     }
 
     private func remove(_ line: String) {
         let before = sites
         save(DirectSites.removing(line, from: sites),
-             notice: Notice(text: "已把 \(line) 从不走 VPN 的名单删除。新连接改走 VPN。", before: before))
+             notice: Notice(text: "已把 \(line) 从不走 Cisco 的名单删除。新连接改走 Cisco。", before: before))
     }
 
     /// Stores and pushes the list (the same path as the 分流 page), shows
@@ -475,16 +475,16 @@ struct ConnectionsPage: View {
         let proxyRate = (proxied.reduce(0) { $0 + $1.down }, proxied.reduce(0) { $0 + $1.up })
         let proxyText = proxy == 0 ? "" : "走代理 \(proxy) 条" + (totals == nil ? "" : "  ↓" + Self.rate(proxyRate.0) + "/s ↑" + Self.rate(proxyRate.1) + "/s")
         guard let totals else {
-            return (["走 VPN \(vpn) 条", proxyText, "直连 \(direct) 条", "本机内部 \(local) 条"]).filter { !$0.isEmpty }.joined(separator: " · ")
+            return (["走 Cisco \(vpn) 条", proxyText, "直连 \(direct) 条", "本机内部 \(local) 条"]).filter { !$0.isEmpty }.joined(separator: " · ")
         }
         func pair(_ v: [Int]) -> String { "↓" + Self.rate(v[0]) + "/s ↑" + Self.rate(v[1]) + "/s" }
-        return (["走 VPN \(vpn) 条  \(pair(totals.vpn))", proxyText, "直连 \(direct) 条  \(pair(totals.direct))", "本机内部 \(local) 条"])
+        return (["走 Cisco \(vpn) 条  \(pair(totals.vpn))", proxyText, "直连 \(direct) 条  \(pair(totals.direct))", "本机内部 \(local) 条"])
             .filter { !$0.isEmpty }.joined(separator: "   ·   ")
     }
 
     static func wayName(_ via: String) -> String {
         switch via {
-        case "vpn": return "VPN"
+        case "vpn": return "Cisco"
         case "proxy": return "代理"
         case "local": return "本机"
         default: return "直连"

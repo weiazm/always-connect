@@ -121,7 +121,7 @@ struct EgressReconnectPrompt: View {
     let confirm: () -> Void
     var body: some View {
         EgressCallout(icon: "arrow.triangle.2.circlepath", tint: .accentColor,
-                      text: change.after.isActive ? "开启出口保护要重连一次 VPN" : "关掉最后一个保护要重连一次 VPN",
+                      text: change.after.isActive ? "开启出口保护要重连一次 Cisco" : "关掉最后一个保护要重连一次 Cisco",
                       caption: "通常不用在手机上确认；已打开的网页可能要刷新。") {
             Button("取消", action: cancel)
             Button(change.confirmationTitle, action: confirm).disabled(!canConfirm).keyboardShortcut(.defaultAction)

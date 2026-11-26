@@ -255,7 +255,7 @@ struct SplitOrderStrip: View {
             arrow
             step("分流直连", SettingsTone.direct)
             arrow
-            step("其余走 VPN", SettingsTone.vpn)
+            step("其余走 Cisco", SettingsTone.vpn)
         }
         .font(.caption)
         .accessibilityElement(children: .combine)

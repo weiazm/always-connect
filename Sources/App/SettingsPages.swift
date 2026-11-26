@@ -276,7 +276,7 @@ struct UninstallRows: View {
 
     var body: some View {
         if confirming {
-            Text("会断开 VPN、恢复直连，然后删除后台服务、随附的 openconnect、日志、桌面上的恢复网络脚本和 App 本身。需要输入一次这台电脑的开机密码。Cisco Secure Client 不受影响。默认什么都不留；勾了保留的，以后重新安装会自动带回来。")
+            Text("会断开 Cisco、恢复直连，然后删除后台服务、随附的 openconnect、日志、桌面上的恢复网络脚本和 App 本身。需要输入一次这台电脑的开机密码。Cisco Secure Client 不受影响。默认什么都不留；勾了保留的，以后重新安装会自动带回来。")
                 .fixedSize(horizontal: false, vertical: true)
             Toggle("保留账号密码（钥匙串里）", isOn: $keepPassword)
             Toggle("保留设置（服务器、分流名单等）", isOn: $keepSettings)
@@ -694,7 +694,7 @@ struct LoginCertificateSection: View {
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Footnote(own
-                    ? "按网站分流开着时，AlwaysConnect 自己连 VPN，登录时出示这张证书；私钥不离开钥匙串。"
+                    ? "按网站分流开着时，AlwaysConnect 自己连 Cisco，登录时出示这张证书；私钥不离开钥匙串。"
                     : "只在按网站分流开着时用；现在经 Cisco 连接，证书由 Cisco 出示。")
                 if own, !preview, let problem = LoginCertificate.problem(settings.clientCertificate, certificates) {
                     Text(problem).font(.caption).foregroundStyle(.red)
@@ -794,7 +794,7 @@ struct LocalLanStatus: View {
                     Text(enabled == true ? "已允许访问家里的设备" : "未允许访问家里的设备")
                         .font(.body.weight(.medium))
                     Text(enabled == true
-                         ? "连着 VPN 也能打开家里的路由器、NAS、打印机等设备。"
+                         ? "连着 Cisco 也能打开家里的路由器、NAS、打印机等设备。"
                          : "在 Cisco 的设置里勾选 “Allow local (LAN) access when using VPN”，然后退出 Cisco。只需做一次。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -910,7 +910,7 @@ struct SplitPage: View {
             } header: {
                 PageHeader(symbol: "arrow.triangle.branch", color: SettingsTone.direct, title: "按网站分流",
                          status: own
-                            ? "开 · \(sites.count) 条直连，\(proxyCount) 个代理，其余走 VPN"
+                            ? "开 · \(sites.count) 条直连，\(proxyCount) 个代理，其余走 Cisco"
                             : "关 · 经 Cisco 连接，按公司的规则分流",
                          dot: own ? .green : nil) {
                     AlwaysSwitchTrack(isOn: Binding(
@@ -946,7 +946,7 @@ struct SplitPage: View {
                               symbol: "house.fill", color: SettingsTone.direct)
                 }
                 } footer: {
-                    Footnote("你现在连着的局域网（家里的 NAS、打印机）不走 VPN；VPN 掉线时也照常可用。")
+                    Footnote("你现在连着的局域网（家里的 NAS、打印机）不走 Cisco；Cisco 掉线时也照常可用。")
                 }
                 if manager.usesCisco {
                     Section("Cisco 的局域网访问") {
@@ -958,14 +958,14 @@ struct SplitPage: View {
                     Section {
                         EgressCallout(icon: "pause.circle.fill", tint: .orange,
                                       text: "分流直连已在菜单栏面板上关闭。",
-                                      caption: "关闭期间这些网站走 VPN。") {
+                                      caption: "关闭期间这些网站走 Cisco。") {
                             Button("打开") { setDirect(on: true) }
                         }
                     }
                 }
                 Section {
                 if sites.isEmpty {
-                    EmptyGuide(symbol: "arrow.uturn.right", color: SettingsTone.direct, title: "还没有不走 VPN 的网站",
+                    EmptyGuide(symbol: "arrow.uturn.right", color: SettingsTone.direct, title: "还没有不走 Cisco 的网站",
                                text: "在下面输入一个网站、网段或清单名，例如 example.com、10.1.0.0/16、geosite:apple。") {
                         EmptyView()
                     }
@@ -1007,7 +1007,7 @@ struct SplitPage: View {
                     Text(problem).font(.caption).foregroundStyle(.orange)
                 }
             } header: {
-                Text("不走 VPN 的网站")
+                Text("不走 Cisco 的网站")
             } footer: {
                 Footnote(siteNote ?? (own
                     ? "改动立即生效，不用重新连接。写法示例：鼠标停在输入框旁的问号上；点问号打开全部清单名。"
@@ -1109,7 +1109,7 @@ struct SiteListsSection: View {
                         Text(updater.version == nil ? "正在下载…" : "正在检查…").font(.caption).foregroundStyle(.secondary)
                     } else if let error = updater.lastError {
                         Text((updater.version == nil ? "还没下载成功：" : "上次更新没成功：") + error
-                             + (error == GeoUpdater.unreachable ? "（VPN 连上后会自动再试）" : ""))
+                             + (error == GeoUpdater.unreachable ? "（Cisco 连上后会自动再试）" : ""))
                             .font(.caption).foregroundStyle(.orange)
                     } else if let result {
                         Text(result).font(.caption).foregroundStyle(.secondary)
@@ -1242,7 +1242,7 @@ struct DiagnosticsPage: View {
                         .disabled(checking)
                 }
             } footer: {
-                Footnote("Clash、sing-box 等只开系统代理时可以和 VPN 共存，开 TUN/增强模式会抢网络。连着 VPN 却打不开家里的设备时，把体检结果截图发给维护者。")
+                Footnote("Clash、sing-box 等只开系统代理时可以和 Cisco 共存，开 TUN/增强模式会抢网络。连着 Cisco 却打不开家里的设备时，把体检结果截图发给维护者。")
             }
             .onAppear { checkNeighbors() }
             // Our own tunnel and DNS forwarder must never read as someone
@@ -1277,7 +1277,7 @@ struct DiagnosticsPage: View {
                             Image(systemName: "arrow.clockwise")
                         }
                         .buttonStyle(.borderless)
-                        .help("刷新本次 VPN 流量")
+                        .help("刷新本次 Cisco 流量")
                         .disabled(statsRunning || !manager.showsConnected)
                     }
                 }
@@ -1410,7 +1410,7 @@ struct DiagnosticsPage: View {
             runLeakCheck()
         } else {
             leakItems = nil
-            leakMessage = "没连 VPN，连上后再查"
+            leakMessage = "没连 Cisco，连上后再查"
         }
     }
 

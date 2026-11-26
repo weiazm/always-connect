@@ -44,13 +44,13 @@ struct ProxySections: View {
             Section {
                 if !splitOn {
                     EgressCallout(icon: "info.circle.fill", tint: .blue,
-                                  text: "分流代理只在上面的「按网站分流」开启时生效。",
-                                  caption: "经 Cisco 连接时由 Cisco 决定流量去向，这里的规则不起作用。") { EmptyView() }
+                                  text: "经 Cisco 客户端连接时，连着的期间由 Cisco 决定流量去向，代理暂停。",
+                                  caption: "Cisco 断开后代理照常生效：命中规则的网站走代理，其余走本地网络。") { EmptyView() }
                 }
                 if paused {
                     EgressCallout(icon: "pause.circle.fill", tint: .orange,
                                   text: "分流代理已在菜单栏面板上关闭。",
-                                  caption: "关闭期间这些网站照常按分流名单走 VPN 或直连。") {
+                                  caption: "关闭期间这些网站照常按分流名单走 Cisco 或直连。") {
                         Button("打开") {
                             var stored = ProfileStore.loadAppSettings()
                             stored.proxiesPaused = nil
@@ -63,7 +63,7 @@ struct ProxySections: View {
                 if serviceTooOld && routes.contains(where: \.enabled) {
                     EgressCallout(icon: "exclamationmark.triangle.fill", tint: .orange,
                                   text: "后台服务需要更新，代理才会生效。",
-                                  caption: "更新之前，这些网站照常走 VPN，不会走直连。") { EmptyView() }
+                                  caption: "更新之前，这些网站照常走 Cisco，不会走直连。") { EmptyView() }
                 }
                 if let note {
                     EgressCallout(icon: "exclamationmark.triangle.fill", tint: .orange, text: note) {
@@ -110,11 +110,12 @@ struct ProxySections: View {
     private var explanation: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach([
-                "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 VPN 的网站」之前。",
-                "geoip、网段规则：按 VPN 的 DNS 答复地址判断；直接写的网段，连 IP 也走代理。",
+                "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 Cisco 的网站」之前。",
+                "geoip、网段规则：按 DNS 答复的地址判断（连着 Cisco 时问 Cisco 的 DNS，否则问本地网络的）；直接写的网段，连 IP 也走代理。",
                 "TCP 两种代理都转发；UDP（如 QUIC）只经 SOCKS5，HTTP 代理的网站浏览器会自动改用 TCP。",
-                "连代理本身按分流名单走：在局域网或「不走 VPN 的网站」里就走本地网络，否则经 VPN。",
-                "代理连不上、拒绝或密码不对：这些网站直接打不开，不会改走直连或 VPN。",
+                "连代理本身按分流名单走：在局域网或「不走 Cisco 的网站」里就走本地网络，否则经 Cisco；Cisco 没连时一律走本地网络。",
+                "Cisco 没连时代理照样生效（只开代理）：命中规则的网站走代理，其余走本地网络。",
+                "代理连不上、拒绝或密码不对：这些网站直接打不开，不会改走直连或 Cisco。",
             ], id: \.self) { line in
                 Text("• " + line).fixedSize(horizontal: false, vertical: true)
             }
