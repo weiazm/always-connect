@@ -673,6 +673,29 @@ fn the_site_to_check_is_the_first_plain_name() {
 }
 
 #[test]
+fn forwarded_bytes_are_counted_by_the_road_to_the_proxy() {
+    // §69.17: the panel's 代理 speed. A proxy on this Mac is the local road.
+    let site = origin();
+    let proxy = socks_proxy(site.address, Behaviour::default());
+    let r = rig(&list(&[&format!("proxy:0 socks5 127.0.0.1 {}", proxy.port), "via:0:full:count.example"]));
+    let mut stream = r.open("count.example", 443);
+    round_trip(&mut stream, "");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let sent = "ping through the proxy".len() as u64;
+    loop {
+        let traffic = r.routing.traffic_json();
+        if traffic["local"][0].as_u64() == Some(sent) && traffic["local"][1].as_u64() == Some(sent) {
+            assert_eq!(traffic["direct"], serde_json::json!([0, 0]));
+            assert_eq!(traffic["vpn"], serde_json::json!([0, 0]));
+            break;
+        }
+        assert!(Instant::now() < deadline, "{traffic}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(Leg::of("127.0.0.1".parse().unwrap()), Leg::Local);
+}
+
+#[test]
 fn each_proxy_reports_its_last_success_and_failure() {
     let site = origin();
     let good = socks_proxy(site.address, Behaviour::default());

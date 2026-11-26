@@ -1,7 +1,7 @@
 import Foundation
 
 @_silgen_name("ac_speed_totals")
-private func ac_speed_totals() -> UnsafeMutablePointer<CChar>?
+private func ac_speed_totals(_ proxy: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_speed_totals_stop")
 private func ac_speed_totals_stop()
 @_silgen_name("ac_string_free")
@@ -10,15 +10,18 @@ private func speed_string_free(_ s: UnsafeMutablePointer<CChar>?)
 /// The panel's 网速 card (DESIGN.md §45.4; user, 2026-11-12: not in the
 /// menu bar all the time, only when the panel is opened). Lives with the
 /// panel's SwiftUI tree: `start` on appear, `stop` on disappear (the
-/// panel is released when it closes, §32.1). While open, every 3 s with
+/// panel is released when it closes, §32.1). While open, every 2 s with
 /// tolerance, the Rust core reads the interface counters once (one
-/// sysctl, about 0.4 ms, no process) and returns the totals.
+/// sysctl, about 0.4 ms, no process) and returns the totals, with the
+/// proxied part from the background service's counts (§69.17).
 final class PanelSpeed: ObservableObject {
     struct Totals: Decodable, Equatable {
         var ready: Bool
         var total: [Int]
         var vpn: [Int]
         var direct: [Int]
+        /// Through the split's proxies, taken out of the other two (§69.17).
+        var proxy: [Int]?
     }
 
     /// Nil until the second reading (a speed needs two).
@@ -56,7 +59,10 @@ final class PanelSpeed: ObservableObject {
     }
 
     private func read() {
-        guard let raw = ac_speed_totals() else { return }
+        // The service's proxied-byte totals arrive with the split status,
+        // which the panel asks for every 2 s too.
+        let proxy = HelperClient.shared.proxyBytes
+        guard let raw = proxy.map({ $0.withCString { ac_speed_totals($0) } }) ?? ac_speed_totals(nil) else { return }
         defer { speed_string_free(raw) }
         let decoded = try? JSONDecoder().decode(Totals.self, from: Data(String(cString: raw).utf8))
         let next = decoded?.ready == true ? decoded : nil

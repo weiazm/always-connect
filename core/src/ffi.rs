@@ -1051,10 +1051,12 @@ pub extern "C" fn ac_traffic_stop() {
 
 /// The panel's speed totals (DESIGN.md §45.4): Totals JSON (free with
 /// ac_string_free). One sysctl, no process; keeps one snapshot until
-/// ac_speed_totals_stop.
+/// ac_speed_totals_stop. `proxy` (may be null): the background service's
+/// proxied-byte totals as ProxyBytes JSON (§69.17).
 #[no_mangle]
-pub extern "C" fn ac_speed_totals() -> *mut c_char {
-    serde_json::to_string(&crate::traffic::sample_totals())
+pub extern "C" fn ac_speed_totals(proxy: *const c_char) -> *mut c_char {
+    let proxy = c_str(proxy).and_then(|text| serde_json::from_str::<crate::traffic::ProxyBytes>(&text).ok());
+    serde_json::to_string(&crate::traffic::sample_totals_with(proxy))
         .ok()
         .and_then(|json| CString::new(json).ok())
         .map(CString::into_raw)

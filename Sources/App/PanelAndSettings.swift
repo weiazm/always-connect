@@ -288,7 +288,12 @@ struct PanelView: View {
         Button { onOpenSettings("traffic") } label: {
             HStack(spacing: 10) {
                 speedColumn("走 VPN", color: .green, speed.totals?.vpn)
-                Divider().frame(height: 30)
+                Divider().frame(height: 36)
+                // §69.17: shown while proxies carry traffic in this session.
+                if let proxy = speed.totals?.proxy {
+                    speedColumn("代理", color: .purple, proxy)
+                    Divider().frame(height: 36)
+                }
                 speedColumn("直连", color: .orange, speed.totals?.direct)
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -308,14 +313,15 @@ struct PanelView: View {
                 Circle().fill(color).frame(width: 6, height: 6)
                 Text(title).font(.caption).foregroundStyle(.secondary)
             }
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("↓ " + (rate.map { PanelSpeed.text($0[0]) } ?? "…"))
-                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
-                Text("↑ " + (rate.map { PanelSpeed.text($0[1]) } ?? "…"))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .lineLimit(1)
+            // Down above up: three columns fit without cutting a number.
+            Text("↓ " + (rate.map { PanelSpeed.text($0[0]) } ?? "…"))
+                .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text("↑ " + (rate.map { PanelSpeed.text($0[1]) } ?? "…"))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

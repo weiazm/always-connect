@@ -2,9 +2,9 @@
 //! pf sent here, carried through the proxy their rules name.
 
 use super::protocol::{no_sigpipe, open_through, udp_associate, udp_unwrap, udp_wrap};
-use super::{Kind, Routing, Target};
+use super::{Kind, Leg, Routing, Target};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -100,6 +100,8 @@ struct Flow {
     state: FlowState, target: Target, port: u16, last: Instant, control: Option<TcpStream>,
     /// A local proxy's own datagrams: sent as they are to the real address.
     raw: bool,
+    /// The road to the proxy's relay, for the panel's count (None: raw).
+    leg: Option<Leg>,
 }
 
 type Flows = Arc<Mutex<HashMap<(SocketAddrV4, SocketAddrV4), Flow>>>;
@@ -208,7 +210,7 @@ fn accept(stream: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinat
     if started.is_err() { /* the stream was moved and dropped: closed */ }
 }
 
-fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, open: &Mutex<Open>) {
+fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestination, open: &Mutex<Open>) {
     let addresses = client.peer_addr().ok().and_then(v4).zip(client.local_addr().ok().and_then(v4));
     let Some(destination) = addresses.and_then(|(peer, local)| original(Proto::Tcp, peer, local)) else {
         // Not a redirected connection (someone connected to the port).
@@ -250,30 +252,51 @@ fn serve(client: TcpStream, routing: &Routing, original: &OriginalDestination, o
             return;
         }
     };
+    // Proxied bytes are counted for the panel; a local proxy's own
+    // connections are the ordinary split, not proxied.
+    let mut leg = None;
     if !local_proxy {
         routing.record(n, None);
-        if let Ok(peer) = upstream.peer_addr() { routing.connected_to(n, peer); }
+        if let Ok(peer) = upstream.peer_addr() {
+            routing.connected_to(n, peer);
+            leg = Some(Leg::of(peer.ip()));
+        }
     }
     routing.opened();
     if let (Some(entry), Ok(copy)) = (open.lock().unwrap().streams.get_mut(&id), upstream.try_clone()) { entry.1 = Some(copy); }
     let _ = client.set_nodelay(true);
     let mut to_app = &client;
     if !early.is_empty() && to_app.write_all(&early).is_err() { reset(&client); forget(); return; }
-    splice(&client, &upstream);
+    if let Some(leg) = leg { routing.count(leg, true, early.len()); }
+    splice(&client, &upstream, routing, leg);
     forget();
+}
+
+/// One direction, counting as it goes (the panel's 代理 speed, §69.17).
+fn pump(from: &TcpStream, to: &TcpStream, mut counted: impl FnMut(usize)) {
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = match (&*from).read(&mut buffer) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if (&*to).write_all(&buffer[..n]).is_err() { return; }
+        counted(n);
+    }
 }
 
 /// Both directions until both ends are done; one end finishing closes
 /// the other's sending side.
-fn splice(client: &TcpStream, upstream: &TcpStream) {
+fn splice(client: &TcpStream, upstream: &TcpStream, routing: &Arc<Routing>, leg: Option<Leg>) {
     let (Ok(client_read), Ok(upstream_write)) = (client.try_clone(), upstream.try_clone()) else { return };
+    let up_routing = routing.clone();
     let up = std::thread::Builder::new().name("ac-proxy-up".into()).stack_size(STACK).spawn(move || {
-        let (mut from, mut to) = (&client_read, &upstream_write);
-        let _ = io::copy(&mut from, &mut to);
+        pump(&client_read, &upstream_write, |n| if let Some(leg) = leg { up_routing.count(leg, false, n) });
         let _ = upstream_write.shutdown(Shutdown::Write);
     });
-    let (mut from, mut to) = (upstream, client);
-    let _ = io::copy(&mut from, &mut to);
+    pump(upstream, client, |n| if let Some(leg) = leg { routing.count(leg, true, n) });
     let _ = client.shutdown(Shutdown::Write);
     match up {
         Ok(thread) => { let _ = thread.join(); }
@@ -297,6 +320,7 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         match &flow.state {
             FlowState::Ready(relay) => {
                 flow.last = now;
+                if let Some(leg) = flow.leg { routing.count(leg, false, payload.len()); }
                 if flow.raw { let _ = relay.send(payload); }
                 else if let Some(packet) = udp_wrap(&flow.target, flow.port, payload) { let _ = relay.send(&packet); }
                 return;
@@ -319,7 +343,7 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         table.retain(|_, flow| flow.last.elapsed() < UDP_IDLE);
         if table.len() >= MAX_FLOWS { routing.failed(&target.label(), "同时经代理的 UDP 太多"); return; }
     }
-    table.insert(key, Flow { state: FlowState::Pending, target: target.clone(), port: destination.port(), last: now, control: None, raw });
+    table.insert(key, Flow { state: FlowState::Pending, target: target.clone(), port: destination.port(), last: now, control: None, raw, leg: None });
     drop(table);
     let first = payload.to_vec();
     let (udp, routing, stopped) = (udp.clone(), routing.clone(), stopped.clone());
@@ -350,14 +374,17 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         }
         let relay = Arc::new(relay);
         let _ = relay.set_read_timeout(Some(UDP_CHECK));
+        let leg = if raw { None } else { relay.peer_addr().ok().map(|peer| Leg::of(peer.ip())) };
         {
             let mut table = flows.lock().unwrap();
             let Some(flow) = table.get_mut(&key) else { return };
             if stopped.load(Ordering::Acquire) { return; }
             flow.state = FlowState::Ready(relay.clone());
             flow.control = control.as_ref().and_then(|c| c.try_clone().ok());
+            flow.leg = leg;
         }
         routing.opened();
+        if let Some(leg) = leg { routing.count(leg, false, first.len()); }
         if raw { let _ = relay.send(&first); }
         else if let Some(packet) = udp_wrap(&target, destination.port(), &first) { let _ = relay.send(&packet); }
         let mut buffer = vec![0u8; 65535];
@@ -366,6 +393,7 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
                 Ok(n) => {
                     let data = if raw { Some(&buffer[..n]) } else { udp_unwrap(&buffer[..n]) };
                     if let Some(data) = data {
+                        if let Some(leg) = leg { routing.count(leg, true, data.len()); }
                         // pf turns our source back into the address the app used.
                         let _ = udp.send_to(data, app);
                         if let Some(flow) = flows.lock().unwrap().get_mut(&key) { flow.last = Instant::now(); }

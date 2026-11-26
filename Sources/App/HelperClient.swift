@@ -972,16 +972,19 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// What the split did in this session (§26.12), refreshed by the
     /// open panel: list entries looked up and addresses sent direct.
     @Published private(set) var splitActivity: (entries: [String], addresses: Int)?
+    /// The service's running totals of proxied bytes and when they came
+    /// (ProxyBytes JSON for the panel's 代理 speed, §69.17); nil without proxies.
+    private(set) var proxyBytes: String?
     @Published private(set) var splitWarning: String?
     @Published private(set) var dnsNotice: String?
 
     func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
+        guard !usesCisco, state == .connected else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; dnsNotice = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
         let sessionStarted = connectedSince
         ensureConnection { proxy in
             var finished = false
@@ -1000,12 +1003,19 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                             var splitHits: [String]; var splitAddresses: Int
                             var splitRunning: Bool; var splitWarning: String?; var pfError: String?; var dnsNotice: String?
                             var proxyHealth: [ProxyTraffic]?
+                            struct Bytes: Codable { var direct: [UInt64]; var vpn: [UInt64]; var local: [UInt64] }
+                            var proxyBytes: Bytes?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         if let rows = status?.proxyHealth, !rows.isEmpty {
                             ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
                         }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        self.proxyBytes = status?.proxyBytes.flatMap { bytes in
+                            let reading: [String: Any] = ["at": Date().timeIntervalSince1970,
+                                                          "direct": bytes.direct, "vpn": bytes.vpn, "local": bytes.local]
+                            return (try? JSONSerialization.data(withJSONObject: reading)).map { String(decoding: $0, as: UTF8.self) }
+                        }
                         self.dnsNotice = status?.dnsNotice
                         self.splitWarning = status?.splitWarning
                         if let status { self.pfWarning = status.pfError }
