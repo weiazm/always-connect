@@ -240,10 +240,20 @@ pub struct ProxyRates {
     rates: Option<[[u64; 2]; 3]>,
 }
 
+/// Two readings further apart than this are not one interval: the older
+/// one is from an earlier panel opening (the App keeps the service's last
+/// totals while the panel is closed), and an average over minutes would
+/// show as the first speed (§69.18).
+pub const PROXY_READING_GAP: f64 = 10.0;
+
 impl ProxyRates {
     pub fn update(&mut self, now: Option<ProxyBytes>) -> Option<[[u64; 2]; 3]> {
         let Some(now) = now else { *self = ProxyRates::default(); return None };
         match self.last {
+            Some(last) if now.at - last.at > PROXY_READING_GAP => {
+                self.last = Some(now);
+                self.rates = None;
+            }
             Some(last) if now.at > last.at => {
                 let seconds = (now.at - last.at).max(0.5);
                 let grow = |new: u64, old: u64| if new >= old { new - old } else { new };
@@ -322,7 +332,18 @@ static PROXY_RATES: Mutex<ProxyRates> = Mutex::new(ProxyRates { last: None, rate
 /// or None when there are none).
 pub fn sample_totals_with(proxy: Option<ProxyBytes>) -> Totals {
     let rates = PROXY_RATES.lock().unwrap().update(proxy);
-    with_proxy(sample_totals(), rates)
+    complete(with_proxy(sample_totals(), rates), proxy.is_some())
+}
+
+/// The card shows its numbers together (§69.18; user, 2026-11-26: "两个跳变成3个，
+/// 这是什么鬼交互啊"): while proxies carry traffic but their speed needs a
+/// second reading, no column has a number yet, else 走 VPN and 直连 would
+/// first show the proxied bytes and then drop.
+pub fn complete(mut t: Totals, proxied: bool) -> Totals {
+    if proxied && t.proxy.is_none() {
+        t.ready = false;
+    }
+    t
 }
 
 /// The panel's totals since its previous call (no process, one sysctl).
@@ -538,6 +559,33 @@ mod tests {
         assert_eq!(with_proxy(base.clone(), None), base, "no proxies: unchanged");
         assert_eq!(rates.update(None), None);
         assert_eq!(rates.update(Some(second)), None, "no proxies resets: two readings again");
+    }
+
+    #[test]
+    fn a_reading_from_an_earlier_panel_opening_is_not_an_interval() {
+        // §69.18: the panel closed at 12 s and opened again at 300 s; the
+        // first speed must come from two new readings, not an average
+        // over almost five minutes.
+        let mut rates = ProxyRates::default();
+        let kept = ProxyBytes { at: 12.0, direct: [6_000, 1_000], vpn: [0, 0], local: [0, 0] };
+        assert_eq!(rates.update(Some(kept)), None);
+        let reopened = ProxyBytes { at: 300.0, direct: [900_000, 90_000], vpn: [0, 0], local: [0, 0] };
+        assert_eq!(rates.update(Some(reopened)), None, "too far apart: starts again");
+        let next = ProxyBytes { at: 300.5, direct: [1_000_000, 100_000], vpn: [0, 0], local: [0, 0] };
+        assert_eq!(rates.update(Some(next)).unwrap()[0], [200_000, 20_000]);
+    }
+
+    #[test]
+    fn the_card_numbers_come_together() {
+        // §69.18: with proxies but no proxied speed yet, nothing is shown;
+        // without proxies the two roads show at once.
+        let t = Totals { ready: true, total: [10, 1], vpn: [4, 1], direct: [6, 0], proxy: None };
+        assert!(!complete(t.clone(), true).ready);
+        assert!(complete(t.clone(), false).ready);
+        let with = Totals { proxy: Some([1, 0]), ..t.clone() };
+        assert!(complete(with, true).ready);
+        let first = Totals { ready: false, ..t };
+        assert!(!complete(first, false).ready, "the first reading stays not ready");
     }
 
     /// On a real Mac: `cargo test live_totals -- --ignored --nocapture`.

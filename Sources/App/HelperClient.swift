@@ -978,17 +978,27 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var splitWarning: String?
     @Published private(set) var dnsNotice: String?
 
-    func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
+    /// `then` runs on main once the answer is in (or did not come in 3 s):
+    /// the panel's speed card reads right after it, with fresh proxied
+    /// totals (§69.18).
+    func refreshSplitActivity(then done: (() -> Void)? = nil) {
+        guard !usesCisco, state == .connected else {
+            splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
+        }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else {
+            splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
+        }
         let sessionStarted = connectedSince
+        var answered = false
+        let finish = { guard !answered else { return }; answered = true; done?() }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                defer { finish() }
                 guard !finished, self.connectedSince == sessionStarted else { return }
                 finished = true
                 self.splitWarning = nil
@@ -997,6 +1007,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if HelperInstaller.installedHelperMatchesBundle {
                 proxy.getSplitStatus { text in
                     DispatchQueue.main.async {
+                        defer { finish() }
                         guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                         finished = true
                         struct Status: Decodable {
@@ -1025,6 +1036,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             proxy.getSplitActivity { entries, addresses, running in
                 DispatchQueue.main.async {
+                    defer { finish() }
                     guard !finished, self.connectedSince == sessionStarted, self.state == .connected, !self.usesCisco else { return }
                     finished = true
                     self.dnsNotice = nil
