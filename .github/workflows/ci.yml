@@ -410,6 +410,10 @@ jobs:
       - name: Split list rules (domains, geosite, geoip, networks; bundled data)
         # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
         run: scripts/list-rules-test.sh
+      - name: One keychain item for every secret (in-memory stand-in)
+        # Sources/App/KeychainStore.swift (DESIGN.md §69.19): older items copied
+        # in once, a refused vault never overwritten. No real keychain is touched.
+        run: scripts/secret-vault-test.sh
       - name: Site-list updates (synthetic releases on a local feed)
         # Sources/App/GeoUpdater.swift (DESIGN.md §66.30): hash, catalogue and
         # lists-in-use checks, no download for an unchanged release. The real

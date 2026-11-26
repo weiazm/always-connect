@@ -314,14 +314,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if let cached = cachedPassword, cached.key == key { return cached.value }
         if let password = KeychainStore.read(server: KeychainStore.accountKey, username: username) {
             cachedPassword = (key, password)
-            cleanUpKeychain(username: username, password: password, server: server)
             return password
         }
         // Saved per server by an older build: move it to the account.
-        guard let password = KeychainStore.read(server: server, username: username) else { return nil }
+        guard let password = KeychainStore.read(server: server, username: username, moveToVault: false) else { return nil }
         _ = KeychainStore.save(server: KeychainStore.accountKey, username: username, password: password)
         cachedPassword = (key, password)
-        cleanUpKeychain(username: username, password: password, server: server)
         return password
     }
 
@@ -351,13 +349,6 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 _ = self?.connectWithStoredCredentials()
             }
         }
-    }
-
-    /// One-time keychain clean-up under a stable signer (§21.16).
-    private func cleanUpKeychain(username: String, password: String, server: String) {
-        let legacy = ProfileStore.loadServers().map(\.target) + [server]
-        KeychainStore.rebindIfSignerChanged(username: username, password: password,
-                                            legacyServers: legacy)
     }
 
     func credentialsChanged() {
