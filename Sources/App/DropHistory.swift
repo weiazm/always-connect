@@ -132,7 +132,7 @@ extension DropRecord {
             text = "\(down)，\(attempts.map { $0 + "后" } ?? "")停止重试"
             if let failureReason { text += "：\(failureReason)" }
         case .stoppedByUser:
-            text = "\(down)，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 VPN"
+            text = "\(down)，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 Cisco"
         case .quit:
             text = "\(down)，\(attempts.map { $0 + "时" } ?? "重连中")退出了 App"
         }
@@ -163,8 +163,8 @@ extension DropRecord {
                 : "，\(attempts.map { $0 + "后" } ?? "")停止重试"
             if let failureReason { text += "：\(failureReason)" }
         case .stoppedByUser:
-            text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次重连中你断开了 VPN"
-                : "，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 VPN"
+            text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次重连中你断开了 Cisco"
+                : "，\(attempts.map { $0 + "时" } ?? "重连中")你断开了 Cisco"
         case .quit:
             text += n > 1 ? "，\(attempts.map { "共" + $0 + "，" } ?? "")最后一次重连中退出了 App"
                 : "，\(attempts.map { $0 + "时" } ?? "重连中")退出了 App"

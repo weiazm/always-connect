@@ -45,9 +45,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private var awaitingCiscoStart = false
     var showsConnected: Bool { state == .connected && !gatewayTrustFailed }
     var certificateProtectionText: String {
-        if !protectsDrops { return "断线保护已关闭。请联系 VPN 管理员。" }
+        if !protectsDrops { return "断线保护已关闭。请联系 IT 管理员。" }
         if rejectedLoginHeld { return "网络已拦截。可点「恢复网络」回到直连。" }
-        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 VPN 管理员。"
+        return "网络拦截尚未确认，其他应用仍可能走直连。请联系 IT 管理员。"
     }
     @Published private(set) var loginProtectionNotice: String?
     @Published private(set) var loginGatewayReadiness: LoginGatewayReadiness = .idle
@@ -143,7 +143,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard !usesCisco, state == .authenticating || state == .awaitingApproval else { return nil }
         switch ApprovalPromptTracker.ownLoginSignal(detail) {
         case .gatewayReply: return "网关已回应，等待连接结果"
-        case .configuring: return "隧道协商完成，正在配置 VPN 网络"
+        case .configuring: return "隧道协商完成，正在配置 Cisco 网络"
         default: return nil
         }
     }
@@ -517,8 +517,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             case "give_up":
                 RelayLog.write("login: the engine did not start after fresh starts, stopped")
                 loginWatchRetrying = false
-                loginProtectionNotice = "没能开始登录" + (loginStepFailure.map { "：" + $0 } ?? "：后台服务没有启动 VPN")
-                    + "。网络仍处拦截，可点「断开 VPN，恢复直连网络」，或关掉开关再打开重试"
+                loginProtectionNotice = "没能开始登录" + (loginStepFailure.map { "：" + $0 } ?? "：后台服务没有启动 Cisco")
+                    + "。网络仍处拦截，可点「断开 Cisco，恢复直连网络」，或关掉开关再打开重试"
             default: break
             }
         }
@@ -1404,9 +1404,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     case .timedOut:
                         loginProtectionNotice = ProtectedLoginNotice.preparationTimedOut
                     case .unavailable:
-                        loginProtectionNotice = "没有取得可用的 VPN 服务器地址。网络已拦截，请恢复直连后重试。"
+                        loginProtectionNotice = "没有取得可用的 Cisco 服务器地址。网络已拦截，请恢复直连后重试。"
                     case .dnsFailed:
-                        loginProtectionNotice = "无法解析 VPN 服务器的名称。网络已拦截，请恢复直连后重试。"
+                        loginProtectionNotice = "无法解析 Cisco 服务器的名称。网络已拦截，请恢复直连后重试。"
                     case .networkUnknown:
                         loginProtectionNotice = ProtectedLoginNotice.preparationUnavailable
                     default: break
@@ -1416,7 +1416,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 return
             }
             networkHeld = true
-            loginProtectionNotice = "网络已拦截，正在连接 VPN"
+            loginProtectionNotice = "网络已拦截，正在连接 Cisco"
             if !native {
                 if !loginWatchRetrying { loginStepFailure = nil }
                 RelayLog.write("login: network held, preparing the relay")
@@ -2079,7 +2079,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // the drop (it read as 断了 2 秒，没恢复, §30.4).
             return
         }
-        let rejectedWithHold = detail == "VPN 网关证书校验失败，网络已拦截"
+        let rejectedWithHold = detail == "Cisco 网关证书校验失败，网络已拦截"
         if !usesCisco && relay == nil && (detail == StatusLook.certificateHeadline || rejectedWithHold) {
             showGatewayRejection()
             rejectedLoginHeld = rejectedWithHold && protectsDrops

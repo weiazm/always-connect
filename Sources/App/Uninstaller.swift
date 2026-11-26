@@ -32,7 +32,7 @@ enum Uninstaller {
         ]
         if keepSettings { arguments.append("--keep-settings") }
         PrivilegedBundle.run(resource: "uninstall.sh", arguments: arguments,
-                             prompt: "AlwaysConnect 要卸载自己：断开 VPN、恢复直连，删除后台服务、随附组件和它留下的文件。") { result in
+                             prompt: "AlwaysConnect 要卸载自己：断开 Cisco、恢复直连，删除后台服务、随附组件和它留下的文件。") { result in
                 if let code = result.errorNumber {
                     if code == -128 {
                         completion(.cancelled)

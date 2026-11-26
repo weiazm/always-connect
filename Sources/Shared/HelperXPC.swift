@@ -207,7 +207,7 @@ enum ServiceUpdateRight {
 }
 
 enum ProtectedLoginNotice {
-    static let preparationTimedOut = "查找 VPN 服务器超时。网络已拦截，请恢复直连后重试。"
+    static let preparationTimedOut = "查找 Cisco 服务器超时。网络已拦截，请恢复直连后重试。"
     static let preparationUnavailable = "网络已拦截。无法确认可用于查找网关的直连网络，请恢复直连后重试。"
     static let noTrustedAddress = "网络已拦截。暂无可信网关地址，请恢复直连后准备网关地址"
     static let preparingGateway = "首次连接正在查网关，当前仍直连"

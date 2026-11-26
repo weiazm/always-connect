@@ -1119,7 +1119,7 @@ impl Shared {
         self.update_forwarder(c);
         let held = c.config.drop_protection && c.config.login_port.is_some() && self.require_login_hold(c);
         if direct { c.direct_certificate_error = Some(held); }
-        self.report(c, "VPN 网关证书校验失败");
+        self.report(c, "Cisco 网关证书校验失败");
         held
     }
 
@@ -1140,8 +1140,8 @@ impl Shared {
         }
         self.publish(c);
         let detail = match c.direct_certificate_error.filter(|_| !c.stop_requested) {
-            Some(true) if c.config.drop_protection && c.pf_error.is_none() => "VPN 网关证书校验失败，网络已拦截",
-            Some(_) => "VPN 网关证书校验失败",
+            Some(true) if c.config.drop_protection && c.pf_error.is_none() => "Cisco 网关证书校验失败，网络已拦截",
+            Some(_) => "Cisco 网关证书校验失败",
             None => detail,
         };
         (self.hooks.state)(state_code(state), detail);
@@ -3348,7 +3348,7 @@ mod tests {
         }
         assert!(engine.verified_tunnel(0));
         assert!(!engine.record_gateway_rejection(11), "protection is off");
-        assert_eq!(reports.lock().unwrap().last().unwrap(), &(state_code(SessionStatus::Reconnecting), "VPN 网关证书校验失败".into()));
+        assert_eq!(reports.lock().unwrap().last().unwrap(), &(state_code(SessionStatus::Reconnecting), "Cisco 网关证书校验失败".into()));
         assert!(!engine.verified_tunnel(11));
         engine.record_gateway_rejection(12);
         {

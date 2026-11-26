@@ -88,7 +88,7 @@ struct EgressProtectionPage: View {
             } header: {
                 statusBar
             } footer: {
-                Text("命中规则的新连接先检查出口，走错国家就拦。查不到出口时按各保护的设置处理。出口保护开启时，VPN 内的 QUIC 流量会被拦。")
+                Text("命中规则的新连接先检查出口，走错国家就拦。查不到出口时按各保护的设置处理。出口保护开启时，Cisco 隧道内的 QUIC 流量会被拦。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if !config.groups.isEmpty {
@@ -148,7 +148,7 @@ struct EgressProtectionPage: View {
                 ProfileStore.saveAppSettings(settings)
                 manager.dropProtectionChanged()
             }
-        } message: { Text("VPN 断开时会暂时拦住网络，直到重新连上或你手动断开。") }
+        } message: { Text("Cisco 断开时会暂时拦住网络，直到重新连上或你手动断开。") }
     }
 
     // MARK: - Top
@@ -204,7 +204,7 @@ struct EgressProtectionPage: View {
         if !available { return .init(tint: .gray, line: "要先打开断线保护才能用", lineColor: .secondary) }
         if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个保护", lineColor: .secondary) }
         if active.isEmpty { return .init(tint: .gray, line: "已全部暂停", lineColor: .secondary) }
-        guard connected else { return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · VPN 连上后开始检查") }
+        guard connected else { return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · Cisco 连上后开始检查") }
         switch liveStatus?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown {
         case .ok: return .init(tint: .green, line: "一切正常 · \(ruleCount) 个保护已开启")
         case .partial:
@@ -248,7 +248,7 @@ struct EgressProtectionPage: View {
             }
             .disabled(prefetch == 0)
             Toggle(isOn: Binding(get: { config.steer ?? true }, set: { on in change { $0.steer = on } })) {
-                settingLabel("自动换到出口正确的服务器", "出口不对时，换到同一网站里出口正确的服务器，仍走 VPN。")
+                settingLabel("自动换到出口正确的服务器", "出口不对时，换到同一网站里出口正确的服务器，仍走 Cisco。")
             }
         }
         .pickerStyle(.menu)

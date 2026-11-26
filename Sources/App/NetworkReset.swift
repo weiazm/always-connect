@@ -14,7 +14,7 @@ enum NetworkReset {
 
     static func run(completion: @escaping (Outcome) -> Void) {
         PrivilegedBundle.run(resource: "reset-network.sh", arguments: ["--from-app"],
-                             prompt: "AlwaysConnect 要把网络恢复到直连：断开 VPN，清除它改过的路由、DNS 和防火墙设置。") { result in
+                             prompt: "AlwaysConnect 要把网络恢复到直连：断开 Cisco，清除它改过的路由、DNS 和防火墙设置。") { result in
             if let code = result.errorNumber {
                 if code == -128 {
                     completion(.cancelled)

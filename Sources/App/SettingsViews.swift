@@ -112,13 +112,13 @@ struct WizardView: View {
             VStack(spacing: 6) {
                 Text("欢迎使用 AlwaysConnect")
                     .font(.largeTitle.weight(.semibold))
-                Text("让单位的 VPN 一直在线的菜单栏助手")
+                Text("让 Cisco 一直在线的菜单栏助手")
                     .foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 12) {
                 feature("person.badge.key.fill", "记住账号，打开就自动登录")
                 feature("arrow.triangle.2.circlepath", "断线后自动重连，断线期间不走本地网络")
-                feature("house.fill", "连着 VPN 也能访问家里的路由器和设备")
+                feature("house.fill", "连着 Cisco 也能访问家里的路由器和设备")
             }
             .padding(.top, 6)
             // Responsible use (DESIGN.md §34.4): said once, before the

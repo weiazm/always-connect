@@ -25,7 +25,7 @@ struct ApprovalPromptTest {
         }
         check(c1.kind == .approval && c1.request == 1 && c1.stage == .waiting, "first request, waiting")
         check(t.handle(.approval, now: at(2)) == .none, "the same state pushed again changes nothing")
-        check(c1.title == "请在手机上批准 VPN 登录", "title: \(c1.title)")
+        check(c1.title == "请在手机上批准 Cisco 登录", "title: \(c1.title)")
         check(c1.subtitle(now: at(24)) == "登录请求已发到手机 · 已等 0:23", "subtitle: \(c1.subtitle(now: at(24)))")
         guard case .update(let c2) = t.handle(.establishing, now: at(30)) else {
             check(false, "approved -> establishing updates"); exit(1)
@@ -76,7 +76,7 @@ struct ApprovalPromptTest {
         guard case .show(let o1) = o.handle(.ownLogin, now: at(0)) else {
             check(false, "own login shows"); exit(1)
         }
-        check(o1.title == "正在登录 VPN" && o1.subtitle(now: at(9)) == "收到手机请求请批准 · 0:09",
+        check(o1.title == "正在登录 Cisco" && o1.subtitle(now: at(9)) == "收到手机请求请批准 · 0:09",
               "own wording: \(o1.subtitle(now: at(9)))")
         if case .update(let o2) = o.handle(.establishing, now: at(12)) {
             check(o2.title == "正在建立连接…", "own establishing: \(o2.title)")
@@ -107,7 +107,7 @@ struct ApprovalPromptTest {
             check(response.handle(.gatewayReply, now: at(56)) == .none, "repeated reply does not restart the wait")
         } else { check(false, "gateway response updates the visible approval card") }
         if case .update(let configuring) = response.handle(.configuring, now: at(52)) {
-            check(configuring.title == "正在配置 VPN 网络" && configuring.subtitle(now: at(54)).hasSuffix("0:31"),
+            check(configuring.title == "正在配置 Cisco 网络" && configuring.subtitle(now: at(54)).hasSuffix("0:31"),
                   "accepted tunnel changes the stage without reporting a connected VPN")
         } else { check(false, "negotiated tunnel updates the card") }
         check(response.handle(.gatewayReply, now: at(55)) == .none, "late generic reply cannot undo tunnel negotiation")

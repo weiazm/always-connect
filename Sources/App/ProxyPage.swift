@@ -50,7 +50,7 @@ struct ProxySections: View {
                 if paused {
                     EgressCallout(icon: "pause.circle.fill", tint: .orange,
                                   text: "分流代理已在菜单栏面板上关闭。",
-                                  caption: "关闭期间这些网站照常按分流名单走 VPN 或直连。") {
+                                  caption: "关闭期间这些网站照常按分流名单走 Cisco 或直连。") {
                         Button("打开") {
                             var stored = ProfileStore.loadAppSettings()
                             stored.proxiesPaused = nil
@@ -63,7 +63,7 @@ struct ProxySections: View {
                 if serviceTooOld && routes.contains(where: \.enabled) {
                     EgressCallout(icon: "exclamationmark.triangle.fill", tint: .orange,
                                   text: "后台服务需要更新，代理才会生效。",
-                                  caption: "更新之前，这些网站照常走 VPN，不会走直连。") { EmptyView() }
+                                  caption: "更新之前，这些网站照常走 Cisco，不会走直连。") { EmptyView() }
                 }
                 if let note {
                     EgressCallout(icon: "exclamationmark.triangle.fill", tint: .orange, text: note) {

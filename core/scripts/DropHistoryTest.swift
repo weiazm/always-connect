@@ -63,7 +63,7 @@ struct DropHistoryTest {
         let r4 = tracker.handle(.disconnected, previous: .reconnecting, engine: "cisco", retries: 1, now: at(675))
         check(r4?.outcome == .stoppedByUser && r4!.applyingTerminal(1).outcome == .stoppedByUser,
               "user stop stays the user's")
-        check(r4?.summary == "断了 1 分 15 秒，连接重试 1 轮时你断开了 VPN", "stopped: \(r4?.summary ?? "")")
+        check(r4?.summary == "断了 1 分 15 秒，连接重试 1 轮时你断开了 Cisco", "stopped: \(r4?.summary ?? "")")
 
         // 5 quit mid-drop; then the late disconnected push records nothing
         _ = tracker.handle(.reconnecting, previous: .connected, engine: "own", retries: 0, now: at(700))

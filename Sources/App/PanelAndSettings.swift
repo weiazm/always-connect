@@ -231,7 +231,7 @@ struct PanelView: View {
                     showConfirmReset = true
                 }
                 .disabled(resettingNetwork)
-                .help("上不了网、被 AlwaysConnect 卡住时：断开 VPN，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
+                .help("上不了网、被 AlwaysConnect 卡住时：断开 Cisco，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
                 Spacer(minLength: 0)
                 // Quit = VPN off, direct network, nothing of ours left
                 // running (DESIGN.md §21.5); confirm only when that
@@ -243,11 +243,11 @@ struct PanelView: View {
                         AppQuit.request()
                     }
                 }
-                .help("断开 VPN、恢复直连网络，并退出 AlwaysConnect")
+                .help("断开 Cisco、恢复直连网络，并退出 AlwaysConnect")
             }
             if showConfirmQuit {
                 HStack {
-                    Text("退出会断开 VPN，网络恢复直连")
+                    Text("退出会断开 Cisco，网络恢复直连")
                         .font(.callout)
                     Spacer()
                     Button("断开并退出") {
@@ -356,7 +356,7 @@ struct PanelView: View {
     @ViewBuilder private var networkResetConfirm: some View {
         if showConfirmReset {
             VStack(alignment: .leading, spacing: 6) {
-                Text("会断开 VPN，并清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连。需要输入一次开机密码。")
+                Text("会断开 Cisco，并清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连。需要输入一次开机密码。")
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
@@ -595,12 +595,12 @@ struct PanelView: View {
         let on = own && settings.directOn
         let (caption, tint): (String, Color) = {
             if !own { return ("要开按网站分流", .secondary) }
-            if !settings.directOn { return ("关 · 都走 VPN", .secondary) }
+            if !settings.directOn { return ("关 · 都走 Cisco", .secondary) }
             if siteCount == 0 { return ("名单是空的", .secondary) }
             if manager.showsConnected, let activity = manager.splitActivity, !activity.entries.isEmpty {
                 return ("\(activity.entries.count) 个网站正在直连", .green)
             }
-            return ("\(siteCount) 条不走 VPN", .secondary)
+            return ("\(siteCount) 条不走 Cisco", .secondary)
         }()
         return PanelOptionRow(symbol: "arrow.turn.up.right", title: "分流直连", caption: caption, tint: tint, isOn: on,
                               enabled: own, resting: resting, help: splitHelp) { turnOn in
@@ -798,7 +798,7 @@ struct PanelView: View {
         if manager.state == .disconnected, !manager.networkHeld, manager.protectsDrops,
            let preparation = manager.loginGatewayReadiness.caption { return preparation }
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
-        if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
+        if manager.state == .disconnected, !manager.networkHeld { return "Cisco 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
         if manager.showsConnected {
             // Which server and for how long (§45.4), not the engine's words.
@@ -826,7 +826,7 @@ struct PanelView: View {
             // Never trapped behind drop protection: one click, no
             // confirm, back to the direct network.
             Button { showConfirmDisconnect = false; onStop() } label: {
-                Text("断开 VPN，恢复直连网络").frame(maxWidth: .infinity)
+                Text("断开 Cisco，恢复直连网络").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
@@ -847,13 +847,13 @@ struct PanelView: View {
                 .buttonStyle(.borderedProminent).controlSize(.large)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
-                Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
+                Text(manager.onDemandPaused ? "仍然连接" : "连接 Cisco").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
         } else {
             Button { showConfirmDisconnect = true } label: {
-                Text(manager.showsConnected ? "断开 VPN" : "取消连接").frame(maxWidth: .infinity)
+                Text(manager.showsConnected ? "断开 Cisco" : "取消连接").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)

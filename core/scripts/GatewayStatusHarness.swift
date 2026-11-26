@@ -16,7 +16,7 @@ struct GatewayStatusHarness {
         StatusLook.updateMenuButton(button, client: client)
         check(header.badge == (rejected ? .alert : .lock), "panel badge")
         check(header.look.color == (rejected ? .systemRed : .systemGreen), "panel colour")
-        check(header.look.headline == (rejected ? "VPN 网关证书校验失败" : "VPN 已连接"), "panel headline")
+        check(header.look.headline == (rejected ? "Cisco 网关证书校验失败" : "Cisco 已连接"), "panel headline")
         check(client.showsConnected == !rejected, "connection duration and traffic visibility")
         if rejected {
             check(!header.subtitle.contains("已连接") && header.subtitle == client.certificateProtectionText, "subtitle")
@@ -60,7 +60,7 @@ struct GatewayStatusHarness {
         check(retrying.stateLine == "等待网络恢复", "offline waiting does not imply another retry")
         let login = HelperClient()
         for (state, detail, expected) in [(HelperClient.State.authenticating, "approval answered", "网关已回应，等待连接结果"),
-                                          (.awaitingApproval, "tunnel negotiation accepted", "隧道协商完成，正在配置 VPN 网络")] {
+                                          (.awaitingApproval, "tunnel negotiation accepted", "隧道协商完成，正在配置 Cisco 网络")] {
             login.state = state
             login.detail = detail
             let header = PanelStatusHeader(client: login, subtitle: detail)

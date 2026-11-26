@@ -34,10 +34,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             if blocking {
                 // Action-required: the network is paused, always say so.
                 post(title: "AlwaysConnect：网络已暂停",
-                     body: "VPN 断了，正在重连；为防止流量绕过 VPN，网络暂时被拦截。点「恢复直连」可立即恢复。",
+                     body: "Cisco 断了，正在重连；为防止流量绕过 Cisco，网络暂时被拦截。点「恢复直连」可立即恢复。",
                      held: true)
             } else if aggregation {
-                post(title: "AlwaysConnect", body: "VPN 断了，正在重连（断线保护已关，流量走本地网络）")
+                post(title: "AlwaysConnect", body: "Cisco 断了，正在重连（断线保护已关，流量走本地网络）")
             }
         case (.reconnecting, .connected):
             if aggregation {
@@ -100,23 +100,23 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// Still paused, as a reminder (HelperClient, every 10 minutes).
     func remindHeld() {
         post(title: "AlwaysConnect：网络仍暂停",
-             body: "VPN 还没连上，网络仍被拦截。点「恢复直连」可立即恢复。", held: true)
+             body: "Cisco 还没连上，网络仍被拦截。点「恢复直连」可立即恢复。", held: true)
     }
 
     /// The gate let go on its own while the App was gone (§25.2).
     func notifyReleasedWhileAway() {
         post(title: "AlwaysConnect 上次意外退出",
-             body: "2 分钟内没有回来，网络已自动恢复直连，VPN 未连接。")
+             body: "2 分钟内没有回来，网络已自动恢复直连，Cisco 未连接。")
     }
 
     /// The own connection's self-check gave up (§26.11).
     func notifyOwnConnectionUnusable() {
         post(title: "AlwaysConnect：已自动断开自建连接",
-             body: "连上后 30 秒都上不了网，已断开 VPN、恢复直连。可在设置里改用「经 Cisco」连接。")
+             body: "连上后 30 秒都上不了网，已断开 Cisco、恢复直连。可在设置里改用「经 Cisco」连接。")
     }
 
     func notifyGatewayCertificateFailure() {
-        post(title: "VPN 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 VPN 管理员。")
+        post(title: "Cisco 网关证书校验失败", body: "打开 AlwaysConnect 查看网络拦截状态，或联系 IT 管理员。")
     }
 
     /// A rule started blocking connections.

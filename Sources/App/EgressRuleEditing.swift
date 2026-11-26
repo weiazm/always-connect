@@ -150,7 +150,7 @@ struct EgressRuleChange: Identifiable, Equatable {
     func needsReconnect(connected: Bool) -> Bool { connected && before.isActive != after.isActive }
     var undo: Self { .init(before: after, after: before) }
     var confirmationTitle: String { after.isActive ? "开启并重连" : "关闭并重连" }
-    static let reconnectCaption = "需要重新连接一次 VPN。通常不用在手机上确认，已打开的网页可能需要刷新。"
+    static let reconnectCaption = "需要重新连接一次 Cisco。通常不用在手机上确认，已打开的网页可能需要刷新。"
 
     static func replacingSites(_ sites: [String], expected: [String], group id: UInt32, in config: EgressProtection) -> Self? {
         guard let index = config.groups.firstIndex(where: { $0.id == id && $0.sites == expected }) else { return nil }

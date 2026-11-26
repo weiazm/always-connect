@@ -95,10 +95,10 @@ struct ConnectPage: View {
     }
 
     private var dropLine: String {
-        guard settings.isDropProtectionOn else { return "关：VPN 断开后直接用本地网络上网，后台照常重连" }
+        guard settings.isDropProtectionOn else { return "关：Cisco 断开后直接用本地网络上网，后台照常重连" }
         return manager.usesCisco
-            ? "VPN 断开时暂停上网，直到重新连上或你手动断开"
-            : "VPN 断开时暂停上网（分流直连的网站照常），直到重新连上或你手动断开"
+            ? "Cisco 断开时暂停上网，直到重新连上或你手动断开"
+            : "Cisco 断开时暂停上网（分流直连的网站照常），直到重新连上或你手动断开"
     }
 
     /// The newest drop, with the way to all of them (诊断).

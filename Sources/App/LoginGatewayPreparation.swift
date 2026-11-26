@@ -256,14 +256,14 @@ enum LoginGatewayReadiness {
 
     var caption: String? {
         switch self {
-        case .checking: return "正在检查是否有可用的 VPN 服务器地址。"
-        case .preparing: return "正在验证 VPN 服务器，准备期间保持直连。"
+        case .checking: return "正在检查是否有可用的 Cisco 服务器地址。"
+        case .preparing: return "正在验证 Cisco 服务器，准备期间保持直连。"
         case .cached, .candidate: return "服务器地址已准备好，可以连接。"
         case .unavailable: return "暂时无法验证服务器地址，可以重新准备。"
-        case .certificateRejected: return "VPN 服务器证书校验失败，可以重新准备。"
+        case .certificateRejected: return "Cisco 服务器证书校验失败，可以重新准备。"
         case .networkUnknown: return "暂未确认可直连。可以先恢复网络，再准备服务器地址。"
-        case .timedOut: return "查找 VPN 服务器超时。"
-        case .dnsFailed: return "无法解析 VPN 服务器的名称。"
+        case .timedOut: return "查找 Cisco 服务器超时。"
+        case .dnsFailed: return "无法解析 Cisco 服务器的名称。"
         case .idle: return nil
         }
     }
