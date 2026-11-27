@@ -497,6 +497,7 @@ K 项模拟补测：通知中心替身验证通知类别、阻断与恢复文案
 - [ ] L22（DESIGN §七十）Hysteria2 换 Wi-Fi 与交接：在只开代理与自建 Cisco 之间来回切换时未改规则的 Hysteria2 进程保持不重启；切换 Wi-Fi 后 Hysteria2 代理自动恢复可用。
 - [ ] L23（DESIGN §七十）Hysteria2 带宽参数与速度：不填 `upmbps`/`downmbps`（BBR）与填写实际上下行带宽（Brutal）对比测速，确认吞吐表现符合预期。
 - [ ] L24（DESIGN §七十）Hysteria2 开销与清理：未启用 Hysteria2 代理时无 `hysteria` 进程、常驻 `footprint`/CPU/唤醒对照 §三十二 基线无劣化；启用并运行后测量 `hysteria` 与后台服务的 `footprint`/CPU；关闭代理、退出 App、恢复网络或卸载后无 `hysteria` 进程及 `/Library/Application Support/AlwaysConnect-hysteria` 残留。
+- [ ] L25（DESIGN §69.21）代理服务器一律不走 Cisco：自建连接 Cisco 时，已有的 SOCKS5 / HTTP 代理更新到 0.4.2 后，命中规则的网站照常经代理访问；连接页里到代理服务器的连接走本地网络（不在 Cisco 隧道里）；新加一个代理时编辑窗显示灰色说明、「完成」直接保存，2 秒后检测通过；断线保护拦网期间代理服务器照常放行。
 - [ ] L17（DESIGN §69.19）从 0.3.6 点「更新」装上 0.3.7：relay.log 里没有 "step failed: 后台服务没有接受连接请求"，一次就连上；这一次钥匙串会问两次（读两个老条目），之后再更新只问一次（一个 vault 条目）；设置里改密码、加删代理密码后都能正常连接。
 - [ ] L16（DESIGN §69.18）从 0.3.5 点「更新」装上 0.3.6：按一次指纹后自动连上，不在"网络已拦截，正在连接 VPN"上停住；若停住，15 秒内自己重来（relay.log 里有 "starting the login again"），最多两次后写明原因。连上后打开面板，网速卡一出来就是三栏（有启用的代理时），三栏的数同时出现，不再由两栏变三栏。
 - [ ] L15（DESIGN §69.17）经代理下载一个大文件：面板「代理」一栏的下载速度接近实际速度；同时「直连」或「走 VPN」（看代理服务器走哪条路）不再把这份算进去。
