@@ -992,9 +992,8 @@ struct SplitPage: View {
                         .help("从名单删除")
                     }
                 }
-                HStack {
-                    TextField("添加", text: $newSite, prompt: Text("例如 example.com、geosite:apple、10.1.0.0/16"))
-                        .onSubmit(addSite)
+                HStack(spacing: 8) {
+                    AlwaysTextField("例如 example.com、geosite:apple、10.1.0.0/16", text: $newSite, onSubmit: addSite)
                     Button("添加", action: addSite)
                         .disabled(ListRule.parse(newSite) == nil)
                     // Examples the moment the pointer is on the question

@@ -115,7 +115,7 @@ struct ProxySections: View {
     private var explanation: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach([
-                "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 Cisco 的网站」之前。",
+                "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 Cisco 的网站」之前；如果同时受出口保护，会先经此代理核实出口。",
                 "geoip、网段规则：按 DNS 答复的地址判断（连着 Cisco 时问 Cisco 的 DNS，否则问本地网络的）；直接写的网段，连 IP 也走代理。",
                 "TCP 全部代理都转发；UDP（如 QUIC / HTTP/3）经 SOCKS5 和 Hysteria2 转发，HTTP 代理的网站浏览器会自动改用 TCP。",
                 "代理服务器本身一律走本地网络，不经 Cisco（Hysteria2 也只能这样：Cisco 隧道的包太小，QUIC 过不去）。",
@@ -225,14 +225,17 @@ struct ProxyEditor: View {
     @State private var checkingNow = false
 
     private let previewSavesFirst: Bool?
+    private let previewProtectedSites: [String]?
 
     /// `previewCheck`: a check result shown as if just made (screenshots).
     init(route: ProxyRoute, isNew: Bool, previewCheck: ProxyCheck? = nil, previewSavesFirst: Bool? = nil,
+         previewProtectedSites: [String]? = nil,
          cancel: @escaping () -> Void, done: @escaping (ProxyRoute) -> Void) {
         self.isNew = isNew
         self.cancel = cancel
         self.done = done
         self.previewSavesFirst = previewSavesFirst
+        self.previewProtectedSites = previewProtectedSites
         original = route
         let link = isNew ? "" : ProxyLink.display(route)
         let rules = route.sites.joined(separator: "\n")
@@ -244,6 +247,28 @@ struct ProxyEditor: View {
 
     private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
     private var rulesParsed: ProxyRuleInput { ProxyRuleInput(rules) }
+    /// Sites in this proxy's rule box that also fall under an enabled exit
+    /// protection rule (§71): shown as a quiet note below the box.
+    private var overlappingProtectedSites: [String] {
+        if let forced = previewProtectedSites { return forced }
+        guard let egress = ProfileStore.loadAppSettings().egressProtection, egress.isActive else { return [] }
+        let protectedRules = Set(egress.groups.filter(\.enabled).flatMap(\.sites).map { $0.lowercased() })
+        let domainMatchers: [String] = egress.groups.filter(\.enabled).flatMap(\.sites).compactMap { entry in
+            let s = entry.lowercased()
+            if s.hasPrefix("domain:") { return String(s.dropFirst(7)) }
+            if !s.contains(":") && s.contains(".") && !s.contains("/") { return s }
+            return nil
+        }
+        return rulesParsed.sites.filter { site in
+            let s = site.lowercased()
+            if protectedRules.contains(s) { return true }
+            let host: String? = s.hasPrefix("domain:") ? String(s.dropFirst(7))
+                : s.hasPrefix("full:") ? String(s.dropFirst(5))
+                : (!s.contains(":") && s.contains(".") && !s.contains("/")) ? s : nil
+            guard let host else { return false }
+            return domainMatchers.contains { m in host == m || host.hasSuffix("." + m) }
+        }
+    }
     /// A saved password is kept when editing without retyping it.
     private var keepsPassword: Bool {
         guard let l = parsed.link, l.password == nil, original.passwordStamp != nil else { return false }
@@ -291,24 +316,33 @@ struct ProxyEditor: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("代理地址").font(.callout.weight(.medium))
-                TextField("", text: $link, prompt: Text("socks5://、http:// 或 hysteria2:// 链接"))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.body, design: .monospaced))
+                AlwaysTextField("socks5://、http:// 或 hysteria2:// 链接", text: $link, monospaced: true)
                 status
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("名称").font(.callout.weight(.medium))
-                TextField("", text: $name, prompt: Text(parsed.link.map { l in
+                AlwaysTextField(parsed.link.map { l in
                     l.name ?? (l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)")
-                } ?? "可不填"))
-                    .textFieldStyle(.roundedBorder)
+                } ?? "可不填", text: $name)
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("经这个代理访问的网站").font(.callout.weight(.medium))
                 EgressRuleText(input: $rules, height: 140)
                 EgressRuleIssues(issues: rulesParsed.issues)
+                let guarded = overlappingProtectedSites
+                if !guarded.isEmpty {
+                    let previewNames = guarded.prefix(3).joined(separator: "、")
+                        + (guarded.count > 3 ? " 等 \(guarded.count) 条" : "")
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "checkmark.shield").foregroundStyle(SettingsTone.shield)
+                        Text("规则里的 \(previewNames) 受出口保护，经此代理访问时会先检查出口。")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
 
             if savesBeforeChecking {

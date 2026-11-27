@@ -210,6 +210,24 @@ struct EgressNotificationHarness {
             #"{"host":"old.example","method":"trace","evidence":"member","country":"YY"}"#.utf8))
         check(EgressProtection.wrongExits([historical], expected: ["ZZ"]) == nil,
               "an observation without its server address cannot authorize trust")
+        // Proxy-path observations (§71) have no peerAddress (the proxy resolves the
+        // host) and carry path "proxy:<n>"; they can authorize country approval.
+        let proxyObs = try! JSONDecoder().decode(EgressProtection.Observation.self, from: Data(
+            #"{"host":"proxy-site.example","country":"YY","ip":"198.51.100.22","path":"proxy:0"}"#.utf8))
+        let proxyWrong = EgressProtection.wrongExits([proxyObs], expected: ["ZZ"])
+        check(proxyWrong?.count == 1 && proxyWrong?.first?.path == "proxy:0" && proxyWrong?.first?.address == "",
+              "a proxy-path observation authorizes trust without peerAddress")
+        let proxyGroup = EgressProtection.GroupState(
+            id: 42, name: "Proxy Rule", state: "blocked", lastCheck: 1240,
+            observed: [proxyObs], blockedCount: 2,
+            lastBlockedHost: "proxy-site.example", lastBlockedCountry: "YY", path: "proxy:0")
+        let proxyRecord = EgressProtection.BlockRecord(
+            started: 1240, ended: nil, group: 42, name: "Proxy Rule",
+            host: "proxy-site.example", observed: [proxyObs], expected: ["ZZ"], path: "proxy:0")
+        let proxyStatus = EgressProtection.Status(running: true, checking: [], groups: [proxyGroup], records: [proxyRecord])
+        let proxyApproval = proxyStatus.approvals(for: 42).first
+        check(proxyApproval?.country == "YY" && proxyApproval?.observation.path == "proxy:0" && proxyApproval?.observation.peerAddress == nil,
+              "proxy-path status produces a country approval bound to the proxy path")
         notifier.notifyGatewayCertificateFailure()
         check(center.requests.last!.content.categoryIdentifier.isEmpty, "certificate rejection offers no policy action")
         let legacy = try! JSONDecoder().decode(EgressProtection.Group.self, from: Data(

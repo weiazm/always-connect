@@ -26,6 +26,7 @@ struct ConnectionsUITest {
     @MainActor static func main() {
         _ = NSApplication.shared
         checkEgressEditing()
+        checkTextTrim()
         if let output = ProcessInfo.processInfo.environment["AC_EGRESS_RENDER_DIR"] { renderEgress(to: output) }
         // Use the real settings process' snapshot entry. A late engine state
         // can still say connected while the menu App reports a trust failure.
@@ -254,13 +255,79 @@ struct ConnectionsUITest {
         print("PASS rule lines parse, expand and copy like the split list")
     }
 
+    private static func checkTextTrim() {
+        check(TextTrim.singleLine("  socks5://127.0.0.1:1080 \n") == "socks5://127.0.0.1:1080",
+              "singleLine trims outer spaces and trailing newline")
+        check(TextTrim.singleLine("  foo\r\nbar  ") == "foo bar",
+              "singleLine collapses embedded CRLF")
+        check(TextTrim.liveSingleLine(old: "", new: "   ") == "",
+              "liveSingleLine strips accidental leading whitespace on empty field")
+        check(TextTrim.liveSingleLine(old: "my", new: "my ") == "my ",
+              "liveSingleLine keeps a single space while typing")
+        check(TextTrim.liveSingleLine(old: "", new: "  socks5://198.51.100.1:1080  ") == "socks5://198.51.100.1:1080",
+              "liveSingleLine trims pasted proxy address immediately")
+        check(TextTrim.liveSingleLine(old: "a", new: "a\nb") == "a b",
+              "liveSingleLine flattens pasted newline")
+        check(TextTrim.ruleLines("\n  example.com  \r\n\tfull:exact.example  \n\n") == "example.com\nfull:exact.example",
+              "ruleLines trims each line and outer blank lines")
+        check(TextTrim.liveRuleLines(old: "example.com", new: "example.com\n") == "example.com\n",
+              "liveRuleLines keeps a single Enter key while typing")
+        check(TextTrim.liveRuleLines(old: "", new: "  example.com \n  example.org  \n") == "example.com\nexample.org",
+              "liveRuleLines cleans pasted multi-line rules immediately")
+        print("PASS input auto-trim cleans paste and blur without fighting normal typing")
+    }
+
     @MainActor private static func renderEgress(to output: String) {
         let sample = [Fixture.row(1), Fixture.row(2)]
-        let group = EgressProtection.Group(id: 7, name: "示例保护", enabled: true,
+        let now = Date().timeIntervalSince1970
+        let proxyRoutes = [
+            ProxyRoute(name: "示例节点 A", kind: .hysteria2, host: "198.51.100.10", port: 443,
+                       sites: ["example.test", "full:exact.test"]),
+            ProxyRoute(name: "备用代理", kind: .socks5, host: "198.51.100.20", port: 1080,
+                       sites: ["work.example.org"]),
+        ]
+        let group1 = EgressProtection.Group(id: 7, name: "示例保护", enabled: true,
             sites: ["example.test", "full:exact.test", "192.0.2.0/24"], expect: ["ZZ"], unverified: .block)
-        let config = EgressProtection(enabled: true, groups: [group])
-        let render: (String, CGFloat, AnyView) -> Void = { name, height, view in
-            let bounds = NSRect(x: 0, y: 0, width: 600, height: height)
+        let group2 = EgressProtection.Group(id: 8, name: "第二条保护", enabled: true,
+            sites: ["work.example.org", "geosite:test"], expect: ["ZZ"], unverified: .whenWrong)
+        let group3 = EgressProtection.Group(id: 9, name: "本地出口核查", enabled: true,
+            sites: ["direct-check.example"], expect: ["YY"], unverified: .whenWrong)
+        let config = EgressProtection(enabled: true, groups: [group1, group2, group3])
+        let obs1 = EgressProtection.Observation(host: "example.test", country: "ZZ", ip: "198.51.100.50",
+            error: nil, peerAddress: nil, path: "proxy:0")
+        let obs2 = EgressProtection.Observation(host: "work.example.org", country: "YY", ip: "203.0.113.44",
+            error: nil, peerAddress: nil, path: "proxy:1")
+        let obs3 = EgressProtection.Observation(host: "direct-check.example", country: "YY", ip: "203.0.113.12",
+            error: nil, peerAddress: "203.0.113.99", path: "local")
+        let gs1 = EgressProtection.GroupState(
+            id: 7, name: group1.name, state: "ok", lastCheck: now - 45, observed: [obs1],
+            blockedCount: 0, lastBlockedHost: nil, lastBlockedCountry: nil, path: "proxy:0",
+            paths: [
+                EgressProtection.PathState(path: "proxy:0", state: "ok", lastCheck: now - 45,
+                                           country: "ZZ", ip: "198.51.100.50", error: nil, blockedCount: 0),
+                EgressProtection.PathState(path: "cisco", state: "ok", lastCheck: now - 300,
+                                           country: "ZZ", ip: "198.51.100.51", error: nil, blockedCount: 0),
+            ])
+        let gs2 = EgressProtection.GroupState(
+            id: 8, name: group2.name, state: "blocked", lastCheck: now - 15, observed: [obs2],
+            blockedCount: 3, lastBlockedHost: "work.example.org", lastBlockedCountry: "YY", path: "proxy:1",
+            paths: [
+                EgressProtection.PathState(path: "proxy:1", state: "blocked", lastCheck: now - 15,
+                                           country: "YY", ip: "203.0.113.44", error: nil, blockedCount: 3),
+            ])
+        let gs3 = EgressProtection.GroupState(
+            id: 9, name: group3.name, state: "ok", lastCheck: now - 80, observed: [obs3],
+            blockedCount: 0, lastBlockedHost: nil, lastBlockedCountry: nil, path: "local",
+            paths: [
+                EgressProtection.PathState(path: "local", state: "ok", lastCheck: now - 80,
+                                           country: "YY", ip: "203.0.113.12", error: nil, blockedCount: 0),
+            ])
+        let rec1 = EgressProtection.BlockRecord(
+            started: now - 15, ended: nil, group: 8, name: group2.name, host: "work.example.org",
+            observed: [obs2], expected: ["ZZ"], path: "proxy:1")
+        let status = EgressProtection.Status(running: true, checking: [], groups: [gs1, gs2, gs3], records: [rec1])
+        let render: (String, CGFloat, CGFloat, AnyView) -> Void = { name, width, height, view in
+            let bounds = NSRect(x: 0, y: 0, width: width, height: height)
             let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
             let window = NSWindow(contentRect: bounds, styleMask: [.titled], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -278,14 +345,35 @@ struct ConnectionsUITest {
             let path = URL(fileURLWithPath: output).appendingPathComponent(name + ".png")
             do { try png.write(to: path) } catch { fail("write offscreen view") }
         }
-        render("egress-add", 600, AnyView(EgressSiteSheet(sites: group.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
-        render("egress-detail", 560, AnyView(EgressRuleDetail(rule: group, config: config, status: nil, connected: true,
+        render("egress-add", 600, 620, AnyView(EgressSiteSheet(sites: group1.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
+        render("egress-detail", 600, 680, AnyView(EgressRuleDetail(rule: group1, config: config, status: status, connected: true,
             refresh: {}, edit: { _ in }, remove: {}, saveSites: { _, _, done in done(nil) })))
-        let second = EgressProtection.Group(id: 8, name: "第二个保护", enabled: false,
-            sites: ["example.org", "geosite:test"], expect: ["ZZ", "YY"], unverified: .whenWrong)
-        render("egress-page", 820, AnyView(EgressProtectionPage(preview: EgressPagePreview(
-            config: EgressProtection(enabled: true, groups: [group, second]), status: nil, connected: false))))
-        print("PASS offscreen add, detail and page views")
+        render("egress-page", 760, 860, AnyView(EgressProtectionPage(preview: EgressPagePreview(
+            config: config, status: status, connected: true, available: true, proxyRoutes: proxyRoutes))))
+        render("proxy-editor", 520, 560, AnyView(ProxyEditor(
+            route: proxyRoutes[0], isNew: false, previewSavesFirst: false,
+            previewProtectedSites: ["example.test", "full:exact.test"],
+            cancel: {}, done: { _ in })))
+        // Panel A (proxy-only, Cisco off, exit protection active)
+        let previewClient = HelperClient.shared
+        previewClient.applyRemoteSnapshot(#"{"state":0,"proxyOnlyRunning":true,"egressLine":"正常","egressLevel":"ok"}"#)
+        let oldSettings = ProfileStore.loadAppSettings()
+        var panelSettings = oldSettings
+        panelSettings.connectionMode = "own"
+        panelSettings.dropProtection = true
+        panelSettings.proxyRoutes = proxyRoutes
+        panelSettings.egressProtection = config
+        ProfileStore.saveAppSettings(panelSettings, updatingEgress: true)
+        var previewProfile = Profile()
+        previewProfile.server = "VPN-A"
+        let totals = PanelSpeed.Totals(ready: true, total: [160_400, 17_800], vpn: [0, 0],
+                                       direct: [18_400, 2_200], proxy: [142_000, 15_600])
+        render("panel-proxy-only", 340, 470, AnyView(PanelView(
+            manager: previewClient, profile: previewProfile, onStart: {}, onStop: {},
+            preview: PanelPreview(speed: totals, link: .unknown))))
+        ProfileStore.saveAppSettings(oldSettings, updatingEgress: true)
+        previewClient.applyRemoteSnapshot(#"{"state":0}"#)
+        print("PASS offscreen add, detail, page, proxy-editor and panel views")
     }
 
     private static func findTable(in view: NSView) -> NSTableView? {

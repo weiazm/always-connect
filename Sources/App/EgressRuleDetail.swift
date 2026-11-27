@@ -111,6 +111,26 @@ struct EgressRuleDetail: View {
                 } header: {
                     Text("允许的出口")
                 }
+                if let paths = state?.paths, connected, !paths.isEmpty {
+                    let routes = ProfileStore.loadAppSettings().activeProxyRoutes
+                    Section("各路线最近出口") {
+                        ForEach(paths) { row in
+                            HStack(spacing: 8) {
+                                EgressRouteTag(path: row.path, routes: routes, compact: false)
+                                Text(row.country.map { egressCountryLabel($0) } ?? (row.error ?? "尚未核实"))
+                                    .font(.callout)
+                                Spacer()
+                                if row.blockedCount > 0 {
+                                    Text("拦下 \(row.blockedCount) 次").font(.caption).foregroundStyle(.orange)
+                                }
+                                if row.lastCheck.isFinite && row.lastCheck > 0 {
+                                    Text(Date(timeIntervalSince1970: row.lastCheck), format: .dateTime.hour().minute())
+                                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
                 if let records = status?.records.filter({ $0.group == rule.id }), connected, !records.isEmpty {
                     Section("最近拦截") {
                         ForEach(records.prefix(8), id: \.started) { record in recordRow(record) }
@@ -222,11 +242,14 @@ struct EgressRuleDetail: View {
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
         let open = record.ended == nil
+        let routes = ProfileStore.loadAppSettings().activeProxyRoutes
+        let routePath = record.path ?? record.observed.first?.path
         return VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(spacing: 6) {
                 Image(systemName: open ? "hand.raised.fill" : "checkmark.circle")
                     .foregroundStyle(open ? Color.orange : Color.secondary)
                 Text(record.host ?? record.name)
+                EgressRouteTag(path: routePath, routes: routes)
                 Spacer()
                 Text(open ? "拦截中" : "已恢复").font(.caption).foregroundStyle(open ? Color.orange : Color.secondary)
                 Text(Date(timeIntervalSince1970: record.started), format: .dateTime.hour().minute())

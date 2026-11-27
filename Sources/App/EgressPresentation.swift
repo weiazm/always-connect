@@ -58,6 +58,7 @@ extension EgressProtection {
         let host: String
         let address: String
         let country: String
+        let path: String
     }
 
     static func wrongExits(_ observations: [Observation], expected: [String]) -> Set<WrongExit>? {
@@ -75,10 +76,15 @@ extension EgressProtection.Observation {
     }
 
     fileprivate var wrongExit: EgressProtection.WrongExit? {
-        guard let country, let address = peerAddress,
-              IPv4Address(address) != nil || IPv6Address(address) != nil,
+        guard let country,
               country.utf8.count == 2, country.utf8.allSatisfy({ (65...90).contains($0) }) else { return nil }
-        return .init(host: host, address: address, country: country)
+        let route = path ?? "cisco"
+        if let address = peerAddress {
+            guard IPv4Address(address) != nil || IPv6Address(address) != nil else { return nil }
+            return .init(host: host, address: address, country: country, path: route)
+        }
+        guard route.hasPrefix("proxy:") else { return nil }
+        return .init(host: host, address: "", country: country, path: route)
     }
 }
 

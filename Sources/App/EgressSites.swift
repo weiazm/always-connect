@@ -3,6 +3,14 @@ import SwiftUI
 struct EgressRuleText: View {
     @Binding var input: String
     var height: CGFloat = 76
+    @FocusState private var focused: Bool
+    @State private var lastValue: String
+
+    init(input: Binding<String>, height: CGFloat = 76) {
+        self._input = input
+        self.height = height
+        self._lastValue = State(initialValue: input.wrappedValue)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -10,9 +18,27 @@ struct EgressRuleText: View {
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $input)
                 .font(.system(.callout, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .focused($focused)
                 .frame(height: height)
-                .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.secondary.opacity(0.35)).allowsHitTesting(false))
+                .modifier(AlwaysInputChrome(focused: focused, paddingH: 6, paddingV: 6))
                 .accessibilityLabel("出口保护规则，每行一条")
+                .onChange(of: input) { updated in
+                    let cleaned = TextTrim.liveRuleLines(old: lastValue, new: updated)
+                    if cleaned != updated {
+                        input = cleaned
+                        lastValue = cleaned
+                    } else {
+                        lastValue = updated
+                    }
+                }
+                .onChange(of: focused) { isFocused in
+                    if !isFocused {
+                        let cleaned = TextTrim.ruleLines(input)
+                        if cleaned != input { input = cleaned }
+                        lastValue = input
+                    }
+                }
         }
     }
 }
@@ -63,7 +89,7 @@ private struct EgressRecentSites: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if !recent.isEmpty {
-                Text("最近经 Cisco 访问过的网站，点一下加入").font(.caption).foregroundStyle(.secondary)
+                Text("最近经 Cisco 或代理访问过的网站，点一下加入").font(.caption).foregroundStyle(.secondary)
                 FlowChips(items: recent) { site in
                     Button { add(site) } label: { Label(site, systemImage: "plus").font(.callout) }
                         .buttonStyle(.borderless)
@@ -78,7 +104,7 @@ private struct EgressRecentSites: View {
     private func load() {
         func show(_ rows: [ConnectionRow]) {
             var counts: [String: Int] = [:]
-            for row in rows where row.via == "vpn" {
+            for row in rows where row.via == "vpn" || row.via == "proxy" {
                 guard let host = row.host, let site = DirectSites.clean(DirectSites.site(of: host)),
                       !isValidIPv4Address(site) else { continue }
                 counts[site, default: 0] += 1

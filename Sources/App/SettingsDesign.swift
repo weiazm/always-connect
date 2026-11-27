@@ -244,18 +244,23 @@ struct SettingsSegments: View {
 }
 
 /// Which list wins when a site is in several, drawn as a short road
-/// instead of a sentence.
+/// instead of a sentence (DESIGN §69.9, §71 D1-A).
 struct SplitOrderStrip: View {
     var body: some View {
-        HStack(spacing: 6) {
-            Text("同一网站命中多处时").foregroundStyle(.secondary)
-            step("出口保护", SettingsTone.shield)
-            arrow
-            step("分流代理", SettingsTone.proxy)
-            arrow
-            step("分流直连", SettingsTone.direct)
-            arrow
-            step("其余走 Cisco", SettingsTone.vpn)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text("同一网站命中多处时").foregroundStyle(.secondary)
+                step("分流代理", SettingsTone.proxy)
+                arrow
+                step("分流直连", SettingsTone.direct)
+                arrow
+                step("其余走 Cisco", SettingsTone.vpn)
+            }
+            HStack(spacing: 4) {
+                Circle().fill(SettingsTone.shield).frame(width: 6, height: 6)
+                Text("受出口保护的网站不会走分流直连；命中代理时经代理并先检查出口。")
+                    .foregroundStyle(.secondary)
+            }
         }
         .font(.caption)
         .accessibilityElement(children: .combine)
@@ -270,6 +275,133 @@ struct SplitOrderStrip: View {
             Circle().fill(color).frame(width: 6, height: 6)
             Text(title)
         }
+    }
+}
+
+// MARK: - Unified inputs & auto-trim (DESIGN §71)
+
+/// Whitespace cleanup for single-line and multi-line inputs without fighting
+/// normal typing.
+enum TextTrim {
+    /// Trims leading/trailing whitespace and collapses embedded newlines.
+    static func singleLine(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Applied while typing: trims immediately when pasted text contains
+    /// newlines or leading/trailing whitespace (delta > 1), leaving single
+    /// spaces typed mid-input untouched until blur/submit.
+    static func liveSingleLine(old: String, new: String) -> String {
+        if new.contains(where: \.isNewline) {
+            return singleLine(new)
+        }
+        let delta = abs(new.count - old.count)
+        if delta > 1 {
+            return new.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Leading spaces at the start of an empty field are always accidental.
+        if old.isEmpty, new.first?.isWhitespace == true {
+            return new.trimmingCharacters(in: .whitespaces)
+        }
+        return new
+    }
+
+    /// Trims each line's leading/trailing spaces and drops leading/trailing
+    /// blank lines while keeping internal line breaks intact.
+    static func ruleLines(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var lines = normalized.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        while lines.first?.isEmpty == true { lines.removeFirst() }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Applied on paste into a multi-line rule box (delta > 1): cleans pasted
+    /// indentation and outer blank lines without disrupting normal Enter keys.
+    static func liveRuleLines(old: String, new: String) -> String {
+        guard abs(new.count - old.count) > 1 else { return new }
+        return ruleLines(new)
+    }
+}
+
+/// Shared visual frame for single-line and multi-line inputs across Settings
+/// and sheets so every text box shares the same corner radius, surface fill,
+/// border and focus accent.
+struct AlwaysInputChrome: ViewModifier {
+    var focused: Bool
+    var paddingH: CGFloat = 10
+    var paddingV: CGFloat = 7
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, paddingH)
+            .padding(.vertical, paddingV)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(0.055))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(
+                        focused ? Color.accentColor.opacity(0.75) : Color.primary.opacity(0.14),
+                        lineWidth: focused ? 1.5 : 1
+                    )
+                    .allowsHitTesting(false)
+            )
+    }
+}
+
+/// Single-line input matching `SettingsDesign` with automatic trim on paste,
+/// blur and submit.
+struct AlwaysTextField: View {
+    var prompt: String
+    @Binding var text: String
+    var monospaced: Bool = false
+    var onSubmit: (() -> Void)? = nil
+    @FocusState private var focused: Bool
+    @State private var lastValue: String
+
+    init(_ prompt: String, text: Binding<String>, monospaced: Bool = false, onSubmit: (() -> Void)? = nil) {
+        self.prompt = prompt
+        self._text = text
+        self.monospaced = monospaced
+        self.onSubmit = onSubmit
+        self._lastValue = State(initialValue: text.wrappedValue)
+    }
+
+    var body: some View {
+        TextField("", text: $text, prompt: Text(prompt))
+            .textFieldStyle(.plain)
+            .font(monospaced ? .system(.body, design: .monospaced) : .body)
+            .focused($focused)
+            .modifier(AlwaysInputChrome(focused: focused))
+            .onChange(of: text) { updated in
+                let cleaned = TextTrim.liveSingleLine(old: lastValue, new: updated)
+                if cleaned != updated {
+                    text = cleaned
+                    lastValue = cleaned
+                } else {
+                    lastValue = updated
+                }
+            }
+            .onChange(of: focused) { isFocused in
+                if !isFocused {
+                    let cleaned = TextTrim.singleLine(text)
+                    if cleaned != text { text = cleaned }
+                    lastValue = text
+                }
+            }
+            .onSubmit {
+                let cleaned = TextTrim.singleLine(text)
+                if cleaned != text { text = cleaned }
+                lastValue = text
+                onSubmit?()
+            }
     }
 }
 
