@@ -100,8 +100,8 @@ struct ProxySections: View {
                 if let index = routes.firstIndex(where: { $0.id == saved.id }) { routes[index] = saved } else { routes.append(saved) }
                 save()
                 // Its server's way around Cisco is pushed with the save:
-                // checked once that is in place (§70.6).
-                if saved.kind == .hysteria2, saved.enabled, !preview {
+                // checked once that is in place (§69.21).
+                if saved.enabled, !preview {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { health.check([saved], force: true) }
                 }
             }
@@ -118,8 +118,7 @@ struct ProxySections: View {
                 "域名、网站清单规则：查 DNS 之前就交给代理，域名由代理解析，排在「不走 Cisco 的网站」之前。",
                 "geoip、网段规则：按 DNS 答复的地址判断（连着 Cisco 时问 Cisco 的 DNS，否则问本地网络的）；直接写的网段，连 IP 也走代理。",
                 "TCP 全部代理都转发；UDP（如 QUIC / HTTP/3）经 SOCKS5 和 Hysteria2 转发，HTTP 代理的网站浏览器会自动改用 TCP。",
-                "连代理本身按分流名单走：在局域网或「不走 Cisco 的网站」里就走本地网络，否则经 Cisco；Cisco 没连时一律走本地网络。",
-                "Hysteria2 服务器一律走本地网络：Cisco 隧道的包太小，QUIC 过不去。",
+                "代理服务器本身一律走本地网络，不经 Cisco（Hysteria2 也只能这样：Cisco 隧道的包太小，QUIC 过不去）。",
                 "Cisco 没连时代理照样生效（只开代理）：命中规则的网站走代理，其余走本地网络。",
                 "代理连不上、拒绝或密码不对：这些网站直接打不开，不会改走直连或 Cisco。",
             ], id: \.self) { line in
@@ -205,7 +204,7 @@ struct ProxySections: View {
             HelperClient.shared.pushDirectDomains { taken in
                 note = taken == nil ? "已保存；后台服务没有回应，更新后台服务后生效。" : nil
             }
-            // Hysteria2 servers' addresses join the local-network list (§70.6).
+            // Proxy servers' addresses join the local-network list (§69.21).
             HelperClient.shared.updateAllowNetworks(stored.effectiveAllowNetworks) { _ in }
         }
     }
@@ -266,16 +265,17 @@ struct ProxyEditor: View {
         guard let l = parsed.link, l.kind == .hysteria2, l.obfs != nil else { return false }
         return l.obfsPassword == nil && !keepsObfsPassword
     }
-    /// A Hysteria2 server not yet going around Cisco while the own
-    /// connection is up (§70.6): a check now would go into the tunnel,
-    /// where QUIC cannot fit. 完成 saves first (the server then goes the
-    /// local network) and the list checks it right after.
+    /// A proxy server not yet going around Cisco while the own connection
+    /// is up (§69.21): a check now would take the tunnel, not the way the
+    /// proxy will use (for Hysteria2 it cannot even fit, §70.6). 完成 saves
+    /// first (the server then goes the local network) and the list checks
+    /// it right after.
     private var savesBeforeChecking: Bool {
         if let forced = previewSavesFirst { return forced }
-        guard let l = parsed.link, l.kind == .hysteria2 else { return false }
+        guard let l = parsed.link else { return false }
         let manager = HelperClient.shared
         guard !manager.usesCisco && manager.state != .disconnected else { return false }
-        return ProxyLink.hysteriaNeedsDirectHint(host: l.host, settings: ProfileStore.loadAppSettings())
+        return ProxyLink.serverStillThroughCisco(host: l.host, settings: ProfileStore.loadAppSettings())
     }
     private var checkKey: String { link + "\u{0}" + rules }
     /// A failed check shown for what is typed now: 完成 saves anyway.
@@ -314,7 +314,7 @@ struct ProxyEditor: View {
             if savesBeforeChecking {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Image(systemName: "info.circle")
-                    Text("连着 Cisco 时，Hysteria2 服务器自动走本地网络（Cisco 隧道的包太小，QUIC 过不去）。保存后再检测。")
+                    Text("代理服务器自动走本地网络，不经 Cisco。保存后再检测。")
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.caption)

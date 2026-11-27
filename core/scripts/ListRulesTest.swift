@@ -254,11 +254,11 @@ struct ListRulesTest {
         var hintSettings = AppSettings()
         hintSettings.autoLAN = false
         hintSettings.directSites = [DirectSite(name: "direct.example.com", domains: ["direct.example.com"])]
-        check("Cisco UDP hint fires when server is outside direct list and LAN",
-              ProxyLink.hysteriaNeedsDirectHint(host: "203.0.113.10", settings: hintSettings)
-              && !ProxyLink.hysteriaNeedsDirectHint(host: "sub.direct.example.com", settings: hintSettings)
-              && !ProxyLink.hysteriaNeedsDirectHint(host: "192.168.1.5", settings: hintSettings))
-        // Hysteria2 servers go around Cisco by themselves (§70.6).
+        check("a new proxy server outside the direct list and LAN still goes through Cisco",
+              ProxyLink.serverStillThroughCisco(host: "203.0.113.10", settings: hintSettings)
+              && !ProxyLink.serverStillThroughCisco(host: "sub.direct.example.com", settings: hintSettings)
+              && !ProxyLink.serverStillThroughCisco(host: "192.168.1.5", settings: hintSettings))
+        // Every proxy's own server goes around Cisco (§69.21, §70.6).
         var aroundSettings = AppSettings()
         aroundSettings.autoLAN = false
         aroundSettings.proxyRoutes = [
@@ -266,21 +266,26 @@ struct ListRulesTest {
             ProxyRoute(name: "named", kind: .hysteria2, host: "Hy.Example.net", port: 443, sites: ["example.org"]),
             ProxyRoute(name: "off", kind: .hysteria2, host: "198.51.100.9", port: 443, sites: ["example.org"], enabled: false),
             ProxyRoute(name: "socks", kind: .socks5, host: "198.51.100.8", port: 1080, sites: ["example.org"]),
+            ProxyRoute(name: "http", kind: .http, host: "proxy.example.org", port: 8080, sites: ["example.org"]),
+            ProxyRoute(name: "local", kind: .socks5, host: "127.0.0.1", port: 7890, sites: ["example.org"]),
+            ProxyRoute(name: "again", kind: .socks5, host: "198.51.100.8", port: 1081, sites: ["example.net"]),
         ]
-        check("Hysteria2 servers become direct entries (names as full:, addresses as /32), enabled ones only",
-              aroundSettings.hysteriaServerDirectRules == ["full:hy.example.net"]
-              && aroundSettings.hysteriaServerDirectNetworks == ["203.0.113.10/32"]
+        check("every enabled proxy server becomes a direct entry (names as full:, addresses as /32), loopback and duplicates skipped",
+              aroundSettings.proxyServerDirectRules == ["full:hy.example.net", "full:proxy.example.org"]
+              && aroundSettings.proxyServerDirectNetworks == ["203.0.113.10/32", "198.51.100.8/32"]
               && aroundSettings.effectiveAllowNetworks.contains("203.0.113.10/32")
+              && aroundSettings.effectiveAllowNetworks.contains("198.51.100.8/32")
               && !aroundSettings.effectiveAllowNetworks.contains("198.51.100.9/32")
-              && !aroundSettings.effectiveAllowNetworks.contains("198.51.100.8/32"))
-        check("the split-off rule text carries the Hysteria2 servers before the proxies",
-              aroundSettings.proxyRuleText.hasPrefix("full:hy.example.net\nproxy:0 hysteria2 ")
-              && aroundSettings.directRuleText.contains("full:hy.example.net"))
-        check("a saved Hysteria2 server counts as going around Cisco when edited",
-              !ProxyLink.hysteriaNeedsDirectHint(host: "203.0.113.10", settings: aroundSettings))
+              && !aroundSettings.effectiveAllowNetworks.contains(where: { $0.hasPrefix("127.") }))
+        check("the split-off rule text carries the proxy servers before the proxies",
+              aroundSettings.proxyRuleText.hasPrefix("full:hy.example.net\nfull:proxy.example.org\nproxy:0 hysteria2 ")
+              && aroundSettings.directRuleText.contains("full:proxy.example.org"))
+        check("a saved proxy server counts as going around Cisco when edited",
+              !ProxyLink.serverStillThroughCisco(host: "203.0.113.10", settings: aroundSettings)
+              && !ProxyLink.serverStillThroughCisco(host: "Proxy.Example.org", settings: aroundSettings))
         aroundSettings.proxiesPaused = true
-        check("paused proxies send no Hysteria2 server around Cisco",
-              aroundSettings.hysteriaServerDirectRules.isEmpty && aroundSettings.hysteriaServerDirectNetworks.isEmpty)
+        check("paused proxies send no server around Cisco",
+              aroundSettings.proxyServerDirectRules.isEmpty && aroundSettings.proxyServerDirectNetworks.isEmpty)
         ProxyPasswords.delete(for: hyRoute)
         check("deleting hysteria2 route removes both vault entries",
               memVault["proxy@proxy-\(hyRoute.id.uuidString)"] == nil

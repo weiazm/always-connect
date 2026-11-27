@@ -215,29 +215,31 @@ extension AppSettings {
         return (proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
     }
 
-    /// Hysteria2 servers never go through Cisco (DESIGN §70.6, user:
-    /// 「这个不能让我们程序处理掉吗？」): the tunnel's packets are smaller
-    /// (MTU 1230 measured, 1159 seen) than QUIC's first packet (1252 bytes
-    /// from the official client), so through Cisco it could never connect.
-    /// Treated like a 分流直连 entry the user wrote: a name as "full:" for
-    /// the own connection's DNS split, an IPv4 address as a /32 network.
-    private var hysteriaServers: [String] {
+    /// The proxies' own servers never go through Cisco (DESIGN §69.21,
+    /// user: 「那我建议所有代理地址都默认直连，不要走公司」「不要走cisco」;
+    /// for Hysteria2 there is no other way, §70.6: QUIC's first packet does
+    /// not fit the tunnel). Treated like a 分流直连 entry the user wrote: a
+    /// name as "full:" for the own connection's DNS split, an IPv4 address
+    /// as a /32 network. A proxy on this Mac (loopback) needs neither.
+    private var proxyServers: [String] {
         var seen = Set<String>()
-        return activeProxyRoutes.filter { $0.kind == .hysteria2 }
-            .map { $0.host.lowercased() }
-            .filter { ProxyRoute.validHost($0) && !$0.contains(":") && seen.insert($0).inserted }
+        return activeProxyRoutes.map { $0.host.lowercased() }
+            .filter { host in
+                ProxyRoute.validHost(host) && !host.contains(":") && host != "localhost" && !host.hasPrefix("127.")
+                    && seen.insert(host).inserted
+            }
     }
-    var hysteriaServerDirectRules: [String] {
-        hysteriaServers.filter { !isValidIPv4Address($0) }.map { "full:\($0)" }
+    var proxyServerDirectRules: [String] {
+        proxyServers.filter { !isValidIPv4Address($0) }.map { "full:\($0)" }
     }
-    var hysteriaServerDirectNetworks: [String] {
-        hysteriaServers.filter(isValidIPv4Address).map { "\($0)/32" }
+    var proxyServerDirectNetworks: [String] {
+        proxyServers.filter(isValidIPv4Address).map { "\($0)/32" }
     }
 
-    /// What the service gets when the split list is off: the Hysteria2
+    /// What the service gets when the split list is off: the proxy
     /// servers' own way around Cisco, then the proxies.
     var proxyRuleText: String {
-        (hysteriaServerDirectRules + proxyLines).joined(separator: "\n")
+        (proxyServerDirectRules + proxyLines).joined(separator: "\n")
     }
 
     /// The proxies as the background service reads them, inside the split
@@ -324,9 +326,11 @@ struct ProxyLink: Equatable {
         return "\(route.kind.rawValue)://\(user)\(host):\(route.port)"
     }
 
-    /// Whether a Hysteria2 host is NOT covered by the direct list or LAN
-    /// (for the orange hint in ProxyEditor when Cisco own-connection is on).
-    static func hysteriaNeedsDirectHint(host: String, settings: AppSettings) -> Bool {
+    /// Whether a proxy server still goes through Cisco under `settings`:
+    /// not yet among the saved proxies' servers, the direct list or the
+    /// local networks (the editor saves before checking such one, §69.21).
+    static func serverStillThroughCisco(host: String, settings: AppSettings) -> Bool {
+        if settings.proxyServerDirectRules.contains("full:\(host.lowercased())") { return false }
         let isIP = isValidIPv4Address(host)
         if DirectSites.covering(DirectSites.sites(settings), host: isIP ? nil : host, address: isIP ? host : "") != nil {
             return false
