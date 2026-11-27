@@ -664,6 +664,40 @@ fn a_check_tells_reach_password_and_site_apart() {
 }
 
 #[test]
+fn a_check_waits_for_the_site_to_answer_a_tls_hello() {
+    // §70.7: "connected" from the proxy is not enough (Hysteria2's fast open
+    // says so before the server has even tried): the site must answer.
+    let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closing_address = closing.local_addr().unwrap();
+    std::thread::spawn(move || for stream in closing.incoming() { drop(stream); });
+    let socks = socks_proxy(closing_address, Behaviour::default());
+    let result = probe(&Server::parse(&format!("socks5 127.0.0.1 {}", socks.port)).unwrap(), Some("s.example"));
+    assert_eq!(result.level, Level::Warn, "{}", result.text);
+    assert!(result.text.contains("网站没有回应"), "{}", result.text);
+    // The hello: one TLS handshake record, lengths consistent, naming the site.
+    let hello = super::probe::client_hello("s.example");
+    assert_eq!(&hello[..3], &[0x16, 0x03, 0x01]);
+    assert_eq!(u16::from_be_bytes([hello[3], hello[4]]) as usize, hello.len() - 5);
+    assert_eq!(hello[5], 0x01, "client hello");
+    assert_eq!(u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize, hello.len() - 9);
+    assert!(hello.windows(9).any(|w| w == b"s.example"));
+}
+
+/// Run by hand (network): a real HTTPS server answers the hello.
+#[test]
+#[ignore]
+fn a_real_https_server_answers_the_hello() {
+    for site in ["www.apple.com", "www.cloudflare.com"] {
+        let mut stream = TcpStream::connect((site, 443)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        stream.write_all(&super::probe::client_hello(site)).unwrap();
+        let mut first = [0u8; 1];
+        stream.read_exact(&mut first).unwrap();
+        assert_eq!(first[0], 0x16, "{site}: a handshake record");
+    }
+}
+
+#[test]
 fn the_site_to_check_is_the_first_plain_name() {
     assert_eq!(site_from_rules(&["geosite:github", "geoip:cn", "keyword:abc", "203.0.113.0/24", "full:Api.Example.org", "example.com"]),
                Some("api.example.org".into()));
