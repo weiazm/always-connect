@@ -215,6 +215,31 @@ extension AppSettings {
         return (proxyRoutes ?? []).filter { $0.enabled && !$0.sites.isEmpty }
     }
 
+    /// Hysteria2 servers never go through Cisco (DESIGN §70.6, user:
+    /// 「这个不能让我们程序处理掉吗？」): the tunnel's packets are smaller
+    /// (MTU 1230 measured, 1159 seen) than QUIC's first packet (1252 bytes
+    /// from the official client), so through Cisco it could never connect.
+    /// Treated like a 分流直连 entry the user wrote: a name as "full:" for
+    /// the own connection's DNS split, an IPv4 address as a /32 network.
+    private var hysteriaServers: [String] {
+        var seen = Set<String>()
+        return activeProxyRoutes.filter { $0.kind == .hysteria2 }
+            .map { $0.host.lowercased() }
+            .filter { ProxyRoute.validHost($0) && !$0.contains(":") && seen.insert($0).inserted }
+    }
+    var hysteriaServerDirectRules: [String] {
+        hysteriaServers.filter { !isValidIPv4Address($0) }.map { "full:\($0)" }
+    }
+    var hysteriaServerDirectNetworks: [String] {
+        hysteriaServers.filter(isValidIPv4Address).map { "\($0)/32" }
+    }
+
+    /// What the service gets when the split list is off: the Hysteria2
+    /// servers' own way around Cisco, then the proxies.
+    var proxyRuleText: String {
+        (hysteriaServerDirectRules + proxyLines).joined(separator: "\n")
+    }
+
     /// The proxies as the background service reads them, inside the split
     /// list: "proxy:<n> <kind> ...", then "via:<n>:<rule>" per expanded rule
     /// (geoip as "ipcidr:") and "vianet:<n>:<cidr>" per written network, in

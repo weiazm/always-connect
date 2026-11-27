@@ -492,8 +492,8 @@ K 项模拟补测：通知中心替身验证通知类别、阻断与恢复文案
   - 经 Cisco 客户端连接时，连着的期间面板写"Cisco 连着时由 Cisco 管"，断开后代理恢复；
   - 面板按设计 C 显示，Cisco 关着时三项变灰并有一行说明。
 - [ ] L19（DESIGN §七十）Hysteria2 本地网络出 UDP：只开代理添加一个真实 Hysteria2 节点（支持 `hy2://` 粘贴、自签 `pinSHA256` 或正常证书），点「完成」通过保存前检测；命中网站 TCP 与 HTTP/3（UDP）均经该代理正常打开；错密码、错指纹或服务端不可达时面板悬停与菜单显示对应大白话原因且命中网站直接打不开（不改走直连）。
-- [ ] L20（DESIGN §七十）Hysteria2 连着 Cisco 且服务器在直连名单：自建连接 Cisco 时，Hysteria2 服务器加入「分流直连」，命中规则的网站经 Hysteria2 正常访问；服务器不在直连名单时编辑窗显示橙色提示且不自动修改直连名单；面板网速「代理」与「直连」不重复计数，流量页标出「代理本身」。
-- [ ] L21（DESIGN §七十）Hysteria2 断线保护拦网期间：自建连接开启断线保护且服务器在分流直连，触发掉线拦网期间直连名单中的 Hysteria2 服务器照常放行、命中网站仍可经代理访问；不在直连名单里的 Hysteria2 服务器同其他流量一样被拦截。
+- [ ] L20（DESIGN §七十、§70.6）Hysteria2 连着 Cisco：自建连接 Cisco 时新加一个 Hysteria2 代理（服务器不在「分流直连」里），编辑窗显示灰色说明、「完成」直接保存，2 秒后列表检测通过，命中规则的网站经 Hysteria2 正常访问（服务器自动走本地网络；名单不变）；面板网速「代理」与「直连」不重复计数，流量页标出「代理本身」。
+- [ ] L21（DESIGN §七十、§70.6）Hysteria2 断线保护拦网期间：自建连接开启断线保护，触发掉线拦网期间 Hysteria2 服务器（和直连名单里的地址一样）照常放行；SOCKS5 / HTTP 代理服务器不在直连名单时同其他流量一样被拦截。
 - [ ] L22（DESIGN §七十）Hysteria2 换 Wi-Fi 与交接：在只开代理与自建 Cisco 之间来回切换时未改规则的 Hysteria2 进程保持不重启；切换 Wi-Fi 后 Hysteria2 代理自动恢复可用。
 - [ ] L23（DESIGN §七十）Hysteria2 带宽参数与速度：不填 `upmbps`/`downmbps`（BBR）与填写实际上下行带宽（Brutal）对比测速，确认吞吐表现符合预期。
 - [ ] L24（DESIGN §七十）Hysteria2 开销与清理：未启用 Hysteria2 代理时无 `hysteria` 进程、常驻 `footprint`/CPU/唤醒对照 §三十二 基线无劣化；启用并运行后测量 `hysteria` 与后台服务的 `footprint`/CPU；关闭代理、退出 App、恢复网络或卸载后无 `hysteria` 进程及 `/Library/Application Support/AlwaysConnect-hysteria` 残留。

@@ -2610,7 +2610,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         // Without Cisco on this Mac the own connection runs either way;
         // only the switch decides whether the list applies. Through Cisco's
         // client only the proxies go, for while Cisco is off (§69.20).
-        let text = settings.splitOn ? settings.directRuleText : settings.proxyLines.joined(separator: "\n")
+        let text = settings.splitOn ? settings.directRuleText : settings.proxyRuleText
         // A background service built before §66.30 only knows the list form.
         let legacy = HelperInstaller.installedHelperOutdated
         defer { sendProxyOnly() }
