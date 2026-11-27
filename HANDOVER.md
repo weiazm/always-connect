@@ -25,6 +25,7 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
   - 连接页单独标出走代理的连接。
 - **2026-11-26 分流代理支持 Hysteria2（DESIGN §七十）**：作为分流代理的第三种类型，粘贴 `hysteria2://` / `hy2://` 链接即可（拒绝 `insecure=1`，自签用 `pinSHA256`）；服务器走本地网络还是 Cisco 按现有分流直连名单决定。随 App 打包官方客户端（`HyNetworks/hysteria` 固定版本 `app/v2.14.0`，SHA-256 校验，MIT 许可），仅在启用 Hysteria2 代理时由后台服务以 `nobody` 运行本地 SOCKS5 并复用既有 TCP/UDP 转发与故障关闭，监管/解析/去重/错误映射均在 Rust（`core/src/split_proxy/hysteria.rs`）。
   - **Hysteria2 客户端版本与更新办法**：固定在 `scripts/bundle-hysteria.sh` 与 `scripts/hysteria-interop-test.sh` 的 `HYSTERIA_TAG="app/v2.14.0"` 及各平台 SHA-256（来自上游 release `hashes.txt`）；升级时核对新版本发布说明、更新脚本内版本号与 SHA-256 及 `THIRD_PARTY_NOTICES.md`，重跑 `scripts/hysteria-interop-test.sh` 与 `scripts/build-local.sh --tests`。真机待测见 L19–L24。
+  0.4.2（构建号 22）：所有代理（SOCKS5、HTTP、Hysteria2）的服务器都默认走本地网络，不经 Cisco（用户决定）。相当于程序把这些服务器自动加进分流直连；本机上的代理不算。编辑窗连着 Cisco 时先保存再检测（DESIGN §69.21，真机待 L25）。
   0.4.1（构建号 21）：连着 Cisco 时 Hysteria2 连不上的问题修掉了。原因是 Cisco 隧道的包最大 1230 字节，QUIC 的第一个包就有 1252 字节，换端口也过不去。现在 Hysteria2 服务器一律走本地网络，相当于程序自动把它加进分流直连；编辑窗在这种情况下先保存再检测（DESIGN §70.6，真机待 L20、L21）。
   0.4.0（构建号 20）：只开代理，即 Cisco 关着时分流代理照样生效。系统 DNS 经本项目单独登记的一项 DNS 设置指到转发器，停止、恢复网络、卸载、后台服务重启时都会删掉。面板改为设计 C：一张卡里上行 Cisco、下行分流代理，各一个开关，其余三项收成列表。界面上指这条连接的"VPN"改叫 Cisco（DESIGN §69.20，CI 上 root 实测只开代理，真机待 L18）。
   0.3.7（构建号 19）：两次"更新后登录卡住"的根因修掉了。原因是新后台服务还没换上，App 就开始登录，准备做在了旧服务上，新服务拒绝启动引擎；现在要等到换了一个服务进程回应才算更新好。所有密码放进一个钥匙串条目，每次更新只问一次。这是自签名的限制，不能用指纹；要用指纹或完全不问，需要开发者团队签名（DESIGN §69.19，真机待 L17）。
