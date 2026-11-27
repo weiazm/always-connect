@@ -117,11 +117,10 @@ impl SplitPolicy {
     }
     pub fn revalidate(&mut self, rules: &SplitRules) {
         for (name, claims) in &mut self.names {
-            let domain_direct = rules.matches(name).is_some();
-            let protected = rules.protects_name(name);
-            claims.vpn.retain(|ip| protected || rules.protects_ip(*ip) || (!domain_direct && !rules.contains(*ip)));
+            let domain_direct = rules.direct_name(name).is_some();
+            claims.vpn.retain(|ip| !rules.directs_address(name, domain_direct, *ip));
             for (ip, direct) in &mut claims.current {
-                let keep = !protected && !rules.protects_ip(*ip) && (domain_direct || rules.contains(*ip));
+                let keep = rules.directs_address(name, domain_direct, *ip);
                 if *direct && !keep { claims.vpn.insert(*ip); }
                 // New grants still require a fresh query through the right DNS.
                 *direct &= keep;

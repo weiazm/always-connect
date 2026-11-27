@@ -1790,8 +1790,7 @@ pub extern "C" fn ac_egress_match_targets(config: *const c_char, targets: *const
         let targets: Vec<Target> = serde_json::from_str(&c_str(targets)?).ok()?;
         let sites = cfg.protected_sites();
         let matched: Vec<_> = targets.into_iter().map(|target| {
-            sites.group_for(target.host.as_deref().unwrap_or(""))
-                .or_else(|| sites.group_for_ip(target.address.parse().ok()?))
+            sites.group_for_addresses(target.host.as_deref().unwrap_or(""), target.address.parse().ok().into_iter())
         }).collect();
         serde_json::to_string(&matched).ok()
     };

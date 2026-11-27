@@ -25,6 +25,28 @@ fn cfg() -> EgressConfig {
 }
 
 #[test]
+fn relay_exceptions_leave_other_protection_rules_and_remaining_addresses_eligible() {
+    let cfg: EgressConfig = serde_json::from_str(r#"{"enabled":true,"groups":[
+        {"id":1,"name":"broad","enabled":true,"sites":["example.test","198.51.100.0/24"],
+         "exceptions":["full:login.example.test","198.51.100.7/32"],"expect":["ZZ"]},
+        {"id":2,"name":"login","enabled":true,"sites":["full:login.example.test"],"expect":["ZZ"]}
+    ]}"#).unwrap();
+    assert!(cfg.valid());
+    let sites = cfg.protected_sites();
+    let skip = "198.51.100.7".parse().unwrap();
+    let keep = "198.51.100.8".parse().unwrap();
+    assert_eq!(sites.group_for_target("login.example.test", keep), Some(2));
+    assert_eq!(sites.group_for_target("main.example.test", skip), None);
+    assert_eq!(sites.group_for_target("main.example.test", keep), Some(1));
+    assert_eq!(sites.group_for_target("unknown.test", skip), None);
+    let ctl = Controller::in_process(cfg, Arc::new(|_, _| None)).unwrap();
+    let gate = ctl.relay_gate();
+    assert_eq!(gate.protects_target("login.example.test", &[keep]), Some(2));
+    assert_eq!(gate.protects_target("main.example.test", &[skip]), None);
+    assert_eq!(gate.protects_target("main.example.test", &[skip, keep]), Some(1));
+}
+
+#[test]
 fn trace_answers_give_country_and_address() {
     assert_eq!(read_trace(&resp(200, "fl=1\nip=198.51.100.7\nloc=zz\ncolo=XYZ\n")), Ok(("ZZ".into(), Some("198.51.100.7".into()))));
     assert_eq!(read_trace(&resp(200, "loc=ZZ\nip=not-an-address\n")), Ok(("ZZ".into(), None)));

@@ -220,6 +220,7 @@ struct ProxyEditor: View {
     @State private var link: String
     @State private var name: String
     @State private var rules: String
+    @State private var exceptions: String
     /// The check made on 完成, for the address and rules it was made with.
     @State private var result: (key: String, check: ProxyCheck)?
     @State private var checkingNow = false
@@ -242,11 +243,14 @@ struct ProxyEditor: View {
         _link = State(initialValue: link)
         _name = State(initialValue: isNew ? "" : route.name)
         _rules = State(initialValue: rules)
-        _result = State(initialValue: previewCheck.map { (link + "\u{0}" + rules, $0) })
+        let exceptions = (route.exceptions ?? []).joined(separator: "\n")
+        _exceptions = State(initialValue: exceptions)
+        _result = State(initialValue: previewCheck.map { (link + "\u{0}" + rules + "\u{0}" + exceptions, $0) })
     }
 
     private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
     private var rulesParsed: ProxyRuleInput { ProxyRuleInput(rules) }
+    private var exceptionsParsed: ProxyRuleInput { ProxyRuleInput(exceptions) }
     /// Sites in this proxy's rule box that also fall under an enabled exit
     /// protection rule (§71): shown as a quiet note below the box.
     private var overlappingProtectedSites: [String] {
@@ -302,11 +306,12 @@ struct ProxyEditor: View {
         guard !manager.usesCisco && manager.state != .disconnected else { return false }
         return ProxyLink.serverStillThroughCisco(host: l.host, settings: ProfileStore.loadAppSettings())
     }
-    private var checkKey: String { link + "\u{0}" + rules }
+    private var checkKey: String { link + "\u{0}" + rules + "\u{0}" + exceptions }
     /// A failed check shown for what is typed now: 完成 saves anyway.
     private var overriding: Bool { result.map { $0.key == checkKey && $0.check.level != .ok } ?? false }
     private var canSave: Bool {
-        guard parsed.link != nil, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty else { return false }
+        guard parsed.link != nil, rulesParsed.issues.isEmpty, !rulesParsed.sites.isEmpty,
+              exceptionsParsed.issues.isEmpty else { return false }
         return !missingPassword && !missingObfsPassword
     }
 
@@ -314,48 +319,55 @@ struct ProxyEditor: View {
         VStack(alignment: .leading, spacing: 18) {
             Text(isNew ? "添加代理" : "编辑代理").font(.title3.weight(.semibold))
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("代理地址").font(.callout.weight(.medium))
-                AlwaysTextField("socks5://、http:// 或 hysteria2:// 链接", text: $link, monospaced: true)
-                status
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("名称").font(.callout.weight(.medium))
-                AlwaysTextField(parsed.link.map { l in
-                    l.name ?? (l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)")
-                } ?? "可不填", text: $name)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("经这个代理访问的网站").font(.callout.weight(.medium))
-                EgressRuleText(input: $rules, height: 140)
-                EgressRuleIssues(issues: rulesParsed.issues)
-                let guarded = overlappingProtectedSites
-                if !guarded.isEmpty {
-                    let previewNames = guarded.prefix(3).joined(separator: "、")
-                        + (guarded.count > 3 ? " 等 \(guarded.count) 条" : "")
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Image(systemName: "checkmark.shield").foregroundStyle(SettingsTone.shield)
-                        Text("规则里的 \(previewNames) 受出口保护，经此代理访问时会先检查出口。")
-                            .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("代理地址").font(.callout.weight(.medium))
+                        AlwaysTextField("socks5://、http:// 或 hysteria2:// 链接", text: $link, monospaced: true)
+                        status
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("名称").font(.callout.weight(.medium))
+                        AlwaysTextField(parsed.link.map { l in
+                            l.name ?? (l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)")
+                        } ?? "可不填", text: $name)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("经这个代理访问的网站").font(.callout.weight(.medium))
+                        EgressRuleText(input: $rules, height: 140)
+                        EgressRuleIssues(issues: rulesParsed.issues)
+                        let guarded = overlappingProtectedSites
+                        if !guarded.isEmpty {
+                            let previewNames = guarded.prefix(3).joined(separator: "、")
+                                + (guarded.count > 3 ? " 等 \(guarded.count) 条" : "")
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Image(systemName: "checkmark.shield").foregroundStyle(SettingsTone.shield)
+                                Text("规则里的 \(previewNames) 与出口保护有重叠，命中相应规则时会先检查出口。")
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        EgressRuleExceptions(input: $exceptions, parsed: exceptionsParsed.rules,
+                                             explanation: "命中例外的网站跳过这个代理，继续匹配后面的规则。") { EmptyView() }
+                    }
+
+                    if savesBeforeChecking {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Image(systemName: "info.circle")
+                            Text("代理服务器自动走本地网络，不经 Cisco。保存后再检测。")
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+
+                    checkView
                 }
             }
-
-            if savesBeforeChecking {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "info.circle")
-                    Text("代理服务器自动走本地网络，不经 Cisco。保存后再检测。")
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-
-            checkView
+            .frame(height: 430)
 
             HStack {
                 Spacer()
@@ -445,6 +457,8 @@ struct ProxyEditor: View {
         saved.host = l.host
         saved.port = l.port
         saved.sites = rulesParsed.sites
+        let excluded = exceptionsParsed.sites
+        saved.exceptions = excluded.isEmpty ? nil : excluded
         let typedName = name.trimmingCharacters(in: .whitespaces)
         let fallbackName = l.kind == .hysteria2 ? l.host : "\(l.host):\(l.port)"
         saved.name = !typedName.isEmpty ? typedName : (l.name ?? fallbackName)
@@ -521,22 +535,12 @@ struct ProxyEditor: View {
 /// line, comments allowed, pasted Clash lines normalized).
 struct ProxyRuleInput {
     static let siteLimit = 512
-
-    var sites: [String] = []
-    var issues: [EgressRuleInput.Issue] = []
+    let rules: EgressRuleInput
+    var sites: [String] { rules.sites }
+    var issues: [EgressRuleInput.Issue] { rules.issues }
 
     init(_ input: String) {
-        var seen = Set<String>()
-        for (index, raw) in input.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).enumerated() {
-            let text = raw.trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty, !text.hasPrefix("#"), !text.hasPrefix("//") else { continue }
-            guard let rule = ListRule.parse(text) else {
-                issues.append(.init(id: index + 1, message: ListRule.problem(text) ?? "写法无效"))
-                continue
-            }
-            if seen.insert(rule.text).inserted { sites.append(rule.text) }
-        }
-        if sites.count > Self.siteLimit { issues.append(.init(id: 0, message: "最多 \(Self.siteLimit) 条")) }
+        rules = EgressRuleInput(input, limit: Self.siteLimit)
     }
 }
 

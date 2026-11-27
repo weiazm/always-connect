@@ -40,7 +40,7 @@ struct EgressRuleInput {
     var sites: [String] = []
     var issues: [Issue] = []
 
-    init(_ input: String) {
+    init(_ input: String, limit: Int? = nil) {
         var seen = Set<String>()
         for (index, raw) in input.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).enumerated() {
             let text = raw.trimmingCharacters(in: .whitespaces)
@@ -50,6 +50,9 @@ struct EgressRuleInput {
             } else {
                 issues.append(Issue(id: index + 1, message: ListRule.problem(text) ?? "写法无效"))
             }
+        }
+        if let limit, sites.count > limit {
+            issues.append(Issue(id: 0, message: "最多 \(limit) 条"))
         }
     }
 
@@ -152,20 +155,37 @@ struct EgressRuleChange: Identifiable, Equatable {
     var confirmationTitle: String { after.isActive ? "开启并重连" : "关闭并重连" }
     static let reconnectCaption = "需要重新连接一次 Cisco。通常不用在手机上确认，已打开的网页可能需要刷新。"
 
-    static func replacingSites(_ sites: [String], expected: [String], group id: UInt32, in config: EgressProtection) -> Self? {
-        guard let index = config.groups.firstIndex(where: { $0.id == id && $0.sites == expected }) else { return nil }
+    struct Rules: Equatable {
+        var sites: [String]
+        var exceptions: [String]
+
+        init(sites: [String], exceptions: [String] = []) {
+            self.sites = sites
+            self.exceptions = exceptions
+        }
+
+        init(_ group: EgressProtection.Group) {
+            self.init(sites: group.sites, exceptions: group.exceptions ?? [])
+        }
+    }
+
+    static func replacingRules(_ rules: Rules, expected: Rules, group id: UInt32, in config: EgressProtection) -> Self? {
+        guard let index = config.groups.firstIndex(where: { $0.id == id && Rules($0) == expected }) else { return nil }
         var updated = config
-        updated.groups[index].sites = sites
+        updated.groups[index].sites = rules.sites
+        updated.groups[index].exceptions = rules.exceptions.isEmpty ? nil : rules.exceptions
         return Self(before: config, after: updated)
     }
 
-    static func adding(_ input: EgressRuleInput, countries: [String], unverified: EgressProtection.Unverified,
+    static func adding(_ input: EgressRuleInput, exceptions: [String] = [], countries: [String], unverified: EgressProtection.Unverified,
                        config: EgressProtection) -> Self? {
-        guard let first = input.sites.first, !countries.isEmpty else { return nil }
+        guard let sites = input.replacementSites, let first = sites.first,
+              exceptions.count <= EgressRuleInput.siteLimit, !countries.isEmpty else { return nil }
         let change = Self(config: config) { result in
             var group = EgressProtection.newGroup(in: result, name: first)
             group.enabled = true
-            group.sites = input.sites
+            group.sites = sites
+            group.exceptions = exceptions.isEmpty ? nil : exceptions
             group.expect = countries
             group.unverified = unverified
             result.groups.append(group)

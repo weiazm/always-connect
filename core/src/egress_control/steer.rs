@@ -180,7 +180,7 @@ impl Controller {
     pub(crate) fn steer(&self, name: &str, answer: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> {
         let Ok(mut state) = self.shared.state.try_lock() else { return None };
         if !state.config.steering() { return None; }
-        let id = state.sites.group_for(name)?;
+        let id = state.sites.group_for_addresses(name, answer.iter().copied().map(std::net::IpAddr::V4))?;
         let group = state.config.enabled_group(id)?.clone();
         let now = Instant::now();
         let steered = state.ledger.steer(&group, name, answer, now);

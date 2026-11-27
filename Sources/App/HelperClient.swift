@@ -2406,12 +2406,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let settings = ProfileStore.loadAppSettings()
         let usesLists = { (lines: [String]) in lines.contains { $0.lowercased().hasPrefix("geosite:") } }
-        if settings.splitOn, usesLists(DirectSites.sites(settings).flatMap(\.domains)) {
+        let direct = DirectSites.sites(settings).flatMap(\.domains) + (settings.directExceptions ?? [])
+        let proxies = settings.activeProxyRoutes.flatMap { $0.sites + ($0.exceptions ?? []) }
+        if (settings.splitOn && usesLists(direct)) || usesLists(proxies) {
             pushDirectDomains()
         }
         if let egress = settings.egressProtection, egress.isActive,
            (!usesCisco && settings.isDropProtectionOn) || state == .disconnected,
-           usesLists(egress.groups.filter(\.enabled).flatMap(\.sites)) {
+           usesLists(egress.groups.filter(\.enabled).flatMap { $0.sites + ($0.exceptions ?? []) }) {
             sendEgress(egress) { _ in }
         }
     }

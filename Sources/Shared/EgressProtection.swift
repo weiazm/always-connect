@@ -48,16 +48,21 @@ struct EgressProtection: Codable, Equatable {
         var enabled = false
         /// Canonical split-list entries.
         var sites: [String] = []
+        var exceptions: [String]? = nil
         /// Allowed exit countries (ISO 3166 alpha-2).
         var expect: [String] = []
         var unverified: Unverified = .whenWrong
         /// Transient expanded entries, sent only to the background service.
         var matches: [String]? = nil
+        var exceptionMatches: [String]? = nil
     }
 
     var withoutExpandedMatches: Self {
         var result = self
-        for index in result.groups.indices { result.groups[index].matches = nil }
+        for index in result.groups.indices {
+            result.groups[index].matches = nil
+            result.groups[index].exceptionMatches = nil
+        }
         return result
     }
 
@@ -154,6 +159,8 @@ extension EgressProtection.Group {
         enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
         unverified = try values.decodeIfPresent(EgressProtection.Unverified.self, forKey: .unverified) ?? .whenWrong
         matches = try values.decodeIfPresent([String].self, forKey: .matches)
+        exceptions = try values.decodeIfPresent([String].self, forKey: .exceptions)
+        exceptionMatches = try values.decodeIfPresent([String].self, forKey: .exceptionMatches)
         expect = try values.decodeIfPresent([String].self, forKey: .expect) ?? []
         var sites = try values.decodeIfPresent([String].self, forKey: .sites) ?? []
         if sites.isEmpty {

@@ -68,31 +68,59 @@ pub struct SiteGroup {
 
 /// Ordered split-list matchers shared by the gate, controller, and DNS forwarder.
 #[derive(Clone, Debug, Default)]
-pub struct ProtectedSites(Vec<(GroupId, crate::dns_forwarder::SplitRules)>);
+pub struct ProtectedSites {
+    groups: Vec<(GroupId, crate::dns_forwarder::SplitRules)>,
+    has_exceptions: bool,
+}
 
 impl ProtectedSites {
     pub fn new(groups: &[SiteGroup]) -> Self {
-        Self(groups.iter().filter(|group| group.sites.iter().any(|site| !site.trim().is_empty())).map(|group| {
-            (group.id, crate::dns_forwarder::SplitRules::new(&group.sites))
-        }).collect())
+        let groups: Vec<_> = groups.iter()
+            .filter(|group| group.sites.iter().any(|site| !site.trim().is_empty()))
+            .map(|group| (group.id, crate::dns_forwarder::SplitRules::new(&group.sites)))
+            .collect();
+        let has_exceptions = groups.iter().any(|(_, rules)| rules.has_exceptions());
+        Self { groups, has_exceptions }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.groups.is_empty()
     }
 
     pub fn group_for(&self, name: &str) -> Option<GroupId> {
         let name = norm(name);
-        self.0.iter().find(|(_, rules)| rules.matches_name(&name)).map(|(id, _)| *id)
+        self.groups.iter().find(|(_, rules)| rules.matches_name(&name)).map(|(id, _)| *id)
     }
 
     pub fn group_for_ip(&self, ip: IpAddr) -> Option<GroupId> {
         let IpAddr::V4(ip) = ip else { return None };
-        self.0.iter().find(|(_, rules)| rules.contains(ip)).map(|(id, _)| *id)
+        self.groups.iter().find(|(_, rules)| rules.contains(ip)).map(|(id, _)| *id)
     }
 
     pub fn group_for_target(&self, host: &str, ip: IpAddr) -> Option<GroupId> {
-        self.group_for(host).or_else(|| self.group_for_ip(ip))
+        self.group_for_addresses(host, std::iter::once(ip))
+    }
+
+    pub(crate) fn name_needs_addresses(&self, host: &str) -> bool {
+        self.has_exceptions && self.groups.iter().find(|(_, rules)| rules.matches_name(host))
+            .is_some_and(|(_, rules)| rules.has_ip_exceptions())
+    }
+
+    pub(crate) fn group_for_addresses(&self, host: &str, mut ips: impl Iterator<Item = IpAddr> + Clone) -> Option<GroupId> {
+        if !self.has_exceptions {
+            return self.group_for(host).or_else(|| ips.find_map(|ip| self.group_for_ip(ip)));
+        }
+        let host = norm(host);
+        let known = ips.clone().next().is_some();
+        self.groups.iter().find(|(_, rules)| {
+            rules.matches_name(&host) && (!known || ips.clone().any(|ip| match ip {
+                IpAddr::V4(ip) => !rules.excludes_ip(ip),
+                IpAddr::V6(_) => true,
+            }))
+        }).map(|(id, _)| *id).or_else(|| ips.find_map(|ip| {
+            let IpAddr::V4(ip) = ip else { return None };
+            self.groups.iter().find(|(_, rules)| !rules.excludes_name(&host) && rules.contains(ip)).map(|(id, _)| *id)
+        }))
     }
 }
 

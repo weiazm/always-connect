@@ -147,7 +147,12 @@ extension AppSettings {
     /// lines ride along after it (§69): an older service ignores them.
     var directRuleText: String {
         let direct = GeoData.expand(listRules.map(\.text), networks: false)
-        let proxies = proxyRuleText
-        return direct.isEmpty ? proxies : (proxies.isEmpty ? direct : direct + "\n" + proxies)
+        guard directOn, let directExceptions, !directExceptions.isEmpty else {
+            return [direct, proxyRuleText].filter { !$0.isEmpty }.joined(separator: "\n")
+        }
+        let excluded = GeoData.expand(directExceptions, networks: true).split(separator: "\n")
+        let servers = proxyServerDirectRules.map { "directserver:" + $0.dropFirst("full:".count) }
+        return ([direct] + excluded.map { "except:\($0)" } + servers + proxyLines)
+            .filter { !$0.isEmpty }.joined(separator: "\n")
     }
 }

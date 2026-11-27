@@ -15,6 +15,7 @@ private func ac_list_rule_valid(_ rule: UnsafePointer<CChar>) -> Bool
 ///   regexp:^a\d+\.example\.com$  any name matching it
 ///   geosite:github       a ready-made site list, optionally
 ///   geosite:google@cn    only its rules with that attribute
+///   geosite:google@!cn   only its rules without that attribute
 ///   geoip:cn             any name whose address is in China mainland
 ///   192.168.0.0/16       a network (also a single address)
 /// Names and site lists are expanded here into the background service's
@@ -41,12 +42,12 @@ enum ListRule: Equatable {
         }
         let rule: ListRule
         if let name = value("geosite:") {
-            let parts = name.lowercased().split(separator: "@", maxSplits: 1).map(String.init)
+            let parts = name.lowercased().split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             guard let list = parts.first, !list.isEmpty else { return nil }
             let attribute = parts.count == 2 ? parts[1] : nil
             if GeoData.available {
                 guard GeoData.hasList(list) else { return nil }
-                if let attribute, GeoData.ruleCount(list, attribute: attribute) == 0 { return nil }
+                if let attribute, !attribute.hasPrefix("!"), GeoData.ruleCount(list, attribute: attribute) == 0 { return nil }
             }
             // Before the first download a list name is kept as written (the
             // background service's check below still vets its form).
@@ -171,6 +172,8 @@ private func ac_geodata_has_list(_ name: UnsafePointer<CChar>) -> Bool
 private func ac_geodata_rule_count(_ name: UnsafePointer<CChar>, _ attribute: UnsafePointer<CChar>?) -> Int64
 @_silgen_name("ac_geodata_expand")
 private func ac_geodata_expand(_ lines: UnsafePointer<CChar>, _ networks: Bool) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_geodata_split_networks")
+private func ac_geodata_split_networks(_ networks: UnsafePointer<CChar>, _ exceptions: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_string_free")
 private func geodata_string_free(_ value: UnsafeMutablePointer<CChar>?)
 
@@ -236,6 +239,14 @@ enum GeoData {
         defer { geodata_string_free(out) }
         return String(cString: out)
     }
+
+    static func subtract(_ exceptions: [String], from networks: [String]) -> [String] {
+        guard !exceptions.isEmpty, !networks.isEmpty else { return networks }
+        _ = configured
+        guard let out = ac_geodata_split_networks(networks.joined(separator: "\n"), exceptions.joined(separator: "\n")) else { return [] }
+        defer { geodata_string_free(out) }
+        return String(cString: out).split(separator: "\n").map(String.init)
+    }
 }
 
 /// The networks the Mac sits on right now, for "本地局域网直连"
@@ -286,6 +297,7 @@ extension AppSettings {
         var out = listRules.compactMap { rule -> String? in
             if case .network(let cidr) = rule { return cidr } else { return nil }
         }
+        if directOn { out = GeoData.subtract(directExceptions ?? [], from: out) }
         if isAutoLANOn { out += LocalNetwork.current().filter { !out.contains($0) } }
         out += proxyServerDirectNetworks.filter { !out.contains($0) }
         return out

@@ -249,8 +249,8 @@ struct ConnectionsPage: View {
         }
         .sheet(item: $egressAddition) { addition in
             EgressSiteSheet(sites: addition.site.map { [$0] } ?? [],
-                            countries: protectedConfig.groups.last?.expect ?? [], preview: preview) { input, countries, unverified, done in
-                guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config:
+                            countries: protectedConfig.groups.last?.expect ?? [], preview: preview) { input, exceptions, countries, unverified, done in
+                guard let change = EgressRuleChange.adding(input, exceptions: exceptions, countries: countries, unverified: unverified, config:
                         ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()) else { done(false); return }
                 let added = change.after.groups.first { group in !change.before.groups.contains { $0.id == group.id } }
                 let action = EgressAction(change: change, text: "已加入 \(input.sites.count) 条出口保护规则", rule: added?.id)

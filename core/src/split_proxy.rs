@@ -187,8 +187,8 @@ impl Table {
                 }
             } else if let Some(rest) = line.strip_prefix("vianet:") {
                 if let Some((n, cidr)) = rest.split_once(':').and_then(|(i, c)| Some((proxy_index(i)?, c))) {
-                    if let Some(range) = crate::direct_routes::is_network(cidr).then(|| cidr_range(cidr)).flatten() {
-                        networks.push((n, cidr.to_owned(), range));
+                    if crate::direct_routes::is_network(cidr) && cidr_range(cidr).is_some() {
+                        networks.push((n, cidr.to_owned()));
                         rules.entry(n).or_default().push(format!("ipcidr:{cidr}"));
                     }
                 }
@@ -199,9 +199,18 @@ impl Table {
             }
         }
         let size = servers.keys().chain(rules.keys()).max().map_or(0, |n| n + 1);
-        let mut table = Table { servers: vec![None; size], hysteria, groups: Vec::new(), networks };
+        let groups: Vec<_> = rules.into_iter().map(|(n, list)| (n, SplitRules::new(&list))).collect();
+        let mut routed = Vec::new();
+        for (index, matcher) in &groups {
+            let written = networks.iter().filter(|(n, _)| n == index).map(|(_, cidr)| cidr.as_str());
+            routed.extend(matcher.effective_networks(written).into_iter()
+                .filter_map(|cidr| {
+                    let range = cidr_range(&cidr)?;
+                    Some((*index, cidr, range))
+                }));
+        }
+        let mut table = Table { servers: vec![None; size], hysteria, groups, networks: routed };
         for (n, server) in servers { table.servers[n] = server; }
-        table.groups = rules.into_iter().map(|(n, list)| (n, SplitRules::new(&list))).collect();
         table
     }
 
@@ -212,13 +221,29 @@ impl Table {
     pub fn is_empty(&self) -> bool { self.groups.is_empty() }
 
     /// Which proxy takes `name` by its name rules (trimmed, lowercased).
+    fn named_route(&self, name: &str, addresses: &[Ipv4Addr]) -> Option<(usize, bool)> {
+        self.groups.iter().find(|(_, rules)| rules.matches_name(name)
+            && !addresses.iter().any(|ip| rules.excludes_ip(*ip)))
+            .map(|(n, rules)| (*n, rules.has_ip_exceptions()))
+    }
+
+    #[cfg(test)]
     fn route_name(&self, name: &str) -> Option<usize> {
-        self.groups.iter().find(|(_, rules)| rules.matches_name(name)).map(|(n, _)| *n)
+        self.named_route(name, &[]).map(|(n, _)| n)
     }
 
     /// Which proxy takes a name whose answer holds these addresses.
-    fn route_addresses(&self, addresses: &[Ipv4Addr]) -> Option<usize> {
-        self.groups.iter().find(|(_, rules)| rules.has_ranges() && addresses.iter().any(|ip| rules.contains(*ip))).map(|(n, _)| *n)
+    fn route_addresses(&self, name: &str, addresses: &[Ipv4Addr]) -> Option<usize> {
+        self.groups.iter().find(|(_, rules)| rules.has_ranges() && !rules.excludes_name(name)
+            && !addresses.iter().any(|ip| rules.excludes_ip(*ip))
+            && addresses.iter().any(|ip| rules.contains(*ip))).map(|(n, _)| *n)
+    }
+
+    fn route_target(&self, name: &str, addresses: &[Ipv4Addr], include_address_rules: bool) -> Option<usize> {
+        self.named_route(name, addresses)
+            .filter(|(_, needs_addresses)| !needs_addresses || !addresses.is_empty())
+            .map(|(n, _)| n)
+            .or_else(|| include_address_rules.then(|| self.route_addresses(name, addresses)).flatten())
     }
 
     /// Which proxy takes a connection made straight to `ip` (only the
@@ -626,16 +651,25 @@ impl Routing {
     pub fn answer(&self, name: &str) -> Option<Ipv4Addr> {
         let name = clean(name);
         if name.is_empty() { return None; }
-        self.table.read().unwrap().route_name(&name)?;
+        let (_, requires_dns) = self.table.read().unwrap().named_route(&name, &[])?;
+        if requires_dns { return None; }
         Some(self.pool.lock().unwrap().assign(&name, &[], Instant::now()))
     }
 
     /// After the VPN's DNS answered: our address when a proxy's address
     /// rules (geoip, networks) take one of `addresses`.
     pub fn answer_by_address(&self, name: &str, addresses: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+        self.answer_resolved(name, addresses, true)
+    }
+
+    pub(crate) fn name_needs_addresses(&self, name: &str) -> bool {
+        self.table.read().unwrap().named_route(name, &[]).is_some_and(|(_, needs)| needs)
+    }
+
+    pub(crate) fn answer_resolved(&self, name: &str, addresses: &[Ipv4Addr], include_address_rules: bool) -> Option<Ipv4Addr> {
         let name = clean(name);
         if name.is_empty() || addresses.is_empty() { return None; }
-        self.table.read().unwrap().route_addresses(addresses)?;
+        self.table.read().unwrap().route_target(&name, addresses, include_address_rules)?;
         Some(self.pool.lock().unwrap().assign(&name, addresses, Instant::now()))
     }
 
@@ -654,7 +688,7 @@ impl Routing {
                 let entry = pool.by_offset.get(&(u32::from(ip) - FAKE_BASE))?;
                 (entry.name.clone(), entry.addresses.clone())
             };
-            return table.route_name(&name).or_else(|| table.route_addresses(&addresses));
+            return table.route_target(&name, &addresses, true);
         }
         table.route_ip(ip)
     }
@@ -697,7 +731,7 @@ impl Routing {
         if is_fake(ip) {
             let (name, addresses) = self.pool.lock().unwrap().entry(ip, Instant::now())
                 .ok_or_else(|| (ip.to_string(), "这个地址的记录已过期，请重新打开网页".to_owned()))?;
-            if let Some(n) = table.route_name(&name).or_else(|| table.route_addresses(&addresses)) {
+            if let Some(n) = table.route_target(&name, &addresses, true) {
                 let server = self.resolve_server(n).map_err(|reason| (name.clone(), reason))?;
                 return Ok(ResolvedTarget {
                     target: Target::Name(name),

@@ -141,10 +141,14 @@ pub struct Group {
     pub name: String,
     pub enabled: bool,
     pub sites: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exceptions: Option<Arc<Vec<String>>>,
     pub expect: Vec<String>,
     pub unverified: Unverified,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matches: Option<Arc<Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_matches: Option<Arc<Vec<String>>>,
 }
 
 impl<'de> Deserialize<'de> for Group {
@@ -163,10 +167,13 @@ impl<'de> Deserialize<'de> for Group {
             name: String,
             enabled: bool,
             sites: Vec<String>,
+            exceptions: Option<Arc<Vec<String>>>,
             expect: Vec<String>,
             members: Vec<Member>,
             unverified: Unverified,
             matches: Option<Arc<Vec<String>>>,
+            #[serde(rename = "exceptionMatches")]
+            exception_matches: Option<Arc<Vec<String>>>,
         }
         let f = Fields::deserialize(deserializer)?;
         let mut sites = f.sites;
@@ -181,7 +188,8 @@ impl<'de> Deserialize<'de> for Group {
         }
         Ok(Group {
             id: f.id, name: f.name, enabled: f.enabled, sites, expect: f.expect,
-            unverified: f.unverified, matches: f.matches,
+            unverified: f.unverified, matches: f.matches, exceptions: f.exceptions,
+            exception_matches: f.exception_matches,
         })
     }
 }
@@ -192,8 +200,8 @@ impl Group {
     }
 
     fn site_group(&self) -> SiteGroup {
-        let sites = self.matches.as_deref().cloned().unwrap_or_else(|| {
-            self.sites.iter().filter_map(|site| {
+        fn literal_entries(sites: &[String]) -> impl Iterator<Item = String> + '_ {
+            sites.iter().filter_map(|site| {
                 if site.starts_with("geosite:") || site.starts_with("geoip:") {
                     None
                 } else if crate::dns_forwarder::cidr_range(site).is_some() {
@@ -201,8 +209,17 @@ impl Group {
                 } else {
                     Some(site.trim().to_owned())
                 }
-            }).collect()
-        });
+            })
+        }
+        let mut sites = self.matches.as_deref().cloned()
+            .unwrap_or_else(|| literal_entries(&self.sites).collect());
+        if !sites.is_empty() {
+            if let Some(matches) = &self.exception_matches {
+                sites.extend(matches.iter().map(|rule| format!("except:{rule}")));
+            } else if let Some(exceptions) = &self.exceptions {
+                sites.extend(literal_entries(exceptions).map(|rule| format!("except:{rule}")));
+            }
+        }
         SiteGroup { id: self.id, sites }
     }
 }
@@ -238,12 +255,16 @@ impl EgressConfig {
             && self.groups.iter().all(|g| {
                 g.sites.len() <= MAX_SITES
                     && g.sites.iter().all(|site| valid_rule(site, false))
+                    && g.exceptions.as_ref().is_none_or(|entries| entries.len() <= MAX_SITES
+                        && entries.iter().all(|entry| valid_rule(entry, false)))
                     // Empty matches are valid: a rule made only of site lists
                     // the App has not downloaded yet protects nothing until
                     // they arrive, and must not stop the VPN from connecting
                     // (§66.30; on the real Mac it held the network, so the
                     // lists could not download either).
                     && g.matches.as_ref().is_none_or(|entries| entries.len() <= MAX_MATCHES
+                        && entries.iter().all(|entry| valid_rule(entry, true)))
+                    && g.exception_matches.as_ref().is_none_or(|entries| entries.len() <= MAX_MATCHES
                         && entries.iter().all(|entry| valid_rule(entry, true)))
                     && g.expect.iter().all(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
                     && (!g.enabled || g.sites.is_empty() || !g.expect.is_empty())
@@ -285,8 +306,10 @@ pub fn valid_rule(raw: &str, expanded: bool) -> bool {
         Some(("geoip", "cn")) if !expanded => true,
         Some(("geosite", value)) if !expanded => {
             let identifier = |s: &str| !s.is_empty()
-                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-!".contains(&b));
-            value.split_once('@').map_or_else(|| identifier(value), |(n, a)| identifier(n) && identifier(a))
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+            value.split_once('@').map_or_else(|| identifier(value), |(n, a)| {
+                identifier(n) && identifier(a.strip_prefix('!').unwrap_or(a))
+            })
         }
         Some(_) => false,
         None => (rule.contains('.') && valid_host(rule))
@@ -790,7 +813,7 @@ impl RelayGate {
     pub fn protects_target(&self, host: &str, ips: &[IpAddr]) -> Option<u32> {
         let state = self.shared.state.lock().ok()?;
         if !state.config.active() { return None; }
-        state.sites.group_for(host).or_else(|| ips.iter().find_map(|ip| state.sites.group_for_ip(*ip)))
+        state.sites.group_for_addresses(host, ips.iter().copied())
     }
 
     pub fn is_active(&self) -> bool {
@@ -836,8 +859,7 @@ impl RelayGate {
         {
             let mut state = self.shared.state.lock().ok()?;
             if !state.config.active() { return None; }
-            let id = state.sites.group_for(&clean_host)
-                .or_else(|| ips.iter().find_map(|ip| state.sites.group_for_ip(*ip)))?;
+            let id = state.sites.group_for_addresses(&clean_host, ips.iter().copied())?;
             let Some(rule) = state.config.enabled_group(id).cloned() else { return None };
             group_id = id;
 

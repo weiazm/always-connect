@@ -189,7 +189,7 @@ mod macos {
             groups: vec![Group {
                 id: 1, name: "LocalOnlyCheck".into(), enabled: true,
                 sites: vec!["apple.com".into()], expect: vec!["ZZ".into()],
-                unverified: Unverified::Block, matches: None,
+                unverified: Unverified::Block, ..Default::default()
             }],
             ..Default::default()
         };
@@ -268,7 +268,7 @@ mod macos {
             groups: vec![Group {
                 id: 1, name: "RootCheck".into(), enabled: true,
                 sites: vec![SITE.into()], expect: vec!["ZZ".into()],
-                unverified: Unverified::Block, matches: None,
+                unverified: Unverified::Block, ..Default::default()
             }],
             ..Default::default()
         };
@@ -302,7 +302,7 @@ mod macos {
                 groups: vec![Group {
                     id: 1, name: "RootCheck".into(), enabled: true,
                     sites: vec![SITE.into()], expect: vec!["ZZ".into()],
-                    unverified: Unverified::Block, matches: None,
+                    unverified: Unverified::Block, ..Default::default()
                 }],
                 ..Default::default()
             }));
@@ -473,7 +473,7 @@ mod macos {
                 groups: vec![Group {
                     id: 1, name: "Hy2Egress".into(), enabled: true,
                     sites: vec![SITE.into()], expect: vec!["ZZ".into()],
-                    unverified: Unverified::Block, matches: None,
+                    unverified: Unverified::Block, ..Default::default()
                 }],
                 ..Default::default()
             };

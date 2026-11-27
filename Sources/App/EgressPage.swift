@@ -429,16 +429,16 @@ struct EgressProtectionPage: View {
     @ViewBuilder private func sheetView(_ page: Sheet) -> some View {
         switch page {
         case .addSites:
-            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { input, countries, unverified, done in
-                addRules(input, countries: countries, unverified: unverified, done: done)
+            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { input, exceptions, countries, unverified, done in
+                addRules(input, exceptions: exceptions, countries: countries, unverified: unverified, done: done)
             }
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
                                  edit: { edit in changeRule(id, edit: edit) },
                                  remove: { deleteRule(id) },
-                                 saveSites: { original, sites, done in
-                                     replaceSites(id, original: original, sites: sites, done: done)
+                                 saveRules: { original, rules, done in
+                                     replaceRules(id, original: original, rules: rules, done: done)
                                  })
             }
         }
@@ -453,10 +453,11 @@ struct EgressProtectionPage: View {
 
     // MARK: - Changes
 
-    private func addRules(_ input: EgressRuleInput, countries: [String], unverified: EgressProtection.Unverified,
+    private func addRules(_ input: EgressRuleInput, exceptions: [String], countries: [String], unverified: EgressProtection.Unverified,
                           done: @escaping (Bool) -> Void) {
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config: previous),
+        guard let change = EgressRuleChange.adding(input, exceptions: exceptions, countries: countries,
+                                                   unverified: unverified, config: previous),
               change.after.permitsActivation(comparedTo: previous) else { done(false); return }
         if change.needsReconnect(connected: manager.showsConnected) {
             done(true)
@@ -467,10 +468,11 @@ struct EgressProtectionPage: View {
         }
     }
 
-    private func replaceSites(_ id: UInt32, original: [String], sites: [String], done: @escaping (String?) -> Void) {
+    private func replaceRules(_ id: UInt32, original: EgressRuleChange.Rules, rules: EgressRuleChange.Rules,
+                              done: @escaping (String?) -> Void) {
         guard preview == nil else { done(nil); return }
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let change = EgressRuleChange.replacingSites(sites, expected: original, group: id, in: previous) else {
+        guard let change = EgressRuleChange.replacingRules(rules, expected: original, group: id, in: previous) else {
             done("规则已在别处更新。可先复制草稿，再重新打开详情。")
             return
         }

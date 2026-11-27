@@ -229,11 +229,15 @@ struct ConnectionsUITest {
         full:exact.example
         """)
         let expected = ["full:exact.example", "192.0.2.4/32", "legacy.example"]
+        let originalRules = EgressRuleChange.Rules(legacy.groups[0])
+        let excluded = EgressRuleInput(TextTrim.ruleLines("  full:login.legacy.example \n  geosite:test@!cn  "))
         guard let sites = changed.replacementSites,
-              let replacement = EgressRuleChange.replacingSites(sites, expected: original, group: 7, in: legacy)
+              let replacement = EgressRuleChange.replacingRules(.init(sites: sites, exceptions: excluded.sites),
+                                                                expected: originalRules, group: 7, in: legacy)
         else { fail("make a complete rule replacement") }
         var expectedSettings = legacy
         expectedSettings.groups[0].sites = expected
+        expectedSettings.groups[0].exceptions = ["full:login.legacy.example", "geosite:test@!cn"]
         check(replacement.before == legacy && replacement.after == expectedSettings && !replacement.needsReconnect(connected: true),
               "completion deletes omitted entries, normalizes edits and preserves all other settings")
         let update = EgressConfigUpdate(config: replacement.after, previous: replacement.before)
@@ -245,7 +249,9 @@ struct ConnectionsUITest {
         check(invalid.issues.map(\.id) == [2, 3] && invalid.replacementSites == nil
               && EgressRuleInput("# comment only").replacementSites == nil && tooMany.replacementSites == nil,
               "invalid, empty or oversized drafts do not produce a save payload")
-        check(EgressRuleChange.replacingSites(sites, expected: original, group: 7, in: reopened) == nil,
+        check(EgressRuleChange.Rules(reopened.groups[0]).exceptions == expectedSettings.groups[0].exceptions
+              && originalRules.exceptions.isEmpty, "old rules decode and edited exceptions survive JSON")
+        check(EgressRuleChange.replacingRules(.init(sites: sites), expected: originalRules, group: 7, in: reopened) == nil,
               "a stale editor cannot overwrite a rule already changed elsewhere")
         let mixed = ["legacy.example", "full:exact.example", "keyword:fixture", "regexp:^node[0-9]{1,3}[.]example$",
                      "geosite:test", "geoip:cn", "192.0.2.0/24"]
@@ -345,15 +351,26 @@ struct ConnectionsUITest {
             let path = URL(fileURLWithPath: output).appendingPathComponent(name + ".png")
             do { try png.write(to: path) } catch { fail("write offscreen view") }
         }
-        render("egress-add", 600, 620, AnyView(EgressSiteSheet(sites: group1.sites, countries: ["ZZ"], preview: sample) { _, _, _, _ in }))
-        render("egress-detail", 600, 680, AnyView(EgressRuleDetail(rule: group1, config: config, status: status, connected: true,
-            refresh: {}, edit: { _ in }, remove: {}, saveSites: { _, _, done in done(nil) })))
+        render("egress-add", 600, 660, AnyView(EgressSiteSheet(sites: group1.sites, countries: ["ZZ"], preview: sample) { _, _, _, _, _ in }))
+        render("egress-detail", 600, 560, AnyView(EgressRuleDetail(rule: group1, config: config, status: status, connected: true,
+            refresh: {}, edit: { _ in }, remove: {}, saveRules: { _, _, done in done(nil) })))
         render("egress-page", 760, 860, AnyView(EgressProtectionPage(preview: EgressPagePreview(
             config: config, status: status, connected: true, available: true, proxyRoutes: proxyRoutes))))
-        render("proxy-editor", 520, 560, AnyView(ProxyEditor(
+        render("proxy-editor", 520, 552, AnyView(ProxyEditor(
             route: proxyRoutes[0], isNew: false, previewSavesFirst: false,
             previewProtectedSites: ["example.test", "full:exact.test"],
             cancel: {}, done: { _ in })))
+        render("split-direct", 760, 730, AnyView(SplitPage(preview: SplitPagePreview(
+            sites: [DirectSite(name: "example.test", domains: ["example.test"])],
+            directExceptions: ["full:login.example.test"]), section: .constant("direct"))))
+        render("rule-exceptions-expanded", 520, 240, AnyView(Form {
+            Section {
+                EgressRuleExceptions(input: .constant("full:login.example.test"),
+                    parsed: EgressRuleInput("full:login.example.test"),
+                    explanation: "命中例外的网站跳过这个代理，继续匹配后面的规则。",
+                    footer: { EmptyView() }, expanded: true)
+            }
+        }.formStyle(.grouped)))
         // Panel A (proxy-only, Cisco off, exit protection active)
         let previewClient = HelperClient.shared
         previewClient.applyRemoteSnapshot(#"{"state":0,"proxyOnlyRunning":true,"egressLine":"正常","egressLevel":"ok"}"#)
@@ -373,7 +390,7 @@ struct ConnectionsUITest {
             preview: PanelPreview(speed: totals, link: .unknown))))
         ProfileStore.saveAppSettings(oldSettings, updatingEgress: true)
         previewClient.applyRemoteSnapshot(#"{"state":0}"#)
-        print("PASS offscreen add, detail, page, proxy-editor and panel views")
+        print("PASS offscreen add, detail, page, proxy editor, split direct, expanded exceptions and panel views")
     }
 
     private static func findTable(in view: NSView) -> NSTableView? {

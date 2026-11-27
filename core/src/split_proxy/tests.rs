@@ -1,4 +1,16 @@
 use super::*;
+
+#[test]
+fn static_proxy_networks_exclude_addresses_for_each_proxy_in_order() {
+    let table = Table::parse(&[
+        "proxy:0 socks5 127.0.0.1 1080", "vianet:0:198.51.100.0/24", "via:0:except:ipcidr:198.51.100.0/25",
+        "proxy:1 socks5 127.0.0.1 1081", "vianet:1:198.51.100.0/26",
+    ]);
+    assert_eq!(table.route_ip("198.51.100.180".parse().unwrap()), Some(0));
+    assert_eq!(table.route_ip("198.51.100.9".parse().unwrap()), Some(1));
+    assert_eq!(table.route_ip("198.51.100.100".parse().unwrap()), None);
+    assert_eq!(table.networks(), ["198.51.100.128/25", "198.51.100.0/26"]);
+}
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,8 +45,8 @@ fn table_reads_proxies_and_rules_in_order() {
     assert_eq!(table.route_name("example.com"), None);
     assert_eq!(table.route_name("direct.example"), None);
     // geoip ranges match answers; written networks also take connections by address.
-    assert_eq!(table.route_addresses(&[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 2, 3, 4)]), Some(1));
-    assert_eq!(table.route_addresses(&[Ipv4Addr::new(203, 0, 113, 5)]), Some(1));
+    assert_eq!(table.route_addresses("", &[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 2, 3, 4)]), Some(1));
+    assert_eq!(table.route_addresses("", &[Ipv4Addr::new(203, 0, 113, 5)]), Some(1));
     assert_eq!(table.route_ip(Ipv4Addr::new(203, 0, 113, 5)), Some(1));
     assert_eq!(table.route_ip(Ipv4Addr::new(1, 2, 3, 4)), None, "geoip ranges are never routed");
     assert_eq!(table.networks(), vec!["203.0.113.0/24".to_owned()]);
@@ -956,7 +968,7 @@ fn relay_egress_gate_allows_right_country_blocks_wrong_and_drops_protected_udp()
             sites: vec!["good.example".into(), "bad.example".into()],
             expect: vec!["ZZ".into()],
             unverified: Unverified::Block,
-            matches: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -1046,7 +1058,7 @@ fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
             sites: vec!["fastopen.example".into(), "local.example".into()],
             expect: vec!["ZZ".into()],
             unverified: Unverified::Block,
-            matches: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

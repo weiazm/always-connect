@@ -3,26 +3,32 @@ import SwiftUI
 struct EgressRuleText: View {
     @Binding var input: String
     var height: CGFloat = 76
+    var label: String
+    var showSyntax: Bool
     @FocusState private var focused: Bool
     @State private var lastValue: String
 
-    init(input: Binding<String>, height: CGFloat = 76) {
+    init(input: Binding<String>, height: CGFloat = 76, label: String = "网站规则，每行一条", showSyntax: Bool = true) {
         self._input = input
         self.height = height
+        self.label = label
+        self.showSyntax = showSyntax
         self._lastValue = State(initialValue: input.wrappedValue)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("每行一条，和分流名单同一种写法：example.com、full:、keyword:、regexp:、geosite:、geoip:cn、网段。粘贴的 Clash 规则行会自动转换。")
-                .font(.caption).foregroundStyle(.secondary)
+            if showSyntax {
+                Text("每行一条，和分流名单同一种写法：example.com、full:、keyword:、regexp:、geosite:、geoip:cn、网段。粘贴的 Clash 规则行会自动转换。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             TextEditor(text: $input)
                 .font(.system(.callout, design: .monospaced))
                 .scrollContentBackground(.hidden)
                 .focused($focused)
                 .frame(height: height)
                 .modifier(AlwaysInputChrome(focused: focused, paddingH: 6, paddingV: 6))
-                .accessibilityLabel("出口保护规则，每行一条")
+                .accessibilityLabel(label)
                 .onChange(of: input) { updated in
                     let cleaned = TextTrim.liveRuleLines(old: lastValue, new: updated)
                     if cleaned != updated {
@@ -43,6 +49,33 @@ struct EgressRuleText: View {
     }
 }
 
+struct EgressRuleExceptions<Footer: View>: View {
+    @Binding var input: String
+    let parsed: EgressRuleInput
+    let explanation: String
+    @ViewBuilder let footer: () -> Footer
+    @State var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(explanation).font(.caption).foregroundStyle(.secondary)
+                EgressRuleText(input: $input, label: "例外规则，每行一条", showSyntax: false)
+                EgressRuleIssues(issues: parsed.issues)
+                footer()
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Text("例外（不生效的网站）")
+                if !parsed.sites.isEmpty {
+                    Text("\(parsed.sites.count) 条").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
 struct EgressRuleIssues: View {
     let issues: [EgressRuleInput.Issue]
 
@@ -51,7 +84,7 @@ struct EgressRuleIssues: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(issues) { issue in
-                        Text("第 \(issue.id) 行  \(issue.message)")
+                        Text(issue.id > 0 ? "第 \(issue.id) 行  \(issue.message)" : issue.message)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -158,15 +191,16 @@ private struct FlowLayout: Layout {
 struct EgressSiteSheet: View {
     @Environment(\.dismiss) private var dismiss
     var preview: [ConnectionRow]? = nil
-    let save: (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void
+    let save: (EgressRuleInput, [String], [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void
     @State private var input: String
+    @State private var exceptions = ""
     @State private var countries: [String]
     @State private var unverified = EgressProtection.Unverified.whenWrong
     @State private var saving = false
     @State private var error: String?
 
     init(sites: [String] = [], countries: [String] = [], preview: [ConnectionRow]? = nil,
-         save: @escaping (EgressRuleInput, [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void) {
+         save: @escaping (EgressRuleInput, [String], [String], EgressProtection.Unverified, @escaping (Bool) -> Void) -> Void) {
         self.preview = preview
         self.save = save
         _input = State(initialValue: sites.joined(separator: "\n"))
@@ -175,6 +209,7 @@ struct EgressSiteSheet: View {
 
     var body: some View {
         let parsed = EgressRuleInput(input)
+        let excluded = EgressRuleInput(exceptions, limit: EgressRuleInput.siteLimit)
         VStack(spacing: 0) {
             Text("添加出口保护").font(.title3.weight(.semibold))
                 .frame(maxWidth: .infinity, alignment: .leading).padding(20)
@@ -191,6 +226,8 @@ struct EgressSiteSheet: View {
                         if !input.isEmpty && input.last?.isNewline != true { input += "\n" }
                         input += site
                     }
+                    EgressRuleExceptions(input: $exceptions, parsed: excluded,
+                                         explanation: "命中例外的网站跳过这条出口保护。") { EmptyView() }
                 }
                 Section("允许的出口") {
                     EgressCountryChips(countries: countries,
@@ -212,17 +249,17 @@ struct EgressSiteSheet: View {
                 Button("开始保护") {
                     saving = true
                     error = nil
-                    save(parsed, countries, unverified) { ok in
+                    save(parsed, excluded.sites, countries, unverified) { ok in
                         saving = false
                         if ok { dismiss() } else { error = "没有保存。请检查规则数量和出口设置。" }
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(parsed.sites.isEmpty || countries.isEmpty || saving)
+                .disabled(parsed.replacementSites == nil || !excluded.issues.isEmpty || countries.isEmpty || saving)
             }
             .padding(16)
         }
-        .frame(width: 600, height: 600)
+        .frame(width: 600, height: 660)
         .disabled(saving)
     }
 }
