@@ -1790,8 +1790,7 @@ pub extern "C" fn ac_egress_match_targets(config: *const c_char, targets: *const
         let targets: Vec<Target> = serde_json::from_str(&c_str(targets)?).ok()?;
         let sites = cfg.protected_sites();
         let matched: Vec<_> = targets.into_iter().map(|target| {
-            sites.group_for(target.host.as_deref().unwrap_or(""))
-                .or_else(|| sites.group_for_ip(target.address.parse().ok()?))
+            sites.group_for_addresses(target.host.as_deref().unwrap_or(""), target.address.parse().ok().into_iter())
         }).collect();
         serde_json::to_string(&matched).ok()
     };
@@ -2119,10 +2118,46 @@ pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incide
     unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
 }
 
-// MARK: - Proxies with Cisco off (§69.20)
+// MARK: - Proxies with Cisco off (§69.20, §71)
 
 /// The proxy-only session behind an opaque handle.
 pub struct ProxyOnlyHandle(std::sync::Mutex<crate::proxy_only::ProxyOnly>);
+
+static PROXY_ONLY_EGRESS_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<crate::egress_control::ProbeHook>>> =
+    std::sync::OnceLock::new();
+
+fn proxy_only_probe_slot() -> &'static std::sync::Mutex<Option<crate::egress_control::ProbeHook>> {
+    PROXY_ONLY_EGRESS_PROBE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Registers the platform's TLS probe hook for proxy-only exit protection (§71).
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_set_egress_probe_with_peer(
+    ctx: *mut c_void,
+    cb: Option<extern "C" fn(*mut c_void, *const c_char, *mut usize, *mut u8, usize) -> *mut u8>,
+) {
+    let Some(cb) = cb else {
+        *proxy_only_probe_slot().lock().unwrap() = None;
+        return;
+    };
+    let ctx = ctx as usize;
+    *proxy_only_probe_slot().lock().unwrap() = Some(std::sync::Arc::new(move |req, actual_peer| {
+        let json = serde_json::to_string(req).ok()?;
+        let c = CString::new(json).ok()?;
+        let mut len = 0usize;
+        let mut peer_buf = [0u8; 64];
+        let ptr = cb(ctx as *mut c_void, c.as_ptr(), &mut len, peer_buf.as_mut_ptr(), peer_buf.len());
+        if let Some(end) = peer_buf.iter().position(|b| *b == 0) {
+            if let Ok(text) = std::str::from_utf8(&peer_buf[..end]) {
+                *actual_peer = text.parse().ok();
+            }
+        }
+        if ptr.is_null() { return None; }
+        let out = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        unsafe { libc::free(ptr.cast()) };
+        Some(out)
+    }));
+}
 
 fn proxy_network(json: Option<String>) -> crate::proxy_only::Network {
     #[derive(serde::Deserialize, Default)]
@@ -2141,10 +2176,32 @@ fn rule_lines(text: Option<String>) -> Vec<String> {
 #[no_mangle]
 pub extern "C" fn ac_proxy_only_start(rules: *const c_char, network: *const c_char, support: *const c_char,
                                       boot: *const c_char, no_routes: bool, error: *mut *mut c_char) -> *mut ProxyOnlyHandle {
+    ac_proxy_only_start_with_egress(rules, network, std::ptr::null(), support, boot, no_routes, error)
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_start_with_egress(
+    rules: *const c_char,
+    network: *const c_char,
+    egress: *const c_char,
+    support: *const c_char,
+    boot: *const c_char,
+    no_routes: bool,
+    error: *mut *mut c_char,
+) -> *mut ProxyOnlyHandle {
     let support = c_str(support).unwrap_or_default();
-    let result = crate::proxy_only::ProxyOnly::start(rule_lines(c_str(rules)), proxy_network(c_str(network)),
-                                                     std::path::Path::new(&support), c_str(boot).unwrap_or_default(),
-                                                     if no_routes { 25353 } else { 53 }, no_routes);
+    let egress_cfg = c_str(egress).and_then(|s| serde_json::from_str::<crate::egress_control::EgressConfig>(&s).ok());
+    let hook = proxy_only_probe_slot().lock().unwrap().clone();
+    let result = crate::proxy_only::ProxyOnly::start_with_egress(
+        rule_lines(c_str(rules)),
+        proxy_network(c_str(network)),
+        std::path::Path::new(&support),
+        c_str(boot).unwrap_or_default(),
+        if no_routes { 0 } else { 53 },
+        no_routes,
+        egress_cfg,
+        hook,
+    );
     match result {
         Ok(session) => Box::into_raw(Box::new(ProxyOnlyHandle(std::sync::Mutex::new(session)))),
         Err(reason) => {
@@ -2161,6 +2218,13 @@ pub extern "C" fn ac_proxy_only_update_rules(handle: *mut ProxyOnlyHandle, rules
 }
 
 #[no_mangle]
+pub extern "C" fn ac_proxy_only_update_egress(handle: *mut ProxyOnlyHandle, json: *const c_char) {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return };
+    let cfg = c_str(json).and_then(|s| serde_json::from_str::<crate::egress_control::EgressConfig>(&s).ok());
+    handle.0.lock().unwrap().update_egress(cfg);
+}
+
+#[no_mangle]
 pub extern "C" fn ac_proxy_only_update_network(handle: *mut ProxyOnlyHandle, network: *const c_char) {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return };
     handle.0.lock().unwrap().update_network(proxy_network(c_str(network)));
@@ -2171,6 +2235,63 @@ pub extern "C" fn ac_proxy_only_update_network(handle: *mut ProxyOnlyHandle, net
 pub extern "C" fn ac_proxy_only_status(handle: *mut ProxyOnlyHandle) -> *mut c_char {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return owned("{}".into()) };
     owned(handle.0.lock().unwrap().status_json())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_egress_status(handle: *mut ProxyOnlyHandle) -> *mut c_char {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return owned("{}".into()) };
+    owned(handle.0.lock().unwrap().egress_status())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_recheck_egress(handle: *mut ProxyOnlyHandle, group: u32) -> bool {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return false };
+    let job = handle.0.lock().unwrap().recheck_egress_job(group);
+    job.is_some_and(|run| run())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_allow_egress_country(
+    handle: *mut ProxyOnlyHandle,
+    expected: *const c_char,
+    group: u32,
+    started: f64,
+    country: *const c_char,
+    evidence: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Option<String> {
+        let handle = unsafe { handle.as_ref() }?;
+        let cfg: crate::egress_control::EgressConfig = serde_json::from_str(&c_str(expected)?).ok()?;
+        let observed: crate::egress_control::Observation = serde_json::from_str(&c_str(evidence)?).ok()?;
+        let countries = handle.0.lock().unwrap().allow_egress_country(&cfg, group, started, &c_str(country)?, &observed)?;
+        serde_json::to_string(&countries).ok()
+    })();
+    result.map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+/// Checks one proxied hostname against the proxy-only session's live relay
+/// egress gate (for Swift+Rust bridge harnesses without root/pf).
+/// Returns 1 on Allow (or unprotected), 0 on Block, -1 on invalid handle/args.
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_check_egress_target(
+    handle: *mut ProxyOnlyHandle,
+    proxy_index: usize,
+    host: *const c_char,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return -1 };
+    let Some(host) = c_str(host) else { return -1 };
+    let routing = handle.0.lock().unwrap().routing();
+    let Some(routing) = routing else { return -1 };
+    let Some(server) = routing.table().server(proxy_index).cloned() else { return -1 };
+    let target = crate::split_proxy::ResolvedTarget {
+        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server },
+        target: crate::split_proxy::Target::Name(host),
+        resolved_ips: Vec::new(),
+    };
+    match routing.check_egress(&target) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
 }
 
 /// Stops the session (DNS entry first) and frees the handle.

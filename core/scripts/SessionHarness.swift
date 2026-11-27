@@ -270,6 +270,31 @@ struct SessionHarness {
             check(setDrop(false) == true, "service accepts switch-off")
             check(apply() == false, "egress cannot be enabled without drop protection")
             check(setDrop(true) == true && apply() == true, "group accepted after restoring drop protection")
+        case "proxy-only-egress-lifecycle":
+            // §71: proxy-only session carries exit protection while Cisco is off,
+            // disables it when drop protection turns off, and stops immediately
+            // when the App sends setProxyOnly(false) (quit / reset network).
+            let group = EgressProtection.Group(id: 1, name: "ProxyEgress", enabled: true,
+                sites: ["site.example"], expect: ["ZZ"])
+            let config = EgressProtection(enabled: true, groups: [group])
+            let json = String(decoding: try! JSONEncoder().encode(config), as: UTF8.self)
+            func applyEgress() -> Bool? { sync { reply in session.setEgressProtection(json, withReply: reply) } }
+            func setProxyOnly(_ on: Bool) -> Bool? {
+                sync { reply in session.setProxyOnly(on) { running, _ in reply(running) } }
+            }
+            func egressStatus() -> String { sync { reply in session.getEgressStatus(withReply: reply) } ?? "" }
+            func setDrop(_ on: Bool) -> Bool? { sync { reply in session.setDropProtection(on, withReply: reply) } }
+            check(applyEgress() == true, "egress config accepted before starting proxy-only")
+            check(setProxyOnly(true) == true, "proxy-only starts with zero proxies when egress is active")
+            let s1 = egressStatus()
+            check(s1.contains("\"running\":true"),
+                  "proxy-only reports running egress status (\(s1))")
+            check(setDrop(false) == true, "turning drop protection off succeeds")
+            check(egressStatus() == "{}", "disabling drop protection clears proxy-only egress controller")
+            check(setDrop(true) == true && applyEgress() == true, "re-enabling drop protection and egress works")
+            check(egressStatus().contains("\"running\":true"), "proxy-only egress resumes after re-enabling")
+            check(setProxyOnly(false) == false, "setProxyOnly(false) stops proxy-only immediately even with egress active")
+            check(egressStatus() == "{}", "stopped proxy-only reports empty egress status")
         case "cisco-disconnect":
             check(arm(session, 1), "Cisco hold armed")
             check(loads() == (NetworkGuard.shared.held?.inputs.tunnelIf.isEmpty == false ? 2 : 1), "strict hold precedes any connected Cisco rules")

@@ -17,6 +17,9 @@ struct ListRulesTest {
         check("a web address becomes its domain", ListRule.parse("https://www.Example.com/path") == .domain("www.example.com"))
         check("geosite list by name", ListRule.parse("geosite:GitHub") == .geosite("github", attribute: nil))
         check("geosite with an attribute", ListRule.parse("geosite:google@cn") == .geosite("google", attribute: "cn"))
+        check("geosite accepts a negated attribute and rejects malformed negation",
+              ListRule.parse("geosite:google@!CN") == .geosite("google", attribute: "!cn")
+              && ListRule.parse("geosite:google@!") == nil && ListRule.parse("geosite:google@") == nil)
         check("unknown geosite refused with a reason", ListRule.parse("geosite:nosuchlist") == nil
               && ListRule.problem("geosite:nosuchlist") == "没有叫这个名字的网站清单")
         check("geoip:cn accepted, other countries explained", ListRule.parse("geoip:CN") == .geoip("cn")
@@ -54,6 +57,9 @@ struct ListRulesTest {
         let googleCN = ListRule.geosite("google", attribute: "cn").expanded
         let google = ListRule.geosite("google", attribute: nil).expanded
         check("an attribute filters (\(googleCN.count) of \(google.count))", !googleCN.isEmpty && googleCN.count < google.count)
+        let googleWithoutCN = ListRule.geosite("google", attribute: "!cn").expanded
+        check("negated attribute returns the complement", !googleWithoutCN.isEmpty
+              && Set(googleCN + googleWithoutCN) == Set(google))
         let ip = ListRule.geoip("cn").expanded
         check("geoip:cn expands to IP ranges (\(ip.count))", ip.count > 1000 && ip.allSatisfy { $0.hasPrefix("ipcidr:") })
         check("networks are not sent to the forwarder", ListRule.network("10.0.0.0/8").expanded.isEmpty)
@@ -83,6 +89,20 @@ struct ListRulesTest {
               direct.contains("example.com") && direct.contains("domain:ghcr.io") && !direct.contains("10.9.0.0/16")
               && direct.count == Set(direct).count)
         check("the allowlist gets the list's networks", settings.effectiveAllowNetworks == ["10.9.0.0/16"])
+        var withExceptions = settings
+        withExceptions.directExceptions = ["full:login.example.com", "10.9.0.0/17"]
+        let oldProxy = try! JSONDecoder().decode(ProxyRoute.self, from: Data(
+            #"{"id":"00000000-0000-0000-0000-000000000001","name":"Proxy","kind":"socks5","host":"proxy.example","port":1080,"sites":["example.com"],"enabled":true}"#.utf8))
+        var editedProxy = oldProxy
+        editedProxy.exceptions = ["full:login.example.com"]
+        withExceptions.proxyRoutes = [editedProxy]
+        let restoredExceptions = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(withExceptions))
+        check("legacy and edited settings feed exception rules into the normal service payloads",
+              migrated.directExceptions == nil && oldProxy.exceptions == nil
+              && restoredExceptions.effectiveAllowNetworks == ["10.9.128.0/17"]
+              && restoredExceptions.directRuleText.contains("except:full:login.example.com")
+              && restoredExceptions.directRuleText.contains("directserver:proxy.example")
+              && restoredExceptions.proxyRuleText.contains("via:0:except:full:login.example.com"))
         settings.autoLAN = nil
         let local = LocalNetwork.current()
         check("local network on by default (\(local.joined(separator: ",")))",

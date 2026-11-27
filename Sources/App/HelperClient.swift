@@ -1034,12 +1034,22 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Why it does not, when it should.
     @Published private(set) var proxyOnlyError: String?
 
-    /// Proxies on and set, and not Cisco's own client connected (its filter
-    /// decides where traffic goes then). The own connection's split takes
-    /// the proxies over by itself and hands them back when it ends.
+    /// Proxies or exit protection on while no connection owns them (§69.20, §71).
+    /// Cisco's own client decides while connected; the own connection takes
+    /// over both proxies and exit protection while connected and hands back.
     var proxyOnlyWanted: Bool {
-        guard !endingApp, !resettingNetwork, !ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty else { return false }
+        guard !endingApp, !resettingNetwork else { return false }
+        let settings = ProfileStore.loadAppSettings()
+        let hasProxies = !settings.activeProxyRoutes.isEmpty
+        let hasEgress = settings.isDropProtectionOn && settings.egressProtection?.isActive == true
+        guard hasProxies || hasEgress else { return false }
         return !usesCisco || state == .disconnected
+    }
+
+    /// Exit protection is active now (either on the own connection or in
+    /// proxy-only mode while Cisco is off, §71).
+    var egressActiveNow: Bool {
+        (!usesCisco && showsConnected && protectsDrops) || proxyOnlyRunning
     }
 
     /// The rules, then whether the proxies run by themselves.
@@ -1049,23 +1059,33 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// this App (an unknown method drops the connection, §26.14).
     private func sendProxyOnly() {
         guard !AppRole.isSettings else { return }
+        let settings = ProfileStore.loadAppSettings()
         guard HelperInstaller.installedHelperMatchesBundle else {
             proxyOnlyRunning = false
-            proxyOnlyError = ProfileStore.loadAppSettings().activeProxyRoutes.isEmpty ? nil : "要先更新后台服务"
+            proxyOnlyError = settings.activeProxyRoutes.isEmpty ? nil : "要先更新后台服务"
+            updateEgressMonitoring()
             return
         }
         let on = proxyOnlyWanted
-        ensureConnection { proxy in
-            var finished = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
-            proxy.setProxyOnly(on) { running, error in
-                DispatchQueue.main.async {
-                    guard !finished else { return }
-                    finished = true
-                    self.proxyOnlyRunning = running
-                    self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
+        let sendFlag: () -> Void = {
+            self.ensureConnection { proxy in
+                var finished = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
+                proxy.setProxyOnly(on) { running, error in
+                    DispatchQueue.main.async {
+                        guard !finished else { return }
+                        finished = true
+                        self.proxyOnlyRunning = running
+                        self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
+                        self.updateEgressMonitoring()
+                    }
                 }
             }
+        }
+        if on, settings.isDropProtectionOn, let egress = settings.egressProtection, egress.isActive {
+            sendEgress(egress) { _ in sendFlag() }
+        } else {
+            sendFlag()
         }
     }
 
@@ -1207,7 +1227,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                             ProxyHealth.shared.merge(rows, routes: ProfileStore.loadAppSettings().activeProxyRoutes)
                         }
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
-                        if let status, self.state == .disconnected { self.proxyOnlyRunning = status.proxyOnly == true }
+                        if let status, self.state == .disconnected {
+                            let running = status.proxyOnly == true
+                            if self.proxyOnlyRunning != running {
+                                self.proxyOnlyRunning = running
+                                self.updateEgressMonitoring()
+                            }
+                        }
                         self.proxyBytes = status?.proxyBytes.flatMap { bytes in
                             let reading: [String: Any] = ["at": Date().timeIntervalSince1970,
                                                           "direct": bytes.direct, "vpn": bytes.vpn, "local": bytes.local]
@@ -2380,11 +2406,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let settings = ProfileStore.loadAppSettings()
         let usesLists = { (lines: [String]) in lines.contains { $0.lowercased().hasPrefix("geosite:") } }
-        if settings.splitOn, usesLists(DirectSites.sites(settings).flatMap(\.domains)) {
+        let direct = DirectSites.sites(settings).flatMap(\.domains) + (settings.directExceptions ?? [])
+        let proxies = settings.activeProxyRoutes.flatMap { $0.sites + ($0.exceptions ?? []) }
+        if (settings.splitOn && usesLists(direct)) || usesLists(proxies) {
             pushDirectDomains()
         }
-        if let egress = settings.egressProtection, egress.isActive, !usesCisco, settings.isDropProtectionOn,
-           usesLists(egress.groups.filter(\.enabled).flatMap(\.sites)) {
+        if let egress = settings.egressProtection, egress.isActive,
+           (!usesCisco && settings.isDropProtectionOn) || state == .disconnected,
+           usesLists(egress.groups.filter(\.enabled).flatMap { $0.sites + ($0.exceptions ?? []) }) {
             sendEgress(egress) { _ in }
         }
     }
@@ -2401,20 +2430,22 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let settings = ProfileStore.loadAppSettings()
         let stored = settings.egressProtection ?? EgressProtection()
+        let allowed = !config.enabled || (settings.isDropProtectionOn && (!usesCisco || state == .disconnected))
         guard !egressSavePending, previous == nil || previous == stored,
-              config.permitsActivation(comparedTo: stored),
-              !config.enabled || (!usesCisco && settings.isDropProtectionOn) else { completion(false); return }
+              config.permitsActivation(comparedTo: stored), allowed else { completion(false); return }
         egressSavePending = true
         sendEgress(config) { ok in
             self.egressSavePending = false
             if ok {
                 var latest = ProfileStore.loadAppSettings()
-                if config.enabled && (!latest.isDropProtectionOn || self.usesCisco) {
+                let stillAllowed = !config.enabled || (latest.isDropProtectionOn && (!self.usesCisco || self.state == .disconnected))
+                if !stillAllowed {
                     completion(false)
                     return
                 }
                 latest.egressProtection = config
                 ProfileStore.saveAppSettings(latest, updatingEgress: true)
+                if self.state == .disconnected { self.syncProxyOnly() }
                 self.updateEgressMonitoring()
             }
             completion(ok)
@@ -2423,7 +2454,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func fetchEgressJSON(_ completion: @escaping (String?) -> Void) {
         if AppRole.isSettings { SettingsLink.shared.send("egressStatus", done: completion); return }
-        guard !usesCisco else { completion(nil); return }
+        guard !usesCisco || proxyOnlyRunning else { completion(nil); return }
         egressRPC({ $0.getEgressStatus(withReply: $1) }, completion: completion)
     }
 
@@ -2441,7 +2472,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         fetchEgressJSON { json in
             guard let json,
                   let status = try? JSONDecoder().decode(EgressProtection.Status.self, from: Data(json.utf8)),
-                  self.showsConnected, !self.egressSavePending,
+                  self.egressActiveNow, !self.egressSavePending,
                   let evidence = try? JSONEncoder().encode(approval.observation) else { completion(false); return }
             let stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
             guard status.permits(approval, in: stored) else { completion(false); return }
@@ -2455,7 +2486,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }) { (countries: [String]?) in
                 self.egressSavePending = false
                 var latest = ProfileStore.loadAppSettings()
-                guard latest.isDropProtectionOn, let config = latest.egressProtection,
+                guard (latest.isDropProtectionOn || self.proxyOnlyRunning), let config = latest.egressProtection,
                       let updated = approval.applying(countries, then: stored, now: config,
                           sameSession: self.egressSession == session) else { completion(false); return }
                 latest.egressProtection = updated
@@ -2496,7 +2527,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             SettingsLink.shared.send("recheckEgressRule", String(id)) { completion($0 == "1") }
             return
         }
-        guard !usesCisco, showsConnected else { completion(false); return }
+        guard egressActiveNow else { completion(false); return }
         egressRPC({ $0.recheckEgressFailures(id, withReply: $1) }) { didCheck in
             self.refreshEgress()
             completion(didCheck == true)
@@ -2520,8 +2551,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let groups = settings.egressProtection?.groups ?? []
         egressNotifications.retain(Set(groups.map(\.id)))
         egressActiveRules = Set(groups.filter(\.enabled).map(\.id))
-        let enabled = !usesCisco && settings.isDropProtectionOn && settings.egressProtection?.isActive == true
-        guard enabled, state == .connected else {
+        let hasActiveRules = settings.egressProtection?.isActive == true
+        let running = (!usesCisco && settings.isDropProtectionOn && state == .connected) || proxyOnlyRunning
+        guard hasActiveRules, running else {
             egressTimer?.invalidate()
             egressTimer = nil
             if egressLine != nil { egressLine = nil }
@@ -2529,7 +2561,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if !egressNotices.isEmpty { egressNotices = [] }
             if egressRecheckRule != nil { egressRecheckRule = nil }
             egressCheckSeen = nil
-            if state == .disconnected {
+            if state == .disconnected && !proxyOnlyRunning {
                 egressNotifications = EgressNoticeLedger()
                 egressSession = UUID()
             }

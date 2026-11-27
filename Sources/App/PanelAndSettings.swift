@@ -401,22 +401,23 @@ struct PanelView: View {
             || (manager.state == .disconnected && manager.loginProtectionNotice != nil)
     }
 
-    /// Cisco's own three (UI-DESIGN.md 面板, design C, user 2026-11-26): one
-    /// list under the control card. While Cisco is off they rest: names
-    /// only, and one line says they come with Cisco.
+    /// Options list under the control card (panel A chosen 2026-11-27, DESIGN §71):
+    /// 出口保护 sits on top and stays active even when Cisco is off; 分流直连 and
+    /// 断线保护 rest while Cisco is off.
     private var options: some View {
         let ciscoOn = manager.switchIsOn
+        let egressResting = manager.usesCisco && manager.state != .disconnected
         return VStack(alignment: .leading, spacing: 5) {
             VStack(spacing: 0) {
-                directRow(resting: !ciscoOn)
+                egressRow(resting: egressResting)
                 Divider().padding(.leading, 41)
-                egressRow(resting: !ciscoOn)
+                directRow(resting: !ciscoOn)
                 Divider().padding(.leading, 41)
                 dropRow(resting: !ciscoOn)
             }
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
             if !ciscoOn {
-                Text("这三项跟着 Cisco，连上后生效")
+                Text("分流直连和断线保护跟着 Cisco，连上后生效")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .padding(.leading, 4)
             }
@@ -623,13 +624,16 @@ struct PanelView: View {
 
     private func egressRow(resting: Bool) -> some View {
         let config = settings.egressProtection ?? EgressProtection()
-        let available = !manager.usesCisco && protectionOn
+        let available = protectionOn && (!manager.usesCisco || manager.state == .disconnected)
+        let activeCount = config.groups.filter(\.enabled).count
         let (caption, tint): (String, Color) = {
             if config.groups.isEmpty { return ("未设置", .secondary) }
-            if manager.usesCisco { return ("经 Cisco 客户端时不可用", .secondary) }
+            if manager.usesCisco && manager.state != .disconnected { return ("经 Cisco 客户端时暂不可用", .secondary) }
             if !protectionOn { return ("要先开断线保护", .secondary) }
             guard config.isActive else { return ("关", .secondary) }
-            guard let line = manager.egressLine, !manager.gatewayTrustFailed else { return ("开", .secondary) }
+            guard let line = manager.egressLine, !manager.gatewayTrustFailed else {
+                return (activeCount > 0 ? "\(activeCount) 组保护中" : "开", .secondary)
+            }
             switch manager.egressLevel {
             case .ok: return (line, .green)
             case .partial: return (line, .orange)
@@ -637,8 +641,9 @@ struct PanelView: View {
             }
         }()
         return PanelOptionRow(symbol: "checkmark.shield.fill", title: "出口保护", caption: caption, tint: tint,
+                              activeColor: SettingsTone.shield,
                               isOn: config.isActive && available, enabled: available || config.groups.isEmpty,
-                              resting: resting, help: manager.egressLine ?? "") { on in
+                              resting: resting, help: (manager.egressLine ?? "Cisco 关闭时也保护")) { on in
             if config.groups.isEmpty { onOpenSettings("egress"); return }
             setEgress(on: on)
         } open: { onOpenSettings("egress") }
@@ -1047,6 +1052,7 @@ struct PanelOptionRow: View {
     var title: String
     var caption: String
     var tint: Color = .secondary
+    var activeColor: Color = .accentColor
     var isOn: Bool
     var enabled = true
     var resting = false
@@ -1060,7 +1066,7 @@ struct PanelOptionRow: View {
             Button(action: open) {
                 HStack(spacing: 9) {
                     ZStack {
-                        Circle().fill(lit ? Color.accentColor : Color.primary.opacity(0.10))
+                        Circle().fill(lit ? activeColor : Color.primary.opacity(0.10))
                         Image(systemName: symbol)
                             .font(.system(size: 10.5, weight: .semibold))
                             .foregroundStyle(lit ? Color.white : Color.secondary)

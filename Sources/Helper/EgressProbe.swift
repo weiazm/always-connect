@@ -32,10 +32,16 @@ enum EgressProbe {
         }
         let deadline = DispatchTime.now() + .milliseconds(request.timeoutMs)
         let queue = DispatchQueue(label: "com.alwaysconnect.egress-probe")
-        #if EGRESS_PROBE_TEST
-        let monitor = NWPathMonitor(requiredInterfaceType: .loopback)
+        let loopback = request.interface == "lo0"
+        #if !EGRESS_PROBE_TEST
+        if loopback {
+            // Production lo0 probes are only permitted to the service's own
+            // one-shot loopback bridge on 127.0.0.1 (DESIGN §71).
+            guard request.connectIp == "127.0.0.1" else { return nil }
+        }
+        let monitor = NWPathMonitor(requiredInterfaceType: loopback ? .loopback : .other)
         #else
-        let monitor = NWPathMonitor(requiredInterfaceType: .other)
+        let monitor = NWPathMonitor(requiredInterfaceType: .loopback)
         #endif
         let complete = DispatchSemaphore(value: 0)
         var connection: NWConnection?

@@ -1278,8 +1278,9 @@ impl Shared {
     fn sync_proxy(&self, c: &mut Core) {
         let table = crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default());
         let Some(forwarder) = c.forwarder.as_ref() else { self.stop_proxy(c); return; };
-        let redirected = crate::split_proxy::redirect::sync(&mut c.proxy, table, forwarder, &self.proxy_routes,
-                                                            Some(&self.guard), c.config.no_routes);
+        let gate = self.egress.lock().expect("egress").as_ref().map(|ctl| ctl.relay_gate());
+        let redirected = crate::split_proxy::redirect::sync_with_egress(
+            &mut c.proxy, table, forwarder, &self.proxy_routes, Some(&self.guard), c.config.no_routes, gate, false);
         if !redirected {
             c.last_error = Some(PROXY_START_ERROR.into());
             self.report(c, PROXY_START_ERROR);
@@ -1580,9 +1581,13 @@ impl Shared {
         }
         let generation = c.generation + 1;
         let tx = self.tx.lock().expect("engine sender").clone();
-        slot.as_ref().expect("controller installed").watch_next_launch(Box::new(move || {
+        let ctl = slot.as_ref().expect("controller installed");
+        ctl.watch_next_launch(Box::new(move || {
             let _ = tx.send(Event::EgressGateLost(generation));
         }));
+        if let Some(proxy) = &c.proxy {
+            proxy.routing.set_egress(Some(ctl.relay_gate()), false);
+        }
         Ok(gate)
     }
 

@@ -186,7 +186,10 @@ final class GeoUpdater: ObservableObject {
     /// The lists the user's rules name (split list and exit protection).
     static var usedLists: () -> [String] = {
         let settings = ProfileStore.loadAppSettings()
-        return (DirectSites.sites(settings).flatMap(\.domains) + (settings.egressProtection?.groups.flatMap(\.sites) ?? []))
+        let direct = DirectSites.sites(settings).flatMap(\.domains) + (settings.directExceptions ?? [])
+        let proxies = (settings.proxyRoutes ?? []).flatMap { $0.sites + ($0.exceptions ?? []) }
+        let egress = (settings.egressProtection?.groups ?? []).flatMap { $0.sites + ($0.exceptions ?? []) }
+        return (direct + proxies + egress)
             .compactMap { line in
                 guard line.lowercased().hasPrefix("geosite:") else { return nil }
                 return line.dropFirst(8).split(separator: "@").first.map { $0.lowercased() }

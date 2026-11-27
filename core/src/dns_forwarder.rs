@@ -22,7 +22,7 @@ use regex_lite::Regex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -465,6 +465,8 @@ pub struct SplitRules {
     keywords: Vec<String>,
     regexes: Vec<Regex>,
     ranges: Vec<(u32, u32)>,
+    exceptions: Option<Box<SplitRules>>,
+    direct_servers: Vec<String>,
     protected: Option<Arc<crate::egress_gate::ProtectedSites>>,
 }
 
@@ -493,6 +495,39 @@ pub fn cidr_range(cidr: &str) -> Option<(u32, u32)> {
     Some((base & mask, (base & mask) | !mask))
 }
 
+/// Subtract address exceptions from static routes. Keep untouched entries as
+/// written, and cover each surviving interval with the fewest CIDRs.
+pub(crate) fn subtract_networks<'a>(networks: impl Iterator<Item = &'a str>, exceptions: &SplitRules) -> Vec<String> {
+    fn cover(mut start: u64, end: u64, out: &mut Vec<String>) {
+        while start < end {
+            let alignment = (start as u32).trailing_zeros();
+            let remaining = (end - start).ilog2();
+            let bits = alignment.min(remaining);
+            out.push(format!("{}/{}", Ipv4Addr::from(start as u32), 32 - bits));
+            start += 1 << bits;
+        }
+    }
+    let mut out = Vec::new();
+    for network in networks {
+        let Some((lo, hi)) = cidr_range(network) else { continue };
+        let ranges = &exceptions.ranges;
+        let first = ranges.partition_point(|r| r.1 < lo);
+        let mut blocked = ranges[first..].iter().take_while(|r| r.0 <= hi).peekable();
+        if blocked.peek().is_none() {
+            out.push(network.to_owned());
+            continue;
+        }
+        let end = u64::from(hi) + 1;
+        let mut start = u64::from(lo);
+        for &(from, to) in blocked {
+            cover(start, u64::from(from), &mut out);
+            start = start.max(u64::from(to) + 1);
+        }
+        cover(start, end, &mut out);
+    }
+    out
+}
+
 /// The last two labels ("www.siteb.com" -> "siteb.com").
 pub fn site_name(name: &str) -> String {
     let n = trim_dots(name);
@@ -503,9 +538,32 @@ pub fn site_name(name: &str) -> String {
 
 impl SplitRules {
     pub fn new<S: AsRef<str>>(list: &[S]) -> Self {
+        let mut exceptions = Vec::new();
+        let mut servers = Vec::new();
+        let mut rules = Self::from_entries(list.iter().filter_map(|raw| {
+            let line = raw.as_ref().trim();
+            if let Some(exception) = line.strip_prefix("except:") {
+                exceptions.push(exception);
+                None
+            } else if let Some(server) = line.strip_prefix("directserver:") {
+                servers.push(server.to_ascii_lowercase());
+                None
+            } else {
+                Some(line)
+            }
+        }));
+        if !exceptions.is_empty() {
+            rules.exceptions = Some(Box::new(Self::from_entries(exceptions.into_iter())));
+        }
+        servers.sort_unstable();
+        rules.direct_servers = servers;
+        rules
+    }
+
+    fn from_entries<'a>(list: impl Iterator<Item = &'a str>) -> Self {
         let mut r = SplitRules::default();
         for raw in list {
-            let item = raw.as_ref().trim_matches(|c: char| c == ' ' || c == '\t');
+            let item = raw.trim_matches(|c: char| c == ' ' || c == '\t');
             if let Some(v) = item.strip_prefix("full:") {
                 r.fulls.push(v.to_lowercase());
             } else if let Some(v) = item.strip_prefix("keyword:") {
@@ -555,15 +613,57 @@ impl SplitRules {
     /// there is one), or None.
     pub fn matches(&self, name: &str) -> Option<String> {
         let n = trim_dots(name);
-        if n.is_empty() || self.protects_name(&n) {
-            return None;
-        }
-        self.named_rule(&n).map(str::to_owned)
-            .or_else(|| self.matches_pattern(&n).then(|| site_name(&n)))
+        (!self.protects_name(&n)).then(|| self.direct_name(&n)).flatten()
+    }
+
+    pub(crate) fn direct_name(&self, name: &str) -> Option<String> {
+        if name.is_empty() { return None; }
+        if self.is_direct_server(name) { return Some(name.to_owned()); }
+        if self.excludes_name(name) { return None; }
+        self.named_rule(name).map(str::to_owned)
+            .or_else(|| self.matches_pattern(name).then(|| site_name(name)))
     }
 
     pub(crate) fn matches_name(&self, name: &str) -> bool {
-        !name.is_empty() && (self.named_rule(name).is_some() || self.matches_pattern(name))
+        !name.is_empty() && !self.excludes_name(name)
+            && (self.named_rule(name).is_some() || self.matches_pattern(name))
+    }
+
+    pub(crate) fn excludes_name(&self, name: &str) -> bool {
+        self.exceptions.as_ref().is_some_and(|rules| rules.matches_name(name))
+    }
+
+    pub(crate) fn has_exceptions(&self) -> bool {
+        self.exceptions.is_some()
+    }
+
+    pub(crate) fn excludes_ip(&self, ip: Ipv4Addr) -> bool {
+        self.exceptions.as_ref().is_some_and(|rules| rules.contains(ip))
+    }
+
+    pub(crate) fn has_ip_exceptions(&self) -> bool {
+        self.exceptions.as_ref().is_some_and(|rules| rules.has_ranges())
+    }
+
+    pub(crate) fn effective_networks<'a>(&self, networks: impl Iterator<Item = &'a str>) -> Vec<String> {
+        match &self.exceptions {
+            Some(exceptions) if exceptions.has_ranges() => subtract_networks(networks, exceptions),
+            _ => networks.map(str::to_owned).collect(),
+        }
+    }
+
+    fn is_direct_server(&self, name: &str) -> bool {
+        self.direct_servers.binary_search_by(|entry| entry.as_str().cmp(name)).is_ok()
+    }
+
+    /// Revalidate both DNS answers and existing dynamic routes with the same
+    /// name and address context. Static, address-wide routes are handled separately.
+    pub(crate) fn directs_address(&self, name: &str, name_matches: bool, ip: Ipv4Addr) -> bool {
+        if self.protected.as_ref().is_some_and(|sites| sites.group_for_target(name, ip.into()).is_some()) {
+            return false;
+        }
+        self.is_direct_server(name) || (!self.excludes_name(name) && !self.excludes_ip(ip)
+            && (name_matches || self.contains_ip(ip)))
     }
 
     fn named_rule<'a>(&self, name: &'a str) -> Option<&'a str> {
@@ -581,7 +681,10 @@ impl SplitRules {
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        if self.protects_ip(ip) { return false; }
+        !self.protects_ip(ip) && !self.excludes_ip(ip) && self.contains_ip(ip)
+    }
+
+    fn contains_ip(&self, ip: Ipv4Addr) -> bool {
         let v = u32::from(ip);
         // The last range starting at or below v.
         let idx = self.ranges.partition_point(|r| r.0 <= v);
@@ -599,6 +702,14 @@ impl SplitRules {
 
     pub(crate) fn protects_name(&self, name: &str) -> bool {
         self.protected.as_ref().is_some_and(|sites| sites.group_for(name).is_some())
+    }
+
+    fn protection_needs_addresses(&self, name: &str) -> bool {
+        self.protected.as_ref().is_some_and(|sites| sites.name_needs_addresses(name))
+    }
+
+    fn protects_addresses(&self, name: &str, addresses: &[Ipv4Addr]) -> bool {
+        self.protected.as_ref().is_some_and(|sites| sites.group_for_addresses(name, addresses.iter().copied().map(IpAddr::V4)).is_some())
     }
 }
 
@@ -1093,22 +1204,37 @@ impl Inner {
             if !settings.enabled || session.is_some_and(|live| !live.load(Ordering::Acquire)) { return None; }
             (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
         };
-        // Proxied names (§69) come before the direct list: a name in both
-        // goes through its proxy, never direct. Exit-protected names stay
-        // in the VPN. No DNS server is asked about a proxied name.
-        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy && !rules.protects_name(&trim_dots(&q.name)));
+        // Proxied names (§69, §71 D1-A) come before the direct list and before
+        // Cisco even when exit-protected: the proxy relay checks the exit
+        // country before forwarding. In proxy-only mode (§71 D2-A), protected
+        // names that match no proxy also receive our address so the relay
+        // checks the local exit before forwarding.
+        let clean_name = trim_dots(&q.name);
+        let protected_name = rules.protects_name(&clean_name);
+        let protection_needs_addresses = protected_name && rules.protection_needs_addresses(&clean_name);
+        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy);
         if let Some(proxy) = &proxy {
-            if let Some(ip) = proxy.answer(&q.name) {
-                return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
-                    .or_else(|| empty_answer(query));
+            if !protection_needs_addresses {
+                let route = proxy.answer(&clean_name).or_else(|| {
+                    (protected_name && proxy.local_egress_active() && !proxy.name_needs_addresses(&clean_name))
+                        .then(|| proxy.answer_local_protected(&clean_name, &[])).flatten()
+                });
+                if let Some(ip) = route {
+                    return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
+                        .or_else(|| empty_answer(query));
+                }
             }
             // Already proxied by its address: other types (HTTPS address
             // hints above all) must not point around the proxy.
-            if q.qtype != TYPE_A && proxy.knows(&q.name) { return empty_answer(query); }
+            if q.qtype != TYPE_A && (proxy.knows(&clean_name) || proxy.name_needs_addresses(&clean_name)) {
+                return empty_answer(query);
+            }
         }
-        let entry = rules.matches(&q.name);
+        let direct_name = rules.direct_name(&clean_name);
+        let direct_by_name = direct_name.is_some() && !protected_name;
+        let uses_local_dns = direct_by_name && (!rules.has_ip_exceptions() || rules.is_direct_server(&clean_name));
         if q.qtype == TYPE_AAAA { return empty_answer(query); }
-        let (servers, interface) = if entry.is_some() {
+        let (servers, interface) = if uses_local_dns {
             let binding = if up.physical_if.is_some() { Some(physical_binding.as_ref()?) } else { None };
             (&up.local, binding)
         } else {
@@ -1120,13 +1246,13 @@ impl Inner {
             }
             (&up.tunnel, Some(tunnel_binding.as_ref()?))
         };
-        let path = &self.path_inflight[usize::from(entry.is_some())];
+        let path = &self.path_inflight[usize::from(uses_local_dns)];
         if path.fetch_add(1, Ordering::AcqRel) >= PATH_INFLIGHT {
             path.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
         let slot = PathSlot(path);
-        let preference = &self.preferred_server[usize::from(entry.is_some())];
+        let preference = &self.preferred_server[usize::from(uses_local_dns)];
         let first = if servers.len() > 1 {
             preference.lock().unwrap().filter(|(generation, index, since)|
                 *generation == epoch && *index < servers.len() && since.elapsed() < PREFER_BACKUP_FOR
@@ -1140,7 +1266,7 @@ impl Inner {
                 answer
             });
         drop(slot);
-        if entry.is_none() && q.qtype == TYPE_A {
+        if !uses_local_dns && q.qtype == TYPE_A {
             let reason = match answer.as_ref().map(|a| a[3] & 0x0f) {
                 None => Some("VPN DNS 未返回有效应答"),
                 Some(3) => Some("VPN DNS 返回域名不存在（NXDOMAIN）"),
@@ -1155,19 +1281,28 @@ impl Inner {
             answer_addresses(&answer, query)?
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
-        let protected = rules.protects_name(&q.name);
-        // Proxy address rules (geoip, networks, §69) after the direct list's
-        // names and before its addresses: the VPN's answer decides, then
-        // the app gets our address and the proxy gets the name.
-        if q.qtype == TYPE_A && entry.is_none() && !protected && !addresses.iter().any(|ip| rules.protects_ip(*ip)) {
-            if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_by_address(&q.name, &addresses)) {
+        let protected = protected_name && (!protection_needs_addresses || rules.protects_addresses(&clean_name, &addresses));
+        // Proxy address rules (geoip, networks, §69, §71 D1-A) after the direct
+        // list's names and before its addresses: the DNS answer decides, then
+        // the app gets our address and the proxy gets the name (and checks exit
+        // if protected). In proxy-only mode (§71 D2-A), an answer hitting a
+        // protected IP rule with no proxy also routes through our local relay.
+        if q.qtype == TYPE_A {
+            if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_resolved(&clean_name, &addresses, !direct_by_name)) {
                 if self.settings.read().unwrap().epoch != epoch { return None; }
                 return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
             }
+            if let Some(proxy) = proxy.as_ref().filter(|p| p.local_egress_active()) {
+                if rules.protects_addresses(&clean_name, &addresses) {
+                    let ip = proxy.answer_local_protected(&clean_name, &addresses)?;
+                    if self.settings.read().unwrap().epoch != epoch { return None; }
+                    return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
+                }
+            }
         }
         let direct: Vec<_> = addresses.iter().copied()
-            .filter(|ip| !protected && !rules.protects_ip(*ip))
-            .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
+            .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && rules.directs_address(&clean_name, direct_name.is_some(), *ip)).collect();
+        let entry = direct_name.filter(|_| !direct.is_empty());
         if self.settings.read().unwrap().epoch != epoch { return None; }
         if q.qtype == TYPE_A {
             if let Some(hook) = &self.on_answer {
@@ -1191,7 +1326,7 @@ impl Inner {
 
         // A protected name answers with entries whose exit was verified when
         // the controller knows better ones, always with a short TTL (§66.28).
-        let protected_answer = (protected && q.qtype == TYPE_A && entry.is_none() && !addresses.is_empty()).then(|| {
+        let protected_answer = (protected && q.qtype == TYPE_A && !addresses.is_empty()).then(|| {
             let steered = self.protected_answer.read().unwrap().as_ref()
                 .and_then(|hook| hook(&trim_dots(&q.name), &addresses))
                 .filter(|ips| !ips.is_empty());
@@ -1208,9 +1343,9 @@ impl Inner {
         self.remember(&addresses, &q.name);
         let bytes = if is_service(q.qtype) {
             if rules.protected.is_some() {
-                service_reply(query, answer, entry.is_some(), protected)
+                service_reply(query, answer, uses_local_dns, protected)
             } else {
-                sanitize_service_answer(&answer, entry.is_some(), false)
+                sanitize_service_answer(&answer, uses_local_dns, false)
             }
         } else {
             Some(protected_answer.unwrap_or(answer))
@@ -1778,6 +1913,56 @@ mod tests {
         bad[12] = 0xC0;
         bad[13] = 12;
         assert_eq!(question(&bad), None);
+    }
+
+    #[test]
+    fn exceptions_apply_after_rule_updates_in_the_dns_and_relay_paths() {
+        use crate::split_proxy::{Routing, Table};
+        let (local, local_seen) = fake_udp([203, 0, 113, 7], false);
+        let (tunnel, tunnel_seen) = fake_udp([198, 51, 100, 9], false);
+        let forwarder = Forwarder::with_answer_hook(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53, Duration::from_millis(250),
+            vec!["example.test".into()],
+            Upstreams { local: vec![format!("127.0.0.1:{local}")], tunnel: vec![format!("127.0.0.1:{tunnel}")],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) },
+            None, Some(Box::new(|observation: Observation| {
+                if observation.name == "login.example.test" && observation.addresses == ["198.51.100.9".parse::<Ipv4Addr>().unwrap()] {
+                    assert!(observation.direct.is_empty());
+                }
+                true
+            })),
+        );
+        let resolve = |name| ipv4_answers(&forwarder.inner.resolve(&query(name, TYPE_A, 7)).unwrap());
+        assert_eq!(resolve("login.example.test"), [Ipv4Addr::new(203, 0, 113, 7)]);
+        forwarder.set_parsed_rules(SplitRules::new(&[
+            "example.test", "ipcidr:198.51.100.0/24", "except:full:login.example.test",
+        ]));
+        assert_eq!(resolve("login.example.test"), [Ipv4Addr::new(198, 51, 100, 9)]);
+        assert_eq!(resolve("child.login.example.test"), [Ipv4Addr::new(203, 0, 113, 7)]);
+        assert_eq!(local_seen.load(Ordering::Acquire), 2);
+        let proxy = Routing::new(Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080", "via:0:example.test", "via:0:except:full:login.example.test",
+            "proxy:1 socks5 127.0.0.1 1081", "via:1:full:login.example.test",
+        ]));
+        forwarder.set_proxy(Some(proxy.clone()));
+        let cached = resolve("login.example.test")[0];
+        assert_eq!(proxy.proxy_for(cached), Some(1));
+        assert!(proxy.target(cached).is_ok());
+        proxy.set_table(Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080", "via:0:example.test", "via:0:except:ipcidr:198.51.100.0/24",
+        ]));
+        assert_eq!(proxy.proxy_for(cached), None, "an old synthetic answer cannot bypass an IP exception");
+        assert_eq!(resolve("login.example.test"), [Ipv4Addr::new(198, 51, 100, 9)]);
+        assert_eq!(tunnel_seen.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn network_exceptions_cut_only_overlapping_addresses_from_static_routes() {
+        let rules = SplitRules::new(&["except:ipcidr:198.51.100.8/29", "except:ipcidr:198.51.100.9/32",
+            "except:ipcidr:255.255.255.255/32"]);
+        let nets = rules.effective_networks(["198.51.100.0/27", "203.0.113.0/24", "255.255.255.252/30"].into_iter());
+        assert_eq!(nets, ["198.51.100.0/29", "198.51.100.16/28", "203.0.113.0/24",
+            "255.255.255.252/31", "255.255.255.254/32"]);
     }
 
     #[test]
@@ -2485,6 +2670,77 @@ mod tests {
         assert!(!loopback_dns_busy(silent.local_addr().unwrap().port(),Duration::from_millis(40)));
         assert!(start.elapsed()<Duration::from_secs(1));
         assert!(!loopback_dns_busy(0,Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn protected_sites_follow_proxy_rules_and_local_egress_in_proxy_only() {
+        let (tunnel_port, tunnel_seen) = fake_udp([198, 51, 100, 40], false);
+        let (local_port, _) = fake_udp([203, 0, 113, 9], false);
+        let protected = Arc::new(crate::egress_gate::ProtectedSites::new(&[
+            crate::egress_gate::SiteGroup { id: 1, sites: vec!["prot.example".into(), "ipcidr:198.51.100.40/32".into()] },
+        ]));
+        let rules = SplitRules::new(&["prot.example", "direct.example"]).with_protection(Some(protected));
+        let forwarder = Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            53,
+            Duration::from_secs(1),
+            vec!["prot.example".into(), "direct.example".into()],
+            Upstreams {
+                tunnel: vec![format!("127.0.0.1:{tunnel_port}")],
+                local: vec![format!("127.0.0.1:{local_port}")],
+                physical_if: None,
+                tunnel_if: Some(loopback_interface().into()),
+            },
+            None,
+        );
+        forwarder.set_parsed_rules(rules);
+        let inner = forwarder.inner();
+        inner.settings.write().unwrap().enabled = true;
+        let table = crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080",
+            "via:0:domain:via-proxy.prot.example",
+            "via:0:ipcidr:198.51.100.40/32",
+        ]);
+        let routing = crate::split_proxy::Routing::new(table);
+        *inner.proxy.write().unwrap() = Some(routing.clone());
+
+        // D1-A: protected name matching a proxy name rule gets our fake IP (no DNS sent).
+        let before = tunnel_seen.load(Ordering::SeqCst);
+        let ips = ipv4_answers(&inner.resolve(&query("via-proxy.prot.example", TYPE_A, 1)).unwrap());
+        assert_eq!(ips.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips[0]), "proxy wins for protected name");
+        assert_eq!(tunnel_seen.load(Ordering::SeqCst), before);
+
+        // Protected site whose resolved address hits proxy ipcidr rule -> handed to proxy too (D1-A).
+        let ips_addr = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 2)).unwrap());
+        assert_eq!(ips_addr.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips_addr[0]), "proxy address rule also takes protected site");
+
+        // Non-matching proxy table: with Cisco on (local_egress = false), stays on Cisco;
+        // with proxy-only (local_egress = true), routed through local relay for exit checking (D2-A).
+        let empty_routing = crate::split_proxy::Routing::new(crate::split_proxy::Table::default());
+        *inner.proxy.write().unwrap() = Some(empty_routing.clone());
+        let ips_vpn = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 3)).unwrap());
+        assert_eq!(ips_vpn, vec![Ipv4Addr::new(198, 51, 100, 40)], "Cisco connected: tunnel DNS answers normally");
+
+        let ctl = crate::egress_control::Controller::in_process(
+            crate::egress_control::EgressConfig {
+                enabled: true,
+                prefetch: Some(0),
+                groups: vec![crate::egress_control::Group {
+                    id: 1, name: "P".into(), enabled: true,
+                    sites: vec!["prot.example".into()], expect: vec!["ZZ".into()], ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Arc::new(|_, _| None),
+        ).unwrap();
+        empty_routing.set_egress(Some(ctl.relay_gate()), true);
+        let ips_local = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 4)).unwrap());
+        assert_eq!(ips_local.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips_local[0]), "proxy-only D2-A routes protected name through local relay");
+        let aaaa = inner.resolve(&query("only-cisco.prot.example", TYPE_AAAA, 5)).unwrap();
+        assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0, "no IPv6 bypass");
     }
 
 }

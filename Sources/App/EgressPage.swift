@@ -9,12 +9,14 @@ struct EgressPagePreview {
     var connected = true
     var available = true
     var connections: [ConnectionRow] = []
+    var proxyRoutes: [ProxyRoute] = []
 }
 
-/// Settings → 出口保护 (UI-DESIGN.md「出口保护页」, 2026-11-24 redesign).
-/// Layout B chosen by the maintainer (2026-11-24): one status line with
-/// 添加网站 and a ⋯ menu, then a compact table of websites; a question about
-/// a website appears right under its row.
+/// Settings → 出口保护 (UI-DESIGN.md「出口保护页」, DESIGN §71).
+/// Layout C chosen by the maintainer (2026-11-27): one status line with
+/// 添加保护 and a ⋯ menu, then a compact table showing rules, expected
+/// countries, route + live status, and switches; a question about a site
+/// appears right under its row.
 struct EgressProtectionPage: View {
     @ObservedObject private var manager = HelperClient.shared
     @ObservedObject private var window = SettingsWindow.shared
@@ -51,8 +53,14 @@ struct EgressProtectionPage: View {
     }
 
     private var config: EgressProtection { stored.rulesForEditing }
-    private var connected: Bool { preview?.connected ?? manager.showsConnected }
-    private var available: Bool { preview?.available ?? (!manager.usesCisco && manager.protectsDrops) }
+    /// Protection is actively running (own connection up or proxy-only session running, §71).
+    private var connected: Bool { preview?.connected ?? manager.egressActiveNow }
+    private var available: Bool {
+        preview?.available ?? (manager.protectsDrops && (!manager.usesCisco || manager.state == .disconnected))
+    }
+    private var activeProxyRoutes: [ProxyRoute] {
+        preview?.proxyRoutes ?? ProfileStore.loadAppSettings().activeProxyRoutes
+    }
     private var active: [EgressProtection.Group] { config.groups.filter(\.enabled) }
     private var liveStatus: EgressProtection.Status? { connected ? status : nil }
 
@@ -88,7 +96,7 @@ struct EgressProtectionPage: View {
             } header: {
                 statusBar
             } footer: {
-                Text("命中规则的新连接先检查出口，走错国家就拦。查不到出口时按各保护的设置处理。出口保护开启时，Cisco 隧道内的 QUIC 流量会被拦。")
+                Text("命中代理的受保护网站经代理检查出口，其余经 Cisco 或本地网络检查出口；出口不对直接拦住。Cisco 关闭时仍照常保护。受保护网站不走 QUIC。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if !config.groups.isEmpty {
@@ -110,6 +118,7 @@ struct EgressProtectionPage: View {
         .onDisappear { visible = false; status = nil }
         .onChange(of: window.egressRuleToOpen) { _ in openRequestedRule() }
         .onChange(of: manager.showsConnected) { _ in refresh() }
+        .onChange(of: manager.proxyOnlyRunning) { _ in refresh() }
         .background {
             if visible && config.isActive && preview == nil {
                 Color.clear.onReceive(Timer.publish(every: 5, tolerance: 1, on: .main, in: .common).autoconnect()) { _ in refresh() }
@@ -160,7 +169,7 @@ struct EgressProtectionPage: View {
         return PageHeader(symbol: "checkmark.shield.fill", color: SettingsTone.shield, title: "出口保护",
                         status: look.line, dot: look.tint) {
             HStack(spacing: 8) {
-                if preview == nil && manager.usesCisco {
+                if preview == nil && manager.usesCisco && manager.state != .disconnected {
                     Button("去「分流」打开") { UserDefaults.standard.set("split", forKey: "settingsTab") }
                 } else if !(preview?.available ?? manager.protectsDrops) {
                     Button("打开断线保护") { confirmDropProtection = true }
@@ -198,20 +207,20 @@ struct EgressProtectionPage: View {
 
     private var statusLook: StatusLook {
         let ruleCount = active.count
-        if preview == nil && manager.usesCisco {
-            return .init(tint: .gray, line: "要先在「分流」页打开「按网站分流」才能用", lineColor: .secondary)
+        if preview == nil && manager.usesCisco && manager.state != .disconnected {
+            return .init(tint: .gray, line: "经 Cisco 客户端连接期间暂不可用，断开后自动恢复", lineColor: .secondary)
         }
         if !available { return .init(tint: .gray, line: "要先打开断线保护才能用", lineColor: .secondary) }
         if config.groups.isEmpty { return .init(tint: .gray, line: "还没开始用：先添加一个保护", lineColor: .secondary) }
         if active.isEmpty { return .init(tint: .gray, line: "已全部暂停", lineColor: .secondary) }
-        guard connected else { return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · Cisco 连上后开始检查") }
+        guard connected else { return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · Cisco 关闭时也保护") }
         switch liveStatus?.displayLevel(expectedRules: Set(active.map(\.id))) ?? .unknown {
-        case .ok: return .init(tint: .green, line: "一切正常 · \(ruleCount) 个保护已开启")
+        case .ok: return .init(tint: .green, line: "一切正常 · \(ruleCount) 个保护已开启 · Cisco 关闭时也保护")
         case .partial:
             let count = liveStatus?.blockedCount ?? 0
-            return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 次连接" : "部分连接已拦下",
+            return .init(tint: .orange, line: count > 0 ? "这次已拦下 \(count) 次连接 · Cisco 关闭时也保护" : "部分连接已拦下 · Cisco 关闭时也保护",
                          lineColor: .orange)
-        case .unknown: return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · 有连接时核实出口")
+        case .unknown: return .init(tint: .accentColor, line: "\(ruleCount) 个保护已开启 · 有连接时核实出口 · Cisco 关闭时也保护")
         }
     }
 
@@ -271,22 +280,33 @@ struct EgressProtectionPage: View {
         Array(Set([1, 2, 5, 10, 30, current])).sorted()
     }
 
-    // MARK: - Table
+    // MARK: - Table (Layout C chosen by maintainer 2026-11-27, DESIGN §71)
 
-    private static let countryWidth: CGFloat = 160
-    private static let stateWidth: CGFloat = 96
-    private static let switchWidth: CGFloat = 56
+    private static let countryWidth: CGFloat = 145
+    private static let stateWidth: CGFloat = 175
+    private static let switchWidth: CGFloat = 52
     private static let deleteWidth: CGFloat = 24
 
     private var tableHeader: some View {
         HStack(spacing: 8) {
             Text("保护规则").frame(maxWidth: .infinity, alignment: .leading)
             Text("只从这里出去").frame(width: Self.countryWidth, alignment: .leading)
-            Text("状态").frame(width: Self.stateWidth, alignment: .leading)
+            Text("路线与状态").frame(width: Self.stateWidth, alignment: .leading)
             Text("保护").frame(width: Self.switchWidth)
             Color.clear.frame(width: Self.deleteWidth, height: 1)
         }
         .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func latestCheckCaption(_ state: EgressProtection.GroupState?) -> String? {
+        guard let state, state.lastCheck.isFinite, state.lastCheck > 0 else { return nil }
+        let time = Date(timeIntervalSince1970: state.lastCheck).formatted(date: .omitted, time: .shortened)
+        let country = state.paths?.first(where: { $0.path == state.path })?.country
+            ?? state.observed.first?.country
+        if let country {
+            return "最近核实 \(egressCountryLabel(country)) · \(time)"
+        }
+        return "最近检查 · \(time)"
     }
 
     private func ruleRow(_ group: EgressProtection.Group, decisions: [EgressDecision]) -> some View {
@@ -295,6 +315,7 @@ struct EgressProtectionPage: View {
         let canEnable = !group.sites.isEmpty && !group.expect.isEmpty
         let problem = group.enabled && decisions.isEmpty ? badge.problem : nil
         let unverified = connected ? state?.unverifiedCount ?? 0 : 0
+        let checkLine = group.enabled && connected ? latestCheckCaption(state) : nil
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Button { sheet = .details(group.id) } label: {
@@ -322,7 +343,21 @@ struct EgressProtectionPage: View {
                         Text(egressCountriesLabel(group.expect)).lineLimit(1)
                             .foregroundStyle(group.enabled ? Color.primary : Color.secondary)
                             .frame(width: Self.countryWidth, alignment: .leading)
-                        EgressStatusPill(badge: badge).frame(width: Self.stateWidth, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                EgressStatusPill(badge: badge)
+                                if group.enabled && connected {
+                                    EgressRouteTag(path: state?.path, routes: activeProxyRoutes)
+                                }
+                            }
+                            if let checkLine {
+                                Text(checkLine)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .frame(width: Self.stateWidth, alignment: .leading)
                     }
                     .contentShape(Rectangle())
                 }
@@ -346,7 +381,7 @@ struct EgressProtectionPage: View {
                 .accessibilityLabel("删除「\(group.name)」")
             }
             if !decisions.isEmpty {
-                EgressDecisionList(decisions: decisions, refresh: refresh)
+                EgressDecisionList(decisions: decisions, refresh: refresh, proxyRoutes: activeProxyRoutes)
             }
         }
         .padding(.vertical, 3)
@@ -367,12 +402,16 @@ struct EgressProtectionPage: View {
                 .map { "出口在 \(egressCountryLabel($0.country ?? ""))，不在允许范围" }
             ?? "没能核实出口"
         let open = record.ended == nil
+        let routePath = record.path ?? record.observed.first?.path
         return Button { sheet = .details(record.group) } label: {
             HStack(spacing: 10) {
                 Image(systemName: open ? "hand.raised.fill" : "checkmark.circle")
                     .foregroundStyle(open ? Color.orange : Color.secondary).frame(width: 18)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(record.host ?? record.name).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(record.host ?? record.name).lineLimit(1)
+                        EgressRouteTag(path: routePath, routes: activeProxyRoutes)
+                    }
                     Text(cause).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
@@ -390,16 +429,16 @@ struct EgressProtectionPage: View {
     @ViewBuilder private func sheetView(_ page: Sheet) -> some View {
         switch page {
         case .addSites:
-            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { input, countries, unverified, done in
-                addRules(input, countries: countries, unverified: unverified, done: done)
+            EgressSiteSheet(countries: config.groups.last?.expect ?? [], preview: preview?.connections) { input, exceptions, countries, unverified, done in
+                addRules(input, exceptions: exceptions, countries: countries, unverified: unverified, done: done)
             }
         case .details(let id):
             if let group = config.groups.first(where: { $0.id == id }) {
                 EgressRuleDetail(rule: group, config: config, status: liveStatus, connected: connected, refresh: refresh,
                                  edit: { edit in changeRule(id, edit: edit) },
                                  remove: { deleteRule(id) },
-                                 saveSites: { original, sites, done in
-                                     replaceSites(id, original: original, sites: sites, done: done)
+                                 saveRules: { original, rules, done in
+                                     replaceRules(id, original: original, rules: rules, done: done)
                                  })
             }
         }
@@ -414,10 +453,11 @@ struct EgressProtectionPage: View {
 
     // MARK: - Changes
 
-    private func addRules(_ input: EgressRuleInput, countries: [String], unverified: EgressProtection.Unverified,
+    private func addRules(_ input: EgressRuleInput, exceptions: [String], countries: [String], unverified: EgressProtection.Unverified,
                           done: @escaping (Bool) -> Void) {
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let change = EgressRuleChange.adding(input, countries: countries, unverified: unverified, config: previous),
+        guard let change = EgressRuleChange.adding(input, exceptions: exceptions, countries: countries,
+                                                   unverified: unverified, config: previous),
               change.after.permitsActivation(comparedTo: previous) else { done(false); return }
         if change.needsReconnect(connected: manager.showsConnected) {
             done(true)
@@ -428,10 +468,11 @@ struct EgressProtectionPage: View {
         }
     }
 
-    private func replaceSites(_ id: UInt32, original: [String], sites: [String], done: @escaping (String?) -> Void) {
+    private func replaceRules(_ id: UInt32, original: EgressRuleChange.Rules, rules: EgressRuleChange.Rules,
+                              done: @escaping (String?) -> Void) {
         guard preview == nil else { done(nil); return }
         let previous = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard let change = EgressRuleChange.replacingSites(sites, expected: original, group: id, in: previous) else {
+        guard let change = EgressRuleChange.replacingRules(rules, expected: original, group: id, in: previous) else {
             done("规则已在别处更新。可先复制草稿，再重新打开详情。")
             return
         }
@@ -506,9 +547,9 @@ struct EgressProtectionPage: View {
     private func refresh() {
         guard preview == nil else { return }
         stored = ProfileStore.loadAppSettings().egressProtection ?? EgressProtection()
-        guard visible, config.isActive, manager.showsConnected else { status = nil; return }
+        guard visible, config.isActive, manager.egressActiveNow else { status = nil; return }
         manager.fetchEgressJSON { json in
-            guard visible, config.isActive, manager.showsConnected else { return }
+            guard visible, config.isActive, manager.egressActiveNow else { return }
             status = json.flatMap { try? JSONDecoder().decode(EgressProtection.Status.self, from: Data($0.utf8)) }
         }
     }

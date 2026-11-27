@@ -254,6 +254,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var pendingLogin: (ticket: UInt64, target: GatewayAddress, physical: String, cisco: Bool)?
     private var dropProtection = true
     private var egress = EgressProtection()
+    private var egressJSON = ""
     private var egressConfigured = false
     private var lastStateCode = 0
     private var lastDetail = ""
@@ -378,7 +379,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 guard let self, self.clients.isEmpty else { return }
                 Self.log("proxy only: the App did not come back, stopped")
                 self.proxyOnlyWanted = false
-                self.reconcileProxyOnly()
+                self.stopProxyOnly(handover: false)
+                ac_hysteria_stop_all()
                 self.onLastClientGone?()
             }
             proxyOnlyOrphan?.cancel()
@@ -405,7 +407,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         let ciscoActive = !KillSwitch.shared.isOff
         let run = ProxyOnlySession.shouldRun(wanted: proxyOnlyWanted, engineActive: engineActive, ciscoActive: ciscoActive)
         if run, proxyOnly == nil {
-            let (session, error) = ProxyOnlySession.start(rules: directRuleText)
+            let (session, error) = ProxyOnlySession.start(rules: directRuleText,
+                                                          egressJSON: egress.isActive && !egressJSON.isEmpty ? egressJSON : nil)
             proxyOnly = session
             proxyOnlyError = error
             if let error { Self.log("proxy only: " + error) }
@@ -750,6 +753,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 }
                 self.preparedLogin = nil
                 self.egress.enabled = false
+                self.proxyOnly?.updateEgress(nil)
+                self.reconcileProxyOnly()
                 if wasGated && self.restartForEgressChange() { reply(true); return }
             }
             if let engine = self.engine {
@@ -789,16 +794,19 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private func applyEgressConfiguration(_ config: EgressProtection, json: String) {
         let modeChanged = config.isActive != egress.isActive
         egress = config
+        egressJSON = json
         egressConfigured = true
         if relay != nil && modeChanged {
             // Only switching the gate on or off changes how OpenConnect is started.
             HelperSession.log("egress: protection turned \(config.isActive ? "on" : "off"); reconnecting with the same login")
         }
         if relay != nil && !(modeChanged && restartForEgressChange()) { engine?.updateEgress(json) }
+        proxyOnly?.updateEgress(config.isActive ? json : nil)
+        reconcileProxyOnly()
     }
 
     func getEgressStatus(withReply reply: @escaping (String) -> Void) {
-        queue.async { reply(self.engine?.egressStatus() ?? "{}") }
+        queue.async { reply(self.engine?.egressStatus() ?? self.proxyOnly?.egressStatus() ?? "{}") }
     }
 
     func retryLoginNow(withReply reply: @escaping (Bool) -> Void) {
@@ -840,10 +848,20 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
 
     func recheckEgressFailures(_ group: UInt32, withReply reply: @escaping (Bool) -> Void) {
         queue.async {
-            guard self.dropProtection, self.egress.isActive, let engine = self.engine else { reply(false); return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let finished = engine.recheckEgressFailures(group)
-                self.queue.async { reply(finished && self.engine === engine) }
+            guard self.egress.isActive else { reply(false); return }
+            if let engine = self.engine {
+                guard self.dropProtection else { reply(false); return }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let finished = engine.recheckEgressFailures(group)
+                    self.queue.async { reply(finished && self.engine === engine) }
+                }
+            } else if let proxyOnly = self.proxyOnly {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let finished = proxyOnly.recheckEgressFailures(group)
+                    self.queue.async { reply(finished && self.proxyOnly === proxyOnly) }
+                }
+            } else {
+                reply(false)
             }
         }
     }
@@ -851,14 +869,27 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func allowEgressCountry(_ country: String, group: UInt32, started: Double, evidence: String,
                             withReply reply: @escaping (Bool, [String]) -> Void) {
         queue.async {
-            guard self.dropProtection, self.egress.isActive,
-                  let index = self.egress.groups.firstIndex(where: { $0.id == group && $0.enabled }),
-                  let countries = self.engine?.allowEgressCountry(country, group: group, started: started,
-                                                                  evidence: evidence, expected: self.egress) else {
+            guard self.egress.isActive,
+                  let index = self.egress.groups.firstIndex(where: { $0.id == group && $0.enabled }) else {
                 reply(false, [])
                 return
             }
+            let countries: [String]?
+            if let engine = self.engine {
+                guard self.dropProtection else { reply(false, []); return }
+                countries = engine.allowEgressCountry(country, group: group, started: started,
+                                                      evidence: evidence, expected: self.egress)
+            } else if let proxyOnly = self.proxyOnly {
+                countries = proxyOnly.allowEgressCountry(country, group: group, started: started,
+                                                         evidence: evidence, expected: self.egress)
+            } else {
+                countries = nil
+            }
+            guard let countries else { reply(false, []); return }
             self.egress.groups[index].expect = countries
+            if let data = try? JSONEncoder().encode(self.egress) {
+                self.egressJSON = String(decoding: data, as: UTF8.self)
+            }
             reply(true, countries)
         }
     }

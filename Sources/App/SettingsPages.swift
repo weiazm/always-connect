@@ -847,14 +847,24 @@ enum DirectList {
         stored.directSites = sites
         stored.directGroups = nil
         stored.directCustom = nil
-        ProfileStore.saveAppSettings(stored)
+        return apply(stored, note: note)
+    }
+
+    static func saveExceptions(_ rules: [String], note: ((String?) -> Void)? = nil) -> AppSettings {
+        var stored = ProfileStore.loadAppSettings()
+        stored.directExceptions = rules.isEmpty ? nil : rules
+        return apply(stored, note: note)
+    }
+
+    private static func apply(_ settings: AppSettings, note: ((String?) -> Void)?) -> AppSettings {
+        ProfileStore.saveAppSettings(settings)
         pushNetworks()
         if !HelperClient.shared.usesCisco {
             HelperClient.shared.pushDirectDomains { taken in
                 note?(taken == nil ? "已保存；后台服务版本过旧，更新后生效。" : nil)
             }
         }
-        return stored
+        return settings
     }
 }
 
@@ -863,6 +873,7 @@ struct SplitPagePreview {
     var ownConnection = true
     var sites: [DirectSite] = []
     var routes: [ProxyRoute] = []
+    var directExceptions: [String] = []
 }
 
 struct SplitPage: View {
@@ -875,6 +886,7 @@ struct SplitPage: View {
     @State private var sites = DirectSites.sites(ProfileStore.loadAppSettings())
     @State private var certificates: [CertificateRelay.ClientIdentity] = []
     @State private var newSite = ""
+    @State private var exceptions = ""
     @State private var siteNote: String?
     @State private var confirmSwitch: Bool?
     @State private var localNetworks: [String] = []
@@ -992,9 +1004,8 @@ struct SplitPage: View {
                         .help("从名单删除")
                     }
                 }
-                HStack {
-                    TextField("添加", text: $newSite, prompt: Text("例如 example.com、geosite:apple、10.1.0.0/16"))
-                        .onSubmit(addSite)
+                HStack(spacing: 8) {
+                    AlwaysTextField("例如 example.com、geosite:apple、10.1.0.0/16", text: $newSite, onSubmit: addSite)
                     Button("添加", action: addSite)
                         .disabled(ListRule.parse(newSite) == nil)
                     // Examples the moment the pointer is on the question
@@ -1005,6 +1016,15 @@ struct SplitPage: View {
                 }
                 if let problem = ListRule.problem(newSite) {
                     Text(problem).font(.caption).foregroundStyle(.orange)
+                }
+                let excluded = EgressRuleInput(exceptions, limit: EgressRuleInput.siteLimit)
+                EgressRuleExceptions(input: $exceptions, parsed: excluded,
+                                     explanation: "命中例外的网站跳过分流直连，连着 Cisco 时按默认路线走。") {
+                    Button("保存例外") {
+                        settings = DirectList.saveExceptions(excluded.sites) { note in siteNote = note }
+                        exceptions = excluded.sites.joined(separator: "\n")
+                    }
+                    .disabled(preview != nil || !excluded.issues.isEmpty || excluded.sites == (settings.directExceptions ?? []))
                 }
             } header: {
                 Text("不走 Cisco 的网站")
@@ -1020,12 +1040,17 @@ struct SplitPage: View {
         }
         .formStyle(.grouped)
         .onAppear {
-            if let preview { sites = preview.sites; return }
+            if let preview {
+                sites = preview.sites
+                exceptions = preview.directExceptions.joined(separator: "\n")
+                return
+            }
             certificates = CertificateRelay.loginCandidates()
             localNetworks = LocalNetwork.current()
             // The 连接 page may have changed the list meanwhile (§四十四).
             settings = ProfileStore.loadAppSettings()
             sites = DirectSites.sites(settings)
+            exceptions = (settings.directExceptions ?? []).joined(separator: "\n")
             if settings.directSites == nil { saveSites() }  // migrate once
         }
     }
@@ -1043,6 +1068,7 @@ struct SplitPage: View {
         ("geosite:microsoft", "微软相关域名"),
         ("geosite:github", "GitHub 相关域名"),
         ("geosite:apple@cn", "只取清单里标了 @cn 的条目"),
+        ("geosite:apple@!cn", "只取清单里没标 @cn 的条目"),
     ]
 
     /// The full list of geosite names (domain-list-community's data).

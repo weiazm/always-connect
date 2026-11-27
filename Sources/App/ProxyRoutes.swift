@@ -29,6 +29,7 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
     var host: String
     var port: Int
     var sites: [String]
+    var exceptions: [String]? = nil
     var enabled: Bool = true
     /// Username for SOCKS5/HTTP; the password is in the keychain.
     var username: String?
@@ -94,6 +95,7 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? ""
         port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 0
         sites = try c.decodeIfPresent([String].self, forKey: .sites) ?? []
+        exceptions = try c.decodeIfPresent([String].self, forKey: .exceptions)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         username = try c.decodeIfPresent(String.self, forKey: .username)
         passwordStamp = try c.decodeIfPresent(String.self, forKey: .passwordStamp)
@@ -261,6 +263,9 @@ extension AppSettings {
             let named = rules.filter { !$0.isNetwork }.map(\.text)
             for item in GeoData.expand(named, networks: false).split(separator: "\n") where !item.isEmpty {
                 out.append("via:\(index):\(item)")
+            }
+            for item in GeoData.expand(route.exceptions ?? [], networks: true).split(separator: "\n") {
+                out.append("via:\(index):except:\(item)")
             }
         }
         return out

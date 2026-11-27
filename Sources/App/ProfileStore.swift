@@ -278,6 +278,8 @@ struct AppSettings: Codable, Equatable {
     /// The user's list of sites that skip the VPN (§26.12), in their
     /// order. Nil until migrated from directGroups/directCustom.
     var directSites: [DirectSite]?
+    /// Exceptions to the user's split-direct list, absent in older settings.
+    var directExceptions: [String]?
     /// "本地局域网直连" (§26.13): the Mac's own networks always allowed,
     /// detected, not a fixed 192.168. Nil = on.
     var autoLAN: Bool?

@@ -2,7 +2,7 @@
 //! pf sent here, carried through the proxy their rules name.
 
 use super::protocol::{no_sigpipe, open_through, udp_associate, udp_unwrap, udp_wrap};
-use super::{Kind, Leg, Routing, Target};
+use super::{Kind, Leg, RouteVia, Routing, Target};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
@@ -217,8 +217,8 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
         reset(&client);
         return;
     };
-    let (target, server, n) = match routing.target(*destination.ip()) {
-        Ok(target) => target,
+    let resolved = match routing.target(*destination.ip()) {
+        Ok(resolved) => resolved,
         Err((site, reason)) => { routing.failed(&site, &reason); reset(&client); return; }
     };
     // A proxy on this Mac connecting for its own upstream: the ordinary
@@ -232,30 +232,61 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
         id
     };
     let forget = || { open.lock().unwrap().streams.remove(&id); };
-    let opened = if local_proxy {
-        match routing.passthrough(&target) {
+
+    // Exit protection gate (§71): verify the road's exit country BEFORE
+    // opening the upstream business connection or forwarding a single byte.
+    let local_ip = if !local_proxy {
+        match routing.check_egress(&resolved) {
+            Ok(local_ip) => local_ip,
+            Err(reason) => {
+                if let Some(reason) = reason {
+                    routing.failed(&resolved.target.label(), &reason);
+                }
+                reset(&client);
+                forget();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let (opened, proxy_index) = if local_proxy {
+        let res = match routing.passthrough(&resolved.target) {
             Some(ip) => TcpStream::connect_timeout(&SocketAddr::from((ip, destination.port())), Duration::from_secs(8))
                 .map(|stream| { no_sigpipe(&stream); (stream, Vec::new()) })
                 .map_err(|e| format!("本机代理自己的连接没能接通（{e}）")),
             None => Err("本机代理自己的连接没有可用的真实地址".to_owned()),
-        }
+        };
+        (res, None)
     } else {
-        open_through(&server, &target, destination.port())
+        match &resolved.via {
+            RouteVia::Proxy { server, index } => (open_through(server, &resolved.target, destination.port()), Some(*index)),
+            RouteVia::Local => {
+                let res = match local_ip {
+                    Some(ip) => TcpStream::connect_timeout(&SocketAddr::from((ip, destination.port())), Duration::from_secs(8))
+                        .map(|stream| { no_sigpipe(&stream); let _ = stream.set_nodelay(true); (stream, Vec::new()) })
+                        .map_err(|e| format!("经本地网络直连失败（{e}）")),
+                    None => Err("本地网络没有可用的真实地址".to_owned()),
+                };
+                (res, None)
+            }
+        }
     };
     let (upstream, early) = match opened {
         Ok(opened) => opened,
         Err(reason) => {
-            if !local_proxy { routing.record(n, Some(&reason)); }
-            routing.failed(&target.label(), &reason);
+            if let Some(n) = proxy_index { routing.record(n, Some(&reason)); }
+            routing.failed(&resolved.target.label(), &reason);
             reset(&client);
             forget();
             return;
         }
     };
     // Proxied bytes are counted for the panel; a local proxy's own
-    // connections are the ordinary split, not proxied.
+    // connections and RouteVia::Local connections are direct, not proxied.
     let mut leg = None;
-    if !local_proxy {
+    if let Some(n) = proxy_index {
         routing.record(n, None);
         if let Ok(peer) = upstream.peer_addr() {
             routing.connected_to(n, peer);
@@ -330,11 +361,21 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
             FlowState::Refused(_) => { table.remove(&key); }
         }
     }
-    let (target, server, n) = match routing.target(*destination.ip()) {
-        Ok(target) => target,
+    let resolved = match routing.target(*destination.ip()) {
+        Ok(resolved) => resolved,
         Err((site, reason)) => { routing.failed(&site, &reason); return; }
     };
     let raw = routing.from_local_proxy(Proto::Udp, app.port());
+    // Drop UDP/QUIC for protected sites (§66.5, §71): browsers fall back to TCP
+    // where exit protection checks before forwarding. Local protected paths
+    // never forward UDP either.
+    if !raw && (matches!(resolved.via, RouteVia::Local) || routing.is_egress_protected(&resolved.target, &resolved.resolved_ips)) {
+        return;
+    }
+    let (target, server, n) = match resolved.via {
+        RouteVia::Proxy { server, index } => (resolved.target, server, index),
+        RouteVia::Local => return,
+    };
     if server.kind != Kind::Socks5 && !raw {
         // HTTP CONNECT carries TCP only; the app falls back to TCP.
         return;

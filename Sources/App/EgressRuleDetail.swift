@@ -11,9 +11,10 @@ struct EgressRuleDetail: View {
     let refresh: () -> Void
     let edit: ((inout EgressProtection.Group) -> Void) -> Void
     let remove: () -> Void
-    let saveSites: (_ original: [String], _ replacement: [String], _ done: @escaping (String?) -> Void) -> Void
-    @State private var originalSites: [String]
+    let saveRules: (EgressRuleChange.Rules, EgressRuleChange.Rules, @escaping (String?) -> Void) -> Void
+    @State private var originalRules: EgressRuleChange.Rules
     @State private var input: String
+    @State private var exceptions: String
     @State private var issues: [EgressRuleInput.Issue] = []
     @State private var saveError: String?
     @State private var saving = false
@@ -25,7 +26,7 @@ struct EgressRuleDetail: View {
     init(rule: EgressProtection.Group, config: EgressProtection, status: EgressProtection.Status?, connected: Bool,
          refresh: @escaping () -> Void, edit: @escaping ((inout EgressProtection.Group) -> Void) -> Void,
          remove: @escaping () -> Void,
-         saveSites: @escaping ([String], [String], @escaping (String?) -> Void) -> Void) {
+         saveRules: @escaping (EgressRuleChange.Rules, EgressRuleChange.Rules, @escaping (String?) -> Void) -> Void) {
         self.rule = rule
         self.config = config
         self.status = status
@@ -33,9 +34,10 @@ struct EgressRuleDetail: View {
         self.refresh = refresh
         self.edit = edit
         self.remove = remove
-        self.saveSites = saveSites
-        _originalSites = State(initialValue: rule.sites)
+        self.saveRules = saveRules
+        _originalRules = State(initialValue: EgressRuleChange.Rules(rule))
         _input = State(initialValue: rule.sites.joined(separator: "\n"))
+        _exceptions = State(initialValue: (rule.exceptions ?? []).joined(separator: "\n"))
     }
 
     private var state: EgressProtection.GroupState? { status?.groups.first { $0.id == rule.id } }
@@ -81,6 +83,8 @@ struct EgressRuleDetail: View {
                 Section {
                     EgressRuleText(input: $input, height: 145)
                     EgressRuleIssues(issues: issues)
+                    EgressRuleExceptions(input: $exceptions, parsed: parsedExceptions,
+                                         explanation: "命中例外的网站跳过这条出口保护。") { EmptyView() }
                 } header: {
                     Text("要保护的网站或网段")
                 } footer: {
@@ -110,6 +114,26 @@ struct EgressRuleDetail: View {
                     }
                 } header: {
                     Text("允许的出口")
+                }
+                if let paths = state?.paths, connected, !paths.isEmpty {
+                    let routes = ProfileStore.loadAppSettings().activeProxyRoutes
+                    Section("各路线最近出口") {
+                        ForEach(paths) { row in
+                            HStack(spacing: 8) {
+                                EgressRouteTag(path: row.path, routes: routes, compact: false)
+                                Text(row.country.map { egressCountryLabel($0) } ?? (row.error ?? "尚未核实"))
+                                    .font(.callout)
+                                Spacer()
+                                if row.blockedCount > 0 {
+                                    Text("拦下 \(row.blockedCount) 次").font(.caption).foregroundStyle(.orange)
+                                }
+                                if row.lastCheck.isFinite && row.lastCheck > 0 {
+                                    Text(Date(timeIntervalSince1970: row.lastCheck), format: .dateTime.hour().minute())
+                                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
                 }
                 if let records = status?.records.filter({ $0.group == rule.id }), connected, !records.isEmpty {
                     Section("最近拦截") {
@@ -152,8 +176,11 @@ struct EgressRuleDetail: View {
         } message: { Text("以后不再核对出口。只想临时停一下，可以用右上角的开关暂停。") }
     }
 
+    private var parsedExceptions: EgressRuleInput { EgressRuleInput(exceptions, limit: EgressRuleInput.siteLimit) }
+
     private func finish() {
-        if input == originalSites.joined(separator: "\n") {
+        if input == originalRules.sites.joined(separator: "\n"),
+           exceptions == originalRules.exceptions.joined(separator: "\n") {
             dismiss()
             return
         }
@@ -169,13 +196,19 @@ struct EgressRuleDetail: View {
             }
             return
         }
-        if sites == originalSites {
+        let excluded = parsedExceptions
+        guard excluded.issues.isEmpty else {
+            saveError = "例外中有无效规则，请修正后保存。"
+            return
+        }
+        let replacement = EgressRuleChange.Rules(sites: sites, exceptions: excluded.sites)
+        if replacement == originalRules {
             dismiss()
             return
         }
         saving = true
         saveError = nil
-        saveSites(originalSites, sites) { error in
+        saveRules(originalRules, replacement) { error in
             saving = false
             if let error { saveError = error } else { dismiss() }
         }
@@ -222,11 +255,14 @@ struct EgressRuleDetail: View {
 
     private func recordRow(_ record: EgressProtection.BlockRecord) -> some View {
         let open = record.ended == nil
+        let routes = ProfileStore.loadAppSettings().activeProxyRoutes
+        let routePath = record.path ?? record.observed.first?.path
         return VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(spacing: 6) {
                 Image(systemName: open ? "hand.raised.fill" : "checkmark.circle")
                     .foregroundStyle(open ? Color.orange : Color.secondary)
                 Text(record.host ?? record.name)
+                EgressRouteTag(path: routePath, routes: routes)
                 Spacer()
                 Text(open ? "拦截中" : "已恢复").font(.caption).foregroundStyle(open ? Color.orange : Color.secondary)
                 Text(Date(timeIntervalSince1970: record.started), format: .dateTime.hour().minute())

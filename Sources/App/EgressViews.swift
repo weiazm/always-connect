@@ -54,6 +54,49 @@ struct EgressStatusPill: View {
     }
 }
 
+/// Human-readable name and route tone for an egress path wire value
+/// ("cisco", "proxy:<n>", "local"; DESIGN §71).
+enum EgressRouteDisplay {
+    static func info(for path: String?, routes: [ProxyRoute]) -> (name: String, color: Color)? {
+        guard let path, !path.isEmpty else { return nil }
+        if path == "cisco" { return ("Cisco", SettingsTone.vpn) }
+        if path == "local" { return ("本地网络", SettingsTone.neutral) }
+        if path.hasPrefix("proxy:"), let index = Int(path.dropFirst(6)) {
+            let name = routes.indices.contains(index) ? routes[index].name : "代理 #\(index + 1)"
+            return (name, SettingsTone.proxy)
+        }
+        return nil
+    }
+
+    static func phrase(for path: String?, routes: [ProxyRoute]) -> String {
+        guard let info = info(for: path, routes: routes) else { return "Cisco" }
+        return info.name
+    }
+}
+
+/// Compact capsule showing which road a rule or block record used (§71).
+struct EgressRouteTag: View {
+    let path: String?
+    var routes: [ProxyRoute] = []
+    var compact: Bool = true
+
+    var body: some View {
+        if let info = EgressRouteDisplay.info(for: path, routes: routes) {
+            HStack(spacing: 4) {
+                Circle().fill(info.color).frame(width: 6, height: 6)
+                Text(info.name)
+                    .font(compact ? .caption2.weight(.medium) : .caption.weight(.medium))
+                    .foregroundStyle(.primary.opacity(0.9))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, compact ? 6 : 7)
+            .padding(.vertical, compact ? 1.5 : 2)
+            .background(Capsule().fill(info.color.opacity(0.14)))
+            .fixedSize()
+        }
+    }
+}
+
 /// A letter tile for a website, tinted from its name so rows are told
 /// apart at a glance without fetching any icon.
 struct EgressSiteAvatar: View {
@@ -209,6 +252,7 @@ struct EgressDecisionList: View {
     let decisions: [EgressDecision]
     let refresh: () -> Void
     var open: ((UInt32) -> Void)? = nil
+    var proxyRoutes: [ProxyRoute]? = nil
     @State private var pending: Pending?
     @State private var busy = false
     @State private var message: String?
@@ -255,17 +299,27 @@ struct EgressDecisionList: View {
         // The site first, in words (user, 2026-11-25: "ip我怎么看懂是哪个域名");
         // the server and exit addresses only on hover.
         let site = approval.observation.displayedHost
-        let fix = decision.steering ? "正在换到同一网站出口正确的服务器，通常一分钟内恢复。" : ""
+        let path = approval.observation.path
+        let isCisco = path == nil || path == "cisco"
+        let routes = proxyRoutes ?? ProfileStore.loadAppSettings().activeProxyRoutes
+        let routePrefix = isCisco ? "这台服务器" : "经\(EgressRouteDisplay.phrase(for: path, routes: routes))"
+        let fix = (decision.steering && isCisco) ? "正在换到同一网站出口正确的服务器，通常一分钟内恢复。" : ""
+        let helpText: String = {
+            var parts: [String] = []
+            if let name = EgressRouteDisplay.info(for: path, routes: routes)?.name { parts.append("路线 \(name)") }
+            if let peer = approval.observation.peerAddress { parts.append("服务器 \(peer)") }
+            if let ip = approval.observation.ip { parts.append("出口地址 \(ip)") }
+            return parts.joined(separator: "，")
+        }()
         return EgressCallout(icon: "exclamationmark.shield.fill", tint: .orange,
-                             text: "\(site) 这台服务器走了 \(egressCountryLabel(approval.country)) 出口，已拦住",
+                             text: "\(site) \(routePrefix)走了 \(egressCountryLabel(approval.country)) 出口，已拦住",
                              caption: "它属于「\(decision.ruleName)」这条保护。" + fix) {
             if let open { Button("详情") { open(approval.group) } }
             Button(busy ? "正在检查…" : "重新检查") { recheck(approval.group) }
             Button("允许" + egressCountryName(approval.country)) { pending = .country(approval) }
         }
-        .help("服务器 \(approval.observation.peerAddress ?? "—")"
-              + (approval.observation.ip.map { "，出口地址 \($0)" } ?? ""))
-        .disabled(busy || !manager.showsConnected)
+        .help(helpText)
+        .disabled(busy || !manager.egressActiveNow)
     }
 
     private func recheck(_ id: UInt32) {

@@ -147,7 +147,7 @@ fn located(m: &mut Mapping, name: &str) -> Option<(usize, usize)> {
 }
 
 /// One stored line ("d:x @a") as a background-service entry when it
-/// carries `attribute` (or no attribute is asked for).
+/// satisfies the optional attribute filter (a leading ! excludes the attribute).
 fn entry<'a>(line: &'a [u8], attribute: Option<&str>) -> Option<(&'static str, &'a str)> {
     let line = std::str::from_utf8(line).ok()?;
     let mut parts = line.split(' ');
@@ -163,7 +163,8 @@ fn entry<'a>(line: &'a [u8], attribute: Option<&str>) -> Option<(&'static str, &
         _ => return None,
     };
     if let Some(attribute) = attribute {
-        if !parts.any(|p| p.strip_prefix('@') == Some(attribute)) {
+        let (attribute, negated) = attribute.strip_prefix('!').map_or((attribute, false), |a| (a, true));
+        if parts.any(|p| p.strip_prefix('@') == Some(attribute)) == negated {
             return None;
         }
     }
@@ -258,14 +259,16 @@ pub fn expand_egress(config: &str) -> Option<String> {
     for group in groups {
         let group = group.as_object_mut()?;
         group.remove("matches");
+        group.remove("exceptionMatches");
         if !enabled || !group.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
             continue;
         }
-        let sites: Vec<String> = group.get("sites").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default();
-        let matches = expand(sites.iter().map(String::as_str), true);
-        group.insert("matches".into(), serde_json::Value::from(matches));
+        for (stored, expanded) in [("sites", "matches"), ("exceptions", "exceptionMatches")] {
+            let entries = group.get(stored).and_then(|v| v.as_array());
+            if entries.is_none() && stored == "exceptions" { continue; }
+            let matches = expand(entries.into_iter().flatten().filter_map(|site| site.as_str()), true);
+            group.insert(expanded.into(), serde_json::Value::from(matches));
+        }
     }
     serde_json::to_string(&value).ok()
 }
@@ -372,6 +375,14 @@ pub extern "C" fn ac_geodata_expand(lines: *const libc::c_char, networks: bool) 
 }
 
 #[no_mangle]
+pub extern "C" fn ac_geodata_split_networks(networks: *const libc::c_char, exceptions: *const libc::c_char) -> *mut libc::c_char {
+    let Some(networks) = c_str(networks) else { return std::ptr::null_mut() };
+    let Some(exceptions) = c_str(exceptions) else { return std::ptr::null_mut() };
+    let exceptions = crate::dns_forwarder::SplitRules::new(&expand(exceptions.lines(), true));
+    out(crate::dns_forwarder::subtract_networks(networks.lines(), &exceptions).join("\n"))
+}
+
+#[no_mangle]
 pub extern "C" fn ac_geodata_expand_egress(config: *const libc::c_char) -> *mut libc::c_char {
     c_str(config).and_then(|c| expand_egress(&c)).map(out).unwrap_or(std::ptr::null_mut())
 }
@@ -426,6 +437,7 @@ mod tests {
         assert_eq!(rule_count("alpha", None), 4);
         assert_eq!(rule_count("alpha", Some("cn")), 2);
         assert_eq!(rule_count("alpha", Some("ads")), 1);
+        assert_eq!(rule_count("alpha", Some("!cn")), 2);
         assert_eq!(rule_count("empty", None), 0);
         let split = expand(["geosite:alpha@cn", "example.org", "10.0.0.0/8", "geosite:beta", "geoip:cn", "full:x.example"], false);
         assert_eq!(split, [
@@ -435,6 +447,8 @@ mod tests {
         ]);
         let egress = expand(["10.0.0.0/8", "domain:plain.example", "geosite:nosuch"], true);
         assert_eq!(egress, ["ipcidr:10.0.0.0/8", "plain.example"]);
+        assert_eq!(expand(["geosite:ALPHA@!CN"], true), ["domain:alpha.example", "keyword:alpha"]);
+        assert!(!valid_rule("geosite:alpha@!", false) && !valid_rule("geosite:alpha@!!cn", false));
         // A changed file is read again.
         std::fs::write(dir.join("geosite.txt"), "[alpha]\nd:changed.example\n").unwrap();
         assert_eq!(expand(["geosite:alpha"], false), ["domain:changed.example"]);
@@ -451,11 +465,20 @@ mod tests {
         std::fs::write(dir.join("geosite.txt"), LISTS).unwrap();
         configure(&dir.join("geosite.txt"), &dir.join("none.txt"));
         let config = r#"{"enabled":true,"groups":[
-            {"id":1,"name":"a","enabled":true,"sites":["geosite:beta","192.0.2.0/24","beta.example"],"expect":["ZZ"],"matches":["stale"]},
-            {"id":2,"name":"b","enabled":false,"sites":["geosite:alpha"],"expect":["ZZ"],"matches":["stale"]}]}"#;
+            {"id":1,"name":"a","enabled":true,"sites":["geosite:beta","192.0.2.0/24","beta.example"],
+             "exceptions":["geosite:alpha@!cn","192.0.2.8/32"],"expect":["ZZ"],"matches":["stale"],"exceptionMatches":["stale"]},
+            {"id":2,"name":"b","enabled":false,"sites":["geosite:alpha"],"expect":["ZZ"],"matches":["stale"],"exceptionMatches":["stale"]}]}"#;
         let out: serde_json::Value = serde_json::from_str(&expand_egress(config).unwrap()).unwrap();
         assert_eq!(out["groups"][0]["matches"], serde_json::json!(["domain:beta.example", "domain:alpha.example", "ipcidr:192.0.2.0/24", "beta.example"]));
         assert!(out["groups"][1].get("matches").is_none());
+        assert!(out["groups"][1].get("exceptionMatches").is_none());
+        assert_eq!(out["groups"][0]["exceptionMatches"], serde_json::json!(["domain:alpha.example", "keyword:alpha", "ipcidr:192.0.2.8/32"]));
+        let cfg: crate::egress_control::EgressConfig = serde_json::from_value(out.clone()).unwrap();
+        let matcher = cfg.protected_sites();
+        assert!(cfg.valid());
+        assert_eq!(matcher.group_for("alpha.example"), None);
+        assert_eq!(matcher.group_for_target("beta.example", "192.0.2.8".parse().unwrap()), None);
+        assert_eq!(matcher.group_for_target("beta.example", "192.0.2.9".parse().unwrap()), Some(1));
         assert_eq!(out["groups"][0]["expect"], serde_json::json!(["ZZ"]), "other fields are kept");
         let off = expand_egress(&config.replacen("\"enabled\":true", "\"enabled\":false", 1)).unwrap();
         assert!(!off.contains("matches"));
