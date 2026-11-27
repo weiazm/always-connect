@@ -24,6 +24,8 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
     }
 
     var id = UUID()
+    var healthRevision: UUID?
+    var healthKey: UUID { healthRevision ?? id }
     var name: String
     var kind: Kind
     var host: String
@@ -90,6 +92,7 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        healthRevision = try c.decodeIfPresent(UUID.self, forKey: .healthRevision)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         kind = (try? c.decodeIfPresent(Kind.self, forKey: .kind)) ?? .socks5
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? ""
@@ -255,6 +258,7 @@ extension AppSettings {
             let line = route.serverLine(password: ProxyPasswords.password(for: route),
                                         obfsPassword: ProxyPasswords.obfsPassword(for: route))
             out.append("proxy:\(index) " + line)
+            out.append("proxyhealth:\(index) " + route.healthKey.uuidString)
             let rules = route.sites.compactMap(ListRule.parse)
             for rule in rules {
                 if case .network(let cidr) = rule { out.append("vianet:\(index):\(cidr)") }

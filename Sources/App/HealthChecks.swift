@@ -9,8 +9,8 @@ private func probe_string_free(_ s: UnsafeMutablePointer<CChar>?)
 /// Rust core connects, completes the handshake and password, and asks the
 /// proxy to open a site from its rules) or from the background service's
 /// real connections through it, whichever is newer.
-struct ProxyCheck: Equatable {
-    enum Level: String { case ok, warn, fail }
+struct ProxyCheck: Equatable, Codable {
+    enum Level: String, Codable { case ok, warn, fail, pending }
     var level: Level
     var text: String
     var millis: Int?
@@ -24,6 +24,7 @@ struct ProxyCheck: Equatable {
     var short: String {
         switch level {
         case .ok: return millis.map { "正常 · \($0) ms" } ?? "正常"
+        case .pending: return text
         case .warn: return "部分网站打不开"
         case .fail: return "连不上"
         }
@@ -67,68 +68,100 @@ struct ProxyCheck: Equatable {
 
 /// One proxy's recent results from the background service (split status).
 struct ProxyTraffic: Decodable, Equatable {
-    var proxy: Int
-    var okAgo: Int?
-    var failedAgo: Int?
+    var key: String?
+    var okAt: Double?
+    var failedAt: Double?
     var reason: String?
 }
 
-/// The checks, kept for this run of the App only (in memory, a few
-/// entries). Checks run only while the panel or a page showing proxies is
-/// open: at once on opening, then at most every 2 s per proxy (user,
-/// 2026-11-26: "只有打开面板做就行啊", and fast), and when real traffic failed.
+@_silgen_name("ac_proxy_health_now")
+private func healthNow() -> Double
+@_silgen_name("ac_proxy_health_begin")
+private func healthBegin(_ key: UnsafePointer<CChar>, _ now: Double, _ gap: Double, _ force: Bool) -> UInt64
+@_silgen_name("ac_proxy_health_finish")
+private func healthFinish(_ key: UnsafePointer<CChar>, _ ticket: UInt64, _ now: Double) -> Int32
+@_silgen_name("ac_proxy_health_traffic")
+private func healthTraffic(_ key: UnsafePointer<CChar>, _ at: Double) -> Bool
+@_silgen_name("ac_proxy_health_reset")
+private func healthReset(_ now: Double)
+
+/// The menu-bar process owns saved proxy checks. Settings mirrors these display
+/// values over its inherited socket. Probe ordering and throttling live in Rust.
 final class ProxyHealth: ObservableObject {
     static let shared = ProxyHealth()
     @Published private(set) var checks: [UUID: ProxyCheck] = [:]
     @Published private(set) var checking: Set<UUID> = []
-    static let gap: TimeInterval = 2
-    /// Hysteria2 probes go through the background service; throttle to avoid
-    /// unnecessary work while the panel stays open.
-    static let hysteriaGap: TimeInterval = 30
+    @Published private(set) var keys: [UUID: UUID] = [:]
 
-    /// Fixed results (offscreen screenshots).
+    struct Snapshot: Codable {
+        var checks: [UUID: ProxyCheck]
+        var checking: Set<UUID>
+    }
+
+    var snapshot: Snapshot { Snapshot(checks: checks, checking: checking) }
+    func apply(_ s: Snapshot) {
+        if checks != s.checks { checks = s.checks }
+        if checking != s.checking { checking = s.checking }
+    }
     func preview(_ checks: [UUID: ProxyCheck]) { self.checks = checks }
 
+    func invalidate() {
+        healthReset(healthNow())
+        apply(Snapshot(checks: [:], checking: []))
+    }
+
+    func configure(_ routes: [ProxyRoute]) {
+        let next = routes.reduce(into: [UUID: UUID]()) { $0[$1.id] = $1.healthKey }
+        if next != keys {
+            keys = next
+            invalidate()
+        }
+    }
+
     func check(_ routes: [ProxyRoute], force: Bool = false) {
-        for route in routes where route.enabled && !checking.contains(route.id) {
-            let minGap = route.kind == .hysteria2 ? Self.hysteriaGap : Self.gap
-            if !force, let last = checks[route.id] {
-                if route.kind == .hysteria2, Date().timeIntervalSince(last.at) < minGap { continue }
-                if route.kind != .hysteria2, !last.fromTraffic, Date().timeIntervalSince(last.at) < minGap { continue }
+        if AppRole.isSettings {
+            if force {
+                for route in routes { SettingsLink.shared.send("checkProxy", route.id.uuidString) }
+            } else {
+                SettingsLink.shared.send("checkProxies")
             }
+            return
+        }
+        for route in routes where route.enabled && keys[route.id] == route.healthKey {
+            let key = route.healthKey.uuidString
+            let last = checks[route.id]?.level
+            let gap: Double = route.kind == .hysteria2 && last == .ok ? 30 : 2
+            let ticket = healthBegin(key, healthNow(), gap, force)
+            guard ticket != 0 else { continue }
             checking.insert(route.id)
             let pw = ProxyPasswords.password(for: route)
             let obfsPw = ProxyPasswords.obfsPassword(for: route)
             ProxyCheck.runAsync(route, password: pw, obfsPassword: obfsPw) { result in
+                let decision = healthFinish(key, ticket, healthNow())
+                guard decision >= 0 else { return }
                 self.checking.remove(route.id)
-                self.checks[route.id] = result
+                if decision & 1 != 0 { self.checks[route.id] = result }
+                if decision & 2 != 0 { self.check([route], force: true) }
             }
         }
     }
 
-    /// A check the editor already made for this proxy.
-    func record(_ result: ProxyCheck, for id: UUID) { checks[id] = result }
-
-    func forget(_ id: UUID) { checks[id] = nil }
-
-    /// Real connections: a success newer than the last check keeps it
-    /// green; a failure newer than the last check is shown at once and
-    /// checked again (was it the proxy, or only that site?).
     func merge(_ rows: [ProxyTraffic], routes: [ProxyRoute]) {
-        let now = Date()
-        for row in rows where routes.indices.contains(row.proxy) {
-            let route = routes[row.proxy]
-            let ok = row.okAgo.map { now.addingTimeInterval(-Double($0)) }
-            let failed = row.failedAgo.map { now.addingTimeInterval(-Double($0)) }
-            let current = checks[route.id]
-            // Seconds are rounded: "newer" means by more than two.
-            func newer(_ date: Date) -> Bool { current.map { date.timeIntervalSince($0.at) > 2 } ?? true }
-            if let failed, ok.map({ failed >= $0 }) ?? true, newer(failed) {
-                checks[route.id] = ProxyCheck(level: .warn, text: "最近一次经它失败：\(row.reason ?? "原因不明")",
-                                              at: failed, fromTraffic: true)
-                check([route])
-            } else if let ok, newer(ok), current?.level != .ok || current?.fromTraffic == true {
-                checks[route.id] = ProxyCheck(level: .ok, text: "最近经它的连接正常", millis: current?.millis, at: ok, fromTraffic: true)
+        guard !AppRole.isSettings else { return }
+        let byKey = routes.reduce(into: [String: ProxyRoute]()) {
+            $0[$1.healthKey.uuidString.replacingOccurrences(of: "-", with: "").lowercased()] = $1
+        }
+        for row in rows {
+            guard let key = row.key, let route = byKey[key], keys[route.id] == route.healthKey else { continue }
+            let failed = (row.failedAt ?? 0) >= (row.okAt ?? 0)
+            guard let observed = failed ? row.failedAt : row.okAt,
+                  healthTraffic(route.healthKey.uuidString, observed) else { continue }
+            let at = Date().addingTimeInterval(observed - healthNow())
+            if failed {
+                checks[route.id] = ProxyCheck(level: .warn, text: "最近一次经它失败：" + (row.reason ?? "原因不明"),
+                                              at: at, fromTraffic: true)
+            } else if checks[route.id]?.level != .ok {
+                checks[route.id] = ProxyCheck(level: .ok, text: "最近经它的连接正常", at: at, fromTraffic: true)
             }
         }
     }
@@ -138,6 +171,7 @@ final class ProxyHealth: ObservableObject {
         let results = routes.map { checks[$0.id] }
         if results.contains(where: { $0?.level == .fail }) { return ("连不上", .fail) }
         if results.contains(where: { $0?.level == .warn }) { return ("部分网站打不开", .warn) }
+        if let waiting = results.compactMap({ $0 }).first(where: { $0.level == .pending }) { return (waiting.short, .pending) }
         if results.allSatisfy({ $0?.level == .ok }) {
             let fastest = results.compactMap { $0?.millis }.min()
             return ("正常" + (fastest.map { " · \($0) ms" } ?? ""), .ok)

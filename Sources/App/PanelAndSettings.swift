@@ -267,6 +267,8 @@ struct PanelView: View {
                 link.showPreview(preview.link)
                 return
             }
+            settings = ProfileStore.loadAppSettings()
+            proxyHealth.configure(settings.activeProxyRoutes)
             manager.prepareGatewayWhileDirect()
             // Also refreshes the split status (正在直连, proxied totals).
             speed.start()
@@ -280,6 +282,9 @@ struct PanelView: View {
                     oursActive: active && !cisco, ciscoTunnel: active && cisco, splitOn: split))
                 DispatchQueue.main.async { neighbors = found }
             }
+        }
+        .onReceive(proxyHealth.$keys.dropFirst()) { _ in
+            if preview == nil { settings = ProfileStore.loadAppSettings() }
         }
         .onReceive(activityTimer) { _ in manager.expireGatewayPreparation() }
         .onReceive(healthTimer) { _ in if preview == nil { checkHealth() } }

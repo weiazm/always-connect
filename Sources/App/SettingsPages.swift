@@ -42,7 +42,7 @@ struct SettingsView: View {
         switch tag {
         case "credentials": CredentialsPage(preview: splitPreview != nil)
         case "connect": ConnectPage()
-        case "split": SplitPage(preview: splitPreview, section: $splitSection)
+        case "split": SplitPage(preview: splitPreview, visible: SettingsPages.resolve(tab) == "split", section: $splitSection)
         case "egress": EgressProtectionPage()
         case "traffic": ConnectionsPage(preview: connectionPreview)
         case "diagnostics": DiagnosticsPage()
@@ -878,6 +878,7 @@ struct SplitPagePreview {
 
 struct SplitPage: View {
     var preview: SplitPagePreview? = nil
+    var visible = true
     /// 分流直连, 分流代理 or 局域网 (§69.9).
     @Binding var section: String
     @ObservedObject private var manager = HelperClient.shared
@@ -940,7 +941,7 @@ struct SplitPage: View {
 
             switch section {
             case "proxy":
-                ProxySections(splitOn: own, previewRoutes: preview?.routes) { settings = $0 }
+                ProxySections(splitOn: own, previewRoutes: preview?.routes, visible: visible && window.contentVisible) { settings = $0 }
             case "lan":
                 Section {
                 Toggle(isOn: Binding(

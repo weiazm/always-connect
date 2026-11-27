@@ -23,16 +23,18 @@ struct ProxySections: View {
     @State private var editing: ProxyRoute?
     @State private var note: String?
     private let preview: Bool
+    private let visible: Bool
     private let splitOn: Bool
     private let onSave: (AppSettings) -> Void
     /// Read once (it hashes two binaries): an older service ignores proxies.
     @State private var serviceTooOld: Bool
 
-    init(splitOn: Bool, previewRoutes: [ProxyRoute]? = nil, onSave: @escaping (AppSettings) -> Void = { _ in }) {
+    init(splitOn: Bool, previewRoutes: [ProxyRoute]? = nil, visible: Bool = true, onSave: @escaping (AppSettings) -> Void = { _ in }) {
         let settings = previewRoutes == nil ? ProfileStore.loadAppSettings() : AppSettings()
         _routes = State(initialValue: previewRoutes ?? settings.proxyRoutes ?? [])
         preview = previewRoutes != nil
         _paused = State(initialValue: previewRoutes == nil && !settings.proxiesOn)
+        self.visible = visible
         self.splitOn = splitOn
         self.onSave = onSave
         _serviceTooOld = State(initialValue: previewRoutes == nil && HelperInstaller.installedHelperOutdated)
@@ -92,7 +94,18 @@ struct ProxySections: View {
                          + (routes.count > 1 ? "几个代理都命中同一个网站时，用排在前面的。" : ""))
             }
         }
-        .onAppear { if !preview { health.check(routes) } }
+        .task(id: visible) {
+            guard visible, !preview else { return }
+            SettingsLink.shared.send("watchProxyHealth", "1")
+            defer { SettingsLink.shared.send("watchProxyHealth", "0") }
+            while !Task.isCancelled {
+                let settings = ProfileStore.loadAppSettings()
+                if paused == settings.proxiesOn { paused = !settings.proxiesOn }
+                if !paused { health.check(routes) }
+                do { try await Task.sleep(for: .seconds(2), tolerance: .milliseconds(300)) }
+                catch { break }
+            }
+        }
         .sheet(item: $editing) { route in
             ProxyEditor(route: route, isNew: !routes.contains(where: { $0.id == route.id }),
                         cancel: { editing = nil }) { saved in
@@ -172,7 +185,6 @@ struct ProxySections: View {
                 Divider()
                 Button("删除", role: .destructive) {
                     routes.removeAll { $0.id == route.id }
-                    health.forget(route.id)
                     if !preview { ProxyPasswords.delete(for: route) }
                     save()
                 }
@@ -224,6 +236,7 @@ struct ProxyEditor: View {
     /// The check made on 完成, for the address and rules it was made with.
     @State private var result: (key: String, check: ProxyCheck)?
     @State private var checkingNow = false
+    @ObservedObject private var health = ProxyHealth.shared
 
     private let previewSavesFirst: Bool?
     private let previewProtectedSites: [String]?
@@ -246,6 +259,11 @@ struct ProxyEditor: View {
         let exceptions = (route.exceptions ?? []).joined(separator: "\n")
         _exceptions = State(initialValue: exceptions)
         _result = State(initialValue: previewCheck.map { (link + "\u{0}" + rules + "\u{0}" + exceptions, $0) })
+    }
+
+    private var matchesSaved: Bool {
+        !isNew && link == ProxyLink.display(original) && rules == original.sites.joined(separator: "\n")
+            && exceptions == (original.exceptions ?? []).joined(separator: "\n")
     }
 
     private var parsed: ProxyLink.Parsed { ProxyLink.parse(link) }
@@ -424,7 +442,9 @@ struct ProxyEditor: View {
 
     /// Under the rules: the check 完成 runs before saving (§69.8).
     @ViewBuilder private var checkView: some View {
-        if checkingNow {
+        if matchesSaved, result?.key != checkKey {
+            ProxyStatusLine(route: original, check: health.checks[original.id], checking: health.checking.contains(original.id))
+        } else if checkingNow {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
                 Text(parsed.link?.kind == .hysteria2
@@ -436,11 +456,13 @@ struct ProxyEditor: View {
             let check = result.check
             let tint: Color = check.level == .ok ? .green : (check.level == .warn ? .orange : .red)
             VStack(alignment: .leading, spacing: 3) {
-                Label(check.short, systemImage: check.level == .ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                Label("本次编辑检测 · " + check.short, systemImage: check.level == .ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                     .font(.callout.weight(.medium)).foregroundStyle(tint)
                 Text(check.text).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if check.level != .ok {
+                if check.level == .pending {
+                    Text("保存后会继续检测。").font(.caption).foregroundStyle(.secondary)
+                } else if check.level != .ok {
                     Text(check.level == .fail
                          ? "这样保存的话，规则里的网站会打不开（不会改走别的路）。改好地址再点「完成」会重新检测。"
                          : "代理本身能用。如果这个网站本来就打不开，可以照样保存。")
@@ -490,7 +512,8 @@ struct ProxyEditor: View {
     /// shows why and turns into 仍然保存.
     private func save() {
         guard let l = parsed.link, canSave, !checkingNow else { return }
-        if overriding || savesBeforeChecking { commit(l, check: overriding ? result?.check : nil); return }
+        if matchesSaved { commit(l); return }
+        if overriding || savesBeforeChecking { commit(l); return }
         let route = candidate(l)
         let password = l.password ?? (keepsPassword ? ProxyPasswords.password(for: original) : nil)
         let obfsPassword = l.obfsPassword ?? (keepsObfsPassword ? ProxyPasswords.obfsPassword(for: original) : nil)
@@ -499,11 +522,11 @@ struct ProxyEditor: View {
         ProxyCheck.runAsync(route, password: password, obfsPassword: obfsPassword) { check in
             checkingNow = false
             result = (key, check)
-            if check.level == .ok, key == checkKey { commit(l, check: check) }
+            if check.level == .ok, key == checkKey { commit(l) }
         }
     }
 
-    private func commit(_ l: ProxyLink, check: ProxyCheck?) {
+    private func commit(_ l: ProxyLink) {
         var saved = candidate(l)
         if l.kind == .hysteria2 {
             if let password = l.password {
@@ -526,7 +549,7 @@ struct ProxyEditor: View {
                 saved.passwordStamp = ProxyPasswords.save(password, for: saved) ? UUID().uuidString : nil
             }
         }
-        if let check { ProxyHealth.shared.record(check, for: saved.id) }
+        if !matchesSaved { saved.healthRevision = UUID() }
         done(saved)
     }
 }
@@ -556,6 +579,7 @@ struct ProxyStatusLine: View {
             if checking && check == nil { return ("检测中…", .secondary) }
             guard let check else { return ("未检测", .secondary) }
             switch check.level {
+            case .pending: return (check.short, .secondary)
             case .ok: return (check.short, .green)
             case .warn: return (check.short, .orange)
             case .fail: return (check.short, .red)

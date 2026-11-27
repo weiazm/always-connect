@@ -1146,7 +1146,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func pollProxyProbe(ticket: UInt64, deadline: Date, finish: @escaping (ProxyCheck) -> Void) {
         guard Date() < deadline else {
-            finish(ProxyCheck(level: .fail, text: "UDP 出不去", at: Date()))
+            finish(ProxyCheck(level: .fail, text: "代理检测超时", at: Date()))
             return
         }
         ensureConnection { proxy in
@@ -1184,10 +1184,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// `then` runs on main once the answer is in (or did not come in 3 s):
     /// the panel's speed card reads right after it, with fresh proxied
     /// totals (§69.18).
+    private var lastSplitRead = Date.distantPast
+
     func refreshSplitActivity(then done: (() -> Void)? = nil) {
         guard (!usesCisco && state == .connected) || proxyOnlyRunning else {
             splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
         }
+        // A visible panel already reads this status for its speed card.
+        // Settings has no completion to wait for and can reuse that read.
+        if done == nil && Date().timeIntervalSince(lastSplitRead) < 1.5 { return }
+        lastSplitRead = Date()
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
@@ -2186,6 +2192,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if (parsed == .disconnected) != (old == .disconnected), !AppRole.isSettings { syncProxyOnly() }
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
+        if !AppRole.isSettings && (parsed == .connected) != (old == .connected) { ProxyHealth.shared.invalidate() }
         if parsed == .connected && old != .connected && !AppRole.isSettings {
             // The network is usable now: a site-list check that found none
             // (launch while connecting) runs again (§66.30).
@@ -2639,6 +2646,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             return
         }
         let settings = ProfileStore.loadAppSettings()
+        ProxyHealth.shared.configure(settings.activeProxyRoutes)
         // Without Cisco on this Mac the own connection runs either way;
         // only the switch decides whether the list applies. Through Cisco's
         // client only the proxies go, for while Cisco is off (§69.20).
@@ -2674,6 +2682,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pathMonitor.pathUpdateHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                ProxyHealth.shared.invalidate()
                 self.cisco?.networkChanged()
                 self.onDemandPathReady = true
                 self.scheduleOnDemandEvaluation()

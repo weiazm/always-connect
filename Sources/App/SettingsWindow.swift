@@ -22,6 +22,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, ObservableObject {
     static let frameName = "AlwaysConnectSettings"
 
     private var window: NSWindow?
+    @Published private(set) var contentVisible = true
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === self.window else { return }
+        let visible = window.occlusionState.contains(.visible)
+        if visible != contentVisible { contentVisible = visible }
+    }
     @Published var egressRuleToOpen: UInt32?
     @Published var vpnConnectionsRequested = false
 

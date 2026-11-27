@@ -2284,7 +2284,7 @@ pub extern "C" fn ac_proxy_only_check_egress_target(
     let Some(routing) = routing else { return -1 };
     let Some(server) = routing.table().server(proxy_index).cloned() else { return -1 };
     let target = crate::split_proxy::ResolvedTarget {
-        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server },
+        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server, health_key: None },
         target: crate::split_proxy::Target::Name(host),
         resolved_ips: Vec::new(),
     };

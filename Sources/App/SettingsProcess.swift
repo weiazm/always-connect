@@ -25,6 +25,7 @@ final class SettingsLink {
 
     private var transport: SettingsTransport?
     private var process: Process?
+    private var healthSubscription: AnyCancellable?
     private var cancellables = Set<AnyCancellable>()
     private var pendingReplies: [String: (String?) -> Void] = [:]
 
@@ -61,6 +62,7 @@ final class SettingsLink {
         p.terminationHandler = { [weak self] ended in
             DispatchQueue.main.async {
                 guard let self, self.process === ended else { return }
+                self.healthSubscription = nil
                 self.transport?.close()
                 self.transport = nil
                 self.process = nil
@@ -102,6 +104,11 @@ final class SettingsLink {
         transport?.send(["type": "state", "json": HelperClient.shared.remoteSnapshot()])
     }
 
+    private func sendProxyHealth() {
+        guard let data = try? JSONEncoder().encode(ProxyHealth.shared.snapshot) else { return }
+        transport?.send(["type": "proxyHealth", "json": String(decoding: data, as: UTF8.self)])
+    }
+
     private func reply(_ id: String?, _ result: String?) {
         guard let id else { return }
         var info = ["type": "reply", "id": id]
@@ -112,6 +119,23 @@ final class SettingsLink {
     private func perform(_ name: String, argument: String, id: String?) {
         let client = HelperClient.shared
         switch name {
+        case "watchProxyHealth":
+            healthSubscription = nil
+            if argument == "1" {
+                let health = ProxyHealth.shared
+                healthSubscription = health.objectWillChange
+                    .debounce(for: .milliseconds(40), scheduler: DispatchQueue.main)
+                    .sink { [weak self] _ in self?.sendProxyHealth() }
+                sendProxyHealth()
+            }
+        case "checkProxies", "checkProxy":
+            let routes = ProfileStore.loadAppSettings().activeProxyRoutes
+            ProxyHealth.shared.configure(routes)
+            let selected = name == "checkProxies" ? routes : routes.filter { $0.id.uuidString == argument }
+            if client.proxyOnlyRunning || (client.ownConnection && client.showsConnected) {
+                if name == "checkProxies" { client.refreshSplitActivity() }
+                ProxyHealth.shared.check(selected, force: name == "checkProxy")
+            }
         case "setSplit": client.setSplit(on: argument == "1")
         case "deleteDrop": if let uuid = UUID(uuidString: argument) { client.deleteDrop(uuid) }
         case "clearDropHistory": client.clearDropHistory()
@@ -184,6 +208,10 @@ final class SettingsLink {
                 guard let json = info["json"] else { return }
                 HelperClient.shared.applyRemoteSnapshot(json)
                 fire()
+            case "proxyHealth":
+                if let json = info["json"], let snapshot = try? JSONDecoder().decode(ProxyHealth.Snapshot.self, from: Data(json.utf8)) {
+                    ProxyHealth.shared.apply(snapshot)
+                }
             case "reply":
                 guard let id = info["id"], let done = self?.pendingReplies.removeValue(forKey: id) else { return }
                 done(info["result"])

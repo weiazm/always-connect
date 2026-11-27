@@ -25,6 +25,10 @@ private struct FixtureSettings: View {
 struct ConnectionsUITest {
     @MainActor static func main() {
         _ = NSApplication.shared
+        if let marker = ProcessInfo.processInfo.environment["AC_PROXY_HEALTH_MARKER"] {
+            checkProxyProcesses(marker: URL(fileURLWithPath: marker))
+            return
+        }
         checkEgressEditing()
         checkTextTrim()
         if let output = ProcessInfo.processInfo.environment["AC_EGRESS_RENDER_DIR"] { renderEgress(to: output) }
@@ -396,6 +400,56 @@ struct ConnectionsUITest {
     private static func findTable(in view: NSView) -> NSTableView? {
         if let table = view as? NSTableView { return table }
         return view.subviews.lazy.compactMap(findTable).first
+    }
+
+    // Run the production SettingsLink on both ends of its inherited socket.
+    // The harness's suite is isolated and the test server is loopback only.
+    @MainActor private static func checkProxyProcesses(marker: URL) {
+        let health = ProxyHealth.shared
+        let link = SettingsLink.shared
+        let until = Date().addingTimeInterval(12)
+        let progress = marker.appendingPathExtension("stage")
+        func stage(_ text: String) { try? Data(text.utf8).write(to: progress, options: .atomic) }
+        if AppRole.isSettings {
+            stage("child started")
+            guard let route = ProfileStore.loadAppSettings().activeProxyRoutes.first else { exit(2) }
+            stage("read saved route")
+            var requested = false
+            link.startSettingsSide { stage("connected"); link.send("watchProxyHealth", "1") }
+            while Date() < until {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                if !requested, health.checks[route.id]?.millis == 17 {
+                    requested = true
+                    stage("received initial status")
+                    health.check([route], force: true)
+                } else if requested, health.checks[route.id]?.level == .fail {
+                    try! Data("mirrored".utf8).write(to: marker, options: .atomic)
+                    exit(0)
+                }
+            }
+            exit(3)
+        }
+        var settings = AppSettings()
+        let route = ProxyRoute(name: "Loopback", kind: .socks5, host: "127.0.0.1", port: 0, sites: ["example.test"])
+        settings.proxyRoutes = [route]
+        ProfileStore.saveAppSettings(settings)
+        UserDefaults(suiteName: AppGroups.suiteName)?.synchronize()
+        defer { UserDefaults.standard.removePersistentDomain(forName: AppGroups.suiteName) }
+        HelperClient.shared.applyRemoteSnapshot(#"{"state":4,"ownConnection":true}"#)
+        health.configure([route])
+        link.startAppSide()
+        link.show(tab: nil)
+        var seeded = false
+        while Date() < until && !FileManager.default.fileExists(atPath: marker.path) {
+            if !seeded, (try? String(contentsOf: progress)) == "connected" {
+                seeded = true
+                health.preview([route.id: ProxyCheck(level: .ok, text: "fixture", millis: 17, at: Date())])
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        let step = (try? String(contentsOf: progress)) ?? "launch"
+        check(FileManager.default.fileExists(atPath: marker.path) && health.checks[route.id]?.level == .fail,
+              "settings receives the menu result, requests a saved proxy check there and receives the failure (\(step))")
     }
 
     private static func check(_ condition: @autoclosure () -> Bool, _ message: String) {

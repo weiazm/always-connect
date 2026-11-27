@@ -261,7 +261,7 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
         (res, None)
     } else {
         match &resolved.via {
-            RouteVia::Proxy { server, index } => (open_through(server, &resolved.target, destination.port()), Some(*index)),
+            RouteVia::Proxy { server, index, health_key } => (open_through(server, &resolved.target, destination.port()), Some((*index, *health_key))),
             RouteVia::Local => {
                 let res = match local_ip {
                     Some(ip) => TcpStream::connect_timeout(&SocketAddr::from((ip, destination.port())), Duration::from_secs(8))
@@ -276,7 +276,7 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
     let (upstream, early) = match opened {
         Ok(opened) => opened,
         Err(reason) => {
-            if let Some(n) = proxy_index { routing.record(n, Some(&reason)); }
+            if let Some((n, key)) = proxy_index { routing.record_for(n, key, Some(&reason)); }
             routing.failed(&resolved.target.label(), &reason);
             reset(&client);
             forget();
@@ -286,8 +286,7 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
     // Proxied bytes are counted for the panel; a local proxy's own
     // connections and RouteVia::Local connections are direct, not proxied.
     let mut leg = None;
-    if let Some(n) = proxy_index {
-        routing.record(n, None);
+    if let Some((n, _)) = proxy_index {
         if let Ok(peer) = upstream.peer_addr() {
             routing.connected_to(n, peer);
             leg = Some(routing.leg_for(n, peer.ip()));
@@ -299,7 +298,11 @@ fn serve(client: TcpStream, routing: &Arc<Routing>, original: &OriginalDestinati
     let mut to_app = &client;
     if !early.is_empty() && to_app.write_all(&early).is_err() { reset(&client); forget(); return; }
     if let Some(leg) = leg { routing.count(leg, true, early.len()); }
-    splice(&client, &upstream, routing, leg);
+    let mut awaiting_reply = proxy_index;
+    if !early.is_empty() {
+        if let Some((n, key)) = awaiting_reply.take() { routing.record_for(n, key, None); }
+    }
+    splice(&client, &upstream, routing, leg, awaiting_reply);
     forget();
 }
 
@@ -320,14 +323,18 @@ fn pump(from: &TcpStream, to: &TcpStream, mut counted: impl FnMut(usize)) {
 
 /// Both directions until both ends are done; one end finishing closes
 /// the other's sending side.
-fn splice(client: &TcpStream, upstream: &TcpStream, routing: &Arc<Routing>, leg: Option<Leg>) {
+fn splice(client: &TcpStream, upstream: &TcpStream, routing: &Arc<Routing>, leg: Option<Leg>,
+          mut awaiting_reply: Option<(usize, Option<u128>)>) {
     let (Ok(client_read), Ok(upstream_write)) = (client.try_clone(), upstream.try_clone()) else { return };
     let up_routing = routing.clone();
     let up = std::thread::Builder::new().name("ac-proxy-up".into()).stack_size(STACK).spawn(move || {
         pump(&client_read, &upstream_write, |n| if let Some(leg) = leg { up_routing.count(leg, false, n) });
         let _ = upstream_write.shutdown(Shutdown::Write);
     });
-    pump(upstream, client, |n| if let Some(leg) = leg { routing.count(leg, true, n) });
+    pump(upstream, client, |n| {
+        if let Some((index, key)) = awaiting_reply.take() { routing.record_for(index, key, None); }
+        if let Some(leg) = leg { routing.count(leg, true, n); }
+    });
     let _ = client.shutdown(Shutdown::Write);
     match up {
         Ok(thread) => { let _ = thread.join(); }
@@ -372,8 +379,8 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
     if !raw && (matches!(resolved.via, RouteVia::Local) || routing.is_egress_protected(&resolved.target, &resolved.resolved_ips)) {
         return;
     }
-    let (target, server, n) = match resolved.via {
-        RouteVia::Proxy { server, index } => (resolved.target, server, index),
+    let (target, server, n, health_key) = match resolved.via {
+        RouteVia::Proxy { server, index, health_key } => (resolved.target, server, index, health_key),
         RouteVia::Local => return,
     };
     if server.kind != Kind::Socks5 && !raw {
@@ -403,14 +410,13 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         let (control, relay) = match opened {
             Ok(opened) => opened,
             Err(reason) => {
-                if !raw { routing.record(n, Some(&reason)); }
+                if !raw { routing.record_for(n, health_key, Some(&reason)); }
                 routing.failed(&target.label(), &reason);
                 if let Some(flow) = flows.lock().unwrap().get_mut(&key) { flow.state = FlowState::Refused(Instant::now() + UDP_RETRY); }
                 return;
             }
         };
         if !raw {
-            routing.record(n, None);
             if let Some(peer) = control.as_ref().and_then(|c| c.peer_addr().ok()) { routing.connected_to(n, peer); }
         }
         let relay = Arc::new(relay);
@@ -428,12 +434,17 @@ fn datagram(payload: &[u8], from: SocketAddr, udp: &Arc<UdpSocket>, routing: &Ar
         if let Some(leg) = leg { routing.count(leg, false, first.len()); }
         if raw { let _ = relay.send(&first); }
         else if let Some(packet) = udp_wrap(&target, destination.port(), &first) { let _ = relay.send(&packet); }
+        let mut awaiting_reply = !raw;
         let mut buffer = vec![0u8; 65535];
         loop {
             match relay.recv(&mut buffer) {
                 Ok(n) => {
                     let data = if raw { Some(&buffer[..n]) } else { udp_unwrap(&buffer[..n]) };
                     if let Some(data) = data {
+                        if awaiting_reply {
+                            routing.record_for(n, health_key, None);
+                            awaiting_reply = false;
+                        }
                         if let Some(leg) = leg { routing.count(leg, true, data.len()); }
                         // pf turns our source back into the address the app used.
                         let _ = udp.send_to(data, app);

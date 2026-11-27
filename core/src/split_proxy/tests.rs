@@ -1120,3 +1120,20 @@ fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
     let mut ok_stream = rig.open_address(SocketAddrV4::new(fake_local, local_port));
     round_trip(&mut ok_stream, "");
 }
+
+#[test]
+fn health_follows_the_saved_configuration_and_first_reply() {
+    let first = "proxyhealth:0 00000000-0000-0000-0000-000000000001";
+    let next = "proxyhealth:0 00000000-0000-0000-0000-000000000002";
+    let lines = |id: &str| Table::parse(&[id, "proxy:0 socks5 127.0.0.1 1080", "via:0:full:one.example"]);
+    let routing = Routing::new(lines(first));
+    routing.record_for(0, Some(1), None);
+    let old = routing.health_json();
+    assert!(old[0]["okAt"].as_f64().unwrap() > 0.);
+    assert_eq!(old[0]["key"], format!("{:032x}", 1));
+    routing.set_table(lines(next));
+    routing.record_for(0, Some(1), Some("late"));
+    assert_eq!(routing.health_json(), serde_json::json!([]));
+    routing.record_for(0, Some(2), None);
+    assert_eq!(routing.health_json()[0]["key"], format!("{:032x}", 2));
+}
