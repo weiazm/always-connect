@@ -1349,6 +1349,25 @@ impl HysteriaManager {
         &self, specs: BTreeMap<usize, HysteriaSpec>, routing: Arc<Routing>,
         resolver: Option<HostResolver>, path: Option<(&str, &str)>,
     ) {
+        // Ordinary SOCKS5/HTTP needs only the resolver for editor probes.
+        // Keep the process supervisor and its code off this common path.
+        if specs.is_empty() {
+            let mut st = self.inner.lock().unwrap();
+            if st.specs.is_empty() {
+                st.handover_token = st.handover_token.wrapping_add(1);
+                st.routing = None;
+                st.resolver = resolver;
+                return;
+            }
+        }
+        self.reconcile(specs, routing, resolver, path);
+    }
+
+    #[inline(never)]
+    fn reconcile(
+        &self, specs: BTreeMap<usize, HysteriaSpec>, routing: Arc<Routing>,
+        resolver: Option<HostResolver>, path: Option<(&str, &str)>,
+    ) {
         let mut to_stop = Vec::new();
         let mut to_start = Vec::new();
         let mut recheck = Vec::new();
@@ -1357,7 +1376,6 @@ impl HysteriaManager {
             st.handover_token = st.handover_token.wrapping_add(1);
             st.routing = Some(routing.clone());
             st.resolver = resolver.clone();
-            if specs.is_empty() && st.specs.is_empty() { return; }
             let changed = path.is_some_and(|(interface, gateway)| st.last_path.as_ref()
                 .is_some_and(|(old_if, old_gw)| old_if != interface || old_gw != gateway));
             st.path_ready = path.is_some();

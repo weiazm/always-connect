@@ -432,10 +432,8 @@ impl Leg {
 }
 
 #[derive(Default, Clone)]
-struct Health { key: Option<u128>, ok: Option<HealthTime>, failed: Option<(HealthTime, String)> }
+struct Health { key: Option<u128>, ok: Option<f64>, failed: Option<(f64, String)> }
 
-#[derive(Clone, Copy)]
-struct HealthTime { when: Instant, tick: f64 }
 
 pub(crate) type Refusal = (String, String);
 
@@ -815,11 +813,11 @@ impl Routing {
     }
 
     fn record_for(&self, n: usize, tag: Option<(u128, u64)>, failure: Option<&str>) {
-        let table = self.table.read().unwrap();
         let mut health = self.health.lock().unwrap();
+        let table = self.table.read().unwrap();
         if self.health_tag(&table, n) != tag { return; }
         let key = tag.map(|(key, _)| key);
-        let now = HealthTime { when: Instant::now(), tick: crate::proxy_health::ac_proxy_health_now() };
+        let now = crate::proxy_health::ac_proxy_health_now();
         let entry = health.entry(n).or_default();
         if entry.key != key { *entry = Health { key, ..Health::default() }; }
         match failure {
@@ -831,21 +829,27 @@ impl Routing {
     /// Each proxy's recent results, for the panel: seconds since the last
     /// success and the last failure (within the last ten minutes).
     pub fn health_json(&self) -> serde_json::Value {
-        let table = self.table.read().unwrap();
         let mut health = self.health.lock().unwrap();
+        if health.is_empty() { return serde_json::Value::Array(Vec::new()); }
+        self.health_rows(&mut health)
+    }
+
+    fn health_rows(&self, health: &mut HashMap<usize, Health>) -> serde_json::Value {
+        let table = self.table.read().unwrap();
+        let now = crate::proxy_health::ac_proxy_health_now();
         health.retain(|n, h| {
             if h.key != table.health_keys.get(n).copied() { return false; }
-            if h.ok.is_some_and(|at| at.when.elapsed() >= HEALTH_FOR) { h.ok = None; }
-            if h.failed.as_ref().is_some_and(|(at, _)| at.when.elapsed() >= HEALTH_FOR) { h.failed = None; }
+            if h.ok.is_some_and(|at| now - at >= HEALTH_FOR.as_secs_f64()) { h.ok = None; }
+            if h.failed.as_ref().is_some_and(|(at, _)| now - at >= HEALTH_FOR.as_secs_f64()) { h.failed = None; }
             h.ok.is_some() || h.failed.is_some()
         });
         let mut rows: Vec<_> = health.iter().map(|(n, h)| serde_json::json!({
             "proxy": n,
             "key": h.key.map(|key| format!("{key:032x}")),
-            "okAt": h.ok.map(|at| at.tick),
-            "failedAt": h.failed.as_ref().map(|(at, _)| at.tick),
-            "okAgo": h.ok.map(|at| at.when.elapsed().as_secs()),
-            "failedAgo": h.failed.as_ref().map(|(at, _)| at.when.elapsed().as_secs()),
+            "okAt": h.ok,
+            "failedAt": h.failed.as_ref().map(|(at, _)| at),
+            "okAgo": h.ok.map(|at| (now - at) as u64),
+            "failedAgo": h.failed.as_ref().map(|(at, _)| (now - at) as u64),
             "reason": h.failed.as_ref().map(|(_, why)| why.clone()),
         })).collect();
         rows.sort_by_key(|row| row["proxy"].as_u64());
