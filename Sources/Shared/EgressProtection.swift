@@ -70,8 +70,10 @@ struct EgressProtection: Codable, Equatable {
         var peerAddress: String? = nil
         /// Set on a wrong-country observation the user may approve.
         var approvalId: String? = nil
+        /// Which road produced this observation ("cisco", "proxy:<n>", "local"; §71).
+        var path: String? = nil
         var displayedHost: String { host.isEmpty ? (peerAddress ?? "无网站名") : host }
-        var id: String { host + " " + (peerAddress ?? "") }
+        var id: String { host + " " + (peerAddress ?? "") + " " + (path ?? "") }
     }
 
     struct Status: Decodable {
@@ -79,6 +81,18 @@ struct EgressProtection: Codable, Equatable {
         let checking: [UInt32]
         let groups: [GroupState]
         let records: [BlockRecord]
+    }
+
+    /// Per-road status & latest exit for one rule (DESIGN §71).
+    struct PathState: Decodable, Equatable, Identifiable {
+        let path: String
+        let state: String
+        let lastCheck: Double
+        let country: String?
+        var ip: String? = nil
+        var error: String? = nil
+        let blockedCount: UInt64
+        var id: String { path }
     }
 
     /// A rule's state: "ok", "blocked" (some servers exit from a wrong
@@ -98,6 +112,10 @@ struct EgressProtection: Codable, Equatable {
         var lastBlockedHost: String? = nil
         var lastBlockedCountry: String? = nil
         var sites: [SiteState]? = nil
+        /// Latest road checked for this rule ("cisco", "proxy:<n>", "local"; §71).
+        var path: String? = nil
+        /// Per-road latest exit & status (§71).
+        var paths: [PathState]? = nil
         var blocked: Bool { state == "blocked" }
     }
 
@@ -107,6 +125,7 @@ struct EgressProtection: Codable, Equatable {
         let lastCheck: Double
         let country: String?
         let blockedCount: UInt64
+        var path: String? = nil
         var id: String { host }
     }
 
@@ -118,6 +137,7 @@ struct EgressProtection: Codable, Equatable {
         let host: String?
         let observed: [Observation]
         let expected: [String]
+        var path: String? = nil
     }
 }
 
