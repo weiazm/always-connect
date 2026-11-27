@@ -258,6 +258,29 @@ struct ListRulesTest {
               ProxyLink.hysteriaNeedsDirectHint(host: "203.0.113.10", settings: hintSettings)
               && !ProxyLink.hysteriaNeedsDirectHint(host: "sub.direct.example.com", settings: hintSettings)
               && !ProxyLink.hysteriaNeedsDirectHint(host: "192.168.1.5", settings: hintSettings))
+        // Hysteria2 servers go around Cisco by themselves (§70.6).
+        var aroundSettings = AppSettings()
+        aroundSettings.autoLAN = false
+        aroundSettings.proxyRoutes = [
+            hyRoute,
+            ProxyRoute(name: "named", kind: .hysteria2, host: "Hy.Example.net", port: 443, sites: ["example.org"]),
+            ProxyRoute(name: "off", kind: .hysteria2, host: "198.51.100.9", port: 443, sites: ["example.org"], enabled: false),
+            ProxyRoute(name: "socks", kind: .socks5, host: "198.51.100.8", port: 1080, sites: ["example.org"]),
+        ]
+        check("Hysteria2 servers become direct entries (names as full:, addresses as /32), enabled ones only",
+              aroundSettings.hysteriaServerDirectRules == ["full:hy.example.net"]
+              && aroundSettings.hysteriaServerDirectNetworks == ["203.0.113.10/32"]
+              && aroundSettings.effectiveAllowNetworks.contains("203.0.113.10/32")
+              && !aroundSettings.effectiveAllowNetworks.contains("198.51.100.9/32")
+              && !aroundSettings.effectiveAllowNetworks.contains("198.51.100.8/32"))
+        check("the split-off rule text carries the Hysteria2 servers before the proxies",
+              aroundSettings.proxyRuleText.hasPrefix("full:hy.example.net\nproxy:0 hysteria2 ")
+              && aroundSettings.directRuleText.contains("full:hy.example.net"))
+        check("a saved Hysteria2 server counts as going around Cisco when edited",
+              !ProxyLink.hysteriaNeedsDirectHint(host: "203.0.113.10", settings: aroundSettings))
+        aroundSettings.proxiesPaused = true
+        check("paused proxies send no Hysteria2 server around Cisco",
+              aroundSettings.hysteriaServerDirectRules.isEmpty && aroundSettings.hysteriaServerDirectNetworks.isEmpty)
         ProxyPasswords.delete(for: hyRoute)
         check("deleting hysteria2 route removes both vault entries",
               memVault["proxy@proxy-\(hyRoute.id.uuidString)"] == nil

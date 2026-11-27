@@ -147,7 +147,7 @@ extension AppSettings {
     /// lines ride along after it (§69): an older service ignores them.
     var directRuleText: String {
         let direct = GeoData.expand(listRules.map(\.text), networks: false)
-        let proxies = proxyLines.joined(separator: "\n")
+        let proxies = proxyRuleText
         return direct.isEmpty ? proxies : (proxies.isEmpty ? direct : direct + "\n" + proxies)
     }
 }

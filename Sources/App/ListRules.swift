@@ -287,6 +287,7 @@ extension AppSettings {
             if case .network(let cidr) = rule { return cidr } else { return nil }
         }
         if isAutoLANOn { out += LocalNetwork.current().filter { !out.contains($0) } }
+        out += hysteriaServerDirectNetworks.filter { !out.contains($0) }
         return out
     }
 }
