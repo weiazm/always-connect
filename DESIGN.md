@@ -4937,4 +4937,47 @@ DNS 得到 198.19.128.x，HTTPS 200，代理日志记录的是域名；未列入
 - 原因：不开 fast open 时客户端要等服务器回复才告诉应用"连上了"，应用在此之前不发数据；而这台服务器在连目标之前先等第一份数据（看起来是开了嗅探），只好等到超时，两边互等约 1 秒。fast open 把请求和应用的第一份数据一起发，没有这一等。
 - 改动：受管客户端（含保存前检测的临时客户端）一律 `fastOpen: true`。代价：目标连不上时应用看到的是连接被关，而不是代理报的原因；规则上仍然打不开、不改走别的路。
 - 检测口径：原来 SOCKS5 / HTTP 的检测量到代理回复 CONNECT 为止，Hysteria2 的检测从启动临时客户端算起（含进程启动与 QUIC 握手），两者不可比；开了 fast open 后 Hysteria2 的 CONNECT 又会立即返回、量不出网站能否打开。现在所有类型在 CONNECT 之后都向网站发一个 TLS 客户端问候（带 SNI，`probe::client_hello`），等到网站的第一个字节（握手、重试或告警都算回应）为止，8 秒没回应或被关即「代理可用，但它打不开 X：网站没有回应」；Hysteria2 的延迟只算经客户端打开网站这一段，不含临时客户端自己的启动（那是一次性的）。网站只收到这一个问候。
+
+## 七十一、出口保护覆盖分流代理与只开代理（0.5.0，2026-11-27）
+
+起因：0.4.x 起支持「分流代理」（SOCKS5 / HTTP / Hysteria2）与「只开代理」（Cisco 关闭），但出口保护仍只接在自建 Cisco 的隧道闸门（`alwaysconnect-gate`）上，且此前 DNS 转发器强制让出口保护排在分流代理之前。用户需求与三项产品决策（2026-11-27 确认）：
+- **D1 代理优先**：受保护网站同时命中分流代理规则时，走该代理并核实该代理的出口；未命中代理时再走 Cisco（或只开代理下的本地网络）。不再因出口保护把命中的代理网站强行拉回 Cisco；分流直连仍排除受保护网站。
+- **D2 只开代理下未命中代理的受保护网站（`LocalPolicy::Probe`）**：经本机转发层核实本地网络出口国家，符合才放行、不符即拦截（故障关闭）。
+- **D3 开关复用**：不新增单独开关，沿用现有出口保护开关（依赖断线保护开启）；界面注明「Cisco 关闭时也保护」。
+- **界面版式与输入体验**：出口保护页采用方案 C（规则表带彩色路线标签与最近核实国家/时间，拦截提示与记录均带路线名）；面板采用方案 A（出口保护置顶且 Cisco 关闭时保持高亮可用，分流直连与断线保护变灰）；编辑代理窗命中受保护网站时给出青色盾牌提示；统一美化输入框（圆角 8 浅色底框与聚焦边框）并在粘贴、失焦、提交时自动清理首尾空白与粘贴缩进/换行（不打断正常输入）。
+
+### 71.1 路由优先级与本地受保护目标
+- `core/src/dns_forwarder.rs`：取消代理域名与代理地址匹配中的 `!rules.protects_name` / `!protects_ip` 排除，使命中代理的受保护网站走代理合成池（`198.19.128.0/17`）；分流直连名单仍排除受保护网站。
+- 只开代理模式（无隧道）下，未命中代理但命中出口保护的域名/IPv4 目标先由转发器经本地 DNS 解析出真实 IPv4，再分配 `198.19.128.0/17` 合成地址并登记为 `RouteVia::Local`（`Routing::answer_local_protected`），由 `pf` 锚点 `301.AlwaysConnectProxy` 重定向到本机转发层统一执行出口核实；即使没有配置任何代理，只要开启出口保护，`split_proxy::redirect::sync_with_egress` 也会维持回环路由与接收端。
+
+### 71.2 按路线隔离的进程内门禁与缓存（Rust）
+- `EgressPath`（`core/src/egress_control.rs`）：区分 `Cisco`（`"cisco"`）、`Proxy(usize)`（`"proxy:<n>"`）与 `Local`（`"local"`）。所有缓存键、观测记录（`Observation.path`）、规则状态（`GroupStatus.path` / `paths`）与拦截记录（`BlockRecord.path`）均按路线隔离，互不污染。
+- 缓存与后台刷新（`core/src/egress_control/refresh.rs`）：
+  - `Cisco` 路径保持 §66.31 原样（1 秒复用窗口、后台 600 ms 刷新、支持 DNS 换入口 `steer`）；
+  - `Proxy` / `Local` 路径的放行结果按 `half_life` 复用（默认 2 分钟），拦截结果短缓存 10 秒（`PROXY_BLOCK_REUSE`），后台热点刷新周期 `(half_life / 2).max(30s)`，且不做 DNS 换入口（`steer` 仅限 `path.is_cisco()`）。
+  - 代理配置变更、Hysteria2 节点就绪/失效、只开代理换网时，自动调用 `invalidate_path` / `invalidate_all` 作废旧判定。
+- `RelayGate`（`core/src/egress_control.rs`）与 `split_proxy/relay.rs`：
+  - 转发层 `serve()` 在向代理发起连接（`open_through`）或向本地目标直连之前同步调用 `routing.check_connection()`，使用 `Condvar` singleflight 去重并发探测；未通过时立刻断开，**零字节业务流量外发**（含 Hysteria2 `fastOpen: true` 路径）。
+  - 转发层 `datagram()` 对所有受保护目标及 `RouteVia::Local` 无条件丢弃 UDP（禁 QUIC），浏览器自动回落 TCP 受门禁保护。
+  - 只开代理模式使用 `Controller::in_process`（纯内存控制器，不创建 UNIX 闸门套接字，不启动 `alwaysconnect-gate` 子进程）。
+
+### 71.3 经代理与本地核实出口的一次性回环桥（`OneShotBridge`）
+- `core/src/egress_control/bridge.rs`：后台服务做 TLS 核实（`Sources/Helper/EgressProbe.swift`）时，`OneShotBridge` 在 `127.0.0.1:0`（CLOEXEC）开一个一次性监听，只接受一条连接并随即关闭监听，通过 macOS `libproc`（`PROC_PIDFDSOCKETINFO`，`split_proxy::owner::owns`）校验来连端口属于本后台服务 PID 后，再把字节转发到经 `Routing::open_for_probe` 打开的目标代理通道（SOCKS5 / HTTP CONNECT / 受管 Hysteria2）或本地真实 IPv4（443 端口），全程透传真实域名 SNI、系统根证书校验与 HTTP `Host`。未使用时经停止管道立刻退出，无常驻监听或句柄泄漏。
+- `Sources/Helper/EgressProbe.swift`：生产构建仅在 `interface == "lo0"` 且 `connectIp == "127.0.0.1"` 时放行回环（`NWPathMonitor(requiredInterfaceType: .loopback)`），其余对 `lo0` 的请求仍拒绝。
+
+### 71.4 后台服务与 App 接线、版本兼容
+- `core/src/proxy_only.rs` / `core/src/ffi.rs` / `Sources/Helper/ProxyOnlySession.swift` / `Sources/Helper/HelperDaemon.swift`：只开代理支持接收与热更新出口保护配置，并把 `getEgressStatus`、`recheckEgressFailures`、`allowEgressCountry` 路由到活动会话（自建引擎优先，否则只开代理）。复用现有 XPC 协议，不新增 XPC 方法。`allow_country` 对 `proxy:*` 路径接受无 `peerAddress` 的观测（代理远端解析目标地址），历史无地址且非代理路径的观测仍拒收。
+- `HelperDaemon.reconcileProxyOnly` 在 `proxyOnlyWanted || egressActive` 且无自建连接/Cisco 断线保护时自动拉起只开代理会话；断线保护关闭时同步停用出口保护（保持现有 `egress-drop-dependency` 契约）。
+- 界面更新见 `UI-DESIGN.md`（方案 C、面板 A、顺序条、代理编辑窗盾牌提示、统一输入框与自动 trim）。目标版本 `0.5.0`（构建号 `24`）。
+
+### 71.5 开销与验证级别
+- **隔离开销对照**（Rust release 隔离基准，本机 `footprint` 与 `top -l 4 -s 2 -stats pid,cpu,idlew`，不触碰本机网络与正在运行的 App）：
+  - 出口保护关闭（仅 `split_proxy::Routing` + 本地测试 SOCKS5）：`phys_footprint` 1040 KB（峰值 1056 KB），CPU 0.0%，`idlew` 0 次/秒。
+  - 出口保护开启（进程内 `Controller::in_process` + `RelayGate`，经 `OneShotBridge` 完成首次 `Allow` 核实并执行 1000 次缓存命中判定后空闲）：`phys_footprint` 1136 KB（峰值 1168 KB，增量 +96 KB），CPU 0.0%，`idlew` 0 次/秒；首次本机回环探测 1.16 ms，1000 次缓存判定共 0.73 ms（约 0.73 µs/次）。
+  - App 侧无新增常驻定时器或缓存；只开代理模式不启动 `alwaysconnect-gate` 子进程。完整真机 App / 后台服务三组对照需实测（`docs/mac-proof-checklist.md` L31）。
+- **验证级别**：
+  - Rust 单测与集成测试（`cargo test`，435 + 5 全通过）：`OneShotBridge` 一次性转发与早停、代理/本地缓存隔离与 `half_life` 复用、`Controller::in_process` 核实/拦截/重查/按路径批准、并发 singleflight 去重、`LocalPolicy::Block`、转发层 `RelayGate` 放行/拦截/禁 QUIC/拦截 Hysteria2 类 fast-open 代理与本地路径、DNS 代理优先与本地受保护合成地址。
+  - Swift 脚本级与全套本机检查（`scripts/build-local.sh --tests`，`FAILS=0`）：`egress-notification`（含 `proxy:0` 无 `peerAddress` 批准与历史记录拒收）、`egress-peer-probe`、`connections-ui`（含 `TextTrim` 全部边界用例与方案 C / 面板 A / 代理编辑窗 / 添加与详情页的实际 SwiftUI 离屏渲染目视核对）、`session`、`on-demand`、`dns-forwarder`、`relay`、`uninstall` 等全部检查。
+  - CI macOS harness（root，`core/examples/proxy-only-check.rs` 新增 `run_egress_proxy_check`）：真实 `scutil` + `pf` 锚点 301 + 进程内出口门禁端到端核实（正确国家放行、错误国家连接立即重置且测试业务站点收到 0 连接）。
+  - 真机待测（`docs/mac-proof-checklist.md` L27–L31）：真实代理/Hysteria2 出口放行与拦截、只开代理本地网络出口核实、Cisco 与代理并存及切换重查、面板交接与真机开销对照。
 - 验证级别：cargo test（fast open 写进配置；关闭连接的网站得「网站没有回应」；问候的记录与握手长度一致、带站点名）；本机手动（`--ignored`）真实 HTTPS 站点对问候回 0x16；互通测试（官方服务端，带 fast open 的 TCP 与 UDP 往返）通过；真机待测 L26。

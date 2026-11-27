@@ -25,6 +25,7 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
   - 连接页单独标出走代理的连接。
 - **2026-11-26 分流代理支持 Hysteria2（DESIGN §七十）**：作为分流代理的第三种类型，粘贴 `hysteria2://` / `hy2://` 链接即可（拒绝 `insecure=1`，自签用 `pinSHA256`）；服务器走本地网络还是 Cisco 按现有分流直连名单决定。随 App 打包官方客户端（`HyNetworks/hysteria` 固定版本 `app/v2.14.0`，SHA-256 校验，MIT 许可），仅在启用 Hysteria2 代理时由后台服务以 `nobody` 运行本地 SOCKS5 并复用既有 TCP/UDP 转发与故障关闭，监管/解析/去重/错误映射均在 Rust（`core/src/split_proxy/hysteria.rs`）。
   - **Hysteria2 客户端版本与更新办法**：固定在 `scripts/bundle-hysteria.sh` 与 `scripts/hysteria-interop-test.sh` 的 `HYSTERIA_TAG="app/v2.14.0"` 及各平台 SHA-256（来自上游 release `hashes.txt`）；升级时核对新版本发布说明、更新脚本内版本号与 SHA-256 及 `THIRD_PARTY_NOTICES.md`，重跑 `scripts/hysteria-interop-test.sh` 与 `scripts/build-local.sh --tests`。真机待测见 L19–L24。
+  0.5.0（构建号 24，待合入发布）：出口保护覆盖分流代理（SOCKS5 / HTTP / Hysteria2）与只开代理（Cisco 关闭）。命中代理规则的受保护网站走代理优先（不再被强拉回 Cisco）并经该代理核实出口，未命中代理的在连着 Cisco 时走 Cisco、在只开代理时经本地网络核实出口；每条路线独立检查与缓存，查前零字节外发、不符即拦截且禁 QUIC，Cisco 隧道侧的 1 秒复用、主动刷新与自动换入口均保持不变。出口保护页按方案 C 展示路线标签与最近核实，面板按方案 A 将出口保护置顶并在只开代理时保持高亮可用，分流与代理编辑窗同步更新说明并统一美化输入框与自动去空白（DESIGN §七十一，真机待测 L27–L31）。
   0.4.3（构建号 23）：Hysteria2 每条新连接多等约 1 秒的问题修掉了（受管客户端开 fast open；实测从约 1.1 秒降到 0.13–0.2 秒）。代理检测改为量到网站回应为止，各类代理的延迟同一口径，Hysteria2 不再把客户端启动算进去（DESIGN §70.7，真机待 L26）。
   0.4.2（构建号 22）：所有代理（SOCKS5、HTTP、Hysteria2）的服务器都默认走本地网络，不经 Cisco（用户决定）。相当于程序把这些服务器自动加进分流直连；本机上的代理不算。编辑窗连着 Cisco 时先保存再检测（DESIGN §69.21，真机待 L25）。
   0.4.1（构建号 21）：连着 Cisco 时 Hysteria2 连不上的问题修掉了。原因是 Cisco 隧道的包最大 1230 字节，QUIC 的第一个包就有 1252 字节，换端口也过不去。现在 Hysteria2 服务器一律走本地网络，相当于程序自动把它加进分流直连；编辑窗在这种情况下先保存再检测（DESIGN §70.6，真机待 L20、L21）。
