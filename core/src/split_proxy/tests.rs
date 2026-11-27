@@ -893,7 +893,13 @@ fn interop_with_a_reference_hysteria2_server() {
     let routing = Routing::new(table);
     let mut specs = std::collections::BTreeMap::new();
     specs.insert(0, spec.clone());
-    hysteria::shared().sync(specs, routing.clone(), None);
+    let manager = hysteria::shared();
+    manager.sync_on_path(specs.clone(), routing.clone(), None, None);
+    let waiting = hysteria::probe_hysteria(&spec, None, None);
+    assert_eq!(waiting.text, "正在等本地网络就绪");
+    assert!(manager.running_socks_for(&spec).is_none());
+    let path = Some(("wifi", "router-a"));
+    manager.sync_on_path(specs.clone(), routing.clone(), None, path);
 
     // Wait for managed client to become ready
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -918,6 +924,27 @@ fn interop_with_a_reference_hysteria2_server() {
     let mut buf = [0u8; 2048];
     let n = udp_sock.recv(&mut buf).expect("udp recv");
     assert_eq!(udp_unwrap(&buf[..n]), Some(&b"hy2-udp-ping"[..]));
+
+    // Normal handover on the same network reuses the socket. Physical loss
+    // retires it even when the next network has the same interface and router.
+    manager.sync_on_path(specs.clone(), routing.clone(), None, None);
+    assert!(manager.running_socks_for(&spec).is_none());
+    manager.sync_on_path(specs.clone(), routing.clone(), None, path);
+    assert_eq!(manager.running_socks_for(&spec).unwrap(), local_socks);
+    manager.physical_network_lost(&routing);
+    assert!(manager.running_socks_for(&spec).is_none());
+    manager.sync_on_path(specs, routing.clone(), None, Some(("wifi", "router-b")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(replacement) = manager.running_socks_for(&spec) {
+            assert_ne!(replacement, local_socks);
+            let (mut stream, _) = open_through(&replacement, &Target::Ip(Ipv4Addr::LOCALHOST), tcp_origin.address.port()).unwrap();
+            round_trip(&mut stream, "");
+            break;
+        }
+        assert!(Instant::now() < deadline, "replacement did not become ready on the restored path");
+        std::thread::sleep(Duration::from_millis(30));
+    }
 
     // Stop cleanly
     hysteria::shared().stop_all();

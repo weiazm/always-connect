@@ -2161,9 +2161,9 @@ pub extern "C" fn ac_proxy_only_set_egress_probe_with_peer(
 
 fn proxy_network(json: Option<String>) -> crate::proxy_only::Network {
     #[derive(serde::Deserialize, Default)]
-    struct Wire { interface: Option<String>, dns: Vec<String> }
+    struct Wire { interface: Option<String>, gateway: Option<String>, dns: Vec<String> }
     let wire: Wire = json.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-    crate::proxy_only::Network { interface: wire.interface, dns: wire.dns }
+    crate::proxy_only::Network { interface: wire.interface, gateway: wire.gateway, dns: wire.dns }
 }
 
 fn rule_lines(text: Option<String>) -> Vec<String> {

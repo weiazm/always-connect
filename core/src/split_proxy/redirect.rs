@@ -26,7 +26,7 @@ pub struct RedirectSession {
 /// reached another way. `no_routes`: tests and the session harness, answers only.
 pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &Forwarder, routes: &DirectRoutes,
             guard: Option<&Guard>, no_routes: bool) -> bool {
-    sync_with_egress(session, table, forwarder, routes, guard, no_routes, None, false)
+    sync_with_egress(session, table, forwarder, routes, guard, no_routes, None, false, Some(("", "")))
 }
 
 /// Like `sync`, attaching an optional exit-protection gate (`egress`). When
@@ -43,6 +43,7 @@ pub fn sync_with_egress(
     no_routes: bool,
     egress: Option<crate::egress_control::RelayGate>,
     local_egress: bool,
+    physical_path: Option<(&str, &str)>,
 ) -> bool {
     if table.is_empty() && !local_egress {
         stop(session, Some(forwarder), routes, guard, no_routes);
@@ -70,7 +71,7 @@ pub fn sync_with_egress(
         inner.upgrade().map(|inner| inner.resolve_plain(name)).unwrap_or_default()
     });
     s.routing.set_resolver(Some(resolver.clone()));
-    super::hysteria::shared().sync(hysteria_specs, s.routing.clone(), Some(resolver));
+    super::hysteria::shared().sync_on_path(hysteria_specs, s.routing.clone(), Some(resolver), physical_path);
     if no_routes { return true; }
     if s.listener.is_none() {
         match super::pf_original_destination().and_then(|original| Listener::start(s.routing.clone(), original)) {

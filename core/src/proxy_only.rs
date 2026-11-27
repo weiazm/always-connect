@@ -72,6 +72,7 @@ pub fn set_dns(on: bool) -> bool {
 pub struct Network {
     /// The physical interface the local DNS servers are reached on.
     pub interface: Option<String>,
+    pub gateway: Option<String>,
     pub dns: Vec<String>,
 }
 
@@ -152,7 +153,11 @@ impl ProxyOnly {
         if let Some(ctl) = &self.egress {
             ctl.invalidate();
         }
+        if network.interface.is_none() {
+            if let Some(s) = &self.session { crate::split_proxy::hysteria::shared().physical_network_lost(&s.routing); }
+        }
         self.network = network;
+        self.sync_all();
     }
 
     fn sync_all(&mut self) {
@@ -182,7 +187,8 @@ impl ProxyOnly {
         let guard = network_guard::shared();
         let gate = self.egress.as_ref().map(|c| c.relay_gate());
         let ok = redirect::sync_with_egress(
-            &mut self.session, table, &self.forwarder, &self.routes, guard.as_deref(), self.no_routes, gate, local_egress);
+            &mut self.session, table, &self.forwarder, &self.routes, guard.as_deref(), self.no_routes, gate, local_egress,
+            self.network.interface.as_deref().map(|interface| (interface, self.network.gateway.as_deref().unwrap_or(""))));
         self.error = (!ok).then_some(REDIRECT_FAILED);
         if !ok { network_guard::log(REDIRECT_FAILED); }
     }
@@ -332,7 +338,7 @@ mod tests {
         let lines = vec!["proxy:0 socks5 192.0.2.5 1080".to_string(), "via:0:proxied.example".to_string()];
         let listen = 25353;
         let lo = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
-        let mut session = ProxyOnly::start(lines, Network { interface: Some(lo.into()), dns: vec![format!("127.0.0.1:{upstream_port}")] },
+        let mut session = ProxyOnly::start(lines, Network { interface: Some(lo.into()), gateway: None, dns: vec![format!("127.0.0.1:{upstream_port}")] },
                                            &dir, "B1".into(), listen, true).expect("started");
         let proxied = ask(listen, "www.proxied.example").expect("answered");
         assert!(proxied.len() == 1 && crate::split_proxy::is_fake(proxied[0]), "our address: {proxied:?}");
