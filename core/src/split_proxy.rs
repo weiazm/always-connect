@@ -228,7 +228,7 @@ impl Table {
         self.networks.iter().find(|(_, _, (lo, hi))| *lo <= v && v <= *hi).map(|(n, _, _)| *n)
     }
 
-    fn server(&self, n: usize) -> Option<&Server> {
+    pub(crate) fn server(&self, n: usize) -> Option<&Server> {
         self.servers.get(n).and_then(Option::as_ref)
     }
 

@@ -1041,7 +1041,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard !endingApp, !resettingNetwork else { return false }
         let settings = ProfileStore.loadAppSettings()
         let hasProxies = !settings.activeProxyRoutes.isEmpty
-        let hasEgress = settings.egressProtection?.isActive == true
+        let hasEgress = settings.isDropProtectionOn && settings.egressProtection?.isActive == true
         guard hasProxies || hasEgress else { return false }
         return !usesCisco || state == .disconnected
     }
@@ -1067,21 +1067,25 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             return
         }
         let on = proxyOnlyWanted
-        if on, let egress = settings.egressProtection, egress.isActive {
-            sendEgress(egress) { _ in }
-        }
-        ensureConnection { proxy in
-            var finished = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
-            proxy.setProxyOnly(on) { running, error in
-                DispatchQueue.main.async {
-                    guard !finished else { return }
-                    finished = true
-                    self.proxyOnlyRunning = running
-                    self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
-                    self.updateEgressMonitoring()
+        let sendFlag: () -> Void = {
+            self.ensureConnection { proxy in
+                var finished = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
+                proxy.setProxyOnly(on) { running, error in
+                    DispatchQueue.main.async {
+                        guard !finished else { return }
+                        finished = true
+                        self.proxyOnlyRunning = running
+                        self.proxyOnlyError = on && !running && !error.isEmpty ? error : nil
+                        self.updateEgressMonitoring()
+                    }
                 }
             }
+        }
+        if on, settings.isDropProtectionOn, let egress = settings.egressProtection, egress.isActive {
+            sendEgress(egress) { _ in sendFlag() }
+        } else {
+            sendFlag()
         }
     }
 

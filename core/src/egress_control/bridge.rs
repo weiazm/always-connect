@@ -87,9 +87,9 @@ impl OneShotBridge {
 
     pub(crate) fn finish(mut self) -> bool {
         self.stop_flag.store(true, Ordering::Release);
-        if let Some(w) = self.wake_write.take() {
-            unsafe { libc::write(w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-        }
+        // Closing the write end wakes poll(wake_read) via POLLHUP with zero
+        // risk of SIGPIPE when run_bridge already exited and dropped wake_read.
+        drop(self.wake_write.take());
         self.thread.take().and_then(|t| t.join().ok()).unwrap_or(false)
     }
 }
@@ -97,9 +97,7 @@ impl OneShotBridge {
 impl Drop for OneShotBridge {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
-        if let Some(w) = self.wake_write.take() {
-            unsafe { libc::write(w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-        }
+        drop(self.wake_write.take());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }

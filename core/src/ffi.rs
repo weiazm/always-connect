@@ -2198,7 +2198,7 @@ pub extern "C" fn ac_proxy_only_start_with_egress(
         proxy_network(c_str(network)),
         std::path::Path::new(&support),
         c_str(boot).unwrap_or_default(),
-        if no_routes { 25353 } else { 53 },
+        if no_routes { 0 } else { 53 },
         no_routes,
         egress_cfg,
         hook,
@@ -2268,6 +2268,31 @@ pub extern "C" fn ac_proxy_only_allow_egress_country(
         serde_json::to_string(&countries).ok()
     })();
     result.map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+/// Checks one proxied hostname against the proxy-only session's live relay
+/// egress gate (for Swift+Rust bridge harnesses without root/pf).
+/// Returns 1 on Allow (or unprotected), 0 on Block, -1 on invalid handle/args.
+#[no_mangle]
+pub extern "C" fn ac_proxy_only_check_egress_target(
+    handle: *mut ProxyOnlyHandle,
+    proxy_index: usize,
+    host: *const c_char,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return -1 };
+    let Some(host) = c_str(host) else { return -1 };
+    let routing = handle.0.lock().unwrap().routing();
+    let Some(routing) = routing else { return -1 };
+    let Some(server) = routing.table().server(proxy_index).cloned() else { return -1 };
+    let target = crate::split_proxy::ResolvedTarget {
+        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server },
+        target: crate::split_proxy::Target::Name(host),
+        resolved_ips: Vec::new(),
+    };
+    match routing.check_egress(&target) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
 }
 
 /// Stops the session (DNS entry first) and frees the handle.

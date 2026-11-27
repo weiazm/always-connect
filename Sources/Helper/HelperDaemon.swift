@@ -405,8 +405,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private func reconcileProxyOnly() {
         let engineActive = engine != nil || stoppingEngine != nil
         let ciscoActive = !KillSwitch.shared.isOff
-        let wanted = proxyOnlyWanted || egress.isActive
-        let run = ProxyOnlySession.shouldRun(wanted: wanted, engineActive: engineActive, ciscoActive: ciscoActive)
+        let run = ProxyOnlySession.shouldRun(wanted: proxyOnlyWanted, engineActive: engineActive, ciscoActive: ciscoActive)
         if run, proxyOnly == nil {
             let (session, error) = ProxyOnlySession.start(rules: directRuleText,
                                                           egressJSON: egress.isActive && !egressJSON.isEmpty ? egressJSON : nil)
