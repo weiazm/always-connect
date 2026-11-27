@@ -4976,8 +4976,11 @@ DNS 得到 198.19.128.x，HTTPS 200，代理日志记录的是域名；未列入
   - 出口保护开启（进程内 `Controller::in_process` + `RelayGate`，经 `OneShotBridge` 完成首次 `Allow` 核实并执行 1000 次缓存命中判定后空闲）：`phys_footprint` 1136 KB（峰值 1168 KB，增量 +96 KB），CPU 0.0%，`idlew` 0 次/秒；首次本机回环探测 1.16 ms，1000 次缓存判定共 0.73 ms（约 0.73 µs/次）。
   - App 侧无新增常驻定时器或缓存；只开代理模式不启动 `alwaysconnect-gate` 子进程。完整真机 App / 后台服务三组对照需实测（`docs/mac-proof-checklist.md` L31）。
 - **验证级别**：
-  - Rust 单测与集成测试（`cargo test`，435 + 5 全通过）：`OneShotBridge` 一次性转发与早停、代理/本地缓存隔离与 `half_life` 复用、`Controller::in_process` 核实/拦截/重查/按路径批准、并发 singleflight 去重、`LocalPolicy::Block`、转发层 `RelayGate` 放行/拦截/禁 QUIC/拦截 Hysteria2 类 fast-open 代理与本地路径、DNS 代理优先与本地受保护合成地址。
-  - Swift 脚本级与全套本机检查（`scripts/build-local.sh --tests`，`FAILS=0`）：`egress-notification`（含 `proxy:0` 无 `peerAddress` 批准与历史记录拒收）、`egress-peer-probe`、`connections-ui`（含 `TextTrim` 全部边界用例与方案 C / 面板 A / 代理编辑窗 / 添加与详情页的实际 SwiftUI 离屏渲染目视核对）、`session`、`on-demand`、`dns-forwarder`、`relay`、`uninstall` 等全部检查。
-  - CI macOS harness（root，`core/examples/proxy-only-check.rs` 新增 `run_egress_proxy_check`）：真实 `scutil` + `pf` 锚点 301 + 进程内出口门禁端到端核实（正确国家放行、错误国家连接立即重置且测试业务站点收到 0 连接）。
+  - Rust 单测与集成测试（`cargo test`，435 + 5 全通过）：`OneShotBridge` 一次性转发与早停（关闭写端经 `POLLHUP` 唤醒，无写已关闭管道触发 `SIGPIPE` 风险）、代理/本地缓存隔离与 `half_life` 复用、`Controller::in_process` 核实/拦截/重查/按路径批准、并发 singleflight 去重、`LocalPolicy::Block`、转发层 `RelayGate` 放行/拦截/禁 QUIC/拦截 Hysteria2 类 fast-open 代理与本地路径、DNS 代理优先与本地受保护合成地址。
+  - Swift + Rust 跨语言联合测试（`scripts/egress-proxy-bridge-test.sh`）与 `EgressProbe` 生产分支守卫（`scripts/egress-peer-probe-test.sh`）：
+    - 真实 Swift `EgressProbe.exchange`（`NWConnection` 走 `lo0` + `SecTrust`）↔ 真实 Rust `OneShotBridge`（`libproc` PID 校验）↔ Rust `split_proxy` SOCKS5 客户端 ↔ 本机 SOCKS5 代理 ↔ 本机 TLS `/cdn-cgi/trace` 服务器同进程联调，覆盖允许与缓存复用、错误国家拦截、重新检查恢复、无 `peerAddress` 的 `proxy:0` 国家批准与不受信任证书零 HTTP 故障关闭（该联调直接抓出并修复了 `OneShotBridge::finish` 向已关读端管道写字节引发 `SIGPIPE` 的问题）。
+    - 不带 `-D EGRESS_PROBE_TEST` 编译生产版 `EgressProbe.swift`，验证 `lo0` 仅允许 `127.0.0.1`（`::1`、`127.0.0.2` 与 `nil` 均在建连前被拒）。
+  - 本机构建与全套脚本/模拟套件（`scripts/build-local.sh --tests`，`FAILS=0`）：含新增的 `session-test` `proxy-only-egress-lifecycle`（验证零代理启停、断线保护联动与 `setProxyOnly(false)` 立即停止退出清理，防止退出后残留 DNS 设置）、`egress-notification`（含 `proxy:0` 无 `peerAddress` 批准与历史记录拒收）、`connections-ui`（含 `TextTrim` 全部边界用例与方案 C / 面板 A / 代理编辑窗 / 添加与详情页的实际 SwiftUI 离屏渲染目视核对）等全部检查。
+  - CI macOS harness（root，`core/examples/proxy-only-check.rs`）：真实 `scutil` + `pf` 锚点 301 + 进程内出口门禁端到端核实，覆盖三条链路——SOCKS5 + 出口保护（正确国家放行、错误国家零业务连接拦截）、真实官方 Hysteria2（`fastOpen: true`）+ 出口保护、以及零代理 `RouteVia::Local`（`EgressPath::Local`，无代理配置下系统解析仍返回 `198.19.128.x` 并经 `pf` 拦住错误出口，停止后零残留）。
   - 真机待测（`docs/mac-proof-checklist.md` L27–L31）：真实代理/Hysteria2 出口放行与拦截、只开代理本地网络出口核实、Cisco 与代理并存及切换重查、面板交接与真机开销对照。
 - 验证级别：cargo test（fast open 写进配置；关闭连接的网站得「网站没有回应」；问候的记录与握手长度一致、带站点名）；本机手动（`--ignored`）真实 HTTPS 站点对问候回 0x16；互通测试（官方服务端，带 fast open 的 TCP 与 UDP 往返）通过；真机待测 L26。
