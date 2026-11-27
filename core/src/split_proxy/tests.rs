@@ -1077,6 +1077,14 @@ fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
             let _ = s.read_to_end(&mut out);
             return (!out.is_empty()).then_some(out);
         }
+        // Complete one exchange through the local probe bridge. A synthetic
+        // country alone can return before the echo server's accept runs.
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, req.port)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream.write_all(b"probe").ok()?;
+        let mut echo = [0; 5];
+        stream.read_exact(&mut echo).ok()?;
+        if &echo != b"probe" { return None; }
         let code = lc.lock().unwrap().clone();
         Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={code}\n").into_bytes())
     });
