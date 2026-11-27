@@ -153,8 +153,9 @@ impl ProxyOnly {
         if let Some(ctl) = &self.egress {
             ctl.invalidate();
         }
-        if network.interface.is_none() {
-            if let Some(s) = &self.session { crate::split_proxy::hysteria::shared().physical_network_lost(&s.routing); }
+        if let Some(s) = &self.session {
+            if network.interface.is_none() { crate::split_proxy::hysteria::shared().physical_network_lost(&s.routing); }
+            else { s.routing.reset_health(); }
         }
         self.network = network;
         self.sync_all();

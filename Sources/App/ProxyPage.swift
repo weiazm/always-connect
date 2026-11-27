@@ -218,6 +218,8 @@ struct ProxySections: View {
             }
             // Proxy servers' addresses join the local-network list (§69.21).
             HelperClient.shared.updateAllowNetworks(stored.effectiveAllowNetworks) { _ in }
+        } else if HelperClient.shared.state == .disconnected {
+            HelperClient.shared.syncProxyOnly()
         }
     }
 }

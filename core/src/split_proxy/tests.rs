@@ -1127,13 +1127,18 @@ fn health_follows_the_saved_configuration_and_first_reply() {
     let next = "proxyhealth:0 00000000-0000-0000-0000-000000000002";
     let lines = |id: &str| Table::parse(&[id, "proxy:0 socks5 127.0.0.1 1080", "via:0:full:one.example"]);
     let routing = Routing::new(lines(first));
-    routing.record_for(0, Some(1), None);
+    routing.record_for(0, Some((1, 0)), None);
     let old = routing.health_json();
     assert!(old[0]["okAt"].as_f64().unwrap() > 0.);
     assert_eq!(old[0]["key"], format!("{:032x}", 1));
     routing.set_table(lines(next));
-    routing.record_for(0, Some(1), Some("late"));
+    routing.record_for(0, Some((1, 0)), Some("late"));
     assert_eq!(routing.health_json(), serde_json::json!([]));
-    routing.record_for(0, Some(2), None);
+    routing.record_for(0, Some((2, 0)), None);
     assert_eq!(routing.health_json()[0]["key"], format!("{:032x}", 2));
+    routing.reset_health();
+    routing.record_for(0, Some((2, 0)), Some("previous network"));
+    assert_eq!(routing.health_json(), serde_json::json!([]));
+    routing.record_for(0, Some((2, 1)), None);
+    assert!(routing.health_json()[0]["okAt"].is_number());
 }

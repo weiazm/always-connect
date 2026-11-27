@@ -1447,6 +1447,7 @@ impl HysteriaManager {
     /// A confirmed loss of the physical network retires even a ready UDP
     /// socket. The returning Wi-Fi may have the same router and interface.
     pub fn physical_network_lost(&self, routing: &Arc<Routing>) {
+        routing.reset_health();
         let stopped: Vec<_> = {
             let mut st = self.inner.lock().unwrap();
             if !st.routing.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, routing)) { return; }

@@ -324,7 +324,7 @@ fn pump(from: &TcpStream, to: &TcpStream, mut counted: impl FnMut(usize)) {
 /// Both directions until both ends are done; one end finishing closes
 /// the other's sending side.
 fn splice(client: &TcpStream, upstream: &TcpStream, routing: &Arc<Routing>, leg: Option<Leg>,
-          mut awaiting_reply: Option<(usize, Option<u128>)>) {
+          mut awaiting_reply: Option<(usize, Option<(u128, u64)>)>) {
     let (Ok(client_read), Ok(upstream_write)) = (client.try_clone(), upstream.try_clone()) else { return };
     let up_routing = routing.clone();
     let up = std::thread::Builder::new().name("ac-proxy-up".into()).stack_size(STACK).spawn(move || {

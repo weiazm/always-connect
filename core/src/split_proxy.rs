@@ -371,7 +371,7 @@ enum ManagedProxy {
 /// Where the relay sends one redirected connection (§69, §71).
 #[derive(Clone, Debug)]
 pub(crate) enum RouteVia {
-    Proxy { server: Server, index: usize, health_key: Option<u128> },
+    Proxy { server: Server, index: usize, health_key: Option<(u128, u64)> },
     /// Proxy-only mode: a protected site not matched by any proxy (§71 D2).
     Local,
 }
@@ -406,6 +406,7 @@ pub struct Routing {
     /// Per proxy (the App's index): the last connection that opened
     /// through it, and the last that did not, with why.
     health: Mutex<HashMap<usize, Health>>,
+    health_generation: AtomicU64,
     /// The proxy servers' addresses this relay connected to, per proxy,
     /// and when: the connections page marks those connections (§69.12).
     upstreams: Mutex<HashMap<std::net::SocketAddr, (usize, Instant)>>,
@@ -751,7 +752,7 @@ impl Routing {
                 let server = self.resolve_server(n).map_err(|reason| (name.clone(), reason))?;
                 return Ok(ResolvedTarget {
                     target: Target::Name(name),
-                    via: RouteVia::Proxy { server, index: n, health_key: table.health_keys.get(&n).copied() },
+                    via: RouteVia::Proxy { server, index: n, health_key: self.health_tag(&table, n) },
                     resolved_ips: addresses,
                 });
             }
@@ -771,7 +772,7 @@ impl Routing {
         let server = self.resolve_server(n).map_err(|reason| (ip.to_string(), reason))?;
         Ok(ResolvedTarget {
             target: Target::Ip(ip),
-            via: RouteVia::Proxy { server, index: n, health_key: table.health_keys.get(&n).copied() },
+            via: RouteVia::Proxy { server, index: n, health_key: self.health_tag(&table, n) },
             resolved_ips: vec![ip],
         })
     }
@@ -800,14 +801,25 @@ impl Routing {
 
     /// A connection through proxy `n` opened (None) or failed (Some(why)).
     pub(crate) fn record(&self, n: usize, failure: Option<&str>) {
-        self.record_for(n, self.table().health_keys.get(&n).copied(), failure);
+        self.record_for(n, self.health_tag(&self.table(), n), failure);
     }
 
-    fn record_for(&self, n: usize, key: Option<u128>, failure: Option<&str>) {
-        let table = self.table.read().unwrap();
-        if table.health_keys.get(&n).copied() != key { return; }
-        let now = HealthTime { when: Instant::now(), tick: crate::proxy_health::ac_proxy_health_now() };
+    pub fn reset_health(&self) {
         let mut health = self.health.lock().unwrap();
+        self.health_generation.fetch_add(1, Ordering::AcqRel);
+        health.clear();
+    }
+
+    fn health_tag(&self, table: &Table, n: usize) -> Option<(u128, u64)> {
+        table.health_keys.get(&n).map(|key| (*key, self.health_generation.load(Ordering::Acquire)))
+    }
+
+    fn record_for(&self, n: usize, tag: Option<(u128, u64)>, failure: Option<&str>) {
+        let table = self.table.read().unwrap();
+        let mut health = self.health.lock().unwrap();
+        if self.health_tag(&table, n) != tag { return; }
+        let key = tag.map(|(key, _)| key);
+        let now = HealthTime { when: Instant::now(), tick: crate::proxy_health::ac_proxy_health_now() };
         let entry = health.entry(n).or_default();
         if entry.key != key { *entry = Health { key, ..Health::default() }; }
         match failure {
