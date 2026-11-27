@@ -664,6 +664,12 @@ impl HysteriaSpec {
         root.insert("auth".into(), serde_json::Value::String(self.auth.clone()));
         root.insert("tls".into(), serde_json::Value::Object(tls));
         root.insert("lazy".into(), serde_json::Value::Bool(false));
+        // Fast open (§70.7): answer the app at once and send its request
+        // with the first data. Without it every new connection waited for
+        // the server's reply, and servers that look at the first data
+        // before connecting (sniffing) answer only after a timeout: about
+        // 1 s per connection measured, 130-200 ms with it.
+        root.insert("fastOpen".into(), serde_json::Value::Bool(true));
         root.insert(
             "socks5".into(),
             serde_json::json!({
@@ -1763,13 +1769,10 @@ pub fn probe_hysteria(
                 port,
                 auth: Some((user, pass)),
             };
-            let result = probe_socks(&local, site);
-            // Keep total elapsed millis from start of probe so user sees real latency.
-            Probe {
-                level: result.level,
-                text: result.text,
-                millis: started.elapsed().as_millis() as u64,
-            }
+            // The time of opening the site through the running client (what
+            // every connection takes), not the client's own start, which
+            // happens once: comparable with the other proxies (§70.7).
+            probe_socks(&local, site)
         }
         Ok(Err(reason)) => done(Level::Fail, reason.to_string()),
         Err(_) => done(Level::Fail, "UDP 出不去".into()),
@@ -1898,6 +1901,7 @@ mod tests {
         assert_eq!(v["bandwidth"]["up"], "50 mbps");
         assert_eq!(v["bandwidth"]["down"], "200 mbps");
         assert_eq!(v["socks5"]["listen"], "127.0.0.1:18080");
+        assert_eq!(v["fastOpen"], true, "no wait for the server's reply per connection (§70.7)");
         assert_eq!(v["socks5"]["username"], "u1");
         assert_eq!(v["socks5"]["password"], "p1");
         assert_eq!(v["socks5"]["disableUDP"], false);
