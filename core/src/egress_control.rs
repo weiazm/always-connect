@@ -24,6 +24,9 @@ use crate::egress_gate::{evidence_clock_ms, ProtectedSites, SiteGroup};
 
 mod activity;
 use activity::{Denied, SiteStatus};
+pub use activity::PathStatus;
+mod bridge;
+pub use bridge::RelayOpener;
 mod refresh;
 mod steer;
 pub use refresh::{DEFAULT_HALF_LIFE_MIN, DEFAULT_PREFETCH, MAX_HALF_LIFE_MIN, MAX_PREFETCH};
@@ -38,7 +41,65 @@ const MAX_CHECKS: usize = 32;
 /// Wrong-exit servers remembered per rule (status, approval, recheck).
 const MAX_FAILED_TARGETS: usize = 8;
 const PROBE_TIMEOUT_MS: u64 = 2_400;
+const RELAY_WAIT_TIMEOUT: Duration = Duration::from_millis(bridge::PROXY_PROBE_TIMEOUT_MS + 1_500);
 pub const MAX_RECORDS: usize = 10;
+
+/// Which road a connection or check took (DESIGN.md §71).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EgressPath {
+    #[default]
+    Cisco,
+    Proxy(usize),
+    Local,
+}
+
+impl EgressPath {
+    pub fn wire(&self) -> String {
+        match self {
+            EgressPath::Cisco => "cisco".into(),
+            EgressPath::Proxy(n) => format!("proxy:{n}"),
+            EgressPath::Local => "local".into(),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "cisco" {
+            Some(EgressPath::Cisco)
+        } else if s == "local" {
+            Some(EgressPath::Local)
+        } else if let Some(rest) = s.strip_prefix("proxy:") {
+            rest.parse::<usize>().ok().map(EgressPath::Proxy)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_cisco(&self) -> bool {
+        matches!(self, EgressPath::Cisco)
+    }
+}
+
+/// What to do with a protected site when Cisco is off and no proxy matches
+/// (DESIGN.md §71 D2).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalPolicy {
+    /// Forward directly via local network after checking its exit country.
+    #[default]
+    Probe,
+    /// Refuse immediately when neither Cisco nor a proxy carries the site.
+    Block,
+    /// Do not intercept non-proxied protected sites when Cisco is off.
+    Bypass,
+}
+
+/// Decision returned to the in-process proxy/local relay before forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayVerdict {
+    Allow,
+    Block,
+    Unverified,
+}
 
 // ------------------------------------------------------------------ config
 
@@ -57,6 +118,9 @@ pub struct EgressConfig {
     /// Minutes after which a server's busyness halves (§66.31); None = the default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub half_life: Option<u32>,
+    /// Policy for protected sites when Cisco is off and no proxy matches (§71 D2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_policy: Option<LocalPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -154,6 +218,10 @@ impl EgressConfig {
 
     pub fn steering(&self) -> bool {
         self.steer.unwrap_or(true)
+    }
+
+    pub fn local_policy(&self) -> LocalPolicy {
+        self.local_policy.unwrap_or_default()
     }
 
     pub fn active(&self) -> bool {
@@ -263,6 +331,9 @@ pub struct Observation {
     /// Set on a wrong-country observation the user may approve.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+    /// Which road produced this observation ("cisco", "proxy:<n>", "local"; §71).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(skip)]
     pub evidence_at_ms: Option<u64>,
 }
@@ -328,7 +399,7 @@ pub fn read_trace(resp: &Response) -> Result<(String, Option<String>), String> {
 
 /// Probe `host` at the checked server `ip` through the tunnel.
 fn probe(hook: &ProbeHook, host: &str, ip: IpAddr, marker: &str, interface: &str) -> Observation {
-    let mut obs = Observation { host: host.into(), peer_address: Some(ip), ..Default::default() };
+    let mut obs = Observation { host: host.into(), peer_address: Some(ip), path: Some(EgressPath::Cisco.wire()), ..Default::default() };
     if host.is_empty() {
         obs.error = Some("看不到网站名".into());
         return obs;
@@ -387,6 +458,12 @@ pub struct GroupStatus {
     /// Names recently answered with another entry of their CDN whose
     /// exit was verified (§66.28).
     pub steered: Vec<String>,
+    /// The road most recently checked for this rule ("cisco", "proxy:<n>", "local"; §71).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Per-road status & last observed exit (§71).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathStatus>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -399,6 +476,8 @@ pub struct BlockRecord {
     pub host: Option<String>,
     pub observed: Vec<Observation>,
     pub expected: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -446,11 +525,15 @@ impl Status {
             }
         } else if let Some(open) = self.records.iter_mut().find(|r| r.group == group.id && r.ended.is_none()).filter(|_| was_blocked) {
             open.observed = failing;
+            if let Some(p) = open.observed.first().and_then(|o| o.path.clone()) {
+                open.path = Some(p);
+            }
         } else {
             let host = failing.first().filter(|o| !o.host.is_empty()).map(|o| o.host.clone());
+            let path = failing.first().and_then(|o| o.path.clone());
             self.records.push_front(BlockRecord {
                 started: at, ended: None, group: group.id, name: group.name.clone(), host,
-                observed: failing, expected: group.expect.clone(),
+                observed: failing, expected: group.expect.clone(), path,
             });
             self.records.truncate(MAX_RECORDS);
         }
@@ -468,10 +551,11 @@ struct Shared {
     bell: Bell,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Target {
     host: String,
     ip: IpAddr,
+    path: EgressPath,
 }
 
 struct Failed {
@@ -484,6 +568,8 @@ struct ActiveCheck {
     epoch: u64,
 }
 
+type RelaySlot = Arc<(Mutex<Option<&'static str>>, std::sync::Condvar)>;
+
 struct ControlState {
     config: EgressConfig,
     sites: ProtectedSites,
@@ -492,7 +578,8 @@ struct ControlState {
     peer: Option<UnixStream>,
     peer_id: u64,
     epoch: u64,
-    /// Keyed by (gate peer, request id); explicit rechecks use peer 0.
+    /// Keyed by (gate peer, request id); explicit rechecks use peer 0,
+    /// relay checks use peer u64::MAX.
     checks: HashMap<(u64, u64), ActiveCheck>,
     failures: HashMap<u32, Vec<Failed>>,
     peer_counts: HashMap<u32, Denied>,
@@ -501,6 +588,11 @@ struct ControlState {
     /// Recent results and the busiest servers (§66.31).
     cache: Cache,
     on_peer_loss: Option<Box<dyn Fn() + Send>>,
+    /// In-process proxy/local relay opener (§71).
+    relay_opener: Option<RelayOpener>,
+    /// Singleflight map for concurrent relay connections waiting on one probe.
+    relay_running: HashMap<refresh::Key, RelaySlot>,
+    next_relay_check: u64,
 }
 
 fn approval_id() -> Option<String> {
@@ -530,8 +622,13 @@ impl ControlState {
     /// Note one probe result; `connection` is false for a background
     /// refresh, which does not count as another unreadable connection.
     fn record_probe(&mut self, group: &Group, target: Target, mut obs: Observation, connection: bool) -> &'static str {
-        if let Some(country) = obs.country.as_deref() {
-            self.ledger.note(&target.host, target.ip, country, std::time::Instant::now());
+        if obs.path.is_none() {
+            obs.path = Some(target.path.wire());
+        }
+        if target.path.is_cisco() {
+            if let Some(country) = obs.country.as_deref() {
+                self.ledger.note(&target.host, target.ip, country, std::time::Instant::now());
+            }
         }
         let failed = self.failures.entry(group.id).or_default();
         let previous = failed.iter().position(|f| f.target == target).map(|i| failed.remove(i));
@@ -597,10 +694,26 @@ impl ControlState {
         }
     }
 
+    fn wake_relay_waiters(&mut self, filter: Option<EgressPath>, verdict: &'static str) {
+        let keys: Vec<_> = self.relay_running.keys()
+            .filter(|k| filter.is_none_or(|p| k.1 == p))
+            .cloned().collect();
+        for key in keys {
+            if let Some(slot) = self.relay_running.remove(&key) {
+                let mut guard = slot.0.lock().expect("relay slot");
+                if guard.is_none() {
+                    *guard = Some(verdict);
+                    slot.1.notify_all();
+                }
+            }
+        }
+    }
+
     fn replace_config(&mut self, cfg: EgressConfig, marker: &str) {
         self.epoch = self.epoch.wrapping_add(1);
         self.ledger.clear();
         self.cache.forget();
+        self.wake_relay_waiters(None, "block");
         let sites = cfg.protected_sites();
         self.failures.retain(|id, failed| {
             let Some(group) = cfg.enabled_group(*id) else { return false };
@@ -623,6 +736,12 @@ impl ControlState {
         self.epoch = self.epoch.wrapping_add(1);
         self.ledger.clear();
         self.cache.forget();
+        self.wake_relay_waiters(None, "block");
+    }
+
+    fn invalidate_path(&mut self, path: EgressPath) {
+        self.cache.forget_path(path);
+        self.wake_relay_waiters(Some(path), "block");
     }
 
     fn disconnect(&mut self) {
@@ -643,11 +762,220 @@ impl ControlState {
     }
 }
 
-/// Listens on a root-private UNIX socket for the gate (one at a time).
+/// Listens on a root-private UNIX socket for the gate (one at a time), and
+/// optionally serves the in-process proxy/local relay (§71).
 pub struct Controller {
     shared: Arc<Shared>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     wake_stop: Option<OwnedFd>,
+}
+
+/// Cloneable handle passed to `split_proxy::Routing` so the in-process relay
+/// can check protected connections before forwarding any bytes (§71).
+#[derive(Clone)]
+pub struct RelayGate {
+    shared: Arc<Shared>,
+}
+
+fn verdict_from_str(s: &str) -> RelayVerdict {
+    match s {
+        "allow" => RelayVerdict::Allow,
+        "unverified" => RelayVerdict::Unverified,
+        _ => RelayVerdict::Block,
+    }
+}
+
+impl RelayGate {
+    /// Whether `host` or any of `ips` belongs to an enabled protection group.
+    pub fn protects_target(&self, host: &str, ips: &[IpAddr]) -> Option<u32> {
+        let state = self.shared.state.lock().ok()?;
+        if !state.config.active() { return None; }
+        state.sites.group_for(host).or_else(|| ips.iter().find_map(|ip| state.sites.group_for_ip(*ip)))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.shared.state.lock().ok().is_some_and(|s| s.config.active())
+    }
+
+    pub fn local_policy(&self) -> LocalPolicy {
+        self.shared.state.lock().ok().map(|s| s.config.local_policy()).unwrap_or_default()
+    }
+
+    pub fn set_relay_opener(&self, opener: Option<RelayOpener>) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.relay_opener = opener;
+            self.shared.bell.0.notify_one();
+        }
+    }
+
+    pub fn invalidate_path(&self, path: EgressPath) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.invalidate_path(path);
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.retire_checks();
+        }
+    }
+
+    /// Gate a TCP connection before any bytes are forwarded (§71).
+    /// Returns `None` when the target is not protected by any enabled rule.
+    pub fn check_connection(
+        &self,
+        host: &str,
+        ips: &[IpAddr],
+        path: EgressPath,
+        resolved_local_ip: Option<IpAddr>,
+    ) -> Option<RelayVerdict> {
+        let clean_host = host.trim_end_matches('.').to_ascii_lowercase();
+        let wait_slot: Option<RelaySlot>;
+        let probe_ctx: Option<(u32, Group, refresh::Key, u64, (u64, u64), RelayOpener, RelaySlot)>;
+        let group_id: u32;
+        {
+            let mut state = self.shared.state.lock().ok()?;
+            if !state.config.active() { return None; }
+            let id = state.sites.group_for(&clean_host)
+                .or_else(|| ips.iter().find_map(|ip| state.sites.group_for_ip(*ip)))?;
+            let Some(rule) = state.config.enabled_group(id).cloned() else { return None };
+            group_id = id;
+
+            // D2-B: block non-proxied protected sites when Cisco is off.
+            if path == EgressPath::Local && state.config.local_policy() == LocalPolicy::Block {
+                let obs = Observation {
+                    host: clean_host.clone(),
+                    peer_address: resolved_local_ip,
+                    error: Some("Cisco 未连接且未命中代理".into()),
+                    path: Some(path.wire()),
+                    ..Default::default()
+                };
+                let failing = vec![obs.clone()];
+                state.status.apply(&rule, &obs, failing, now());
+                state.note_relay_denied(&rule, &clean_host, &path);
+                return Some(RelayVerdict::Block);
+            }
+
+            if clean_host.is_empty() {
+                let ip = resolved_local_ip.or_else(|| ips.first().copied())
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let target = Target { host: String::new(), ip, path };
+                let obs = Observation {
+                    host: String::new(),
+                    peer_address: (ip != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).then_some(ip),
+                    error: Some("看不到网站名".into()),
+                    path: Some(path.wire()),
+                    ..Default::default()
+                };
+                let answer = state.record(&rule, target, obs);
+                if answer == "block" {
+                    state.note_relay_denied(&rule, "", &path);
+                }
+                return Some(verdict_from_str(answer));
+            }
+
+            if !valid_host(&clean_host) {
+                state.note_relay_denied(&rule, &clean_host, &path);
+                return Some(RelayVerdict::Block);
+            }
+
+            let key_ip = resolved_local_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let key: refresh::Key = (id, path, clean_host.clone(), key_ip);
+            let now_inst = Instant::now();
+            state.cache.bump(&key, now_inst);
+            self.shared.bell.0.notify_one();
+
+            if let Some(fresh) = state.cache.reusable(&key, state.epoch, now_inst) {
+                let answer = fresh.answer;
+                if answer == "block" {
+                    state.note_relay_denied(&rule, &clean_host, &path);
+                }
+                return Some(verdict_from_str(answer));
+            }
+
+            if let Some(slot) = state.relay_running.get(&key) {
+                wait_slot = Some(slot.clone());
+                probe_ctx = None;
+            } else {
+                let Some(opener) = state.relay_opener.clone() else {
+                    state.note_relay_denied(&rule, &clean_host, &path);
+                    return Some(RelayVerdict::Block);
+                };
+                if state.checks.len() >= MAX_CHECKS {
+                    state.note_relay_denied(&rule, &clean_host, &path);
+                    return Some(RelayVerdict::Block);
+                }
+                let epoch = state.epoch;
+                state.next_relay_check = state.next_relay_check.wrapping_add(1).max(1);
+                let check_key = (u64::MAX, state.next_relay_check);
+                state.checks.insert(check_key, ActiveCheck { group: id, epoch });
+                let slot: RelaySlot = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+                state.relay_running.insert(key.clone(), slot.clone());
+                wait_slot = None;
+                probe_ctx = Some((id, rule, key, epoch, check_key, opener, slot));
+            }
+        }
+
+        if let Some(slot) = wait_slot {
+            let (lock, cv) = &*slot;
+            let mut guard = lock.lock().expect("relay slot");
+            let deadline = Instant::now() + RELAY_WAIT_TIMEOUT;
+            while guard.is_none() {
+                let Some(rem) = deadline.checked_duration_since(Instant::now()) else { break };
+                let (g, timed) = cv.wait_timeout(guard, rem).expect("relay slot");
+                guard = g;
+                if timed.timed_out() { break; }
+            }
+            let answer = *guard;
+            drop(guard);
+            let mut state = self.shared.state.lock().expect("controller");
+            let Some(rule) = state.config.enabled_group(group_id).cloned() else {
+                return Some(RelayVerdict::Block);
+            };
+            let final_ans = match answer {
+                Some(ans) => ans,
+                None => match rule.unverified {
+                    Unverified::Block => "block",
+                    Unverified::WhenWrong if state.failures.get(&group_id).is_some_and(|f| f.iter().any(|x| x.observation.country.is_some())) => "block",
+                    Unverified::WhenWrong | Unverified::Allow => {
+                        state.note_unverified(&rule);
+                        "unverified"
+                    }
+                },
+            };
+            if final_ans == "block" {
+                state.note_relay_denied(&rule, &clean_host, &path);
+            }
+            return Some(verdict_from_str(final_ans));
+        }
+
+        let (id, _rule, key, epoch, check_key, opener, slot) = probe_ctx.expect("probe_ctx");
+        let obs = bridge::probe_via_relay(&self.shared.hook, &opener, &path, &clean_host, resolved_local_ip);
+        let answer = {
+            let mut state = self.shared.state.lock().expect("controller");
+            state.checks.remove(&check_key);
+            state.relay_running.remove(&key);
+            if state.epoch != epoch || self.shared.stop.load(Ordering::SeqCst) {
+                "block"
+            } else if let Some(rule) = state.config.enabled_group(id).cloned() {
+                let target = Target { host: clean_host.clone(), ip: key.3, path };
+                let ans = state.record(&rule, target, obs.clone());
+                state.cache.note(key, ans, &obs, epoch, Instant::now());
+                if ans == "block" {
+                    state.note_relay_denied(&rule, &clean_host, &path);
+                }
+                ans
+            } else {
+                "block"
+            }
+        };
+        {
+            let mut guard = slot.0.lock().expect("relay slot");
+            *guard = Some(answer);
+            slot.1.notify_all();
+        }
+        Some(verdict_from_str(answer))
+    }
 }
 
 impl Controller {
@@ -661,11 +989,12 @@ impl Controller {
                 sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
                 epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
                 ledger: Ledger::default(), cache: Cache::with_half_life(half_life), on_peer_loss: None,
+                relay_opener: None, relay_running: HashMap::new(), next_relay_check: 0,
             }),
             marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
             bell: Bell::default(),
         });
-        let controller = Controller { shared, path: path.to_path_buf(), wake_stop: Some(wake_stop) };
+        let controller = Controller { shared, path: Some(path.to_path_buf()), wake_stop: Some(wake_stop) };
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let shared = controller.shared.clone();
@@ -674,6 +1003,38 @@ impl Controller {
         let shared = controller.shared.clone();
         std::thread::Builder::new().name("egress-refresher".into()).spawn(move || refresh::refresh_loop(shared))?;
         Ok(controller)
+    }
+
+    /// Starts an in-process controller with no UNIX gate socket (for proxy-only
+    /// mode when Cisco is off, §71).
+    pub fn in_process(cfg: EgressConfig, hook: ProbeHook) -> std::io::Result<Controller> {
+        let half_life = cfg.half_life();
+        let shared = Arc::new(Shared {
+            state: Mutex::new(ControlState {
+                sites: cfg.protected_sites(), config: cfg, status: Status::default(), interface: String::new(), peer: None, peer_id: 0,
+                epoch: 0, checks: HashMap::new(), failures: HashMap::new(), peer_counts: HashMap::new(),
+                ledger: Ledger::default(), cache: Cache::with_half_life(half_life), on_peer_loss: None,
+                relay_opener: None, relay_running: HashMap::new(), next_relay_check: 0,
+            }),
+            marker: format!("ac-probe-{:016x}", random_u64()), hook, stop: AtomicBool::new(false),
+            bell: Bell::default(),
+        });
+        let controller = Controller { shared, path: None, wake_stop: None };
+        let shared = controller.shared.clone();
+        std::thread::Builder::new().name("egress-refresher".into()).spawn(move || refresh::refresh_loop(shared))?;
+        Ok(controller)
+    }
+
+    pub fn relay_gate(&self) -> RelayGate {
+        RelayGate { shared: self.shared.clone() }
+    }
+
+    pub fn set_relay_opener(&self, opener: Option<RelayOpener>) {
+        self.relay_gate().set_relay_opener(opener);
+    }
+
+    pub fn invalidate_path(&self, path: EgressPath) {
+        self.relay_gate().invalidate_path(path);
     }
 
     pub fn marker(&self) -> String {
@@ -694,7 +1055,7 @@ impl Controller {
     pub fn status_json(&self) -> String {
         let state = self.shared.state.lock().expect("controller");
         let mut status = state.status.clone();
-        status.running = state.peer.is_some();
+        status.running = state.peer.is_some() || state.relay_opener.is_some();
         status.checking = state.checks.values().filter(|c| c.epoch == state.epoch).map(|c| c.group).collect();
         status.checking.sort_unstable();
         status.checking.dedup();
@@ -706,38 +1067,47 @@ impl Controller {
     pub fn update(&self, cfg: EgressConfig) {
         let mut state = self.shared.state.lock().expect("controller");
         state.replace_config(cfg, &self.shared.marker);
+        self.shared.bell.0.notify_one();
     }
 
     /// Probe a rule's wrong-exit servers again ("重新检查").
     pub fn recheck_job(&self, id: u32) -> Option<impl FnOnce() -> bool + Send + 'static> {
         let mut state = self.shared.state.lock().ok()?;
         state.config.enabled_group(id)?;
-        let targets: Vec<Target> = state.failures.get(&id)?.iter().map(|f| f.target.clone()).collect();
+        let cisco_ready = !state.interface.is_empty() && state.peer.is_some();
+        let relay_opener = state.relay_opener.clone();
+        let targets: Vec<Target> = state.failures.get(&id)?.iter()
+            .filter(|f| if f.target.path.is_cisco() { cisco_ready } else { relay_opener.is_some() })
+            .map(|f| f.target.clone())
+            .collect();
         let key = (0, u64::from(id)); // gate peer ids start at one
-        if targets.is_empty() || state.interface.is_empty() || state.peer.is_none()
-            || state.checks.contains_key(&key) || state.checks.len() >= MAX_CHECKS { return None; }
+        if targets.is_empty() || state.checks.contains_key(&key) || state.checks.len() >= MAX_CHECKS { return None; }
         let epoch = state.epoch;
         let interface = state.interface.clone();
         state.checks.insert(key, ActiveCheck { group: id, epoch });
         let shared = self.shared.clone();
-        Some(move || run_check(&shared, id, targets, &interface, key))
+        Some(move || run_check(&shared, id, targets, &interface, relay_opener, key))
     }
 
     /// Add `country` to a rule after the user approved one of its current
     /// wrong-exit observations. Returns the new configuration.
     pub fn allow_country(&self, expected: &EgressConfig, group_id: u32, started: f64, country: &str,
                          evidence: &Observation) -> Option<EgressConfig> {
-        if !started.is_finite() || evidence.peer_address.is_none() || evidence.error.is_some()
+        let proxy_path = evidence.path.as_deref().is_some_and(|p| p.starts_with("proxy:"));
+        if !started.is_finite() || (evidence.peer_address.is_none() && !proxy_path) || evidence.error.is_some()
             || evidence.approval_id.is_none() || evidence.country.as_deref() != Some(country)
             || country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) { return None; }
         let mut state = self.shared.state.lock().ok()?;
         state.status.records.iter().find(|r| r.group == group_id && r.started == started && r.ended.is_none())?;
+        fn norm_path(p: &Option<String>) -> &str { p.as_deref().unwrap_or("cisco") }
         let current = state.failures.get(&group_id)?.iter().any(|f| {
             let o = &f.observation;
             o.host.eq_ignore_ascii_case(&evidence.host) && o.peer_address == evidence.peer_address
                 && o.country == evidence.country && o.ip == evidence.ip && o.approval_id == evidence.approval_id
+                && norm_path(&o.path) == norm_path(&evidence.path)
         });
-        if &state.config != expected || state.peer.is_none() || state.interface.is_empty() || !current {
+        let active = (state.peer.is_some() && !state.interface.is_empty()) || state.relay_opener.is_some();
+        if &state.config != expected || !active || !current {
             return None;
         }
         let mut config = state.config.clone();
@@ -761,10 +1131,15 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        self.shared.state.lock().expect("controller").disconnect();
+        let mut state = self.shared.state.lock().expect("controller");
+        state.relay_opener = None;
+        state.disconnect();
+        drop(state);
         self.shared.bell.0.notify_all();
         self.wake_stop.take();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -881,7 +1256,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         }
         if host.is_empty() {
             if let Some(rule) = state.config.enabled_group(check.group).cloned() {
-                let target = Target { host, ip: check.ip };
+                let target = Target { host, ip: check.ip, path: EgressPath::Cisco };
                 let obs = probe(&shared.hook, "", target.ip, &shared.marker, &state.interface);
                 let answer = state.record(&rule, target, obs);
                 state.send(&verdict(check.group, id, answer, None));
@@ -890,7 +1265,7 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         }
         // §66.31: a young result answers at once; a probe of the same
         // server already running is waited for instead of repeated.
-        let server = (check.group, host.clone(), check.ip);
+        let server = (check.group, EgressPath::Cisco, host.clone(), check.ip);
         let now = Instant::now();
         state.cache.bump(&server, now);
         shared.bell.0.notify_one();
@@ -908,9 +1283,9 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
         let interface = state.interface.clone();
         state.checks.insert(key, ActiveCheck { group: check.group, epoch });
         let worker = shared.clone();
-        let target = Target { host, ip: check.ip };
+        let target = Target { host, ip: check.ip, path: EgressPath::Cisco };
         if std::thread::Builder::new().name("egress-check".into())
-            .spawn(move || run_check(&worker, check.group, vec![target], &interface, key)).is_err()
+            .spawn(move || run_check(&worker, check.group, vec![target], &interface, None, key)).is_err()
         {
             state.checks.remove(&key);
             state.send(&verdict(check.group, id, "block", None));
@@ -920,17 +1295,36 @@ fn read_loop(stream: UnixStream, shared: Arc<Shared>, peer_id: u64) {
     if state.peer_id == peer_id { state.peer_lost(); }
 }
 
-fn run_check(shared: &Arc<Shared>, group: u32, targets: Vec<Target>, interface: &str, key: (u64, u64)) -> bool {
+fn run_check(shared: &Arc<Shared>, group: u32, targets: Vec<Target>, interface: &str,
+             opener: Option<RelayOpener>, key: (u64, u64)) -> bool {
     let results: Vec<(Target, Observation)> = std::thread::scope(|scope| {
         let workers: Vec<_> = targets.iter().map(|target| {
-            let worker = std::thread::Builder::new().spawn_scoped(scope, ||
-                probe(&shared.hook, &target.host, target.ip, &shared.marker, interface));
+            let opener = opener.clone();
+            let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if target.path.is_cisco() {
+                    probe(&shared.hook, &target.host, target.ip, &shared.marker, interface)
+                } else if let Some(opener) = opener.as_ref() {
+                    let peer_ip = (target.ip != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).then_some(target.ip);
+                    bridge::probe_via_relay(&shared.hook, opener, &target.path, &target.host, peer_ip)
+                } else {
+                    Observation {
+                        host: target.host.clone(),
+                        peer_address: (target.ip != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).then_some(target.ip),
+                        error: Some("代理通道不可用".into()),
+                        path: Some(target.path.wire()),
+                        ..Default::default()
+                    }
+                }
+            });
             (target, worker)
         }).collect();
         workers.into_iter().map(|(target, worker)| {
             let obs = worker.ok().and_then(|w| w.join().ok()).unwrap_or_else(|| Observation {
-                host: target.host.clone(), peer_address: Some(target.ip),
-                error: Some("出口检查未完成".into()), ..Default::default()
+                host: target.host.clone(),
+                peer_address: (target.ip != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).then_some(target.ip),
+                error: Some("出口检查未完成".into()),
+                path: Some(target.path.wire()),
+                ..Default::default()
             });
             (target.clone(), obs)
         }).collect()
@@ -945,9 +1339,10 @@ fn run_check(shared: &Arc<Shared>, group: u32, targets: Vec<Target>, interface: 
     let mut joined = Vec::new();
     for (target, obs) in results {
         at = obs.evidence_at_ms;
-        let wrong_cloudflare = obs.country.is_some() && matches!(target.ip, IpAddr::V4(ip) if steer::cloudflare(ip));
+        let wrong_cloudflare = target.path.is_cisco() && obs.country.is_some()
+            && matches!(target.ip, IpAddr::V4(ip) if steer::cloudflare(ip));
         let host = target.host.clone();
-        let server = (group, target.host.clone(), target.ip);
+        let server = (group, target.path, target.host.clone(), target.ip);
         answer = state.record(&rule, target, obs.clone());
         let epoch = state.epoch;
         state.cache.note(server.clone(), answer, &obs, epoch, Instant::now());

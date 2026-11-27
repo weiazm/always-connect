@@ -26,7 +26,25 @@ pub struct RedirectSession {
 /// reached another way. `no_routes`: tests and the session harness, answers only.
 pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &Forwarder, routes: &DirectRoutes,
             guard: Option<&Guard>, no_routes: bool) -> bool {
-    if table.is_empty() {
+    sync_with_egress(session, table, forwarder, routes, guard, no_routes, None, false)
+}
+
+/// Like `sync`, attaching an optional exit-protection gate (`egress`). When
+/// `local_egress` is true (proxy-only mode with active exit protection, §71),
+/// the redirect stays alive even if `table` has no proxy rules so non-proxied
+/// protected sites still pass through the relay gate.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_with_egress(
+    session: &mut Option<RedirectSession>,
+    table: Table,
+    forwarder: &Forwarder,
+    routes: &DirectRoutes,
+    guard: Option<&Guard>,
+    no_routes: bool,
+    egress: Option<crate::egress_control::RelayGate>,
+    local_egress: bool,
+) -> bool {
+    if table.is_empty() && !local_egress {
         stop(session, Some(forwarder), routes, guard, no_routes);
         return true;
     }
@@ -43,6 +61,7 @@ pub fn sync(session: &mut Option<RedirectSession>, table: Table, forwarder: &For
         None => *session = Some(RedirectSession { routing: Routing::new(table), listener: None, loaded: None }),
     }
     let s = session.as_mut().expect("just set");
+    s.routing.set_egress(egress, local_egress);
     forwarder.set_proxy(Some(s.routing.clone()));
     // A proxy on this Mac resolves through us too: its own connections get
     // real addresses by the ordinary split.
@@ -96,6 +115,7 @@ pub fn stop_with_handover(session: &mut Option<RedirectSession>, forwarder: Opti
         super::hysteria::shared().stop_all();
     }
     let Some(mut s) = session.take() else { return };
+    s.routing.set_egress(None, false);
     if let Some(f) = forwarder { f.set_proxy(None); }
     if !no_routes {
         if let Some(Err(e)) = guard.map(|g| g.proxy_redirect(None)) {

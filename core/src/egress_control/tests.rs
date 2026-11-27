@@ -581,3 +581,140 @@ fn record_start_times_survive_json_exactly() {
         assert_eq!(back["started"].as_f64().unwrap().to_bits(), t.to_bits(), "{text}");
     }
 }
+
+#[test]
+fn in_process_proxy_gate_checks_caches_blocks_rechecks_and_approves_per_path() {
+    let country = Arc::new(Mutex::new(HashMap::<String, Option<String>>::new()));
+    country.lock().unwrap().insert("proxy:0".into(), Some("ZZ".into()));
+    country.lock().unwrap().insert("proxy:1".into(), Some("YY".into()));
+    country.lock().unwrap().insert("local".into(), Some("XX".into()));
+    let probes = Arc::new(Mutex::new(0usize));
+
+    let remote = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote_addr = remote.local_addr().unwrap();
+    std::thread::spawn(move || for _ in remote.incoming() {});
+
+    let seen_path = Arc::new(Mutex::new(String::new()));
+    let opener_path = seen_path.clone();
+    let opener: RelayOpener = Arc::new(move |path, _host, peer_ip| {
+        *opener_path.lock().unwrap() = path.wire();
+        let stream = std::net::TcpStream::connect(remote_addr).map_err(|e| e.to_string())?;
+        Ok((stream, Vec::new(), peer_ip))
+    });
+
+    let c_map = country.clone();
+    let p_cnt = probes.clone();
+    let hook_path = seen_path.clone();
+    let hook: ProbeHook = Arc::new(move |req, peer| {
+        *p_cnt.lock().unwrap() += 1;
+        assert_eq!(req.connect_ip, Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        *peer = req.connect_ip;
+        let path = hook_path.lock().unwrap().clone();
+        let code = c_map.lock().unwrap().get(&path).cloned().flatten()?;
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nip=198.51.100.9\nloc={code}\n").into_bytes())
+    });
+
+    let config = EgressConfig {
+        enabled: true,
+        prefetch: Some(0),
+        groups: vec![Group { unverified: Unverified::Block, ..rule(1, &["a.example"], &["ZZ"]) }],
+        ..Default::default()
+    };
+    let ctl = Controller::in_process(config.clone(), hook).unwrap();
+    let gate = ctl.relay_gate();
+    gate.set_relay_opener(Some(opener));
+
+    // Non-protected site returns None immediately without probing.
+    assert_eq!(gate.check_connection("other.example", &[], EgressPath::Proxy(0), None), None);
+    assert_eq!(*probes.lock().unwrap(), 0);
+
+    // Proxy 0 -> ZZ (allowed), cached on second connection.
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(0), None), Some(RelayVerdict::Allow));
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(0), None), Some(RelayVerdict::Allow));
+    assert_eq!(*probes.lock().unwrap(), 1, "proxy result reused within half_life");
+
+    // Proxy 1 -> YY (wrong country) is isolated from Proxy 0 and blocked.
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(1), None), Some(RelayVerdict::Block));
+    assert_eq!(*probes.lock().unwrap(), 2);
+
+    let st: Value = serde_json::from_str(&ctl.status_json()).unwrap();
+    assert_eq!(st["running"], true);
+    assert_eq!(st["groups"][0]["state"], "blocked");
+    assert_eq!(st["groups"][0]["blockedCount"], 1);
+    assert_eq!(st["records"][0]["path"], "proxy:1");
+    let started = st["records"][0]["started"].as_f64().unwrap();
+    let evidence: Observation = serde_json::from_value(st["records"][0]["observed"][0].clone()).unwrap();
+    assert_eq!(evidence.path.as_deref(), Some("proxy:1"));
+    assert!(evidence.peer_address.is_none());
+    assert!(evidence.approval_id.is_some());
+
+    // Invalidating Proxy 0 forces a re-probe on Proxy 0 only.
+    ctl.invalidate_path(EgressPath::Proxy(0));
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(0), None), Some(RelayVerdict::Allow));
+    assert_eq!(*probes.lock().unwrap(), 3);
+
+    // Manual recheck recovers Proxy 1 when its upstream changes to ZZ.
+    country.lock().unwrap().insert("proxy:1".into(), Some("ZZ".into()));
+    let job = ctl.recheck_job(1).expect("recheck job for proxy failure");
+    assert!(job());
+    let st_after: Value = serde_json::from_str(&ctl.status_json()).unwrap();
+    assert_eq!(st_after["groups"][0]["state"], "ok");
+
+    // Block again on Proxy 1 and approve YY with peer_address: None.
+    country.lock().unwrap().insert("proxy:1".into(), Some("YY".into()));
+    ctl.invalidate_path(EgressPath::Proxy(1));
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(1), None), Some(RelayVerdict::Block));
+    let st_block: Value = serde_json::from_str(&ctl.status_json()).unwrap();
+    let started2 = st_block["records"][0]["started"].as_f64().unwrap();
+    let ev2: Observation = serde_json::from_value(st_block["records"][0]["observed"][0].clone()).unwrap();
+    let updated = ctl.allow_country(&config, 1, started2, "YY", &ev2).expect("approve proxy wrong exit");
+    assert_eq!(updated.groups[0].expect, vec!["ZZ", "YY"]);
+    assert_eq!(gate.check_connection("www.a.example", &[], EgressPath::Proxy(1), None), Some(RelayVerdict::Allow));
+    let _ = started;
+}
+
+#[test]
+fn concurrent_relay_connections_share_one_probe_and_local_block_policy_refuses() {
+    let remote = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote_addr = remote.local_addr().unwrap();
+    std::thread::spawn(move || for _ in remote.incoming() {});
+
+    let opener: RelayOpener = Arc::new(move |_path, _host, peer_ip| {
+        Ok((std::net::TcpStream::connect(remote_addr).map_err(|e| e.to_string())?, Vec::new(), peer_ip))
+    });
+    let probes = Arc::new(Mutex::new(0usize));
+    let cnt = probes.clone();
+    let hook: ProbeHook = Arc::new(move |req, peer| {
+        *cnt.lock().unwrap() += 1;
+        std::thread::sleep(Duration::from_millis(250));
+        *peer = req.connect_ip;
+        Some(b"HTTP/1.1 200 OK\r\n\r\nloc=ZZ\n".to_vec())
+    });
+
+    let config = EgressConfig {
+        enabled: true,
+        prefetch: Some(0),
+        local_policy: Some(LocalPolicy::Block),
+        groups: vec![rule(1, &["a.example"], &["ZZ"])],
+        ..Default::default()
+    };
+    let ctl = Controller::in_process(config, hook).unwrap();
+    let gate = ctl.relay_gate();
+    gate.set_relay_opener(Some(opener));
+
+    // Three simultaneous connections share one probe.
+    let verdicts: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..3).map(|_| {
+            let g = gate.clone();
+            s.spawn(move || g.check_connection("www.a.example", &[], EgressPath::Proxy(0), None))
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(verdicts, vec![Some(RelayVerdict::Allow); 3]);
+    assert_eq!(*probes.lock().unwrap(), 1);
+
+    // LocalPolicy::Block refuses local connections without probing.
+    let local_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+    assert_eq!(gate.check_connection("www.a.example", &[local_ip], EgressPath::Local, Some(local_ip)), Some(RelayVerdict::Block));
+    assert_eq!(*probes.lock().unwrap(), 1, "LocalPolicy::Block never sends a probe");
+}

@@ -17,13 +17,15 @@
 //! site whose proxy cannot be reached does not open.
 
 use crate::direct_routes::DirectRoutes;
-use crate::dns_forwarder::{Forwarder, Upstreams};
+use crate::dns_forwarder::{Forwarder, SplitRules, Upstreams};
+use crate::egress_control::{Controller, EgressConfig, LocalPolicy, Observation, ProbeHook};
 use crate::network_guard;
 use crate::split_proxy::{redirect, RedirectSession, Table};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Our own configd service: only a DNS dictionary, never IPv4, so it can
@@ -85,8 +87,12 @@ pub struct ProxyOnly {
     session: Option<RedirectSession>,
     routes: DirectRoutes,
     network: Network,
+    lines: Vec<String>,
     no_routes: bool,
     error: Option<&'static str>,
+    egress_cfg: Option<EgressConfig>,
+    egress_probe: Option<ProbeHook>,
+    egress: Option<Controller>,
 }
 
 impl ProxyOnly {
@@ -94,15 +100,30 @@ impl ProxyOnly {
     /// tests, answers only (no routes, pf or DNS entry).
     pub fn start(lines: Vec<String>, network: Network, support: &Path, boot: String, listen: u16,
                  no_routes: bool) -> Result<Self, &'static str> {
+        Self::start_with_egress(lines, network, support, boot, listen, no_routes, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_egress(
+        lines: Vec<String>,
+        network: Network,
+        support: &Path,
+        boot: String,
+        listen: u16,
+        no_routes: bool,
+        egress_cfg: Option<EgressConfig>,
+        egress_probe: Option<ProbeHook>,
+    ) -> Result<Self, &'static str> {
         let forwarder = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen), 53, Duration::from_secs(2),
                                        lines.clone(), upstreams(&network), None);
         forwarder.start().map_err(|_| PORT_BUSY)?;
         let mut me = ProxyOnly {
             forwarder, session: None,
             routes: DirectRoutes::new(support.join(ROUTES), boot, no_routes),
-            network, no_routes, error: None,
+            network, lines: lines.clone(), no_routes, error: None,
+            egress_cfg, egress_probe, egress: None,
         };
-        me.apply(lines);
+        me.sync_all();
         if !no_routes && !set_dns(true) {
             me.stop();
             return Err(DNS_FAILED);
@@ -113,23 +134,82 @@ impl ProxyOnly {
 
     /// New rules from the App (the split list with the proxies in it).
     pub fn update_rules(&mut self, lines: Vec<String>) {
-        self.forwarder.set_rules(&lines);
-        self.apply(lines);
+        self.lines = lines;
+        self.sync_all();
+    }
+
+    /// Update exit-protection configuration in place (§71).
+    pub fn update_egress(&mut self, cfg: Option<EgressConfig>) {
+        if self.egress_cfg == cfg { return; }
+        self.egress_cfg = cfg;
+        self.sync_all();
     }
 
     /// The Mac moved to another network or its DNS servers changed.
     pub fn update_network(&mut self, network: Network) {
         if network == self.network { return; }
         self.forwarder.set_upstreams(upstreams(&network));
+        if let Some(ctl) = &self.egress {
+            ctl.invalidate();
+        }
         self.network = network;
     }
 
-    fn apply(&mut self, lines: Vec<String>) {
-        let table = Table::parse(&lines);
+    fn sync_all(&mut self) {
+        let active_egress = self.egress_cfg.as_ref().filter(|e| e.active()).cloned();
+        let protected = active_egress.as_ref().map(|e| Arc::new(e.protected_sites()));
+        let rules = SplitRules::new(&self.lines).with_protection(protected);
+        self.forwarder.set_parsed_rules(rules);
+
+        let local_egress = active_egress.as_ref()
+            .is_some_and(|e| e.local_policy() != LocalPolicy::Bypass);
+        match active_egress {
+            Some(cfg) => match &self.egress {
+                Some(ctl) => ctl.update(cfg),
+                None => {
+                    let hook = self.egress_probe.clone()
+                        .unwrap_or_else(|| Arc::new(|_: &crate::egress_control::ProbeRequest, _| None));
+                    match Controller::in_process(cfg, hook) {
+                        Ok(ctl) => self.egress = Some(ctl),
+                        Err(e) => network_guard::log(&format!("proxy only: egress controller failed: {e}")),
+                    }
+                }
+            },
+            None => { self.egress = None; }
+        }
+
+        let table = Table::parse(&self.lines);
         let guard = network_guard::shared();
-        let ok = redirect::sync(&mut self.session, table, &self.forwarder, &self.routes, guard.as_deref(), self.no_routes);
+        let gate = self.egress.as_ref().map(|c| c.relay_gate());
+        let ok = redirect::sync_with_egress(
+            &mut self.session, table, &self.forwarder, &self.routes, guard.as_deref(), self.no_routes, gate, local_egress);
         self.error = (!ok).then_some(REDIRECT_FAILED);
         if !ok { network_guard::log(REDIRECT_FAILED); }
+    }
+
+    /// Exit-protection status JSON in proxy-only mode (§71).
+    pub fn egress_status(&self) -> String {
+        self.egress.as_ref().map(|c| c.status_json()).unwrap_or_else(|| "{}".into())
+    }
+
+    /// Returns a recheck closure so the caller can drop the ProxyOnly lock
+    /// before executing network I/O.
+    pub fn recheck_egress_job(&self, group: u32) -> Option<Box<dyn FnOnce() -> bool + Send>> {
+        self.egress.as_ref()?.recheck_job(group).map(|f| Box::new(f) as Box<dyn FnOnce() -> bool + Send>)
+    }
+
+    pub fn allow_egress_country(
+        &mut self,
+        expected: &EgressConfig,
+        group: u32,
+        started: f64,
+        country: &str,
+        evidence: &Observation,
+    ) -> Option<Vec<String>> {
+        let cfg = self.egress.as_ref()?.allow_country(expected, group, started, country, evidence)?;
+        let countries = cfg.group(group)?.expect.clone();
+        self.egress_cfg = Some(cfg);
+        Some(countries)
     }
 
     /// The DNS entry first (the Mac asks its own servers again at once),
@@ -144,6 +224,7 @@ impl ProxyOnly {
         if !self.no_routes && !set_dns(false) { network_guard::log("proxy only: DNS entry removal not confirmed"); }
         let guard = network_guard::shared();
         redirect::stop_with_handover(&mut self.session, Some(&self.forwarder), &self.routes, guard.as_deref(), self.no_routes, handover);
+        self.egress = None;
         self.forwarder.stop();
         network_guard::log("proxy only: stopped");
     }

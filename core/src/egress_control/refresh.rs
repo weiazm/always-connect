@@ -25,6 +25,11 @@ use std::sync::Condvar;
 
 pub(super) const REUSE_UNDER: Duration = Duration::from_millis(800);
 pub(super) const REFRESH_EVERY: Duration = Duration::from_millis(600);
+/// Blocked results on proxy/local paths are cached briefly to avoid probe
+/// storms on rapid retries while still recovering promptly when upstream changes.
+pub(super) const PROXY_BLOCK_REUSE: Duration = Duration::from_secs(10);
+/// Minimum interval between background refreshes on a proxy/local path.
+const PROXY_REFRESH_MIN: Duration = Duration::from_secs(30);
 /// Two minutes: while a site is in use its connections keep it on top;
 /// after leaving it, one visit stops being refreshed after about two
 /// minutes and a busy session after about ten (user 2026-11-25: defaults
@@ -36,7 +41,7 @@ pub const DEFAULT_PREFETCH: u32 = 5;
 pub const MAX_PREFETCH: u32 = 20;
 const MAX_SCORED: usize = 256;
 
-pub(super) type Key = (u32, String, IpAddr);
+pub(super) type Key = (u32, EgressPath, String, IpAddr);
 
 pub(super) struct Fresh {
     pub answer: &'static str,
@@ -92,18 +97,38 @@ impl Cache {
         }
     }
 
-    /// A result young enough to answer a new check with. A result with
-    /// evidence is aged by the gate's own clock, so what is reused here is
-    /// still under the gate's one second on arrival.
+    /// A result young enough to answer a new check with. On Cisco (§66.31),
+    /// results are aged by the gate's own clock under one second. On proxy and
+    /// local paths (§71), allowed results stay fresh for `half_life` (invalidated
+    /// immediately on proxy/network/rule changes) and blocked results for
+    /// [`PROXY_BLOCK_REUSE`].
     pub fn reusable(&self, key: &Key, epoch: u64, now: Instant) -> Option<&Fresh> {
         self.reusable_at(key, epoch, now, evidence_clock_ms())
     }
 
     pub fn reusable_at(&self, key: &Key, epoch: u64, now: Instant, clock_ms: Option<u64>) -> Option<&Fresh> {
-        self.fresh.get(key).filter(|f| f.epoch == epoch && match (f.evidence_at, clock_ms) {
-            (Some(at), Some(clock)) => clock.saturating_sub(at) < REUSE_UNDER.as_millis() as u64,
-            _ => now.duration_since(f.at) < REUSE_UNDER,
+        self.fresh.get(key).filter(|f| {
+            if f.epoch != epoch {
+                return false;
+            }
+            if key.1.is_cisco() {
+                match (f.evidence_at, clock_ms) {
+                    (Some(at), Some(clock)) => clock.saturating_sub(at) < REUSE_UNDER.as_millis() as u64,
+                    _ => now.duration_since(f.at) < REUSE_UNDER,
+                }
+            } else {
+                let limit = if f.answer == "block" { PROXY_BLOCK_REUSE } else { self.half_life };
+                now.duration_since(f.at) < limit
+            }
         })
+    }
+
+    fn refresh_interval(&self, path: EgressPath) -> Duration {
+        if path.is_cisco() {
+            REFRESH_EVERY
+        } else {
+            (self.half_life / 2).max(PROXY_REFRESH_MIN)
+        }
     }
 
     /// The servers to re-probe now: the top `limit` by score that are busy
@@ -117,7 +142,7 @@ impl Cache {
         ranked.into_iter().take(limit)
             .filter(|(k, _)| !self.running.contains_key(*k))
             .filter(|(k, _)| self.fresh.get(*k).is_some_and(|f| f.epoch == epoch && f.read
-                && now.duration_since(f.at) >= REFRESH_EVERY))
+                && now.duration_since(f.at) >= self.refresh_interval(k.1)))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -128,12 +153,23 @@ impl Cache {
             && self.fresh.get(k).is_some_and(|f| f.epoch == epoch && f.read))
     }
 
+    pub fn any_hot_cisco(&self, epoch: u64, now: Instant) -> bool {
+        self.scores.iter().any(|(k, (s, at))| k.1.is_cisco() && self.decayed(*s, *at, now) >= MIN_SCORE
+            && self.fresh.get(k).is_some_and(|f| f.epoch == epoch && f.read))
+    }
+
     pub fn note(&mut self, key: Key, answer: &'static str, obs: &Observation, epoch: u64, now: Instant) {
         self.fresh.insert(key, Fresh { answer, evidence_at: obs.evidence_at_ms, at: now, epoch, read: obs.country.is_some() });
         if self.fresh.len() > MAX_SCORED {
             let keep = self.half_life;
             self.fresh.retain(|_, f| f.epoch == epoch && now.duration_since(f.at) < keep);
         }
+    }
+
+    /// Forget results for one specific path (e.g. a proxy restarted or changed).
+    pub fn forget_path(&mut self, path: EgressPath) {
+        self.fresh.retain(|k, _| k.1 != path);
+        self.running.retain(|k, _| k.1 != path);
     }
 
     /// Network change, new rules, disconnect: no result carries over.
@@ -152,31 +188,58 @@ pub(super) fn refresh_loop(shared: Arc<Shared>) {
     while !shared.stop.load(Ordering::SeqCst) {
         let now = Instant::now();
         let limit = state.config.prefetch_limit();
-        let ready = limit > 0 && state.peer.is_some() && !state.interface.is_empty();
+        let cisco_ready = limit > 0 && state.peer.is_some() && !state.interface.is_empty();
+        let relay_ready = limit > 0 && state.relay_opener.is_some();
+        let ready = cisco_ready || relay_ready;
         let due = if ready { state.cache.due(limit, state.epoch, now) } else { Vec::new() };
         for key in due {
+            if key.1.is_cisco() && !cisco_ready { continue; }
+            if !key.1.is_cisco() && !relay_ready { continue; }
+            if !key.1.is_cisco() && state.relay_running.contains_key(&key) { continue; }
             let Some(rule) = state.config.enabled_group(key.0).cloned() else { continue };
             state.cache.running.insert(key.clone(), Vec::new());
-            let (worker, interface, epoch) = (shared.clone(), state.interface.clone(), state.epoch);
+            let (worker, interface, opener, epoch) = (
+                shared.clone(),
+                state.interface.clone(),
+                state.relay_opener.clone(),
+                state.epoch,
+            );
+            let run_key = key.clone();
             let spawned = std::thread::Builder::new().name("egress-refresh".into())
-                .spawn(move || run_refresh(&worker, rule, key.clone(), &interface, epoch));
-            if spawned.is_err() { break; }
+                .spawn(move || run_refresh(&worker, rule, run_key, &interface, opener, epoch));
+            if spawned.is_err() {
+                state.cache.running.remove(&key);
+                break;
+            }
         }
         state = if ready && state.cache.any_hot(state.epoch, now) {
-            shared.bell.0.wait_timeout(state, REFRESH_EVERY / 3).expect("controller").0
+            let wait = if cisco_ready && state.cache.any_hot_cisco(state.epoch, now) {
+                REFRESH_EVERY / 3
+            } else {
+                Duration::from_secs(10)
+            };
+            shared.bell.0.wait_timeout(state, wait).expect("controller").0
         } else {
             shared.bell.0.wait(state).expect("controller")
         };
     }
 }
 
-fn run_refresh(shared: &Arc<Shared>, rule: Group, key: Key, interface: &str, epoch: u64) {
-    let obs = probe(&shared.hook, &key.1, key.2, &shared.marker, interface);
+fn run_refresh(shared: &Arc<Shared>, rule: Group, key: Key, interface: &str, opener: Option<RelayOpener>, epoch: u64) {
+    let obs = if key.1.is_cisco() {
+        probe(&shared.hook, &key.2, key.3, &shared.marker, interface)
+    } else if let Some(opener) = opener.as_ref() {
+        let peer_ip = (key.3 != IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).then_some(key.3);
+        bridge::probe_via_relay(&shared.hook, opener, &key.1, &key.2, peer_ip)
+    } else {
+        return;
+    };
     let mut state = shared.state.lock().expect("controller");
     let waiting = state.cache.running.remove(&key).unwrap_or_default();
     if state.epoch != epoch || state.config.enabled_group(rule.id).is_none() { return; }
-    let wrong_cloudflare = obs.country.is_some() && matches!(key.2, IpAddr::V4(ip) if steer::cloudflare(ip));
-    let target = Target { host: key.1.clone(), ip: key.2 };
+    let wrong_cloudflare = key.1.is_cisco() && obs.country.is_some()
+        && matches!(key.3, IpAddr::V4(ip) if steer::cloudflare(ip));
+    let target = Target { host: key.2.clone(), ip: key.3, path: key.1 };
     let at = obs.evidence_at_ms;
     // A refresh is not a connection: an unreadable exit is not counted again.
     let answer = state.record_probe(&rule, target, obs.clone(), false);
@@ -185,7 +248,7 @@ fn run_refresh(shared: &Arc<Shared>, rule: Group, key: Key, interface: &str, epo
         if peer == state.peer_id { state.send(&verdict(rule.id, id, answer, at)); }
     }
     let search = (answer == "block" && wrong_cloudflare && state.config.steering())
-        .then(|| state.search_job(shared, &rule, &key.1)).flatten();
+        .then(|| state.search_job(shared, &rule, &key.2)).flatten();
     drop(state);
     if let Some(job) = search {
         let _ = std::thread::Builder::new().name("egress-steer".into()).spawn(job);
@@ -196,7 +259,8 @@ fn run_refresh(shared: &Arc<Shared>, rule: Group, key: Key, interface: &str, epo
 mod tests {
     use super::*;
 
-    fn key(n: u8) -> Key { (1, format!("s{n}.example"), IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, n))) }
+    fn key(n: u8) -> Key { (1, EgressPath::Cisco, format!("s{n}.example"), IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, n))) }
+    fn proxy_key(p: usize, n: u8) -> Key { (1, EgressPath::Proxy(p), format!("s{n}.example"), IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)) }
 
     fn read(cache: &mut Cache, k: &Key, at: Instant) {
         let obs = Observation { country: Some("ZZ".into()), evidence_at_ms: Some(1), ..Default::default() };
@@ -254,5 +318,27 @@ mod tests {
         cache.note(key(2), "unverified", &unreadable, 0, start);
         assert!(!cache.due(5, 0, start + REFRESH_EVERY).contains(&key(2)), "an unreadable exit is not polled");
         assert!(!cache.any_hot(0, start + REFRESH_EVERY) || cache.due(5, 0, start + REFRESH_EVERY).is_empty());
+    }
+
+    #[test]
+    fn proxy_paths_are_isolated_from_each_other_and_reuse_for_half_life() {
+        let start = Instant::now();
+        let mut cache = Cache::default();
+        let p0 = proxy_key(0, 1);
+        let p1 = proxy_key(1, 1);
+        read(&mut cache, &p0, start);
+        assert!(cache.reusable_at(&p0, 0, start + Duration::from_secs(60), None).is_some(),
+                "proxy result stays reusable within half_life");
+        assert!(cache.reusable_at(&p0, 0, start + cache.half_life, None).is_none(),
+                "proxy result expires after half_life");
+        assert!(cache.reusable_at(&p1, 0, start, None).is_none(),
+                "different proxy path has its own cache entry");
+        let blocked = Observation { country: Some("YY".into()), ..Default::default() };
+        cache.note(p1.clone(), "block", &blocked, 0, start);
+        assert!(cache.reusable_at(&p1, 0, start + Duration::from_secs(5), None).is_some());
+        assert!(cache.reusable_at(&p1, 0, start + PROXY_BLOCK_REUSE, None).is_none());
+        cache.forget_path(EgressPath::Proxy(0));
+        assert!(cache.reusable_at(&p0, 0, start, None).is_none());
+        assert!(cache.reusable_at(&p1, 0, start, None).is_some());
     }
 }

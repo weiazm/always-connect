@@ -911,3 +911,173 @@ fn interop_with_a_reference_hysteria2_server() {
     hysteria::shared().stop_all();
     assert!(hysteria::shared().running_socks_for(&spec).is_none());
 }
+
+// MARK: - Egress protection on proxy and local paths (§71)
+
+#[test]
+fn relay_egress_gate_allows_right_country_blocks_wrong_and_drops_protected_udp() {
+    use crate::egress_control::{Controller, EgressConfig, Group, ProbeHook, Unverified};
+
+    let site = origin();
+    let proxy_ok = socks_proxy(site.address, Behaviour::default());
+    let proxy_wrong = socks_proxy(site.address, Behaviour::default());
+
+    let lines = list(&[
+        &format!("proxy:0 socks5 127.0.0.1 {}", proxy_ok.port),
+        "via:0:domain:good.example",
+        "via:0:domain:plain.example",
+        &format!("proxy:1 socks5 127.0.0.1 {}", proxy_wrong.port),
+        "via:1:domain:bad.example",
+    ]);
+    let rig = rig(&lines);
+
+    // Probe hook reads through the one-shot loopback bridge: verifies the probe
+    // actually reaches the test proxy (which connects to echo origin) and
+    // returns ZZ for good.example, YY for bad.example.
+    let hook: ProbeHook = Arc::new(|req, peer| {
+        let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, req.port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        *peer = Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        // Send a probe byte through the bridge -> SOCKS5 -> echo origin and
+        // confirm the bridge actually spliced to the proxy.
+        s.write_all(b"probe-check").ok()?;
+        let mut echo = [0u8; 11];
+        s.read_exact(&mut echo).ok()?;
+        assert_eq!(&echo, b"probe-check");
+        let country = if req.host.ends_with("good.example") { "ZZ" } else { "YY" };
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={country}\n").into_bytes())
+    });
+
+    let cfg = EgressConfig {
+        enabled: true,
+        prefetch: Some(0),
+        groups: vec![Group {
+            id: 1, name: "Protected".into(), enabled: true,
+            sites: vec!["good.example".into(), "bad.example".into()],
+            expect: vec!["ZZ".into()],
+            unverified: Unverified::Block,
+            matches: None,
+        }],
+        ..Default::default()
+    };
+    let ctl = Controller::in_process(cfg, hook).unwrap();
+    rig.routing.set_egress(Some(ctl.relay_gate()), false);
+
+    // 1. Protected site on Proxy 0 (ZZ) -> probe runs first, then business TCP succeeds.
+    let mut s = rig.open("api.good.example", 443);
+    round_trip(&mut s, "");
+    assert_eq!(proxy_ok.asked.recv_timeout(Duration::from_secs(2)).unwrap(), "api.good.example:443");
+    assert_eq!(proxy_ok.asked.recv_timeout(Duration::from_secs(2)).unwrap(), "api.good.example:443");
+
+    // 2. Protected site on Proxy 1 (YY) -> probe runs, business connection is reset before open_through!
+    let before = site.accepted.load(Ordering::SeqCst);
+    refused(rig.open("api.bad.example", 443));
+    // Exactly ONE connection reached proxy_wrong (the probe), ZERO business connections!
+    assert_eq!(proxy_wrong.asked.recv_timeout(Duration::from_secs(2)).unwrap(), "api.bad.example:443");
+    assert!(proxy_wrong.asked.recv_timeout(Duration::from_millis(150)).is_err(), "blocked site never opened a business connection");
+    assert_eq!(site.accepted.load(Ordering::SeqCst), before + 1);
+
+    // 3. Protected UDP (QUIC) is dropped; non-protected UDP still forwards through SOCKS5.
+    let protected_ip = rig.routing.answer("api.good.example").unwrap();
+    let blocked_udp = rig.udp(SocketAddrV4::new(protected_ip, 443));
+    blocked_udp.send(b"quic-protected").unwrap();
+    let mut buf = [0u8; 64];
+    assert!(blocked_udp.recv(&mut buf).is_err(), "protected UDP must be dropped");
+
+    let plain_ip = rig.routing.answer("www.plain.example").unwrap();
+    let plain_udp = rig.udp(SocketAddrV4::new(plain_ip, 443));
+    plain_udp.send(b"quic-plain").unwrap();
+    let n = plain_udp.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"echo:quic-plain");
+}
+
+#[test]
+fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
+    use crate::egress_control::{Controller, EgressConfig, Group, ProbeHook, Unverified};
+
+    // Fast-open style proxy: immediately accepts SOCKS5 CONNECT, then closes
+    // without answering /cdn-cgi/trace (simulating unreachable remote behind Hysteria2 fast open).
+    let blackhole = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bh_port = blackhole.local_addr().unwrap().port();
+    std::thread::spawn(move || for stream in blackhole.incoming().flatten() {
+        std::thread::spawn(move || {
+            let mut s = stream;
+            let mut h = [0u8; 2]; if s.read_exact(&mut h).is_err() { return; }
+            let mut m = vec![0u8; h[1] as usize]; if s.read_exact(&mut m).is_err() { return; }
+            let _ = s.write_all(&[5, 0]);
+            let mut r = [0u8; 4]; if s.read_exact(&mut r).is_err() { return; }
+            let _ = read_socks_address(&mut s, r[3]);
+            // Fast open replies success immediately, then closes on data.
+            let _ = s.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]);
+            let _ = s.shutdown(Shutdown::Both);
+        });
+    });
+
+    let local_site = origin();
+    let lines = list(&[
+        &format!("proxy:0 socks5 127.0.0.1 {bh_port}"),
+        "via:0:domain:fastopen.example",
+    ]);
+    let rig = rig(&lines);
+    let local_port = local_site.address.port();
+    rig.routing.set_resolver(Some(Arc::new(|_| vec![Ipv4Addr::LOCALHOST])));
+
+    let local_country = Arc::new(Mutex::new("YY".to_string()));
+    let lc = local_country.clone();
+    let hook: ProbeHook = Arc::new(move |req, peer| {
+        *peer = Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        if req.host.ends_with("fastopen.example") {
+            let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, req.port)).ok()?;
+            s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+            s.write_all(b"GET /cdn-cgi/trace HTTP/1.1\r\n\r\n").ok()?;
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            return (!out.is_empty()).then_some(out);
+        }
+        let code = lc.lock().unwrap().clone();
+        Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={code}\n").into_bytes())
+    });
+
+    let cfg = EgressConfig {
+        enabled: true,
+        prefetch: Some(0),
+        groups: vec![Group {
+            id: 1, name: "Strict".into(), enabled: true,
+            sites: vec!["fastopen.example".into(), "local.example".into()],
+            expect: vec!["ZZ".into()],
+            unverified: Unverified::Block,
+            matches: None,
+        }],
+        ..Default::default()
+    };
+    let ctl = Controller::in_process(cfg, hook).unwrap();
+    rig.routing.set_egress(Some(ctl.relay_gate()), true);
+
+    // 1. Fast-open proxy returns no trace -> treated as unreadable -> Unverified::Block refuses.
+    refused(rig.open("www.fastopen.example", 443));
+
+    // For RouteVia::Local in a unit test (no port 443 listener on localhost),
+    // install an opener pointing Local probes at the local echo server while
+    // keeping real Proxy probes unchanged.
+    let local_addr = local_site.address;
+    ctl.set_relay_opener(Some(Arc::new(move |path, _host, peer_ip| {
+        if matches!(path, crate::egress_control::EgressPath::Local) {
+            let s = TcpStream::connect(local_addr).map_err(|e| e.to_string())?;
+            Ok((s, Vec::new(), peer_ip))
+        } else {
+            Err("unexpected path".into())
+        }
+    })));
+
+    // 2. Local protected path (proxy-only D2-A): wrong country (YY) is refused with 0 business bytes.
+    let fake_local = rig.routing.answer_local_protected("www.local.example", &[]).unwrap();
+    let before = local_site.accepted.load(Ordering::SeqCst);
+    refused(rig.open_address(SocketAddrV4::new(fake_local, local_port)));
+    assert_eq!(local_site.accepted.load(Ordering::SeqCst), before + 1, "only probe hit local site, 0 business connections");
+
+    // 3. Local exit becomes ZZ -> invalidated -> connects directly and echoes!
+    *local_country.lock().unwrap() = "ZZ".into();
+    ctl.invalidate();
+    let mut ok_stream = rig.open_address(SocketAddrV4::new(fake_local, local_port));
+    round_trip(&mut ok_stream, "");
+}

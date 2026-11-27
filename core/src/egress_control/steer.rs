@@ -121,7 +121,8 @@ impl ControlState {
     /// The gate still checks any connection that reaches them anyway.
     pub(super) fn bypassed(&mut self, group: &Group, host: &str) {
         if let Some(failed) = self.failures.get_mut(&group.id) {
-            failed.retain(|f| !(f.target.host == host && matches!(f.target.ip, IpAddr::V4(ip) if cloudflare(ip))));
+            failed.retain(|f| !(f.target.path.is_cisco() && f.target.host == host
+                && matches!(f.target.ip, IpAddr::V4(ip) if cloudflare(ip))));
             if failed.is_empty() {
                 self.failures.remove(&group.id);
             }

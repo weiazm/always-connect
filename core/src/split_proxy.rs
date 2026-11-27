@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub mod hysteria;
-mod owner;
+pub(crate) mod owner;
 mod probe;
 mod protocol;
 pub mod redirect;
@@ -330,6 +330,21 @@ enum ManagedProxy {
     Unavailable(String),
 }
 
+/// Where the relay sends one redirected connection (§69, §71).
+#[derive(Clone, Debug)]
+pub(crate) enum RouteVia {
+    Proxy { server: Server, index: usize },
+    /// Proxy-only mode: a protected site not matched by any proxy (§71 D2).
+    Local,
+}
+
+pub(crate) struct ResolvedTarget {
+    pub target: Target,
+    pub via: RouteVia,
+    /// Real IPv4 addresses known from DNS (address rules or local protected).
+    pub resolved_ips: Vec<Ipv4Addr>,
+}
+
 /// Shared by the DNS forwarder (answers) and the listener (connections).
 #[derive(Default)]
 pub struct Routing {
@@ -337,6 +352,11 @@ pub struct Routing {
     /// Runtime backends for managed Hysteria2 proxies (local SOCKS5 + remote IP).
     managed: Mutex<HashMap<usize, ManagedProxy>>,
     resolver: RwLock<Option<Resolver>>,
+    /// Exit protection gate attached to this relay (§71).
+    egress: RwLock<Option<crate::egress_control::RelayGate>>,
+    /// True in proxy-only mode when non-proxied protected sites also pass
+    /// through this relay (LocalPolicy::Probe / Block, §71 D2).
+    local_egress: std::sync::atomic::AtomicBool,
     /// Processes listening on local proxies' ports, and when looked up.
     local_pids: Mutex<Option<(Instant, Vec<u16>, Vec<i32>)>>,
     /// Harnesses whose stand-in proxies share the test's own process.
@@ -388,16 +408,163 @@ impl Routing {
         let active: std::collections::HashSet<usize> = table.hysteria.keys().copied().collect();
         self.managed.lock().unwrap().retain(|k, _| active.contains(k));
         *self.table.write().unwrap() = Arc::new(table);
+        if let Some(gate) = self.egress.read().unwrap().as_ref() {
+            gate.invalidate_all();
+        }
     }
 
     /// Registers a running managed Hysteria2 backend for proxy `n`.
     pub fn set_managed_ready(&self, n: usize, server: Server, server_ip: Ipv4Addr, ports: String) {
         self.managed.lock().unwrap().insert(n, ManagedProxy::Ready { server, server_ip, ports });
+        if let Some(gate) = self.egress.read().unwrap().as_ref() {
+            gate.invalidate_path(crate::egress_control::EgressPath::Proxy(n));
+        }
     }
 
     /// Marks managed Hysteria2 proxy `n` unavailable with a plain-Chinese reason (fail closed).
     pub fn set_managed_unavailable(&self, n: usize, reason: String) {
         self.managed.lock().unwrap().insert(n, ManagedProxy::Unavailable(reason));
+        if let Some(gate) = self.egress.read().unwrap().as_ref() {
+            gate.invalidate_path(crate::egress_control::EgressPath::Proxy(n));
+        }
+    }
+
+    /// Attach or detach the exit-protection gate for this relay (§71).
+    pub fn set_egress(self: &Arc<Self>, gate: Option<crate::egress_control::RelayGate>, local_egress: bool) {
+        if let Some(prev) = self.egress.read().unwrap().as_ref() {
+            prev.set_relay_opener(None);
+        }
+        self.local_egress.store(local_egress, Ordering::Release);
+        if let Some(ref g) = gate {
+            let weak = Arc::downgrade(self);
+            let opener: crate::egress_control::RelayOpener = Arc::new(move |path, host, peer_ip| {
+                let Some(routing) = weak.upgrade() else {
+                    return Err("代理转发已停止".into());
+                };
+                routing.open_for_probe(path, host, peer_ip)
+            });
+            g.set_relay_opener(Some(opener));
+        }
+        *self.egress.write().unwrap() = gate;
+    }
+
+    pub fn local_egress_active(&self) -> bool {
+        self.local_egress.load(Ordering::Acquire)
+    }
+
+    /// Opens an outbound TCP stream to `host:443` along `path` for one exit check (§71).
+    fn open_for_probe(
+        &self,
+        path: &crate::egress_control::EgressPath,
+        host: &str,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Result<(std::net::TcpStream, Vec<u8>, Option<std::net::IpAddr>), String> {
+        use crate::egress_control::EgressPath;
+        match path {
+            EgressPath::Proxy(n) => {
+                let server = self.resolve_server(*n)?;
+                let target = if !host.is_empty() {
+                    Target::Name(host.to_owned())
+                } else if let Some(std::net::IpAddr::V4(ip)) = peer_ip {
+                    Target::Ip(ip)
+                } else {
+                    return Err("看不到网站名".into());
+                };
+                let (stream, early) = open_through(&server, &target, 443)?;
+                Ok((stream, early, peer_ip))
+            }
+            EgressPath::Local => {
+                let ip = match peer_ip {
+                    Some(std::net::IpAddr::V4(ip)) => ip,
+                    _ => self.passthrough(&Target::Name(host.to_owned()))
+                        .ok_or_else(|| "本地网络解析不到这个网站的地址".to_owned())?,
+                };
+                let stream = std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from((ip, 443)),
+                    Duration::from_secs(4),
+                ).map_err(|e| format!("经本地网络连接失败（{e}）"))?;
+                protocol::no_sigpipe(&stream);
+                Ok((stream, Vec::new(), Some(std::net::IpAddr::V4(ip))))
+            }
+            EgressPath::Cisco => Err("非代理通道".into()),
+        }
+    }
+
+    fn resolve_server(&self, n: usize) -> Result<Server, String> {
+        if let Some(entry) = self.managed.lock().unwrap().get(&n).cloned() {
+            return match entry {
+                ManagedProxy::Ready { server, .. } => Ok(server),
+                ManagedProxy::Unavailable(reason) => Err(reason),
+            };
+        }
+        self.table().server(n).cloned()
+            .ok_or_else(|| "规则指向的代理不存在或地址无效".to_owned())
+    }
+
+    /// Assigns a local fake address for a protected name routed locally in
+    /// proxy-only mode (§71 D2).
+    pub fn answer_local_protected(&self, name: &str, addresses: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+        if !self.local_egress_active() { return None; }
+        let name = clean(name);
+        if name.is_empty() { return None; }
+        Some(self.pool.lock().unwrap().assign(&name, addresses, Instant::now()))
+    }
+
+    pub(crate) fn is_egress_protected(&self, target: &Target, resolved_ips: &[Ipv4Addr]) -> bool {
+        let Some(gate) = self.egress.read().unwrap().clone() else { return false };
+        let host = match target { Target::Name(n) => n.as_str(), Target::Ip(_) => "" };
+        let ips: Vec<std::net::IpAddr> = match target {
+            Target::Ip(ip) => vec![std::net::IpAddr::V4(*ip)],
+            Target::Name(_) => resolved_ips.iter().copied().map(std::net::IpAddr::V4).collect(),
+        };
+        gate.protects_target(host, &ips).is_some()
+    }
+
+    /// Checks exit protection for `resolved` before forwarding any bytes (§71).
+    /// Returns `Ok(Some(local_ip))` for an allowed `RouteVia::Local` connection,
+    /// `Ok(None)` for an allowed `RouteVia::Proxy` connection, or `Err(reason)`
+    /// when refused (`None` when exit protection already recorded the block).
+    pub(crate) fn check_egress(&self, resolved: &ResolvedTarget) -> Result<Option<Ipv4Addr>, Option<String>> {
+        use crate::egress_control::{EgressPath, LocalPolicy, RelayVerdict};
+        let gate = self.egress.read().unwrap().clone();
+        let host = match &resolved.target { Target::Name(n) => n.as_str(), Target::Ip(_) => "" };
+        let ips: Vec<std::net::IpAddr> = match &resolved.target {
+            Target::Ip(ip) => vec![std::net::IpAddr::V4(*ip)],
+            Target::Name(_) => resolved.resolved_ips.iter().copied().map(std::net::IpAddr::V4).collect(),
+        };
+        match &resolved.via {
+            RouteVia::Proxy { index, .. } => {
+                if let Some(gate) = gate {
+                    let peer_ip = match &resolved.target {
+                        Target::Name(_) => None,
+                        Target::Ip(ip) => Some(std::net::IpAddr::V4(*ip)),
+                    };
+                    if let Some(verdict) = gate.check_connection(host, &ips, EgressPath::Proxy(*index), peer_ip) {
+                        if verdict == RelayVerdict::Block {
+                            return Err(None);
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            RouteVia::Local => {
+                let Some(gate) = gate else {
+                    return Err(Some("出口保护已关闭，请重新打开网页".into()));
+                };
+                if gate.local_policy() == LocalPolicy::Block {
+                    let _ = gate.check_connection(host, &ips, EgressPath::Local, None);
+                    return Err(None);
+                }
+                let local_ip = resolved.resolved_ips.first().copied()
+                    .or_else(|| self.passthrough(&resolved.target))
+                    .ok_or_else(|| Some("本地网络解析不到这个网站的地址".into()))?;
+                let check_ips = if ips.is_empty() { vec![std::net::IpAddr::V4(local_ip)] } else { ips };
+                match gate.check_connection(host, &check_ips, EgressPath::Local, Some(std::net::IpAddr::V4(local_ip))) {
+                    Some(RelayVerdict::Block) => Err(None),
+                    Some(RelayVerdict::Allow | RelayVerdict::Unverified) | None => Ok(Some(local_ip)),
+                }
+            }
+        }
     }
 
     /// The road for counting proxied bytes (§69.17, §七十): for a managed
@@ -522,31 +689,41 @@ impl Routing {
         self.pool.lock().unwrap().entry(ip, Instant::now()).map(|(name, _)| name)
     }
 
-    /// The target and proxy for a connection to `ip`, decided by the
-    /// rules now: a rule changed since the answer goes to its new proxy,
-    /// or is refused when no proxy takes it any more.
-    pub(crate) fn target(&self, ip: Ipv4Addr) -> Result<(Target, Server, usize), Refusal> {
+    /// The target and route (proxy or local-protected) for a connection to `ip`,
+    /// decided by the rules now: a rule changed since the answer goes to its new
+    /// proxy, or is refused when no rule takes it any more.
+    pub(crate) fn target(&self, ip: Ipv4Addr) -> Result<ResolvedTarget, Refusal> {
         let table = self.table();
-        let (target, n) = if is_fake(ip) {
+        if is_fake(ip) {
             let (name, addresses) = self.pool.lock().unwrap().entry(ip, Instant::now())
                 .ok_or_else(|| (ip.to_string(), "这个地址的记录已过期，请重新打开网页".to_owned()))?;
-            let n = table.route_name(&name).or_else(|| table.route_addresses(&addresses))
-                .ok_or_else(|| (name.clone(), "代理规则已改，这条连接不再走代理，请重新打开网页".to_owned()))?;
-            (Target::Name(name), n)
-        } else {
-            let n = table.route_ip(ip).ok_or_else(|| (ip.to_string(), "这个地址已不在代理规则里".to_owned()))?;
-            (Target::Ip(ip), n)
-        };
-        if let Some(entry) = self.managed.lock().unwrap().get(&n).cloned() {
-            return match entry {
-                ManagedProxy::Ready { server, .. } => Ok((target, server, n)),
-                ManagedProxy::Unavailable(reason) => Err((target.label(), reason)),
-            };
+            if let Some(n) = table.route_name(&name).or_else(|| table.route_addresses(&addresses)) {
+                let server = self.resolve_server(n).map_err(|reason| (name.clone(), reason))?;
+                return Ok(ResolvedTarget {
+                    target: Target::Name(name),
+                    via: RouteVia::Proxy { server, index: n },
+                    resolved_ips: addresses,
+                });
+            }
+            if self.local_egress_active() {
+                let target = Target::Name(name.clone());
+                if self.is_egress_protected(&target, &addresses) {
+                    return Ok(ResolvedTarget {
+                        target,
+                        via: RouteVia::Local,
+                        resolved_ips: addresses,
+                    });
+                }
+            }
+            return Err((name, "代理规则已改，这条连接不再走代理，请重新打开网页".to_owned()));
         }
-        match table.server(n) {
-            Some(server) => Ok((target, server.clone(), n)),
-            None => Err((target.label(), "规则指向的代理不存在或地址无效".to_owned())),
-        }
+        let n = table.route_ip(ip).ok_or_else(|| (ip.to_string(), "这个地址已不在代理规则里".to_owned()))?;
+        let server = self.resolve_server(n).map_err(|reason| (ip.to_string(), reason))?;
+        Ok(ResolvedTarget {
+            target: Target::Ip(ip),
+            via: RouteVia::Proxy { server, index: n },
+            resolved_ips: vec![ip],
+        })
     }
 
     pub(crate) fn failed(&self, site: &str, reason: &str) {

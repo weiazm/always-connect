@@ -157,7 +157,111 @@ mod macos {
                 run_hysteria_check(&hy_bin, site)?;
             }
         }
+        run_egress_proxy_check(site)?;
         Ok(())
+    }
+
+    /// Proxy-only + exit protection root check (§71): a protected site routed
+    /// through a local SOCKS5 proxy is checked before forwarding — allowed
+    /// country passes traffic through pf -> relay -> SOCKS5 -> echo site;
+    /// wrong country resets the app connection before any business bytes leave.
+    fn run_egress_proxy_check(site: SocketAddr) -> Result<(), String> {
+        use alwaysconnect_core::egress_control::{EgressConfig, Group, ProbeHook, Unverified};
+        use std::sync::{Arc, Mutex};
+
+        stage("proxy-only egress check");
+        let work = std::env::temp_dir().join(format!("ac-proxy-only-egress-{}", std::process::id()));
+        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let (tx, asked) = mpsc::channel();
+        let socks = socks5(site, tx).map_err(|e| e.to_string())?;
+        let net = network()?;
+
+        let country = Arc::new(Mutex::new("ZZ".to_string()));
+        let c_hook = country.clone();
+        let hook: ProbeHook = Arc::new(move |req, peer| {
+            let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, req.port)).ok()?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            *peer = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            s.write_all(b"egress-probe").ok()?;
+            let mut echo = [0u8; 12];
+            s.read_exact(&mut echo).ok()?;
+            if &echo != b"egress-probe" { return None; }
+            let code = c_hook.lock().unwrap().clone();
+            Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={code}\n").into_bytes())
+        });
+
+        let egress_cfg = EgressConfig {
+            enabled: true,
+            prefetch: Some(0),
+            groups: vec![Group {
+                id: 1, name: "RootCheck".into(), enabled: true,
+                sites: vec![SITE.into()], expect: vec!["ZZ".into()],
+                unverified: Unverified::Block, matches: None,
+            }],
+            ..Default::default()
+        };
+        let lines = vec![format!("proxy:0 socks5 127.0.0.1 {socks}"), format!("via:0:domain:{SITE}")];
+        let mut session = ProxyOnly::start_with_egress(
+            lines, net, &work, "check-egress".into(), 53, false, Some(egress_cfg), Some(hook),
+        ).map_err(str::to_owned)?;
+        let res = (|| -> Result<(), String> {
+            session.routing().ok_or("no routing")?.treat_same_process_as_apps();
+            flush();
+            let proxied = resolve(&format!("egress.{SITE}"));
+            if !(proxied.len() == 1 && split_proxy::is_fake(proxied[0])) {
+                return Err(format!("egress: system resolver did not give fake ip: {proxied:?}"));
+            }
+            // Allowed country ZZ: probe runs, then app connection succeeds.
+            let mut app = TcpStream::connect_timeout(&SocketAddr::from((proxied[0], site.port())), Duration::from_secs(5))
+                .map_err(|e| format!("egress allow connect: {e}"))?;
+            app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            app.write_all(b"egress-ok!").map_err(|e| e.to_string())?;
+            let mut back = [0u8; 10];
+            app.read_exact(&mut back).map_err(|e| format!("egress allow read: {e}"))?;
+            if &back != b"egress-ok!" { return Err("egress allow wrong bytes".into()); }
+            let _ = asked.recv_timeout(Duration::from_secs(2));
+            let _ = asked.recv_timeout(Duration::from_secs(2));
+
+            // Switch proxy exit to wrong country YY and update egress to invalidate cache.
+            *country.lock().unwrap() = "YY".into();
+            session.update_egress(Some(EgressConfig {
+                enabled: true,
+                prefetch: Some(0),
+                groups: vec![Group {
+                    id: 1, name: "RootCheck".into(), enabled: true,
+                    sites: vec![SITE.into()], expect: vec!["ZZ".into()],
+                    unverified: Unverified::Block, matches: None,
+                }],
+                ..Default::default()
+            }));
+            // Force epoch bump via rule update.
+            session.update_rules(vec![format!("proxy:0 socks5 127.0.0.1 {socks}"), format!("via:0:domain:{SITE}")]);
+            while asked.try_recv().is_ok() {}
+
+            let mut blocked = TcpStream::connect_timeout(&SocketAddr::from((proxied[0], site.port())), Duration::from_secs(5))
+                .map_err(|e| format!("egress block connect: {e}"))?;
+            blocked.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = blocked.write_all(b"must-not-pass");
+            let mut got = [0u8; 16];
+            if let Ok(n) = blocked.read(&mut got) {
+                if n > 0 { return Err(format!("egress wrong country forwarded {n} bytes!")); }
+            }
+            // Only the probe hit SOCKS5, never the business connection.
+            let _ = asked.recv_timeout(Duration::from_secs(2)).map_err(|_| "egress block did not probe")?;
+            if asked.recv_timeout(Duration::from_millis(200)).is_ok() {
+                return Err("egress wrong country still opened business connection".into());
+            }
+            let status = session.egress_status();
+            if !status.contains("\"state\":\"blocked\"") || !status.contains("\"path\":\"proxy:0\"") {
+                return Err(format!("unexpected egress status: {status}"));
+            }
+            println!("proxy-only egress: allowed ZZ forwarded; wrong YY blocked before business connect");
+            Ok(())
+        })();
+        session.stop();
+        flush();
+        let _ = std::fs::remove_dir_all(&work);
+        res
     }
 
     fn run_hysteria_check(hy_bin: &str, site: SocketAddr) -> Result<(), String> {

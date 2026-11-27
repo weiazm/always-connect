@@ -1093,14 +1093,24 @@ impl Inner {
             if !settings.enabled || session.is_some_and(|live| !live.load(Ordering::Acquire)) { return None; }
             (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
         };
-        // Proxied names (§69) come before the direct list: a name in both
-        // goes through its proxy, never direct. Exit-protected names stay
-        // in the VPN. No DNS server is asked about a proxied name.
-        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy && !rules.protects_name(&trim_dots(&q.name)));
+        // Proxied names (§69, §71 D1-A) come before the direct list and before
+        // Cisco even when exit-protected: the proxy relay checks the exit
+        // country before forwarding. In proxy-only mode (§71 D2-A), protected
+        // names that match no proxy also receive our address so the relay
+        // checks the local exit before forwarding.
+        let clean_name = trim_dots(&q.name);
+        let protected_name = rules.protects_name(&clean_name);
+        let proxy = self.proxy.read().unwrap().clone().filter(|_| !skip_proxy);
         if let Some(proxy) = &proxy {
             if let Some(ip) = proxy.answer(&q.name) {
                 return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
                     .or_else(|| empty_answer(query));
+            }
+            if protected_name && proxy.local_egress_active() {
+                if let Some(ip) = proxy.answer_local_protected(&q.name, &[]) {
+                    return if q.qtype == TYPE_A { a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL) } else { None }
+                        .or_else(|| empty_answer(query));
+                }
             }
             // Already proxied by its address: other types (HTTPS address
             // hints above all) must not point around the proxy.
@@ -1156,13 +1166,22 @@ impl Inner {
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
         let protected = rules.protects_name(&q.name);
-        // Proxy address rules (geoip, networks, §69) after the direct list's
-        // names and before its addresses: the VPN's answer decides, then
-        // the app gets our address and the proxy gets the name.
-        if q.qtype == TYPE_A && entry.is_none() && !protected && !addresses.iter().any(|ip| rules.protects_ip(*ip)) {
+        let protected_ip = addresses.iter().any(|ip| rules.protects_ip(*ip));
+        // Proxy address rules (geoip, networks, §69, §71 D1-A) after the direct
+        // list's names and before its addresses: the DNS answer decides, then
+        // the app gets our address and the proxy gets the name (and checks exit
+        // if protected). In proxy-only mode (§71 D2-A), an answer hitting a
+        // protected IP rule with no proxy also routes through our local relay.
+        if q.qtype == TYPE_A && entry.is_none() {
             if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_by_address(&q.name, &addresses)) {
                 if self.settings.read().unwrap().epoch != epoch { return None; }
                 return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
+            }
+            if (protected || protected_ip) && proxy.as_ref().is_some_and(|p| p.local_egress_active()) {
+                if let Some(ip) = proxy.as_ref().and_then(|p| p.answer_local_protected(&q.name, &addresses)) {
+                    if self.settings.read().unwrap().epoch != epoch { return None; }
+                    return a_answer(query, &[ip], crate::split_proxy::ANSWER_TTL).or_else(|| empty_answer(query));
+                }
             }
         }
         let direct: Vec<_> = addresses.iter().copied()
@@ -2485,6 +2504,77 @@ mod tests {
         assert!(!loopback_dns_busy(silent.local_addr().unwrap().port(),Duration::from_millis(40)));
         assert!(start.elapsed()<Duration::from_secs(1));
         assert!(!loopback_dns_busy(0,Duration::from_millis(40)));
+    }
+
+    #[test]
+    fn protected_sites_follow_proxy_rules_and_local_egress_in_proxy_only() {
+        let (tunnel_port, tunnel_seen) = fake_udp([198, 51, 100, 40], false);
+        let (local_port, _) = fake_udp([203, 0, 113, 9], false);
+        let protected = Arc::new(crate::egress_gate::ProtectedSites::new(&[
+            crate::egress_gate::SiteGroup { id: 1, sites: vec!["prot.example".into(), "ipcidr:198.51.100.40/32".into()] },
+        ]));
+        let rules = SplitRules::new(&["prot.example", "direct.example"]).with_protection(Some(protected));
+        let forwarder = Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            53,
+            Duration::from_secs(1),
+            vec!["prot.example".into(), "direct.example".into()],
+            Upstreams {
+                tunnel: vec![format!("127.0.0.1:{tunnel_port}")],
+                local: vec![format!("127.0.0.1:{local_port}")],
+                physical_if: None,
+                tunnel_if: Some(loopback_interface().into()),
+            },
+            None,
+        );
+        forwarder.set_parsed_rules(rules);
+        let inner = forwarder.inner();
+        inner.settings.write().unwrap().enabled = true;
+        let table = crate::split_proxy::Table::parse(&[
+            "proxy:0 socks5 127.0.0.1 1080",
+            "via:0:domain:via-proxy.prot.example",
+            "via:0:ipcidr:198.51.100.40/32",
+        ]);
+        let routing = crate::split_proxy::Routing::new(table);
+        *inner.proxy.write().unwrap() = Some(routing.clone());
+
+        // D1-A: protected name matching a proxy name rule gets our fake IP (no DNS sent).
+        let before = tunnel_seen.load(Ordering::SeqCst);
+        let ips = ipv4_answers(&inner.resolve(&query("via-proxy.prot.example", TYPE_A, 1)).unwrap());
+        assert_eq!(ips.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips[0]), "proxy wins for protected name");
+        assert_eq!(tunnel_seen.load(Ordering::SeqCst), before);
+
+        // Protected site whose resolved address hits proxy ipcidr rule -> handed to proxy too (D1-A).
+        let ips_addr = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 2)).unwrap());
+        assert_eq!(ips_addr.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips_addr[0]), "proxy address rule also takes protected site");
+
+        // Non-matching proxy table: with Cisco on (local_egress = false), stays on Cisco;
+        // with proxy-only (local_egress = true), routed through local relay for exit checking (D2-A).
+        let empty_routing = crate::split_proxy::Routing::new(crate::split_proxy::Table::default());
+        *inner.proxy.write().unwrap() = Some(empty_routing.clone());
+        let ips_vpn = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 3)).unwrap());
+        assert_eq!(ips_vpn, vec![Ipv4Addr::new(198, 51, 100, 40)], "Cisco connected: tunnel DNS answers normally");
+
+        let ctl = crate::egress_control::Controller::in_process(
+            crate::egress_control::EgressConfig {
+                enabled: true,
+                prefetch: Some(0),
+                groups: vec![crate::egress_control::Group {
+                    id: 1, name: "P".into(), enabled: true,
+                    sites: vec!["prot.example".into()], expect: vec!["ZZ".into()], ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Arc::new(|_, _| None),
+        ).unwrap();
+        empty_routing.set_egress(Some(ctl.relay_gate()), true);
+        let ips_local = ipv4_answers(&inner.resolve(&query("only-cisco.prot.example", TYPE_A, 4)).unwrap());
+        assert_eq!(ips_local.len(), 1);
+        assert!(crate::split_proxy::is_fake(ips_local[0]), "proxy-only D2-A routes protected name through local relay");
+        let aaaa = inner.resolve(&query("only-cisco.prot.example", TYPE_AAAA, 5)).unwrap();
+        assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0, "no IPv6 bypass");
     }
 
 }
