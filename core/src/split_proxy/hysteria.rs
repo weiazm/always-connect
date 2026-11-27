@@ -1730,6 +1730,30 @@ impl HysteriaManager {
 
 // MARK: - On-demand probe (pre-save check & Settings check)
 
+/// A saved check follows its exact configured slot, even while a settings
+/// update is still in flight. It never starts a temporary test client.
+pub fn probe_saved(key: &str, site: Option<&str>) -> Probe {
+    let waiting = |text: &str| Probe { level: Level::Pending, text: text.into(), millis: 0 };
+    let Some(key) = super::parse_health_key(key) else { return waiting("正在等代理配置生效"); };
+    let server = {
+        let st = shared().inner.lock().unwrap();
+        let Some(routing) = &st.routing else { return waiting("正在等代理配置生效"); };
+        let table = routing.table();
+        let index = table.health_keys.iter().find_map(|(n, k)| (*k == key).then_some(*n));
+        let Some(index) = index else { return waiting("正在等代理配置生效"); };
+        if !st.path_ready { return waiting("正在等本地网络就绪"); }
+        if st.specs.get(&index).is_none() || st.specs.get(&index) != table.hysteria.get(&index) {
+            return waiting("正在等代理配置生效");
+        }
+        routing.resolve_server(index)
+    };
+    match server {
+        Ok(server) => probe_socks(&server, site),
+        Err(reason) if reason == "正在连接 Hysteria2 代理" => waiting(&reason),
+        Err(text) => Probe { level: Level::Fail, text, millis: 0 },
+    }
+}
+
 /// Probes a candidate Hysteria2 proxy: reuses an already-running managed client
 /// if identical, otherwise starts a temporary unprivileged client, waits for
 /// handshake/SOCKS5 readiness, and (when `site` is given) asks it to open `site:443`.
@@ -1745,23 +1769,8 @@ pub fn probe_hysteria(
         millis: started.elapsed().as_millis() as u64,
     };
 
-    // A saved proxy must report the client that carries its traffic. A
-    // separate successful handshake could otherwise mask a failed worker.
-    let managed = {
-        let st = shared().inner.lock().unwrap();
-        st.specs.iter().find(|(_, saved)| *saved == spec).map(|(index, _)| {
-            if !st.path_ready { return Err(done(Level::Pending, "正在等本地网络就绪".into())); }
-            if let Some(live) = st.live.get(index).filter(|p| p.ready.load(Ordering::Acquire)) {
-                return Ok(live.local_server.clone());
-            }
-            let reason = st.routing.as_ref().and_then(|r| r.resolve_server(*index).err())
-                .unwrap_or_else(|| "正在连接 Hysteria2 代理".into());
-            let level = if reason == "正在连接 Hysteria2 代理" { Level::Pending } else { Level::Fail };
-            Err(done(level, reason))
-        })
-    };
-    if let Some(target) = managed {
-        return match target { Ok(server) => probe_socks(&server, site), Err(status) => status };
+    if let Some(existing) = shared().running_socks_for(spec) {
+        return probe_socks(&existing, site);
     }
 
     let bin = match resolve_verified_binary() {

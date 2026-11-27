@@ -134,14 +134,20 @@ final class ProxyHealth: ObservableObject {
             let ticket = healthBegin(key, healthNow(), gap, force)
             guard ticket != 0 else { continue }
             checking.insert(route.id)
-            let pw = ProxyPasswords.password(for: route)
-            let obfsPw = ProxyPasswords.obfsPassword(for: route)
-            ProxyCheck.runAsync(route, password: pw, obfsPassword: obfsPw) { result in
+            let finish: (ProxyCheck) -> Void = { result in
                 let decision = healthFinish(key, ticket, healthNow())
                 guard decision >= 0 else { return }
                 self.checking.remove(route.id)
                 if decision & 1 != 0 { self.checks[route.id] = result }
                 if decision & 2 != 0 { self.check([route], force: true) }
+            }
+            if route.kind == .hysteria2 {
+                // The service already has the saved credentials. Asking by
+                // revision also distinguishes two routes to the same server.
+                HelperClient.shared.probeHysteriaProxy(serverLine: "saved-hysteria2 " + key,
+                    rules: route.sites.joined(separator: "\n"), completion: finish)
+            } else {
+                ProxyCheck.runAsync(route, password: ProxyPasswords.password(for: route), completion: finish)
             }
         }
     }

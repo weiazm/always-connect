@@ -2354,13 +2354,16 @@ pub extern "C" fn ac_hysteria_probe(server: *const c_char, rules: *const c_char)
     let Some(line) = c_str(server) else { return std::ptr::null_mut() };
     let rules: Vec<String> = c_str(rules).unwrap_or_default().lines().map(str::to_owned).collect();
     let site = crate::split_proxy::site_from_rules(&rules);
-    let result = match crate::split_proxy::HysteriaSpec::parse_rule_line(&line) {
-        Some(spec) => crate::split_proxy::hysteria::probe_hysteria(&spec, site.as_deref(), None),
-        None => crate::split_proxy::Probe {
+    let result = if let Some(key) = line.strip_prefix("saved-hysteria2 ") {
+        crate::split_proxy::hysteria::probe_saved(key, site.as_deref())
+    } else if let Some(spec) = crate::split_proxy::HysteriaSpec::parse_rule_line(&line) {
+        crate::split_proxy::hysteria::probe_hysteria(&spec, site.as_deref(), None)
+    } else {
+        crate::split_proxy::Probe {
             level: crate::split_proxy::Level::Fail,
             text: "代理地址无效".into(),
             millis: 0,
-        },
+        }
     };
     let json = serde_json::json!({
         "level": result.level.word(),

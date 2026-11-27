@@ -889,13 +889,15 @@ fn interop_with_a_reference_hysteria2_server() {
         }
     });
     let line = format!("proxy:0 {}", spec.to_rule_line());
-    let table = Table::parse(&[&line, "via:0:full:hy2-tcp.example", "vianet:0:127.0.0.0/8"]);
+    let saved = "00000000-0000-0000-0000-000000000001";
+    let identity = format!("proxyhealth:0 {saved}");
+    let table = Table::parse(&[&line, &identity, "via:0:full:hy2-tcp.example", "vianet:0:127.0.0.0/8"]);
     let routing = Routing::new(table);
     let mut specs = std::collections::BTreeMap::new();
     specs.insert(0, spec.clone());
     let manager = hysteria::shared();
     manager.sync_on_path(specs.clone(), routing.clone(), None, None);
-    let waiting = hysteria::probe_hysteria(&spec, None, None);
+    let waiting = hysteria::probe_saved(saved, None);
     assert_eq!(waiting.text, "正在等本地网络就绪");
     assert!(manager.running_socks_for(&spec).is_none());
     let path = Some(("wifi", "router-a"));
@@ -911,6 +913,8 @@ fn interop_with_a_reference_hysteria2_server() {
         std::thread::sleep(Duration::from_millis(50));
     };
 
+    assert_eq!(hysteria::probe_saved(saved, None).level, Level::Ok);
+    assert_eq!(hysteria::probe_saved("00000000-0000-0000-0000-000000000002", None).level, Level::Pending);
     // TCP through managed Hysteria2 client's SOCKS5
     let (mut tcp_stream, _) = open_through(&local_socks, &Target::Ip(Ipv4Addr::LOCALHOST), tcp_origin.address.port())
         .expect("TCP via managed hysteria2");
