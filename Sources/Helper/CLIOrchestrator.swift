@@ -261,6 +261,7 @@ final class CLIOrchestrator {
     }
 
     func rejectGatewayCertificate(_ incident: UInt64) -> Bool { ac_oc_record_gateway_rejection(handle, incident) }
+    func noteDatagram(_ flow: String) -> Bool { ac_oc_note_datagram(handle, flow) }
     func hasVerifiedTunnel(_ incident: UInt64) -> Bool { ac_oc_verified_tunnel(handle, incident) }
     func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_split_status(handle)) ?? "{}" }
 
@@ -407,4 +408,5 @@ func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>
 
 @_silgen_name("ac_oc_record_gateway_rejection") private func ac_oc_record_gateway_rejection(_ engine: OpaquePointer, _ incident: UInt64) -> Bool
 
+@_silgen_name("ac_oc_note_datagram") private func ac_oc_note_datagram(_ engine: OpaquePointer, _ flow: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_oc_verified_tunnel") private func ac_oc_verified_tunnel(_ engine: OpaquePointer, _ incident: UInt64) -> Bool

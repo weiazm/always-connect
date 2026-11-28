@@ -1747,6 +1747,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         }
                         GatewayMemory.save(address.host, last: prepared.gatewayIp,
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onDatagramFlow = { [weak self] flow in
+                            DispatchQueue.main.async {
+                                guard let self, generation == self.relayGeneration, !self.gatewayTrustFailed else { return }
+                                self.egressRPC({ $0.noteRelayDatagram(prepared.serverPin, flow: flow, withReply: $1) }) { _ in }
+                            }
+                        }
                         relay.onGatewayTrustChanged = { [weak self] trusted in
                             DispatchQueue.main.async {
                                 self?.observeRelayTrust(trusted, pin: prepared.serverPin, generation: generation)

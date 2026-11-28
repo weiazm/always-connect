@@ -9,16 +9,28 @@ pub(super) enum CstpDns {
     Request,
     Headers {
         count: u8,
+        listener: Option<u16>,
         servers: Vec<String>,
     },
-    Accepted(Vec<String>),
+    Accepted(Vec<String>, Option<u16>),
 }
 
 impl CstpDns {
     pub(super) fn accepted(&self) -> Option<&[String]> {
         match self {
-            Self::Accepted(servers) => Some(servers),
+            Self::Accepted(servers, _) => Some(servers),
             _ => None,
+        }
+    }
+
+    pub(super) fn listener(&self) -> Option<u16> {
+        match self { Self::Accepted(_, port) => *port, _ => None }
+    }
+
+    pub(super) fn retire_listener(&mut self) {
+        match self {
+            Self::Accepted(_, listener) | Self::Headers { listener, .. } => *listener = None,
+            _ => {}
         }
     }
 
@@ -27,7 +39,7 @@ impl CstpDns {
     pub(super) fn for_reconnect_hook(&self) -> Option<&[String]> {
         match self {
             Self::Idle => None,
-            Self::Accepted(servers) => Some(servers),
+            Self::Accepted(servers, _) => Some(servers),
             Self::Request | Self::Headers { .. } => Some(&[]),
         }
     }
@@ -41,10 +53,14 @@ impl CstpDns {
         {
             *self = Self::Headers {
                 count: 0,
+                listener: None,
                 servers: Vec::new(),
             };
-        } else if let Self::Headers { count, servers } = self {
-            if let Some(value) = line.strip_prefix("X-CSTP-DNS: ") {
+        } else if let Self::Headers { count, servers, listener } = self {
+            if let Some((_, value)) = line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("X-DTLS-Port")) {
+                // Duplicates or malformed values never identify a relay socket.
+                *listener = Some(if listener.is_some() { 0 } else { value.trim().parse::<u16>().unwrap_or(0) });
+            } else if let Some(value) = line.strip_prefix("X-CSTP-DNS: ") {
                 // libopenconnect consumes at most three options in wire order.
                 if *count < 3 {
                     *count += 1;
@@ -53,7 +69,7 @@ impl CstpDns {
                     }
                 }
             } else if line.starts_with("CSTP connected. DPD ") {
-                *self = Self::Accepted(std::mem::take(servers));
+                *self = Self::Accepted(std::mem::take(servers), *listener);
                 return true;
             }
         }

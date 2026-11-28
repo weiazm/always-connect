@@ -402,7 +402,18 @@ struct Counters {
 /// openconnect (a UDP socket on 127.0.0.1) and the gateway's DTLS port,
 /// unchanged. DTLS is end to end between openconnect and the gateway;
 /// nothing here can read it.
+/// The exact connected socket used by this relay. Only the signed App reports
+/// this to the service; the gateway never supplies local addresses or ports.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DatagramFlow {
+    pub listener: u16,
+    pub source: SocketAddrV4,
+    pub peer: SocketAddrV4,
+    pub interface: String,
+}
+
 pub struct DatagramRelay {
+    flow: DatagramFlow,
     pub local_port: u16,
     counters: Arc<Counters>,
     wake: Option<OwnedFd>,
@@ -417,6 +428,8 @@ impl DatagramRelay {
         bind_interface(&upstream, interface)?;
         upstream.connect(&SockAddr::from(gateway))?;
         let upstream: UdpSocket = upstream.into();
+        let SocketAddr::V4(source) = upstream.local_addr()? else { return Err(io::Error::other("expected IPv4")); };
+        let flow = DatagramFlow { listener: local_port, source, peer: gateway, interface: interface.into() };
         local.set_nonblocking(true)?;
         upstream.set_nonblocking(true)?;
         let (read_end, write_end) = crate::child_io::pipe()?;
@@ -426,7 +439,7 @@ impl DatagramRelay {
             .name("ac-relay-udp".into())
             .stack_size(128 * 1024)
             .spawn(move || forward(local, upstream, read_end, c, pair, log))?;
-        Ok(DatagramRelay { local_port, counters, wake: Some(write_end), thread: Some(thread) })
+        Ok(DatagramRelay { flow, local_port, counters, wake: Some(write_end), thread: Some(thread) })
     }
 
     /// Stops forwarding; returns the counters for the pair's log line.
@@ -682,6 +695,10 @@ impl Stream {
         rewritten
     }
 
+    pub fn datagram_flow(&self) -> Option<&DatagramFlow> {
+        self.datagrams.as_ref().map(|d| &d.flow)
+    }
+
     /// Stops the DTLS channel; the counters for the pair's log line.
     pub fn close(&mut self) -> String {
         let tunnel = match self.cstp_since {
@@ -816,6 +833,10 @@ mod tests {
         let mut buf = [0u8; 64];
         let (n, from) = gateway.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello gateway");
+        let proof = s.datagram_flow().unwrap();
+        assert_eq!(SocketAddr::V4(proof.source), from);
+        assert_eq!(SocketAddr::V4(proof.peer), gateway.local_addr().unwrap());
+        assert_eq!(proof.listener, local);
         gateway.send_to(b"hello openconnect", from).unwrap();
         let n = oc.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello openconnect");

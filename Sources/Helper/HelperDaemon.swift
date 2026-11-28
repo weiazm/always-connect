@@ -970,6 +970,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         recordGatewayRejection(serverPin, incident: 0, withReply: reply)
     }
 
+    func noteRelayDatagram(_ serverPin: String, flow: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async { reply(self.activeRelayEngine(serverPin)?.noteDatagram(flow) ?? false) }
+    }
+
     func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void) {
         queue.async { reply(self.activeRelayEngine(serverPin)?.rejectGatewayCertificate(incident) ?? false) }
     }

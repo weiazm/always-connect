@@ -108,6 +108,7 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Installs the pre-login firewall before any VPN connection or DNS lookup.
     /// The candidate, if provided, was TLS-verified before this login intent.
     /// Scope a rejected handshake and its later tunnel verification to the same relay and incident.
+    func noteRelayDatagram(_ serverPin: String, flow: String, withReply reply: @escaping (Bool) -> Void)
     func recordGatewayRejection(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
     func hasVerifiedRelayTunnel(_ serverPin: String, incident: UInt64, withReply reply: @escaping (Bool) -> Void)
     func gatewayCertificateRejected(_ serverPin: String, withReply reply: @escaping (Bool) -> Void)

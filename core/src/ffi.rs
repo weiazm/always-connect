@@ -982,6 +982,13 @@ pub extern "C" fn ac_relay_stream_in_tunnel(s: *const Stream) -> bool {
 /// Stops the DTLS channel; the counters for the close line (free with
 /// ac_string_free).
 #[no_mangle]
+pub extern "C" fn ac_relay_datagram_flow(s: *const Stream) -> *mut c_char {
+    unsafe { s.as_ref() }.and_then(Stream::datagram_flow)
+        .and_then(|f| serde_json::to_string(f).ok()).and_then(|s| CString::new(s).ok())
+        .map_or(std::ptr::null_mut(), CString::into_raw)
+}
+
+#[no_mangle]
 pub extern "C" fn ac_relay_stream_close(s: *mut Stream) -> *mut c_char {
     let Some(s) = (unsafe { s.as_mut() }) else { return std::ptr::null_mut() };
     CString::new(s.close()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
@@ -2112,6 +2119,15 @@ pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engin
     unsafe { engine.as_ref() }.is_some_and(|e| e.record_gateway_rejection(incident))
 }
 
+
+#[no_mangle]
+pub extern "C" fn ac_oc_note_datagram(engine: *const oc_engine::Engine, json: *const c_char) -> bool {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return false };
+    let Some(json) = c_str(json).filter(|s| s.len() <= 512) else { return false };
+    let Ok(flow) = serde_json::from_str(&json) else { return false };
+    engine.note_datagram(flow);
+    true
+}
 
 #[no_mangle]
 pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
