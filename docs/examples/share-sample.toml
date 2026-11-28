@@ -1,70 +1,38 @@
-# ─────────────────────────────────────────────────────────────────────
-#  AlwaysConnect 分享配置
-#
-#  这是别人从 AlwaysConnect 导出、分享给你的一份配置。所有内容都是
-#  普通文字，可以先用文本编辑器打开看一遍。
-#
-#  怎么用：AlwaysConnect → 设置 → 通用 → 导入配置… → 选这个文件。
-#  导入前会先列出要改的每一项，你确认后才会写入；导入的代理和出口
-#  保护都先停用，你填好自己的信息、逐个打开时才生效。
-#
-#  文件里不含任何密码、账号和钥匙串内容。写成
-#      { fill = "…" }
-#  的地方是分享者隐去的信息，导入时 App 会请你填写自己的值。
-#  以 # 开头的行是说明，导入时忽略，删改不影响导入。
-#
-#  （本文件为设计示例，地址、名称全部虚构。）
-# ─────────────────────────────────────────────────────────────────────
+# AlwaysConnect 分享配置。导入：设置 → 通用 → 导入配置…（会先预览，确认后才写入）。
+# 写成 { fill = "…" } 的是分享者没导出的信息，导入时填你自己的。
+# 导入的代理和出口保护默认先停用。（本文件为设计示例，内容全部虚构。）
 
 [file]
-kind = "alwaysconnect-share"   # 固定值，用来认出这是 AlwaysConnect 的分享文件
-format = 1                     # 文件格式版本；比 App 认识的新时，App 会请你先更新
-app_version = "0.6.0"          # 导出它的 App 版本，只作参考
-exported = "2026-11-28"        # 只记日期
+kind = "alwaysconnect-share"
+format = 1
+app_version = "0.6.0"
+exported = "2026-11-28"
+contains_secrets = false
+note = "两个代理换成你自己的服务器；出口保护导入后自己打开。"
 
-# 分享者写给你的话（导出时由分享者填写，导出前会检查里面有没有链接、密码之类的内容）
-note = """
-分流直连里放的是常用的公开网站；两个代理需要换成你自己的服务器。
-出口保护要求示例网站只从美国出口，导入后要你自己打开。
-"""
-
-# ── 通用开关 ─────────────────────────────────────────────────────────
-# 导入时逐项和你本机的设置对比，默认保持你本机的值，勾选的才改。
+# 通用开关：导入时默认保持你本机的值，勾选的才改
 [general]
-drop_protection = true          # 断线保护：Cisco 掉线时暂时拦住网络，直到重新连上
-auto_lan = true                 # 本地局域网直连
-auto_connect_on_launch = true   # 打开 App 自动连接
-approval_card = true            # 等待手机上确认登录时，在屏幕顶部显示提示
-site_lists_auto_update = true   # 网站清单（geosite:）自动更新
+drop_protection = true
+auto_lan = true
+auto_connect_on_launch = true
+approval_card = true
+site_lists_auto_update = true
 
-# ── Cisco 连接 ───────────────────────────────────────────────────────
-# 这一节默认不导出（服务器名和组通常是单位内部信息）；分享者勾选后才有。
-# cisco_entry 指的是你本机 Cisco Secure Client 里的条目名，导入时会在你
-# 本机的 Cisco 配置里找同名条目；找不到的会请你填地址或跳过。
-# 你的账号、密码和登录证书不会出现在这里，导入也不会改动它们。
+# Cisco 服务器：cisco_entry 是 Cisco Secure Client 里的条目名，本机找不到时用 address
 [cisco]
-group = "Staff"                 # 登录时选的组；空着表示用网关默认
-selected = "VPN-A"              # 分享者选中的服务器；导入时默认不切换你当前选中的那台
+group = "Staff"
+selected = "VPN-A"
 
 [[cisco.server]]
 name = "VPN-A"
 cisco_entry = "VPN-A"
+address = "vpn-a.example.com"
 
 [[cisco.server]]
-name = "VPN-B（备用）"
-address = { fill = "gateway", hint = "备用网关的地址，问分享者或单位 IT" }
+name = "VPN-B"
+address = "vpn-b.example.com"
 
-# ── 分流直连 ─────────────────────────────────────────────────────────
-# 按网站分流打开时，命中这些规则的网站不走 Cisco，直接走本地网络。
-# 写法（和 App 里的规则框一样）：
-#   example.com              这个网站和它所有子域名
-#   full:www.example.com     只这一个名字
-#   keyword:example          名字里含有它的都算
-#   regexp:^a\d+\.example\.com$   名字符合这个正则的
-#   geosite:名称[@属性]       一份现成的网站清单
-#   geoip:cn                 地址在中国大陆的
-#   203.0.113.0/24           一个网段（单个地址写 /32）
-# 例外优先于上面的规则：命中例外的网站回到默认路线。
+# 分流直连：命中的网站不走 Cisco；规则写法与 App 里的规则框相同，例外优先
 [split.direct]
 rules = [
   "example.com",
@@ -73,66 +41,50 @@ rules = [
   "geosite:example-list",
   "203.0.113.0/24",
 ]
-exceptions = [
-  "full:login.example.com",
-]
-# 导出时去掉了 1 条可能指向内部网络的规则（内容不写进文件）。
+exceptions = ["full:login.example.com"]
 
-# 有名字的一组规则（从旧版"现成分组"迁来的那种），导入后是一条带名字的条目
 [[split.direct.group]]
 name = "示例分组"
 rules = ["a.example.net", "b.example.net"]
 
-# ── 分流代理 ─────────────────────────────────────────────────────────
-# 命中某个代理规则的网站经这个代理出去；按下面的先后顺序匹配，先命中的生效。
-# 代理服务器本身总是走本地网络，不经过 Cisco。
-# 导入后每个代理都先停用：填好地址和密码、检测通过后由你自己打开。
-
+# 分流代理：按先后顺序匹配，先命中的生效
 [[proxy]]
 name = "示例 SOCKS5"
-type = "socks5"                 # socks5 / http / hysteria2
-host = { fill = "host", hint = "代理服务器的域名或 IP" }
+type = "socks5"
+host = { fill = "host" }
 port = 1080
-username = { fill = "username", optional = true, hint = "没有账号就留空" }
+username = { fill = "username", optional = true }
 password = { fill = "secret", optional = true }
-enabled = true                  # 分享者那边是开着的；导入后仍先停用
-rules = [
-  "geosite:example-media",
-  "full:api.example.net",
-]
+enabled = true
+rules = ["geosite:example-media", "full:api.example.net"]
 exceptions = []
 
 [[proxy]]
 name = "示例 Hysteria2"
 type = "hysteria2"
-host = { fill = "host", hint = "Hysteria2 服务器的域名或 IP" }
-ports = "443,20000-30000"       # 端口或端口跳跃范围
-auth = { fill = "secret", hint = "服务器的认证密码" }
-sni = { fill = "sni", optional = true, hint = "服务器证书上的域名；服务器是 IP 时，这项和下面的指纹至少填一项" }
-pin_sha256 = { fill = "pin_sha256", optional = true, hint = "服务器证书的 SHA-256 指纹，64 位十六进制" }
-obfs = "salamander"             # 混淆类型；混淆密码见下一行
-obfs_password = { fill = "secret", hint = "混淆密码" }
+host = { fill = "host" }
+ports = "443,20000-30000"
+auth = { fill = "secret" }
+sni = { fill = "sni", optional = true, hint = "服务器是 IP 时，sni 和 pin_sha256 至少填一项" }
+pin_sha256 = { fill = "pin_sha256", optional = true }
+obfs = "salamander"
+obfs_password = { fill = "secret" }
 up_mbps = 50
 down_mbps = 200
 hop_seconds = 30
 enabled = false
-rules = [
-  "geosite:example-tools",
-  "198.51.100.0/24",
-]
+rules = ["geosite:example-tools", "198.51.100.0/24"]
 exceptions = ["full:static.example.org"]
 
-# ── 出口保护 ─────────────────────────────────────────────────────────
-# 每条保护：这些网站的连接只允许从列出的国家出去，走错国家的服务器会被拦住。
-# 导入后每条都先暂停，你打开时 App 会重新确认出口。
+# 出口保护：这些网站只允许从列出的国家出去
 [egress]
-steer = true                    # 走错出口时，换到同一 CDN 里出口正确的服务器
-prefetch = 5                    # 后台提前刷新访问最多的几台服务器（0 表示不提前刷新）
+steer = true
+prefetch = 5
 half_life_minutes = 2
 
 [[egress.rule]]
 name = "示例：只从美国出口"
 sites = ["shop.example.com", "geosite:example-shop"]
 exceptions = ["full:cdn.shop.example.com"]
-countries = ["US"]              # ISO 3166 两位国家代码
-when_unverified = "when_wrong"  # 查不到出口时：allow 放行 / when_wrong 有异常就拦 / block 一律拦
+countries = ["US"]
+when_unverified = "when_wrong"   # allow 放行 / when_wrong 有异常就拦 / block 一律拦

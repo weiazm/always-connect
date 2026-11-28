@@ -13,7 +13,7 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
 
 ## 当前状态
 
-- 配置分享（导出/导入）方案待评审，未实现：TOML 格式、密码不进文件、代理服务器信息默认隐去、导入的代理与出口保护先停用。见 docs/config-share-plan.md 与示例 docs/examples/share-sample.toml。
+- 配置分享（导出/导入）方案第二稿待评审，未实现：TOML 格式；导出时按部分勾选，规则与 Cisco 服务器原样导出；代理地址、代理账号密码由用户勾选是否导出，默认留占位；导入的代理与出口保护先停用。见 docs/config-share-plan.md 与示例 docs/examples/share-sample.toml。
 
 - 候选修复分流代理启用时泄漏自检的三项关联误报，诊断页识别内置 Hysteria2。见 DESIGN §七十四、L35。
 
