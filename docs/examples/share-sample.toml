@@ -1,6 +1,7 @@
-# AlwaysConnect 分享配置。导入：设置 → 通用 → 导入配置…（会先预览，确认后才写入）。
+# AlwaysConnect 分享配置。导入：设置 → 通用 → 导入…（先列出会加什么，确认后才写入）。
 # 代理链接里的 {host}、{password} 这类是分享者没导出的部分，导入时粘贴你自己的完整链接即可。
-# 导入的代理和出口保护默认先停用。（本文件为设计示例，内容全部虚构。）
+# 导入只加不删；没填链接的代理先停用，出口保护先暂停。
+# （本文件为示例，内容全部虚构。）
 
 [file]
 kind = "alwaysconnect-share"
@@ -9,7 +10,7 @@ app_version = "0.6.0"
 exported = "2026-11-28"
 contains_secrets = false
 
-# 通用开关：导入时默认保持你本机的值，勾选的才改
+# 通用开关：导入时默认保持你本机的值，打开才改
 [general]
 drop_protection = true
 auto_lan = true
@@ -61,11 +62,6 @@ rules = ["geosite:example-tools", "198.51.100.0/24"]
 exceptions = ["full:static.example.org"]
 
 # 出口保护：rules 里的网站只允许从 countries 出去；exceptions 命中的不受这条保护
-[egress]
-steer = true                     # 走错出口时换到出口正确的服务器
-prefetch = 5                     # 后台提前复查访问最多的几台服务器
-half_life_minutes = 2            # 访问热度减半的分钟数
-
 [[egress.rule]]
 name = "示例：只从美国出口"
 rules = ["shop.example.com", "geosite:example-shop"]
