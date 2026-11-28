@@ -40,7 +40,7 @@ struct StatusLook {
     }
 
     static func updateMenuButton(_ button: NSButton, client: HelperClient) {
-        var badge = GlobeIcon.badge(for: client.state, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
+        var badge = GlobeIcon.badge(for: client.panelConnectionState, held: client.networkHeld, certificateRejected: client.gatewayTrustFailed)
         if badge == .none, client.proxyOnlyRunning { badge = .proxy }
         button.image = GlobeIcon.image(badge)
         button.contentTintColor = nil
@@ -65,12 +65,13 @@ struct PanelStatusHeader: View {
     init(client: HelperClient, subtitle: @autoclosure () -> String) {
         certificateRejected = client.gatewayTrustFailed
         let progress = client.ownLoginProgressText
-        let displayState: HelperClient.State = progress == nil ? client.state : .connecting
-        look = StatusLook.of(displayState, held: client.networkHeld, hasCredentials: client.hasCredentials,
+        let displayState = client.panelConnectionState
+        look = StatusLook.of(displayState, held: client.networkHeld, hasCredentials: displayState != .disconnected || client.hasCredentials,
                              onDemand: client.onDemandPaused, certificateRejected: certificateRejected,
                              pendingLogin: client.loginProtectionNotice != nil)
         badge = GlobeIcon.badge(for: displayState, held: client.networkHeld, certificateRejected: certificateRejected)
-        self.subtitle = certificateRejected ? client.certificateProtectionText : (progress ?? subtitle())
+        self.subtitle = certificateRejected ? client.certificateProtectionText : (progress ??
+            (client.state == .disconnected && displayState == .connecting ? client.stateLine : subtitle()))
     }
 
     var body: some View {

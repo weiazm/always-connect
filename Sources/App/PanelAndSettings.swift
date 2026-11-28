@@ -445,7 +445,7 @@ struct PanelView: View {
 
     /// Held, dropped or refused: the card's edge says it too.
     private var cardAlarm: Bool {
-        manager.gatewayTrustFailed || manager.state == .reconnecting || manager.networkHeld
+        manager.gatewayTrustFailed || manager.panelConnectionState == .reconnecting || (manager.networkHeld && manager.panelConnectionState == .disconnected)
     }
 
     /// Cisco: the globe and the server menu on the left, the state under
@@ -463,8 +463,8 @@ struct PanelView: View {
                 }
             }
             if manager.loginStopped { return (header.subtitle, .orange) }
-            let tint: Color = red ? .red : (manager.state == .disconnected ? .secondary : .orange)
-            if manager.state == .disconnected && !red {
+            let tint: Color = red && manager.panelConnectionState != .connecting ? .red : (manager.panelConnectionState == .disconnected ? .secondary : .orange)
+            if manager.state == .disconnected && !red && manager.panelConnectionState == .disconnected && manager.loginProtectionNotice == nil {
                 return (manager.hasCredentials ? "Cisco 未连接" : header.subtitle, tint)
             }
             return (header.look.headline + (header.subtitle.isEmpty ? "" : " · " + header.subtitle), tint)
@@ -511,7 +511,7 @@ struct PanelView: View {
                 if on {
                     showConfirmDisconnect = false
                     if manager.hasCredentials { onStart() } else { onOpenSettings("credentials") }
-                } else if red {
+                } else if manager.networkHeld || manager.state == .reconnecting || manager.gatewayTrustFailed {
                     onStop()  // never trapped: no confirm (§24.6)
                 } else {
                     showConfirmDisconnect = true
@@ -538,7 +538,7 @@ struct PanelView: View {
             }
             let summary = proxyHealth.summary(all)
             let color: Color = summary.level == .ok ? .green : summary.level == .warn ? .orange : summary.level == .fail ? .red : .secondary
-            return ((all.count > 1 ? "\(all.count) 个代理 · " : "") + summary.text, color)
+            return (summary.text, color)
         }()
         return HStack(spacing: 11) {
             ProxyMark(on: on)
@@ -801,7 +801,7 @@ struct PanelView: View {
     /// notice); for a plain disconnect, what "未连接" means.
     private var subtitle: String {
         if manager.state == .disconnected, let notice = manager.loginProtectionNotice { return notice }
-        if !manager.hasCredentials {
+        if manager.state == .disconnected && !manager.hasCredentials {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }

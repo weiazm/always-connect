@@ -174,7 +174,19 @@ final class ProxyHealth: ObservableObject {
 
     /// The panel tile's line for the proxies in use.
     func summary(_ routes: [ProxyRoute]) -> (text: String, level: ProxyCheck.Level?) {
+        guard !routes.isEmpty else { return ("未启用", nil) }
         let results = routes.map { checks[$0.id] }
+        if results.count > 1 {
+            let levels: [(ProxyCheck.Level?, String)] = [(.ok, "正常"), (.fail, "连不上"),
+                (.warn, "部分网站打不开"), (.pending, "等待连接"), (nil, "检测中")]
+            let groups = levels.compactMap { level, label -> String? in
+                let count = results.filter { $0?.level == level }.count
+                return count > 0 ? "\(count) 个\(label)" : nil
+            }
+            if groups.count > 1 {
+                return (groups.joined(separator: " · "), results.contains { $0?.level == .fail || $0?.level == .warn } ? .warn : .pending)
+            }
+        }
         if results.contains(where: { $0?.level == .fail }) { return ("连不上", .fail) }
         if results.contains(where: { $0?.level == .warn }) { return ("部分网站打不开", .warn) }
         if let waiting = results.compactMap({ $0 }).first(where: { $0.level == .pending }) { return (waiting.short, .pending) }

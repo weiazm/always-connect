@@ -792,7 +792,7 @@ impl Routing {
     pub fn recent_notice(&self) -> Option<String> {
         let mut notice = self.notice.lock().unwrap();
         match &*notice {
-            Some((at, text)) if at.elapsed() < NOTICE_FOR => Some(text.clone()),
+            Some((at, text)) if at.elapsed() < NOTICE_FOR => Some(format!("最近一分钟，{text}")),
             _ => { *notice = None; None }
         }
     }

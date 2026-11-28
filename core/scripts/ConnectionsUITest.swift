@@ -29,12 +29,27 @@ struct ConnectionsUITest {
             checkProxyProcesses(marker: URL(fileURLWithPath: marker))
             return
         }
+        let first = ProxyRoute(name: "A", kind: .hysteria2, host: "192.0.2.1", port: 443, sites: [])
+        let second = ProxyRoute(name: "B", kind: .socks5, host: "192.0.2.2", port: 1080, sites: [])
+        let health = ProxyHealth()
+        health.preview([first.id: ProxyCheck(level: .ok, text: "OK", millis: 80, at: Date()),
+                        second.id: ProxyCheck(level: .fail, text: "timeout", at: Date())])
+        let mixed = health.summary([first, second])
+        check(mixed.text == "1 个正常 · 1 个连不上" && mixed.level == .warn, "mixed proxy availability shows both outcomes")
+        check(health.summary([first]).text == "正常 · 80 ms", "single proxy retains its latency")
         checkEgressEditing()
         checkTextTrim()
         if let output = ProcessInfo.processInfo.environment["AC_EGRESS_RENDER_DIR"] { renderEgress(to: output) }
         // Use the real settings process' snapshot entry. A late engine state
         // can still say connected while the menu App reports a trust failure.
         let manager = HelperClient.shared
+        manager.applyRemoteSnapshot(#"{"state":0,"preparingEngine":true,"ownConnection":true}"#)
+        check(manager.panelConnectionState == .connecting && manager.switchIsOn && !manager.showsConnected,
+              "accepted login shows preparation before the engine pushes state")
+        manager.applyRemoteSnapshot(#"{"state":5,"detail":"tunnel negotiation accepted","ownConnection":true}"#)
+        let progressing = PanelStatusHeader(client: manager, subtitle: "重试")
+        check(progressing.look.headline == "正在连接…" && progressing.subtitle.contains("隧道协商完成"),
+              "negotiated reconnect shows setup progress before confirmed connection")
         manager.applyRemoteSnapshot(#"{"state":4,"gatewayTrustFailed":true,"rejectedLoginHeld":true,"ownConnection":true}"#)
         let failed = PanelStatusHeader(client: manager, subtitle: "已连接")
         let menu = NSButton()

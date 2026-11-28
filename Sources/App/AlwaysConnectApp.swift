@@ -76,6 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if state == .connected && !rejected { MemoryRelief.soon(after: 10) }
             }
             .store(in: &cancellables)
+        HelperClient.shared.$detail.map { _ in () }
+            .merge(with: HelperClient.shared.$preparingEngine.map { _ in () },
+                   HelperClient.shared.$loginProtectionNotice.map { _ in () })
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.updateStatusIcon() }
+            .store(in: &cancellables)
         // Proxies running by themselves show on the icon too (§69.20).
         HelperClient.shared.$proxyOnlyRunning
             .removeDuplicates()

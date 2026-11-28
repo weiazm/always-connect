@@ -228,6 +228,7 @@ final class Client {
     var protectsDrops: Bool { ProfileStore.loadAppSettings().isDropProtectionOn }
     var pendingProtectedStart: UInt64?
     var protectedLoginRetries = 0
+    var preparingEngine = false
     var protectedLoginRetryPending = false
     static let protectedLoginRetryLimit = 2
     let loginWatch = OnDemandMachine("login_watch")
