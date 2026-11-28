@@ -161,7 +161,15 @@ mod macos {
 
     fn load(guard: &Guard, tcp: Option<u16>, udp: Option<u16>) -> Result<(), String> {
         let text = alwaysconnect_core::pf::proxy_redirect(tcp, udp, &[NETWORK.to_owned()]);
-        guard.proxy_redirect(Some(&text)).map_err(|e| format!("pf load: {e}"))
+        guard.proxy_redirect(Some(&text)).map_err(|e| format!("pf load: {e}"))?;
+        // Read the live Darwin filter and redirect printers exactly as the
+        // leak self-check does. This runner already owns this proxy anchor.
+        alwaysconnect_core::network_check::verify_proxy_anchor(Some(&text), &mut |path, args| {
+            let result = std::process::Command::new(path).args(args).output().unwrap();
+            alwaysconnect_core::network_check::Output { ok: result.status.success(),
+                text: String::from_utf8_lossy(&result.stdout).into_owned() }
+        }).map_err(|reason| format!("self-check of loaded proxy anchor: {reason}"))?;
+        Ok(())
     }
 
     fn udp_answer(ip: std::net::Ipv4Addr, port: u16) -> io::Result<Vec<u8>> {
