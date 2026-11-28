@@ -761,6 +761,7 @@ impl Engine {
             physical: c.config.physical_if.clone(), gateway: c.physical_gateway.clone(),
             vpn_gateways: c.last_pf.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
             dns: c.tunnel_dns.clone(), split: c.forwarder.is_some(), protection: c.config.drop_protection,
+            proxy_rules: c.proxy.as_ref().and_then(|p| p.loaded.clone()),
             rules: self.shared.guard.expected_rules(), direct: self.shared.guard.direct_addresses(),
             routes: self.shared.routes.addresses(), error: c.pf_error.clone().or_else(||c.network_routes_error.clone()),
             epoch: c.forwarder.as_ref().map(|f| f.epoch()).unwrap_or(c.generation),

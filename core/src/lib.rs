@@ -21,6 +21,7 @@ pub mod leak_probe;
 pub mod login_cache;
 pub mod network_guard;
 pub mod network_check;
+mod network_neighbors;
 pub mod oc_engine;
 pub mod offline;
 pub mod pf;

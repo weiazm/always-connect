@@ -39,9 +39,6 @@ enum NetworkNeighbors {
         ("com.crossutility.quantumult-x", "Quantumult X"), ("com.shadowrocket", "Shadowrocket"),
         ("net.tunnelblick", "Tunnelblick"), ("com.wireguard.macos", "WireGuard"),
     ]
-    /// Command-line cores that run without an app.
-    static let knownDaemons = ["clash", "mihomo", "sing-box", "xray", "v2ray", "hysteria", "tun2socks"]
-
     static func notices(_ o: Observation) -> [NeighborNotice] {
         var out: [NeighborNotice] = []
         let names = o.apps.joined(separator: "、")
@@ -64,10 +61,10 @@ enum NetworkNeighbors {
     }
 
     /// Reads the Mac's current state. Cheap enough for each panel open.
-    static func observe(oursActive: Bool, ciscoTunnel: Bool, splitOn: Bool) -> Observation {
+    static func observe(oursActive: Bool, ciscoTunnel: Bool, splitOn: Bool, proxyOnlyRunning: Bool) -> Observation {
         Observation(defaultInterface: defaultInterface(), oursActive: oursActive, ciscoTunnel: ciscoTunnel,
                     apps: runningClients(), systemProxy: systemProxy(),
-                    port53Busy: oursActive ? false : port53Busy(), splitOn: splitOn)
+                    port53Busy: (oursActive || proxyOnlyRunning) ? false : port53Busy(), splitOn: splitOn)
     }
 
     private static func runningClients() -> [String] {
@@ -78,21 +75,15 @@ enum NetworkNeighbors {
                 names.append(hit.name)
             }
         }
-        for daemon in knownDaemons where processRunning(daemon) {
-            if !names.contains(daemon) { names.append(daemon) }
+        // Rust reads executable paths once, so the managed Hysteria client
+        // can coexist with an independently running copy of the same name.
+        if let raw = ac_neighbor_daemons() {
+            defer { neighbor_string_free(raw) }
+            for daemon in String(cString: raw).split(separator: ",").map(String.init) where !names.contains(daemon) {
+                names.append(daemon)
+            }
         }
         return names
-    }
-
-    private static func processRunning(_ name: String) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", name]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
     }
 
     private static func defaultInterface() -> String? {
@@ -140,3 +131,6 @@ enum NetworkNeighbors {
 
 @_silgen_name("ac_loopback_dns_busy")
 private func ac_loopback_dns_busy(_ port: UInt16, _ timeoutMilliseconds: UInt32) -> Bool
+
+@_silgen_name("ac_neighbor_daemons") private func ac_neighbor_daemons() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_string_free") private func neighbor_string_free(_ s: UnsafeMutablePointer<CChar>?)

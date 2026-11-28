@@ -2096,6 +2096,16 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
     crate::child_io::duplicate(fd).map(IntoRawFd::into_raw_fd).unwrap_or(-1)
 }
 
+/// Returns only recognized external daemon names. Process arguments are never read.
+#[no_mangle]
+pub extern "C" fn ac_neighbor_daemons() -> *mut c_char {
+    let out = crate::network_check::read_command("/bin/ps", &["-axo".into(), "comm=".into()],
+        std::time::Duration::from_secs(1));
+    if !out.ok { return std::ptr::null_mut(); }
+    let names = crate::network_neighbors::external_daemons(&out.text);
+    CString::new(names.into_iter().collect::<Vec<_>>().join(",")).unwrap().into_raw()
+}
+
 /// Loopback-only compatibility notice probe, never a VPN DNS fallback.
 #[no_mangle]
 pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {

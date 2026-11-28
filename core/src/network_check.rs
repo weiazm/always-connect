@@ -12,7 +12,7 @@ pub struct Expected {
     pub tunnel: Option<String>, pub dns_interface: Option<String>,
     pub physical: String, pub gateway: Option<String>, pub vpn_gateways: Vec<String>,
     pub dns: Vec<String>, pub split: bool, pub protection: bool,
-    pub rules: Option<String>, pub direct: Vec<String>, pub routes: Vec<String>,
+    pub rules: Option<String>, pub proxy_rules: Option<String>, pub direct: Vec<String>, pub routes: Vec<String>,
     pub error: Option<String>, pub epoch: u64,
     /// The physical network's own DNS servers, for the active probe.
     pub local_dns: Vec<String>,
@@ -108,7 +108,7 @@ fn canonical_rules(text: &str) -> Vec<String> {
             } else if let Some(flags) = explicit_flags { if flags != "any" { words.push(format!("unexpected-flags={flags}")); } }
             for w in &mut words {
                 *w = match w.as_str() { "root" => "0", "bootpc" => "68", "bootps" => "67", "domain" => "53", "mdns" => "5353", "icmp6" => "ipv6-icmp", "dhcpv6-client" => "546", "dhcpv6-server" => "547", _ => w }.to_owned();
-                if w.ends_with("/32") { w.truncate(w.len() - 3); }
+                if w.strip_suffix("/32").is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok()) { w.truncate(w.len() - 3); }
             }
             out.push(format!("{} {}", family.unwrap_or("both"), words.join(" ")));
         }
@@ -129,7 +129,7 @@ fn rules_match(actual: &str, expected: &str) -> bool {
 }
 /// PF may fold literal destinations into automatic tables. Read their actual
 /// members in our anchor; the table name alone is never evidence of a match.
-fn expand_loaded_tables(text:&str, get:&mut impl FnMut(&str,&[&str])->Output)->Option<String> {
+fn expand_loaded_tables(text:&str, anchor: &str, get:&mut impl FnMut(&str,&[&str])->Output)->Option<String> {
     let mut names=BTreeSet::new();
     for line in text.lines() {
         let words:Vec<_>=line.split_whitespace().collect();
@@ -146,7 +146,7 @@ fn expand_loaded_tables(text:&str, get:&mut impl FnMut(&str,&[&str])->Output)->O
     if names.len()>8 {return None;}
     let mut expanded=text.to_owned();let mut budget=8192usize;
     for name in names {
-        let loaded=get("/sbin/pfctl",&["-a",crate::pf::ANCHOR,"-t",&name,"-T","show"]);
+        let loaded=get("/sbin/pfctl",&["-a",anchor,"-t",&name,"-T","show"]);
         if !loaded.ok {return None;}
         let members:Vec<_>=loaded.text.split_whitespace().collect();
         if members.is_empty() || members.len()>4096 {return None;}
@@ -204,7 +204,7 @@ pub(crate) fn confirm_login_rules(pfctl: &str, expected: &str) -> Result<(), Str
     let info = get(pfctl, &["-s", "info"]);
     if !info.ok || !info.text.contains("Status: Enabled") { return Err("系统防火墙状态未确认，已停止登录".into()); }
     let anchor = get(pfctl, &["-a", crate::pf::ANCHOR, "-s", "rules"]);
-    if !anchor.ok || !expand_loaded_tables(&anchor.text, &mut get).is_some_and(|actual| rules_match(&actual, expected)) {
+    if !anchor.ok || !expand_loaded_tables(&anchor.text, crate::pf::ANCHOR, &mut get).is_some_and(|actual| rules_match(&actual, expected)) {
         return Err("登录保护规则未确认，已停止登录".into());
     }
     Ok(())
@@ -225,47 +225,115 @@ fn anchor_call(text: &str) -> Option<String> {
     let mut calls=anchor_calls(text)?;
     if calls.len()==1 {calls.pop()} else {None}
 }
-fn anchor_chain(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
-    let main=get("/sbin/pfctl",&["-s","rules"]); if !main.ok {return false;}
-    let Some(calls)=anchor_calls(&main.text) else {return false;};
-    let mut target=false;
-    for name in calls {
-        let current=match name.as_str() {
-            crate::pf::ANCHOR=>Some(true),
-            "com.apple/*"=>Some(apple_children(get)),
-            "com.apple"=>{
-                let parent=get("/sbin/pfctl",&["-a","com.apple","-s","rules"]);if !parent.ok{return false;}
-                Some(match anchor_call(&parent.text).as_deref() {
-                    Some("300.AlwaysConnect")|Some(crate::pf::ANCHOR)=>true,
-                    Some("*")=>apple_children(get),_=>false,
-                })
-            },_=>None,
+/// A proxy anchor contains disjoint TCP/UDP redirects, then loopback passes
+/// followed by terminal inbound blocks. Compare those groups separately so
+/// printer expansion may reorder destinations, but never cross a block.
+#[derive(Default, PartialEq)]
+struct ProxyRules {
+    redirects: Vec<String>,
+    passes: Vec<String>,
+    blocks: Vec<String>,
+}
+
+fn proxy_rules(text: &str) -> Option<ProxyRules> {
+    let mut rules = ProxyRules::default();
+    for line in text.lines().map(str::trim).filter(|s| !s.is_empty() && !s.starts_with('#')) {
+        let section = match line.split_whitespace().next()? {
+            "rdr" if rules.passes.is_empty() && rules.blocks.is_empty() => &mut rules.redirects,
+            "pass" if rules.blocks.is_empty() => &mut rules.passes,
+            "block" => &mut rules.blocks,
+            _ => return None,
         };
-        if let Some(reachable)=current {
-            if target || !reachable {return false;}
-            target=true;
-        } else {
-            // A vendor's bare anchor may coexist with ours, but only after
-            // a successful read proves it contains no filtering rules.
-            if name.is_empty() || name.starts_with('-') || !name.bytes().all(|c|c.is_ascii_alphanumeric()||b"._-".contains(&c)) {return false;}
-            let other=get("/sbin/pfctl",&["-a",&name,"-s","rules"]);
-            if !other.ok || !other.text.trim().is_empty() {return false;}
+        section.extend(expand_sets(line));
+    }
+    rules.redirects = canonical_rules(&rules.redirects.join("\n"));
+    rules.passes = canonical_rules(&rules.passes.join("\n"));
+    // All expected blocks have the same action after the passes.
+    rules.blocks = normalized_passes(&mut canonical_rules(&rules.blocks.join("\n")));
+    Some(rules)
+}
+
+/// Compare the supervisor's installed intent with independent reads from PF.
+/// An empty leftover anchor is valid only when no proxy rules are expected.
+pub fn verify_proxy_anchor(expected: Option<&str>, get: &mut impl FnMut(&str,&[&str])->Output) -> Result<(), &'static str> {
+    let anchor = crate::pf::PROXY_ANCHOR;
+    let mut read = |kind: &str| {
+        let out = get("/sbin/pfctl", &["-a", anchor, "-s", kind]);
+        if !out.ok { return Err("未能读取分流代理规则"); }
+        expand_loaded_tables(&out.text, anchor, get).ok_or("未能核对分流代理规则中的地址表")
+    };
+    let redirects = read("nat")?;
+    let filters = read("rules")?;
+    let expected = proxy_rules(expected.unwrap_or("")).ok_or("分流代理的预期规则无法识别")?;
+    let actual_nat = proxy_rules(&redirects).ok_or("分流代理的转发规则无法识别")?;
+    let actual_filter = proxy_rules(&filters).ok_or("分流代理的过滤规则无法识别")?;
+    if !actual_nat.passes.is_empty() || !actual_nat.blocks.is_empty() || !actual_filter.redirects.is_empty()
+        || expected.redirects != actual_nat.redirects || expected.passes != actual_filter.passes
+        || expected.blocks != actual_filter.blocks { return Err("分流代理实际加载的规则与当前配置不一致"); }
+    Ok(())
+}
+
+fn anchor_chain(proxy_rules: Option<&str>, get: &mut impl FnMut(&str,&[&str])->Output) -> Result<(), &'static str> {
+    let main = get("/sbin/pfctl", &["-s", "rules"]);
+    if !main.ok { return Err("未能读取系统主规则"); }
+    let calls = anchor_calls(&main.text).ok_or("系统主规则含未确认的过滤或调用")?;
+    let mut target = false;
+    for name in calls {
+        match name.as_str() {
+            crate::pf::ANCHOR => {}
+            crate::pf::PROXY_ANCHOR => {
+                verify_proxy_anchor(proxy_rules, get)?;
+                continue;
+            }
+            "com.apple/*" => apple_children(proxy_rules, get)?,
+            "com.apple" => {
+                let parent = get("/sbin/pfctl", &["-a", "com.apple", "-s", "rules"]);
+                if !parent.ok { return Err("未能读取系统父规则"); }
+                match anchor_call(&parent.text).as_deref() {
+                    Some("300.AlwaysConnect") | Some(crate::pf::ANCHOR) => {}
+                    Some("*") => apple_children(proxy_rules, get)?,
+                    _ => return Err("系统父规则未确认调用断线保护"),
+                }
+            }
+            _ => {
+                if !valid_sibling(&name) { return Err("系统含无法识别的过滤分支"); }
+                empty_anchor(&name, get)?;
+                continue;
+            }
+        }
+        if target { return Err("断线保护的调用不唯一"); }
+        target = true;
+    }
+    target.then_some(()).ok_or("未找到断线保护的规则入口")
+}
+
+fn valid_sibling(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+}
+
+fn empty_anchor(name: &str, get: &mut impl FnMut(&str,&[&str])->Output) -> Result<(), &'static str> {
+    let other = get("/sbin/pfctl", &["-a", name, "-s", "rules"]);
+    if !other.ok { return Err("未能读取其他过滤分支"); }
+    if !other.text.trim().is_empty() { return Err("其他过滤分支含未确认的规则"); }
+    Ok(())
+}
+
+fn apple_children(proxy_rules: Option<&str>, get: &mut impl FnMut(&str,&[&str])->Output) -> Result<(), &'static str> {
+    let names = get("/sbin/pfctl", &["-a", "com.apple", "-s", "Anchors"]);
+    if !names.ok { return Err("未能读取系统子规则列表"); }
+    let mut target = false;
+    for name in names.text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let name = name.trim_matches('"');
+        let name = name.strip_prefix("com.apple/").unwrap_or(name);
+        if !valid_sibling(name) { return Err("系统含无法识别的过滤分支"); }
+        let anchor = format!("com.apple/{name}");
+        match anchor.as_str() {
+            crate::pf::ANCHOR => target = true,
+            crate::pf::PROXY_ANCHOR => verify_proxy_anchor(proxy_rules, get)?,
+            _ => empty_anchor(&anchor, get)?,
         }
     }
-    target
-}
-fn apple_children(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
-    let names=get("/sbin/pfctl",&["-a","com.apple","-s","Anchors"]);if !names.ok{return false;}
-    let mut target=false;
-    for name in names.text.lines().map(str::trim).filter(|s|!s.is_empty()) {
-        let name=name.trim_matches('"').strip_prefix("com.apple/").unwrap_or(name.trim_matches('"'));
-        if name=="300.AlwaysConnect" {target=true;continue;}
-        if name.contains('/') || !name.bytes().all(|c|c.is_ascii_alphanumeric()||b"._-".contains(&c)) {return false;}
-        let anchor=format!("com.apple/{name}");
-        let other=get("/sbin/pfctl",&["-a",&anchor,"-s","rules"]);
-        if !other.ok || !other.text.trim().is_empty() {return false;}
-    }
-    target
+    target.then_some(()).ok_or("未找到断线保护的系统子规则")
 }
 
 /// `exec` is injected in tests. Missing output, permission errors and deadlines
@@ -279,10 +347,10 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
             let loaded = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-s", "rules"]);
             let enabled = get("/sbin/pfctl", &["-s", "info"]);
             let matches = loaded.ok && expected.rules.as_ref().is_some_and(|rules| {
-                expand_loaded_tables(&loaded.text, &mut get).is_some_and(|actual|
+                expand_loaded_tables(&loaded.text, crate::pf::ANCHOR, &mut get).is_some_and(|actual|
                     rules_match(&actual, rules))
             });
-            let reached = enabled.ok && enabled.text.contains("Status: Enabled") && matches && anchor_chain(&mut get);
+            let reached = enabled.ok && enabled.text.contains("Status: Enabled") && matches && anchor_chain(expected.proxy_rules.as_deref(), &mut get).is_ok();
             result.push(item("当前拦截规则与调用链", reached,
                 "核对防火墙启用状态、拦截规则和上级锚点，规则内的例外仍然适用"));
             let states = get("/sbin/pfctl", &["-s", "states"]);
@@ -315,17 +383,25 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
     let pf = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-s", "rules"]);
     let info = get("/sbin/pfctl", &["-s", "info"]);
     let enabled=info.ok&&info.text.contains("Status: Enabled");
-    let reachable=if expected.protection {anchor_chain(&mut get)} else {false};
-    let actual_rules=if pf.ok {expand_loaded_tables(&pf.text,&mut get)} else {None};
+    let chain = expected.protection.then(|| anchor_chain(expected.proxy_rules.as_deref(), &mut get));
+    let reachable = matches!(chain, Some(Ok(())));
+    let actual_rules=if pf.ok {expand_loaded_tables(&pf.text,crate::pf::ANCHOR,&mut get)} else {None};
     let configured=actual_rules.as_ref().zip(expected.rules.as_ref()).is_some_and(|(a,e)|rules_match(a,e));
     let effective=enabled&&reachable&&configured;
     if expected.protection {
-        result.push(item("实际防火墙配置与当前策略一致", effective && expected.error.is_none(), "完整核对实际规则；多放行、旧网卡、旧 DNS 和系统操作失败都不能通过"));
+        let config_detail = if !pf.ok { "未能读取实际防火墙规则" }
+            else if actual_rules.is_none() { "实际规则中的地址表未能核对" }
+            else if !configured { "实际加载的规则与当前策略不一致" }
+            else if expected.error.is_some() { "后台服务报告规则或路由操作未完成" }
+            else if !enabled { "规则内容匹配，防火墙启用状态未确认" }
+            else if !reachable { "规则内容匹配，但系统调用链未确认" }
+            else { "已核对实际加载的规则及系统调用链" };
+        result.push(item("实际防火墙配置与当前策略一致", effective && expected.error.is_none(), config_detail));
         result.push(item("pf 已开启", enabled, "读取系统实际过滤状态"));
-        result.push(item("断线保护规则调用链已确认", reachable, "核对主/父锚点实际调用；额外过滤规则或未知分支显示未确认"));
+        result.push(item("断线保护规则调用链已确认", reachable, chain.and_then(Result::err).unwrap_or("已核对系统主规则及其过滤分支")));
         let ipv6_ok=effective && pf.text.lines().last().is_some_and(|l|l.trim().starts_with("block drop out quick"))
             && pf.text.contains("inet proto udp")&&!pf.text.contains(&format!("on {} all",expected.physical));
-        result.push(item("物理公网 IPv6 受保护", ipv6_ok, "默认封堵包含 IPv6；DHCP 限 IPv4，链路本地发现保留；显式地址例外另计"));
+        result.push(item("物理公网 IPv6 受保护", ipv6_ok, if !effective { "防火墙规则或调用链未确认，暂无法判断物理公网 IPv6 保护" } else { "默认封堵包含 IPv6；DHCP 限 IPv4，链路本地发现保留；显式地址例外另计" }));
         // The pre-existing broad tunnel allowance is visible, never a green
         // assertion that only this VPN can carry protected traffic.
         let other_tunnel = pf.text.lines().flat_map(expand_sets).any(|line| {
@@ -389,7 +465,7 @@ mod tests {
     use super::*;
     fn expected() -> Expected {
         let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],tunnel_dns_servers:vec!["10.1.1.1".into()],direct_table:true,strict_dns:false,block_direct:false }).unwrap();
-        Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1,local_dns:vec![] }
+        Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),proxy_rules:None,direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1,local_dns:vec![] }
     }
     fn fixture(e:&Expected, path:&str,args:&[String]) -> Output {
         let text = if args==["-s","rules"] {"anchor \"com.apple/*\" all".into()}
@@ -459,6 +535,73 @@ mod tests {
             });
             assert!(!rows.iter().find(|i|i.item=="断线保护规则调用链已确认").unwrap().passed,
                 "unknown or populated vendor rules must stay unconfirmed");
+        }
+    }
+
+    #[test]
+    fn active_proxy_anchor_verifies_the_three_linked_firewall_checks() {
+        let mut e = expected();
+        let intent = crate::pf::proxy_redirect(Some(50123), Some(50124), &["203.0.113.0/24".into()]);
+        e.proxy_rules = Some(intent.clone());
+        let nat = intent.lines().filter(|l| l.starts_with("rdr ")).collect::<Vec<_>>().join("\n");
+        let filter = intent.lines().filter(|l| l.starts_with("pass ") || l.starts_with("block ")).collect::<Vec<_>>().join("\n");
+        let filter = filter.replace("port 50123 keep", "port = 50123 flags S/SA keep")
+            .replace("port 50124 keep", "port = 50124 keep");
+        let run = |e: &Expected, nat: Option<&str>, filter: Option<&str>, anchored: &str| {
+            run_with(e, |p, a| {
+                if a == ["-a", "com.apple", "-s", "Anchors"] {
+                    return Output { ok: true, text: format!("com.apple/300.AlwaysConnect\n{anchored}") };
+                }
+                if a.first().map(String::as_str) == Some("-a") && a.get(1).is_some_and(|n| n == anchored) {
+                    let text = if a.last().is_some_and(|k| k == "nat") { nat } else { filter };
+                    return Output { ok: text.is_some(), text: text.unwrap_or_default().into() };
+                }
+                fixture(e, p, a)
+            })
+        };
+        let anchor = crate::pf::PROXY_ANCHOR;
+        let checks = ["实际防火墙配置与当前策略一致", "断线保护规则调用链已确认", "物理公网 IPv6 受保护"];
+        let verify = |rows: Vec<Item>, passed| {
+            for name in checks {
+                assert_eq!(rows.iter().find(|i| i.item == name).unwrap().passed, passed, "{name}");
+            }
+        };
+        verify(run(&e, Some(&nat), Some(&filter), anchor), true);
+        for (nat_read, filter_read) in [(None, Some(filter.as_str())), (Some(nat.as_str()), None),
+            (Some(""), Some(filter.as_str())), (Some(nat.as_str()), Some(""))] {
+            verify(run(&e, nat_read, filter_read, anchor), false);
+        }
+        verify(run(&e, Some(&nat.replace("50123", "50125")), Some(&filter), anchor), false);
+        verify(run(&e, Some(&nat), Some(&filter.replace(" (if-bound)", "")), anchor), false);
+        verify(run(&e, Some(&nat), Some(&filter.replace("lo0", "en0")), anchor), false);
+        verify(run(&e, Some(&nat), Some(&filter), "com.apple/302.Unexpected"), false);
+        e.proxy_rules = None;
+        verify(run(&e, Some(&nat), Some(&filter), anchor), false);
+        verify(run(&e, Some(""), Some(""), anchor), true);
+    }
+
+    #[test]
+    fn proxy_tables_must_be_read_from_the_proxy_anchor_and_match_all_destinations() {
+        let intent = crate::pf::proxy_redirect(Some(50123), None, &["203.0.113.0/24".into()]);
+        let mut nat = Vec::new();
+        let mut filters = Vec::new();
+        for line in intent.lines().filter(|line| !line.starts_with('#')) {
+            let compiled = line.replace("{ 198.19.128.0/17, 203.0.113.0/24 }", "<__automatic_test>");
+            if line.starts_with("rdr ") { nat.push(compiled); } else { filters.push(compiled); }
+        }
+        for (members, accepted) in [(Some("203.0.113.0/24\n198.19.128.0/17"), true),
+                                    (Some("198.19.128.0/17"), false), (None, false)] {
+            let verified = verify_proxy_anchor(Some(&intent), &mut |_, args| {
+                assert_eq!(args[1], crate::pf::PROXY_ANCHOR);
+                let value = match &args[2..] {
+                    ["-s", "nat"] => Some(nat.join("\n")),
+                    ["-s", "rules"] => Some(filters.join("\n")),
+                    ["-t", "__automatic_test", "-T", "show"] => members.map(str::to_owned),
+                    _ => panic!("unexpected read"),
+                };
+                Output { ok: value.is_some(), text: value.unwrap_or_default() }
+            });
+            assert_eq!(verified.is_ok(), accepted);
         }
     }
 

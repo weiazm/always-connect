@@ -277,9 +277,10 @@ struct PanelView: View {
             let active = manager.state != .disconnected
             let cisco = manager.usesCisco
             let split = manager.ownConnection
+            let proxyOnly = manager.proxyOnlyRunning
             DispatchQueue.global(qos: .userInitiated).async {
                 let found = NetworkNeighbors.notices(NetworkNeighbors.observe(
-                    oursActive: active && !cisco, ciscoTunnel: active && cisco, splitOn: split))
+                    oursActive: active && !cisco, ciscoTunnel: active && cisco, splitOn: split, proxyOnlyRunning: proxyOnly))
                 DispatchQueue.main.async { neighbors = found }
             }
         }
