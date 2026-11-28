@@ -484,6 +484,7 @@ struct Core {
     direct_retries: HashMap<Ipv4Addr,DirectRetry>,
     direct_retry_warning: Option<String>,
     tunnel_retrying: bool,
+    script_tun: bool,
     gateway_lan_excludes: Vec<String>,
     watching: bool,
     /// Writing to this ends the network watcher's thread.
@@ -590,6 +591,7 @@ impl Engine {
                 direct_retries: HashMap::new(),
                 direct_retry_warning: None,
                 tunnel_retrying: false,
+                script_tun: false,
                 gateway_lan_excludes: Vec::new(),
                 watching: false,
                 watch_stop: None,
@@ -1127,7 +1129,7 @@ impl Shared {
     }
 
     fn reject_certificate(&self, c: &mut Core, incident: u64, direct: bool) -> bool {
-        c.cstp_dns.retire_listener();
+        c.cstp_dns = Default::default();
         self.retire_datagram(c);
         if c.stop_requested || self.guard.was_superseded(&self.holder) { return false; }
         if c.finished {
@@ -1151,7 +1153,8 @@ impl Shared {
             state = SessionStatus::Reconnecting;
         }
         if (c.tunnel_retrying || (c.config.login_port.is_some() && c.config.drop_protection && c.pf_needs_load)
-            || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
+            || (c.hook_fired && (c.script_tun || c.forwarder.is_some()) && c.tunnel_if.is_none()))
+            && state == SessionStatus::Connected {
             state = SessionStatus::Reconnecting;
         }
         // Re-authenticating inside a drop episode is, to the user, still
@@ -1816,6 +1819,7 @@ impl Shared {
         c.proxy_routes_ready = false;
         c.hook_fired = false;
         c.tunnel_retrying = false;
+        c.script_tun = false;
         c.saw_login_failed = false;
         c.tunnel_dns.clear();
         c.cstp_dns = Default::default();
@@ -1886,6 +1890,7 @@ impl Shared {
         } else {
             None
         };
+        c.script_tun = gate.is_some();
         if let Some(gate) = &gate {
             // §66.5: the gate owns the utun and runs the same vpnc-script,
             // whose path stays on openconnect's command line.
@@ -2041,6 +2046,10 @@ impl Shared {
             self.handle_hook(c, payload);
             return;
         }
+        if stdout && c.script_tun && c.hook_fired && !c.tunnel_retrying && !c.stop_requested && c.child_alive()
+            && !c.recovery_suspended() && (line == cstp_dns::CONNECT_REQUEST || cstp_dns::is_retry_wait(line)) {
+            self.begin_script_tun_reconnect(c);
+        }
         let negotiated = stdout && c.cstp_dns.observe(line);
         if negotiated { self.prepare_datagram(c); }
         if negotiated && !c.hook_fired && !c.stop_requested && !c.recovery_suspended()
@@ -2052,7 +2061,11 @@ impl Shared {
             // Its previous checks no longer describe the new connection.
             self.egress_invalidate();
             let servers = c.cstp_dns.accepted().expect("completed CSTP negotiation");
-            if servers != c.tunnel_dns {
+            if c.script_tun && c.tunnel_retrying && !c.stop_requested && c.child_alive()
+                && !c.recovery_suspended() && !c.gate_lost && c.direct_certificate_error.is_none() {
+                c.tunnel_dns = servers.to_vec();
+                self.finish_script_tun_reconnect(c);
+            } else if servers != c.tunnel_dns {
                 c.tunnel_dns = servers.to_vec();
                 self.update_forwarder(c);
                 // Script-tun gets no reconnect hook. The gate's confirmed
@@ -2079,6 +2092,39 @@ impl Shared {
             c.saw_login_failed = true;
             self.timer(c, Timer::ForceKill, 3.0);
         }
+    }
+
+    /// OpenConnect keeps the script-tun device and does not call either
+    /// reconnect hook. The old device alone is no proof of a live transport.
+    fn begin_script_tun_reconnect(&self, c: &mut Core) {
+        self.retire_datagram(c);
+        c.cstp_dns = Default::default();
+        c.tunnel_retrying = true;
+        c.proxy_routes_ready = false;
+        c.tunnel_if = None;
+        c.tunnel_dns.clear();
+        self.egress_invalidate();
+        self.apply_base_pf(c);
+        self.update_forwarder(c);
+        if c.proxy.is_some() {
+            self.sync_proxy(c);
+        }
+        self.report(c, "隧道断了，正在重连…");
+    }
+
+    fn finish_script_tun_reconnect(&self, c: &mut Core) {
+        c.tunnel_retrying = false;
+        c.pf_needs_load |= c.config.drop_protection;
+        if (c.config.no_routes || c.physical_gateway.is_some()) && self.reconfirm_tunnel(c) {
+            if let Some((tun, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tun), gateways, c.last_allow_direct_egress);
+            }
+            self.route_networks_direct(c);
+        } else {
+            self.update_forwarder(c);
+        }
+        let detail = if c.tunnel_if.is_some() { "tunnel up" } else { TUNNEL_NEGOTIATED };
+        self.report(c, c.pf_error.as_deref().unwrap_or(detail));
     }
 
     fn handle_hook(self: &Arc<Self>, c: &mut Core, payload: &str) {
@@ -2543,8 +2589,14 @@ impl Shared {
             self.follow_network(c, &gateway, &interface, true);
             return;
         }
-        if self.reconfirm_tunnel(c) { self.report(c, "网络已恢复，继续使用当前 VPN"); }
-        if c.pf_needs_load {self.apply_base_pf(c);}
+        let reconfirmed = self.reconfirm_tunnel(c);
+        if reconfirmed {
+            if let Some((tun, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tun), gateways, c.last_allow_direct_egress);
+            }
+        } else if c.pf_needs_load {
+            self.apply_base_pf(c);
+        }
         if c.split_needs_sync {self.sync_split_routes(c);}
         if c.network_routes_error.is_some() || c.routes_need_repoint ||
             (!c.proxy_routes_ready && c.hook_fired && !c.tunnel_retrying && !c.pf_needs_load && !c.recovery_suspended()) {
@@ -2560,6 +2612,9 @@ impl Shared {
                     self.load_pf(c, Some(tun), gws, allow);
                 }
             }
+        }
+        if reconfirmed {
+            self.report(c, c.pf_error.as_deref().unwrap_or("网络已恢复，继续使用当前 VPN"));
         }
     }
 
@@ -2882,6 +2937,63 @@ mod tests {
             c.stop_requested = true;
             for line in [request, ok, complete] { engine.shared.handle_line(&mut c, line, true); }
             assert_eq!(reports.lock().unwrap().len(), 2, "a stopping session cannot re-show the card");
+        }
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn script_tun_reconnect_requires_new_transport_before_reusing_the_device() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let sink = reports.clone();
+        let (engine, support) = split_engine_with_hooks("script-tun-reconnect", Hooks {
+            state: Box::new(move |state, detail| sink.lock().unwrap().push((state, detail.to_owned()))),
+            terminal: Box::new(|_| {}),
+            network_available: Box::new(|| true),
+            physical_network: Box::new(|_| Some(("192.0.2.1".into(), "en0".into()))),
+            local_dns: Box::new(|_| vec![]),
+            system_roots: Box::new(|| None),
+            stopped: Box::new(|| {}),
+        });
+        let iface = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
+        let connected = state_code(SessionStatus::Connected);
+        let reconnecting = state_code(SessionStatus::Reconnecting);
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.script_tun = true;
+            c.child = Some(Child { pid: i32::MAX, generation: c.generation, alive: Arc::new(AtomicBool::new(true)) });
+            c.driver.start();
+            c.driver.on_authenticated();
+            engine.shared.handle_hook(&mut c, &format!("connect tun={iface} gateway=198.51.100.7 phys=en0 physgw=192.0.2.1"));
+            assert_eq!(reports.lock().unwrap().last().unwrap().0, connected);
+
+            engine.shared.handle_line(&mut c, "sleep 10s, remaining timeout 300s", true);
+            assert!(c.tunnel_retrying);
+            assert!(c.tunnel_if.is_none());
+            assert_eq!(reports.lock().unwrap().last().unwrap().0, reconnecting);
+            engine.shared.refresh_network(&mut c);
+            assert!(c.tunnel_if.is_none(), "physical network alone cannot recover the transport");
+
+            for line in [cstp_dns::CONNECT_REQUEST, "Got CONNECT response: HTTP/1.1 401 Unauthorized",
+                         "CSTP connected. DPD 30, Keepalive 20"] {
+                engine.shared.handle_line(&mut c, line, true);
+            }
+            assert!(c.tunnel_retrying);
+            assert!(c.tunnel_if.is_none());
+
+            for line in [cstp_dns::CONNECT_REQUEST, "Got CONNECT response: HTTP/1.1 200 OK", "X-CSTP-DNS: 192.0.2.9"] {
+                engine.shared.handle_line(&mut c, line, true);
+            }
+            assert!(c.tunnel_if.is_none(), "response headers alone cannot recover the transport");
+            engine.shared.handle_line(&mut c, "CSTP connected. DPD 30, Keepalive 20", true);
+            assert_eq!(c.tunnel_if.as_deref(), Some(iface));
+            assert_eq!(c.tunnel_dns, ["192.0.2.9"]);
+            assert!(!c.tunnel_retrying);
+            assert_eq!(reports.lock().unwrap().last().unwrap().0, connected);
+            c.stop_requested = true;
+            engine.shared.handle_line(&mut c, "sleep 10s, remaining timeout 300s", true);
+            assert!(!c.tunnel_retrying, "stopped children cannot start a reconnect");
+            c.child.take();
         }
         drop(engine);
         std::fs::remove_dir_all(support).unwrap();

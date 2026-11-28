@@ -293,15 +293,10 @@ final class CertificateRelay {
         queue.async { self.stopLocked() }
     }
 
-    /// A connection to the gateway that starts while the Mac changes
-    /// network is bound to the address it is leaving and never gets an
-    /// answer: switching from a phone hotspot back to Wi-Fi, one waited
-    /// out its whole timeout and the phone approval came 27 s after the
-    /// switch instead of 3 (§30.10). When the network changes, every
-    /// pair still in its handshake is given up at once; openconnect
-    /// tries again straight away, over the new network.
+    /// A handshake on a retired physical route can wait for its full
+    /// timeout (§30.10). Check the connection's own path when the system
+    /// publishes a usable new path.
     private var pathMonitor: NWPathMonitor?
-    private var lastPath: String?
 
     private func watchNetwork() {
         // The physical network only: our own tunnel coming and going is
@@ -312,13 +307,11 @@ final class CertificateRelay {
         } else {
             monitor = NWPathMonitor()
         }
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let signature = "\(path.status) \(path.availableInterfaces.map(\.name)) \(path.gateways.map(\.debugDescription))"
-            defer { self.lastPath = signature }
-            guard let last = self.lastPath, last != signature else { return }
+        monitor.pathUpdateHandler = { [weak self, weak monitor] _ in
+            guard let self, let path = monitor?.currentPath, path.status == .satisfied else { return }
+            let route = Pair.physicalRoute(path)
             for pair in self.pairs.values where pair.handshaking {
-                pair.close("network changed during the handshake")
+                pair.closeHandshakeOnRetiredRoute(route)
             }
         }
         monitor.start(queue: queue)
@@ -328,7 +321,6 @@ final class CertificateRelay {
     private func stopLocked() {
         pathMonitor?.cancel()
         pathMonitor = nil
-        lastPath = nil
         listener?.cancel()
         listener = nil
         for pair in pairs.values { pair.close("relay stopped") }
@@ -582,6 +574,25 @@ private final class Pair {
     /// Both sides not yet connected and relaying.
     var handshaking: Bool { !started && !closed }
 
+    static func physicalRoute(_ path: NWPath) -> (interfaces: String, gateways: String) {
+        let interfaces = path.availableInterfaces
+            .filter { path.usesInterfaceType($0.type) && $0.name.hasPrefix("en") }
+            .map(\.name)
+        let gateways = path.gateways.compactMap { endpoint -> String? in
+            guard case .hostPort(.ipv4(let address), _) = endpoint else { return nil }
+            return "\(address)"
+        }
+        return (interfaces.joined(separator: " "), gateways.joined(separator: " "))
+    }
+
+    func closeHandshakeOnRetiredRoute(_ current: (interfaces: String, gateways: String)) {
+        guard let path = outgoing.currentPath, path.status == .satisfied else { return }
+        let actual = Self.physicalRoute(path)
+        if ac_relay_handshake_uses_old_route(actual.interfaces, actual.gateways, current.interfaces, current.gateways) {
+            close("gateway handshake on retired physical route")
+        }
+    }
+
     private func side(_ incoming: Bool) -> String { incoming ? "openconnect" : "gateway" }
 
     private func state(_ state: NWConnection.State, incoming: Bool) {
@@ -701,6 +712,9 @@ func ac_relay_stream_new(_ pair: UInt32, _ gatewayIp: UnsafePointer<CChar>,
                          _ log: (@convention(c) (UnsafePointer<CChar>?) -> Void)?) -> OpaquePointer?
 @_silgen_name("ac_relay_stream_set_path")
 func ac_relay_stream_set_path(_ s: OpaquePointer, _ localIp: UnsafePointer<CChar>?, _ interface: UnsafePointer<CChar>?)
+@_silgen_name("ac_relay_handshake_uses_old_route")
+private func ac_relay_handshake_uses_old_route(_ interfaces: UnsafePointer<CChar>, _ gateways: UnsafePointer<CChar>,
+                                              _ newInterfaces: UnsafePointer<CChar>, _ newGateways: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_relay_stream_feed")
 func ac_relay_stream_feed(_ s: OpaquePointer, _ fromClient: Bool, _ data: UnsafePointer<UInt8>?, _ len: Int) -> Int32
 @_silgen_name("ac_relay_stream_chunk")

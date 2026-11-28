@@ -944,6 +944,15 @@ pub extern "C" fn ac_relay_stream_set_path(s: *mut Stream, local_ip: *const c_ch
     }
 }
 
+#[no_mangle]
+pub extern "C" fn ac_relay_handshake_uses_old_route(interfaces: *const c_char, gateways: *const c_char,
+                                                   new_interfaces: *const c_char, new_gateways: *const c_char) -> bool {
+    relay::handshake_uses_old_route(
+        c_str(interfaces).as_deref().unwrap_or_default(), c_str(gateways).as_deref().unwrap_or_default(),
+        c_str(new_interfaces).as_deref().unwrap_or_default(), c_str(new_gateways).as_deref().unwrap_or_default(),
+    )
+}
+
 /// One read from openconnect (`from_client`) or the gateway. Returns the
 /// number of chunks to send, each as its own write (read them with
 /// ac_relay_stream_chunk before the next feed in the same direction);
