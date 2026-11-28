@@ -418,6 +418,10 @@ jobs:
       - name: Split list rules (domains, geosite, geoip, networks; bundled data)
         # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
         run: scripts/list-rules-test.sh
+      - name: Configuration sharing (export, import, undo; stand-in service and keychain)
+        # Sources/App/ConfigShare.swift with the Rust core (DESIGN.md §七十五), in a
+        # settings suite of its own. Two Macs sharing a real file are Mac proof (L36).
+        run: scripts/config-share-test.sh
       - name: One keychain item for every secret (in-memory stand-in)
         # Sources/App/KeychainStore.swift (DESIGN.md §69.19): older items copied
         # in once, a refused vault never overwritten. No real keychain is touched.
