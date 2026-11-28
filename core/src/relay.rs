@@ -348,6 +348,23 @@ pub fn pick<'a>(addresses: &'a [String], prefer: Option<&str>, avoid: Option<&st
     pool.first().copied()
 }
 
+/// Interface or gateway evidence must refer to the existing handshake.
+/// General path updates alone can arrive after a new attempt has started.
+pub(crate) fn handshake_uses_old_route(interfaces: &str, gateways: &str, new_interfaces: &str, new_gateways: &str) -> bool {
+    let disjoint = |old: &str, new: &str| {
+        !old.is_empty() && !new.is_empty()
+            && old.split_ascii_whitespace().all(|item| !new.split_ascii_whitespace().any(|n| n == item))
+    };
+    if disjoint(interfaces, new_interfaces) {
+        return true;
+    }
+    // A gateway list has no interface association. Compare it only when
+    // both paths identify a single, shared physical interface.
+    !interfaces.is_empty() && interfaces == new_interfaces
+        && interfaces.split_ascii_whitespace().count() == 1
+        && disjoint(gateways, new_gateways)
+}
+
 // MARK: - The DTLS channel
 
 /// The interface that owns `local` (the TLS leg's own address).
@@ -712,6 +729,18 @@ impl Stream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_network_notification_keeps_current_or_unconfirmed_handshakes() {
+        use super::handshake_uses_old_route as retired;
+        assert!(!retired("", "", "en0", "192.0.2.1"));
+        assert!(!retired("en0", "192.0.2.1", "en0", "192.0.2.1"));
+        assert!(!retired("en0", "192.0.2.1", "en1 en0", "192.0.2.2"));
+        assert!(!retired("en0", "192.0.2.1", "en0", ""));
+        assert!(!retired("en0", "192.0.2.1 192.0.2.2", "en0", "192.0.2.2 192.0.2.1"));
+        assert!(retired("en1", "192.0.2.1", "en0", "192.0.2.1"));
+        assert!(retired("en0", "192.0.2.1", "en0", "192.0.2.2"));
+    }
+
     use super::*;
     use std::sync::Mutex;
 

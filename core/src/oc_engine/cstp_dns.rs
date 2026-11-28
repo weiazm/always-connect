@@ -1,5 +1,17 @@
 use std::net::IpAddr;
 
+pub(super) const CONNECT_REQUEST: &str = "> CONNECT /CSCOSSLC/tunnel HTTP/1.1";
+
+/// OpenConnect 9.21 emits this from ssl_reconnect after a failed transport
+/// connection, even when script-tun suppresses its attempt-reconnect hook.
+pub(super) fn is_retry_wait(line: &str) -> bool {
+    let Some((delay, remaining)) = line.strip_prefix("sleep ")
+        .and_then(|line| line.split_once("s, remaining timeout "))
+    else { return false; };
+    delay.parse::<u32>().is_ok()
+        && remaining.strip_suffix('s').is_some_and(|value| value.parse::<u32>().is_ok())
+}
+
 /// OpenConnect 9.21 prepares the script environment when it creates the
 /// tunnel, but negotiates a new option list on each successful CSTP CONNECT.
 #[derive(Default)]
@@ -46,7 +58,7 @@ impl CstpDns {
 
     /// Return true only after the CLI accepted the complete option set.
     pub(super) fn observe(&mut self, line: &str) -> bool {
-        if line == "> CONNECT /CSCOSSLC/tunnel HTTP/1.1" {
+        if line == CONNECT_REQUEST {
             *self = Self::Request;
         } else if matches!(self, Self::Request)
             && line.starts_with("Got CONNECT response: HTTP/1.1 200 ")
