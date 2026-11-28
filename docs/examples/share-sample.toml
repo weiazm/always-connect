@@ -32,7 +32,8 @@ address = "vpn-a.example.com"
 name = "VPN-B"
 address = "vpn-b.example.com"
 
-# 分流直连：命中的网站不走 Cisco；规则写法与 App 里的规则框相同，例外优先
+# 分流直连（按网站分流时）：rules 命中的网站不走 Cisco；exceptions 是例外，命中的照常走 Cisco。
+# 三类名单的规则写法都和 App 里的规则框相同。
 [split.direct]
 rules = [
   "example.com",
@@ -47,11 +48,12 @@ exceptions = ["full:login.example.com"]
 name = "示例分组"
 rules = ["a.example.net", "b.example.net"]
 
-# 分流代理：按先后顺序匹配，先命中的生效
+# 分流代理：按先后顺序匹配；exceptions 命中的跳过这个代理，继续往后匹配
 [[proxy]]
 name = "示例 SOCKS5"
 link = "socks5://{username}:{password}@{host}:1080"
 rules = ["geosite:example-media", "full:api.example.net"]
+exceptions = []
 
 [[proxy]]
 name = "示例 Hysteria2"
@@ -59,15 +61,15 @@ link = "hysteria2://{password}@{host}:443,20000-30000/?sni={sni}&obfs=salamander
 rules = ["geosite:example-tools", "198.51.100.0/24"]
 exceptions = ["full:static.example.org"]
 
-# 出口保护：这些网站只允许从列出的国家出去
+# 出口保护：rules 里的网站只允许从 countries 出去；exceptions 命中的不受这条保护
 [egress]
-steer = true
-prefetch = 5
-half_life_minutes = 2
+steer = true                     # 走错出口时换到出口正确的服务器
+prefetch = 5                     # 后台提前复查访问最多的几台服务器
+half_life_minutes = 2            # 访问热度减半的分钟数
 
 [[egress.rule]]
 name = "示例：只从美国出口"
-sites = ["shop.example.com", "geosite:example-shop"]
+rules = ["shop.example.com", "geosite:example-shop"]
 exceptions = ["full:cdn.shop.example.com"]
 countries = ["US"]
 when_unverified = "when_wrong"   # allow 放行 / when_wrong 有异常就拦 / block 一律拦
