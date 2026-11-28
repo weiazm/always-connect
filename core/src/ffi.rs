@@ -982,6 +982,13 @@ pub extern "C" fn ac_relay_stream_in_tunnel(s: *const Stream) -> bool {
 /// Stops the DTLS channel; the counters for the close line (free with
 /// ac_string_free).
 #[no_mangle]
+pub extern "C" fn ac_relay_datagram_flow(s: *const Stream) -> *mut c_char {
+    unsafe { s.as_ref() }.and_then(Stream::datagram_flow)
+        .and_then(|f| serde_json::to_string(f).ok()).and_then(|s| CString::new(s).ok())
+        .map_or(std::ptr::null_mut(), CString::into_raw)
+}
+
+#[no_mangle]
 pub extern "C" fn ac_relay_stream_close(s: *mut Stream) -> *mut c_char {
     let Some(s) = (unsafe { s.as_mut() }) else { return std::ptr::null_mut() };
     CString::new(s.close()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
@@ -2114,6 +2121,15 @@ pub extern "C" fn ac_oc_record_gateway_rejection(engine: *const oc_engine::Engin
 
 
 #[no_mangle]
+pub extern "C" fn ac_oc_note_datagram(engine: *const oc_engine::Engine, json: *const c_char) -> bool {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return false };
+    let Some(json) = c_str(json).filter(|s| s.len() <= 512) else { return false };
+    let Ok(flow) = serde_json::from_str(&json) else { return false };
+    engine.note_datagram(flow);
+    true
+}
+
+#[no_mangle]
 pub extern "C" fn ac_oc_verified_tunnel(engine: *const oc_engine::Engine, incident: u64) -> bool {
     unsafe { engine.as_ref() }.is_some_and(|e| e.verified_tunnel(incident))
 }
@@ -2161,9 +2177,9 @@ pub extern "C" fn ac_proxy_only_set_egress_probe_with_peer(
 
 fn proxy_network(json: Option<String>) -> crate::proxy_only::Network {
     #[derive(serde::Deserialize, Default)]
-    struct Wire { interface: Option<String>, dns: Vec<String> }
+    struct Wire { interface: Option<String>, gateway: Option<String>, dns: Vec<String> }
     let wire: Wire = json.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-    crate::proxy_only::Network { interface: wire.interface, dns: wire.dns }
+    crate::proxy_only::Network { interface: wire.interface, gateway: wire.gateway, dns: wire.dns }
 }
 
 fn rule_lines(text: Option<String>) -> Vec<String> {
@@ -2284,7 +2300,7 @@ pub extern "C" fn ac_proxy_only_check_egress_target(
     let Some(routing) = routing else { return -1 };
     let Some(server) = routing.table().server(proxy_index).cloned() else { return -1 };
     let target = crate::split_proxy::ResolvedTarget {
-        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server },
+        via: crate::split_proxy::RouteVia::Proxy { index: proxy_index, server, health_key: None },
         target: crate::split_proxy::Target::Name(host),
         resolved_ips: Vec::new(),
     };
@@ -2354,13 +2370,16 @@ pub extern "C" fn ac_hysteria_probe(server: *const c_char, rules: *const c_char)
     let Some(line) = c_str(server) else { return std::ptr::null_mut() };
     let rules: Vec<String> = c_str(rules).unwrap_or_default().lines().map(str::to_owned).collect();
     let site = crate::split_proxy::site_from_rules(&rules);
-    let result = match crate::split_proxy::HysteriaSpec::parse_rule_line(&line) {
-        Some(spec) => crate::split_proxy::hysteria::probe_hysteria(&spec, site.as_deref(), None),
-        None => crate::split_proxy::Probe {
+    let result = if let Some(key) = line.strip_prefix("saved-hysteria2 ") {
+        crate::split_proxy::hysteria::probe_saved(key, site.as_deref())
+    } else if let Some(spec) = crate::split_proxy::HysteriaSpec::parse_rule_line(&line) {
+        crate::split_proxy::hysteria::probe_hysteria(&spec, site.as_deref(), None)
+    } else {
+        crate::split_proxy::Probe {
             level: crate::split_proxy::Level::Fail,
             text: "代理地址无效".into(),
             millis: 0,
-        },
+        }
     };
     let json = serde_json::json!({
         "level": result.level.word(),

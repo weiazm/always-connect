@@ -16,7 +16,7 @@ def declaration(prefix):
     return source[start:end].removeprefix('private ')
 
 members = [
-    'enum State: Int', 'var ownLoginProgressText: String?', 'var stateLine: String', 'var showsConnected: Bool',
+    'enum State: Int', 'var ownLoginProgressText: String?', 'var panelConnectionState: State', 'var stateLine: String', 'var showsConnected: Bool',
     'var certificateProtectionText: String', 'private func showGatewayRejection()',
     'private func observeRelayTrust(', 'private func confirmRelayRecovery()',
     'private func updateCiscoTrust(',
@@ -59,6 +59,9 @@ final class HelperClient {
     var relayIncident: UInt64 = 0
     var revalidatedRelayPin: String?
     var pendingRecovery: UInt64?
+    var preparingEngine = false
+    var pendingProtectedStart: UInt64?
+    var protectedLoginRetryPending = false
     var awaitingCiscoStart = false
     var relayGeneration = 1
     var connectedSince: Date?

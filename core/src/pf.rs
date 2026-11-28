@@ -211,12 +211,24 @@ pub fn proxy_redirect(tcp: Option<u16>, udp: Option<u16>, networks: &[String]) -
 /// Before authentication there is no trusted tunnel. Keep DNS on loopback and
 /// admit only the selected gateway transport and directly attached private LANs.
 pub fn login_rules(physical: &str, gateways: &[String], port: u16, udp: bool, lans: &[String]) -> Option<String> {
+    login_rules_with_datagram(physical, gateways, port, udp, lans, None)
+}
+
+pub(crate) fn login_rules_with_datagram(physical: &str, gateways: &[String], port: u16, udp: bool,
+                                       lans: &[String], flow: Option<&crate::relay::DatagramFlow>) -> Option<String> {
     if port == 0 || (!valid_iface(physical) && !(physical.is_empty() && gateways.is_empty() && lans.is_empty())) { return None; }
     let mut out = String::from("pass out quick on lo0 all no state\nblock drop out quick proto { udp tcp } to any port 53\n");
     let transport = if udp { "{ tcp udp }" } else { "tcp" };
     for raw in gateways {
         let ip = raw.parse::<std::net::IpAddr>().ok()?;
         out.push_str(&format!("pass out quick on {physical} proto {transport} to {ip} port {port} no state\n"));
+    }
+    if let Some(f) = flow {
+        if udp || f.interface != physical || f.peer.port() != port || f.source.port() < 1024 || f.listener == 0 ||
+            !crate::direct_routes::ordinary_unicast(*f.source.ip()) ||
+            !gateways.iter().any(|g| g.parse().ok() == Some(*f.peer.ip())) { return None; }
+        out.push_str(&format!("pass out quick on {physical} inet proto udp from {} port {} to {} port {port} no state\n",
+                              f.source.ip(), f.source.port(), f.peer.ip()));
     }
     for lan in lans {
         if !valid_cidr(lan) { return None; }

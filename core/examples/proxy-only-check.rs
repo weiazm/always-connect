@@ -110,7 +110,7 @@ mod macos {
             .filter(|ip| ip.parse::<Ipv4Addr>().is_ok_and(|v| !v.is_loopback())).take(1).collect();
         if dns.is_empty() { return Err("no DNS server on the runner".into()); }
         println!("network: {interface}, DNS {dns:?}");
-        Ok(Network { interface: Some(interface), dns })
+        Ok(Network { interface: Some(interface), gateway: None, dns })
     }
 
     pub fn run() -> Result<(), String> {

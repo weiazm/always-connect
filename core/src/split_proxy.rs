@@ -152,6 +152,11 @@ fn proxy_index(text: &str) -> Option<usize> {
     text.parse::<usize>().ok().filter(|n| *n < MAX_PROXIES)
 }
 
+fn parse_health_key(text: &str) -> Option<u128> {
+    if text.len() != 36 { return None; }
+    u128::from_str_radix(&text.replace('-', ""), 16).ok()
+}
+
 /// The proxies and their rules, in the App's order: the first proxy whose
 /// rules match takes the site.
 #[derive(Default, Debug)]
@@ -161,6 +166,7 @@ pub struct Table {
     servers: Vec<Option<Server>>,
     /// Managed Hysteria2 proxies, keyed by the App's proxy index (§七十).
     hysteria: BTreeMap<usize, HysteriaSpec>,
+    health_keys: BTreeMap<usize, u128>,
     groups: Vec<(usize, SplitRules)>,
     /// Networks the user wrote, routed here for connections by address.
     networks: Vec<(usize, String, (u32, u32))>,
@@ -172,6 +178,7 @@ impl Table {
         let mut hysteria: BTreeMap<usize, HysteriaSpec> = BTreeMap::new();
         let mut rules: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         let mut networks = Vec::new();
+        let mut health_keys = BTreeMap::new();
         for raw in list {
             let line = raw.as_ref().trim();
             if let Some(rest) = line.strip_prefix("proxy:") {
@@ -183,6 +190,12 @@ impl Table {
                     } else {
                         hysteria.remove(&n);
                         servers.insert(n, Server::parse(server));
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("proxyhealth:") {
+                if let Some((index, key)) = rest.split_once(' ') {
+                    if let (Some(n), Some(key)) = (proxy_index(index), parse_health_key(key)) {
+                        health_keys.insert(n, key);
                     }
                 }
             } else if let Some(rest) = line.strip_prefix("vianet:") {
@@ -209,7 +222,7 @@ impl Table {
                     Some((*index, cidr, range))
                 }));
         }
-        let mut table = Table { servers: vec![None; size], hysteria, groups, networks: routed };
+        let mut table = Table { servers: vec![None; size], hysteria, health_keys, groups, networks: routed };
         for (n, server) in servers { table.servers[n] = server; }
         table
     }
@@ -358,7 +371,7 @@ enum ManagedProxy {
 /// Where the relay sends one redirected connection (§69, §71).
 #[derive(Clone, Debug)]
 pub(crate) enum RouteVia {
-    Proxy { server: Server, index: usize },
+    Proxy { server: Server, index: usize, health_key: Option<(u128, u64)> },
     /// Proxy-only mode: a protected site not matched by any proxy (§71 D2).
     Local,
 }
@@ -393,6 +406,7 @@ pub struct Routing {
     /// Per proxy (the App's index): the last connection that opened
     /// through it, and the last that did not, with why.
     health: Mutex<HashMap<usize, Health>>,
+    health_generation: AtomicU64,
     /// The proxy servers' addresses this relay connected to, per proxy,
     /// and when: the connections page marks those connections (§69.12).
     upstreams: Mutex<HashMap<std::net::SocketAddr, (usize, Instant)>>,
@@ -418,7 +432,8 @@ impl Leg {
 }
 
 #[derive(Default, Clone)]
-struct Health { ok: Option<Instant>, failed: Option<(Instant, String)> }
+struct Health { key: Option<u128>, ok: Option<f64>, failed: Option<(f64, String)> }
+
 
 pub(crate) type Refusal = (String, String);
 
@@ -735,7 +750,7 @@ impl Routing {
                 let server = self.resolve_server(n).map_err(|reason| (name.clone(), reason))?;
                 return Ok(ResolvedTarget {
                     target: Target::Name(name),
-                    via: RouteVia::Proxy { server, index: n },
+                    via: RouteVia::Proxy { server, index: n, health_key: self.health_tag(&table, n) },
                     resolved_ips: addresses,
                 });
             }
@@ -755,7 +770,7 @@ impl Routing {
         let server = self.resolve_server(n).map_err(|reason| (ip.to_string(), reason))?;
         Ok(ResolvedTarget {
             target: Target::Ip(ip),
-            via: RouteVia::Proxy { server, index: n },
+            via: RouteVia::Proxy { server, index: n, health_key: self.health_tag(&table, n) },
             resolved_ips: vec![ip],
         })
     }
@@ -777,16 +792,34 @@ impl Routing {
     pub fn recent_notice(&self) -> Option<String> {
         let mut notice = self.notice.lock().unwrap();
         match &*notice {
-            Some((at, text)) if at.elapsed() < NOTICE_FOR => Some(text.clone()),
+            Some((at, text)) if at.elapsed() < NOTICE_FOR => Some(format!("最近一分钟，{text}")),
             _ => { *notice = None; None }
         }
     }
 
     /// A connection through proxy `n` opened (None) or failed (Some(why)).
     pub(crate) fn record(&self, n: usize, failure: Option<&str>) {
-        let now = Instant::now();
+        self.record_for(n, self.health_tag(&self.table(), n), failure);
+    }
+
+    pub fn reset_health(&self) {
         let mut health = self.health.lock().unwrap();
+        self.health_generation.fetch_add(1, Ordering::AcqRel);
+        health.clear();
+    }
+
+    fn health_tag(&self, table: &Table, n: usize) -> Option<(u128, u64)> {
+        table.health_keys.get(&n).map(|key| (*key, self.health_generation.load(Ordering::Acquire)))
+    }
+
+    fn record_for(&self, n: usize, tag: Option<(u128, u64)>, failure: Option<&str>) {
+        let mut health = self.health.lock().unwrap();
+        let table = self.table.read().unwrap();
+        if self.health_tag(&table, n) != tag { return; }
+        let key = tag.map(|(key, _)| key);
+        let now = crate::proxy_health::ac_proxy_health_now();
         let entry = health.entry(n).or_default();
+        if entry.key != key { *entry = Health { key, ..Health::default() }; }
         match failure {
             None => entry.ok = Some(now),
             Some(reason) => entry.failed = Some((now, reason.to_owned())),
@@ -797,15 +830,26 @@ impl Routing {
     /// success and the last failure (within the last ten minutes).
     pub fn health_json(&self) -> serde_json::Value {
         let mut health = self.health.lock().unwrap();
-        health.retain(|_, h| {
-            if h.ok.is_some_and(|at| at.elapsed() >= HEALTH_FOR) { h.ok = None; }
-            if h.failed.as_ref().is_some_and(|(at, _)| at.elapsed() >= HEALTH_FOR) { h.failed = None; }
+        if health.is_empty() { return serde_json::Value::Array(Vec::new()); }
+        self.health_rows(&mut health)
+    }
+
+    fn health_rows(&self, health: &mut HashMap<usize, Health>) -> serde_json::Value {
+        let table = self.table.read().unwrap();
+        let now = crate::proxy_health::ac_proxy_health_now();
+        health.retain(|n, h| {
+            if h.key != table.health_keys.get(n).copied() { return false; }
+            if h.ok.is_some_and(|at| now - at >= HEALTH_FOR.as_secs_f64()) { h.ok = None; }
+            if h.failed.as_ref().is_some_and(|(at, _)| now - at >= HEALTH_FOR.as_secs_f64()) { h.failed = None; }
             h.ok.is_some() || h.failed.is_some()
         });
         let mut rows: Vec<_> = health.iter().map(|(n, h)| serde_json::json!({
             "proxy": n,
-            "okAgo": h.ok.map(|at| at.elapsed().as_secs()),
-            "failedAgo": h.failed.as_ref().map(|(at, _)| at.elapsed().as_secs()),
+            "key": h.key.map(|key| format!("{key:032x}")),
+            "okAt": h.ok,
+            "failedAt": h.failed.as_ref().map(|(at, _)| at),
+            "okAgo": h.ok.map(|at| (now - at) as u64),
+            "failedAgo": h.failed.as_ref().map(|(at, _)| (now - at) as u64),
             "reason": h.failed.as_ref().map(|(_, why)| why.clone()),
         })).collect();
         rows.sort_by_key(|row| row["proxy"].as_u64());

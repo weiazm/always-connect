@@ -26,6 +26,7 @@ pub mod offline;
 pub mod pf;
 pub mod pf_verify;
 pub mod proxy_only;
+pub mod proxy_health;
 pub mod relay;
 pub mod relay_log;
 pub mod route_watch;

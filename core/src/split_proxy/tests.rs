@@ -889,11 +889,19 @@ fn interop_with_a_reference_hysteria2_server() {
         }
     });
     let line = format!("proxy:0 {}", spec.to_rule_line());
-    let table = Table::parse(&[&line, "via:0:full:hy2-tcp.example", "vianet:0:127.0.0.0/8"]);
+    let saved = "00000000-0000-0000-0000-000000000001";
+    let identity = format!("proxyhealth:0 {saved}");
+    let table = Table::parse(&[&line, &identity, "via:0:full:hy2-tcp.example", "vianet:0:127.0.0.0/8"]);
     let routing = Routing::new(table);
     let mut specs = std::collections::BTreeMap::new();
     specs.insert(0, spec.clone());
-    hysteria::shared().sync(specs, routing.clone(), None);
+    let manager = hysteria::shared();
+    manager.sync_on_path(specs.clone(), routing.clone(), None, None);
+    let waiting = hysteria::probe_saved(saved, None);
+    assert_eq!(waiting.text, "正在等本地网络就绪");
+    assert!(manager.running_socks_for(&spec).is_none());
+    let path = Some(("wifi", "router-a"));
+    manager.sync_on_path(specs.clone(), routing.clone(), None, path);
 
     // Wait for managed client to become ready
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -905,6 +913,8 @@ fn interop_with_a_reference_hysteria2_server() {
         std::thread::sleep(Duration::from_millis(50));
     };
 
+    assert_eq!(hysteria::probe_saved(saved, None).level, Level::Ok);
+    assert_eq!(hysteria::probe_saved("00000000-0000-0000-0000-000000000002", None).level, Level::Pending);
     // TCP through managed Hysteria2 client's SOCKS5
     let (mut tcp_stream, _) = open_through(&local_socks, &Target::Ip(Ipv4Addr::LOCALHOST), tcp_origin.address.port())
         .expect("TCP via managed hysteria2");
@@ -918,6 +928,27 @@ fn interop_with_a_reference_hysteria2_server() {
     let mut buf = [0u8; 2048];
     let n = udp_sock.recv(&mut buf).expect("udp recv");
     assert_eq!(udp_unwrap(&buf[..n]), Some(&b"hy2-udp-ping"[..]));
+
+    // Normal handover on the same network reuses the socket. Physical loss
+    // retires it even when the next network has the same interface and router.
+    manager.sync_on_path(specs.clone(), routing.clone(), None, None);
+    assert!(manager.running_socks_for(&spec).is_none());
+    manager.sync_on_path(specs.clone(), routing.clone(), None, path);
+    assert_eq!(manager.running_socks_for(&spec).unwrap(), local_socks);
+    manager.physical_network_lost(&routing);
+    assert!(manager.running_socks_for(&spec).is_none());
+    manager.sync_on_path(specs, routing.clone(), None, Some(("wifi", "router-b")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(replacement) = manager.running_socks_for(&spec) {
+            assert_ne!(replacement, local_socks);
+            let (mut stream, _) = open_through(&replacement, &Target::Ip(Ipv4Addr::LOCALHOST), tcp_origin.address.port()).unwrap();
+            round_trip(&mut stream, "");
+            break;
+        }
+        assert!(Instant::now() < deadline, "replacement did not become ready on the restored path");
+        std::thread::sleep(Duration::from_millis(30));
+    }
 
     // Stop cleanly
     hysteria::shared().stop_all();
@@ -1046,6 +1077,14 @@ fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
             let _ = s.read_to_end(&mut out);
             return (!out.is_empty()).then_some(out);
         }
+        // Complete one exchange through the local probe bridge. A synthetic
+        // country alone can return before the echo server's accept runs.
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, req.port)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream.write_all(b"probe").ok()?;
+        let mut echo = [0; 5];
+        stream.read_exact(&mut echo).ok()?;
+        if &echo != b"probe" { return None; }
         let code = lc.lock().unwrap().clone();
         Some(format!("HTTP/1.1 200 OK\r\n\r\nloc={code}\n").into_bytes())
     });
@@ -1092,4 +1131,26 @@ fn relay_egress_blocks_fast_open_silent_proxy_and_guards_local_path() {
     ctl.invalidate();
     let mut ok_stream = rig.open_address(SocketAddrV4::new(fake_local, local_port));
     round_trip(&mut ok_stream, "");
+}
+
+#[test]
+fn health_follows_the_saved_configuration_and_first_reply() {
+    let first = "proxyhealth:0 00000000-0000-0000-0000-000000000001";
+    let next = "proxyhealth:0 00000000-0000-0000-0000-000000000002";
+    let lines = |id: &str| Table::parse(&[id, "proxy:0 socks5 127.0.0.1 1080", "via:0:full:one.example"]);
+    let routing = Routing::new(lines(first));
+    routing.record_for(0, Some((1, 0)), None);
+    let old = routing.health_json();
+    assert!(old[0]["okAt"].as_f64().unwrap() > 0.);
+    assert_eq!(old[0]["key"], format!("{:032x}", 1));
+    routing.set_table(lines(next));
+    routing.record_for(0, Some((1, 0)), Some("late"));
+    assert_eq!(routing.health_json(), serde_json::json!([]));
+    routing.record_for(0, Some((2, 0)), None);
+    assert_eq!(routing.health_json()[0]["key"], format!("{:032x}", 2));
+    routing.reset_health();
+    routing.record_for(0, Some((2, 0)), Some("previous network"));
+    assert_eq!(routing.health_json(), serde_json::json!([]));
+    routing.record_for(0, Some((2, 1)), None);
+    assert!(routing.health_json()[0]["okAt"].is_number());
 }

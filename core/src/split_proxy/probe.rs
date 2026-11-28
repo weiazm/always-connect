@@ -18,6 +18,8 @@ const SITE_ANSWER: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
+    /// The saved managed client is waiting for its network or handshake.
+    Pending,
     /// The proxy answered; the site (when given) opened through it.
     Ok,
     /// The proxy works, but it could not open the site.
@@ -28,7 +30,7 @@ pub enum Level {
 
 impl Level {
     pub fn word(self) -> &'static str {
-        match self { Level::Ok => "ok", Level::Warn => "warn", Level::Fail => "fail" }
+        match self { Level::Pending => "pending", Level::Ok => "ok", Level::Warn => "warn", Level::Fail => "fail" }
     }
 }
 

@@ -13,7 +13,7 @@ final class ProxyOnlySession {
         let interface = physical?.interface
         let dns = interface.map { LocalDNS.servers(for: $0) } ?? []
         var wire: [String: Any] = ["dns": dns]
-        if let interface { wire["interface"] = interface }
+        if let physical { wire["interface"] = physical.interface; wire["gateway"] = physical.gateway }
         let data = (try? JSONSerialization.data(withJSONObject: wire)) ?? Data("{}".utf8)
         return String(decoding: data, as: UTF8.self)
     }

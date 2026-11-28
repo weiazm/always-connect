@@ -56,6 +56,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private var loginPreparationForConnection: UInt64?
     private var loginPreparationTarget: GatewayAddress?
     private var loginPreparationProfileName: String?
+    @Published private(set) var preparingEngine = false
     private var loginIntentActive = false
     private var pendingProtectedStart: UInt64?
     /// The background service did not answer the protected-login request
@@ -140,7 +141,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Localized details shared by the panel and the menu tooltip.
     var ownLoginProgressText: String? {
-        guard !usesCisco, state == .authenticating || state == .awaitingApproval else { return nil }
+        guard !usesCisco, [.authenticating, .awaitingApproval, .reconnecting].contains(state) else { return nil }
         switch ApprovalPromptTracker.ownLoginSignal(detail) {
         case .gatewayReply: return "网关已回应，等待连接结果"
         case .configuring: return "隧道协商完成，正在配置 Cisco 网络"
@@ -148,10 +149,22 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
+    /// Presentation only. Keep the actual engine state for protection, cancel
+    /// and drop history while showing an acknowledged start or a new handshake.
+    var panelConnectionState: State {
+        if gatewayTrustFailed { return state }
+        if ownLoginProgressText != nil { return .connecting }
+        if state == .disconnected && (pendingProtectedStart != nil || protectedLoginRetryPending || preparingEngine) {
+            return .connecting
+        }
+        return state
+    }
+
     /// One-line status shared by the panel, Credentials and Diagnostics.
     var stateLine: String {
         if gatewayTrustFailed { return StatusLook.certificateHeadline }
         if let progress = ownLoginProgressText { return progress }
+        if state == .disconnected && panelConnectionState == .connecting { return loginProtectionNotice ?? "正在准备 Cisco 连接" }
         switch state {
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }
@@ -479,7 +492,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// manual disconnect. AwaitingApproval keeps the switch on: the
     /// user is mid-flow, not disconnected.
     var switchIsOn: Bool {
-        state != .disconnected || networkHeld || loginProtectionNotice != nil || gatewayTrustFailed
+        state != .disconnected || preparingEngine || networkHeld || loginProtectionNotice != nil || gatewayTrustFailed
     }
 
     /// A protected login that stopped before connecting (its notice says
@@ -487,7 +500,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// switch shows off and turning it on tries again (user 2026-11-25:
     /// "没连上开关为什么是打开的").
     var loginStopped: Bool {
-        state == .disconnected && !networkHeld && !gatewayTrustFailed && pendingProtectedStart == nil && !protectedLoginRetryPending
+        state == .disconnected && !preparingEngine && !networkHeld && !gatewayTrustFailed && pendingProtectedStart == nil && !protectedLoginRetryPending
             && loginProtectionNotice != nil && loginProtectionNotice != ProtectedLoginNotice.preparingGateway
     }
 
@@ -531,6 +544,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     private func loginStepFailed(_ reason: String) {
+        preparingEngine = false
         loginStepFailure = reason
         RelayLog.write("login: step failed: " + reason)
         watchLogin("failed")
@@ -673,6 +687,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         resetGatewayPreparation()
         gatewayTrustFailed = false
         rejectedLoginHeld = false
+        preparingEngine = false
         loginIntentActive = false
         loginProtectionNotice = nil
         helperUnresponsive = false
@@ -696,6 +711,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     ) {
         watchLogin("stopped")
         pendingProtectedStart = nil
+        preparingEngine = false
         loginIntentActive = false
         resetGatewayPreparation()
         gatewayTrustFailed = false
@@ -1146,7 +1162,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func pollProxyProbe(ticket: UInt64, deadline: Date, finish: @escaping (ProxyCheck) -> Void) {
         guard Date() < deadline else {
-            finish(ProxyCheck(level: .fail, text: "UDP 出不去", at: Date()))
+            finish(ProxyCheck(level: .fail, text: "代理检测超时", at: Date()))
             return
         }
         ensureConnection { proxy in
@@ -1184,10 +1200,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// `then` runs on main once the answer is in (or did not come in 3 s):
     /// the panel's speed card reads right after it, with fresh proxied
     /// totals (§69.18).
+    private var lastSplitRead = Date.distantPast
+
     func refreshSplitActivity(then done: (() -> Void)? = nil) {
         guard (!usesCisco && state == .connected) || proxyOnlyRunning else {
             splitActivity = nil; proxyBytes = nil; splitWarning = nil; dnsNotice = nil; done?(); return
         }
+        // A visible panel already reads this status for its speed card.
+        // Settings has no completion to wait for and can reuse that read.
+        if done == nil && Date().timeIntervalSince(lastSplitRead) < 1.5 { return }
+        lastSplitRead = Date()
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
@@ -1314,6 +1336,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         resettingNetwork = false
         gatewayTrustFailed = false
         rejectedLoginHeld = false
+        preparingEngine = false
         loginIntentActive = false
         loginProtectionNotice = nil
         refreshStatus()
@@ -1574,6 +1597,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard let password = storedPassword(server: profile.server, username: username) else {
             return false
         }
+        preparingEngine = true
         // Keychain stays keyed by the entry name the user typed; only
         // the Helper gets the resolved address (DESIGN.md §20.6).
         prepareRelay(server: server, authorisedAddresses: addresses) { [weak self] error in
@@ -1723,6 +1747,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         }
                         GatewayMemory.save(address.host, last: prepared.gatewayIp,
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onDatagramFlow = { [weak self] flow in
+                            DispatchQueue.main.async {
+                                guard let self, generation == self.relayGeneration, !self.gatewayTrustFailed else { return }
+                                self.egressRPC({ $0.noteRelayDatagram(prepared.serverPin, flow: flow, withReply: $1) }) { _ in }
+                            }
+                        }
                         relay.onGatewayTrustChanged = { [weak self] trusted in
                             DispatchQueue.main.async {
                                 self?.observeRelayTrust(trusted, pin: prepared.serverPin, generation: generation)
@@ -1863,15 +1893,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         return Data(base64Encoded: body)
     }
 
+    private var statusReadVersion: UInt64 = 0
+
     func refreshStatus() {
         if AppRole.isSettings {
             SettingsLink.shared.send("refreshStatus")
             return
         }
+        statusReadVersion &+= 1
+        let readVersion = statusReadVersion
         ensureConnection { proxy in
             proxy.getStatus { [weak self] stateCode, detail in
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    guard self.statusReadVersion == readVersion else {
+                        if !self.usesCisco { self.resumeOwnSessionIfOrphaned(stateCode: self.state.rawValue) }
+                        return
+                    }
                     self.markHelperReachable()
                     self.onDemandDisconnect.recheck()
                     if self.usesCisco {
@@ -2145,6 +2183,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if AppRole.isSettings { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.statusReadVersion &+= 1
             self.markHelperReachable()
             self.onDemandDisconnect.recheck()
             // With the Cisco engine the Helper's own (idle) engine is
@@ -2180,12 +2219,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             revalidatedRelayPin = ""
             loginProtectionNotice = nil
         }
+        if parsed != .disconnected && preparingEngine { preparingEngine = false }
         state = parsed
         if parsed != .disconnected && old == .disconnected { watchLogin("started") }
         // Cisco on or off: the proxies run by themselves or not (§69.20).
         if (parsed == .disconnected) != (old == .disconnected), !AppRole.isSettings { syncProxyOnly() }
         if parsed != .disconnected && loginGatewayReadiness != .idle { resetGatewayPreparation() }
         if parsed != old { updateEgressMonitoring() }
+        if !AppRole.isSettings && (parsed == .connected) != (old == .connected) { ProxyHealth.shared.invalidate() }
         if parsed == .connected && old != .connected && !AppRole.isSettings {
             // The network is usable now: a site-list check that found none
             // (launch while connecting) runs again (§66.30).
@@ -2639,6 +2680,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             return
         }
         let settings = ProfileStore.loadAppSettings()
+        ProxyHealth.shared.configure(settings.activeProxyRoutes)
         // Without Cisco on this Mac the own connection runs either way;
         // only the switch decides whether the list applies. Through Cisco's
         // client only the proxies go, for while Cisco is off (§69.20).
@@ -2674,6 +2716,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pathMonitor.pathUpdateHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                ProxyHealth.shared.invalidate()
                 self.cisco?.networkChanged()
                 self.onDemandPathReady = true
                 self.scheduleOnDemandEvaluation()
@@ -2857,6 +2900,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         var json: [String: Any] = [
             "state": state.rawValue, "detail": detail, "helperAvailable": helperAvailable,
             "terminalReasonCode": terminalReasonCode, "dropRetryCount": dropRetryCount,
+            "preparingEngine": state == .disconnected && panelConnectionState == .connecting,
             "networkHeld": networkHeld, "helperUnresponsive": helperUnresponsive,
             "ownConnection": ownConnection, "splitSwitchPending": splitSwitchPending,
             "onDemandPaused": onDemandPaused, "onDemandRuleName": onDemandRuleName ?? "",
@@ -2878,6 +2922,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func applyRemoteSnapshot(_ text: String) {
         guard let json = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { return }
+        preparingEngine = json["preparingEngine"] as? Bool ?? false
         state = State(rawValue: json["state"] as? Int ?? 0) ?? .disconnected
         detail = json["detail"] as? String ?? ""
         helperAvailable = json["helperAvailable"] as? Bool ?? false

@@ -157,6 +157,7 @@ enum Event {
     Fire { timer: Timer, token: u64 },
     StopKill { pid: i32, generation: u64 },
     NetworkChanged,
+    Datagram(crate::relay::DatagramFlow),
     DirectDomains(Vec<String>),
     DropProtection(bool),
     AllowNetworks(Vec<String>),
@@ -473,10 +474,13 @@ struct Core {
     last_allow_direct_egress: bool,
     tunnel_dns: Vec<String>,
     cstp_dns: cstp_dns::CstpDns,
+    datagram: Option<crate::relay::DatagramFlow>,
+    datagram_started: bool,
     tunnel_if: Option<String>,
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
     split_needs_sync: bool,
+    proxy_routes_ready: bool,
     direct_retries: HashMap<Ipv4Addr,DirectRetry>,
     direct_retry_warning: Option<String>,
     tunnel_retrying: bool,
@@ -576,10 +580,13 @@ impl Engine {
                 last_allow_direct_egress: false,
                 tunnel_dns: Vec::new(),
                 cstp_dns: Default::default(),
+                datagram: None,
+                datagram_started: false,
                 tunnel_if: None,
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
                 split_needs_sync: false,
+                proxy_routes_ready: false,
                 direct_retries: HashMap::new(),
                 direct_retry_warning: None,
                 tunnel_retrying: false,
@@ -677,6 +684,8 @@ impl Engine {
         let ctl = self.shared.egress.lock().expect("egress");
         ctl.as_ref().map(|c| c.status_json()).unwrap_or_else(|| "{\"running\":false}".into())
     }
+    pub fn note_datagram(&self, flow: crate::relay::DatagramFlow) { self.send(Event::Datagram(flow)); }
+
     pub fn update_direct_domains(&self, d: Vec<String>) {
         self.send(Event::DirectDomains(d));
     }
@@ -940,6 +949,14 @@ impl Shared {
                     self.egress_invalidate();
                     if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
                 }
+                Event::Datagram(flow) => {
+                    if !c.hook_fired && c.child_alive() && !c.stop_requested && !c.recovery_suspended() {
+                        if c.datagram_started || c.datagram.as_ref() == Some(&flow) { continue; }
+                        self.retire_datagram(&mut c);
+                        c.datagram = Some(flow);
+                        self.prepare_datagram(&mut c);
+                    }
+                }
                 Event::DirectDomains(d) => {
                     c.config.direct_domains = Some(d);
                     c.reset_direct_retries();
@@ -1083,6 +1100,8 @@ impl Shared {
     /// cancelled; protection stays (tightened to blocking) and no respawn
     /// runs until the network returns. Never the manual-release path.
     fn suspend_offline(self: &Arc<Self>, c: &mut Core) {
+        c.cstp_dns.retire_listener();
+        self.retire_datagram(c);
         // Preserve the guard and its owner. A normal (non-manual)
         // openconnect exit leaves drop protection in place.
         c.in_drop_episode |= c.hook_fired;
@@ -1107,6 +1126,8 @@ impl Shared {
     }
 
     fn reject_certificate(&self, c: &mut Core, incident: u64, direct: bool) -> bool {
+        c.cstp_dns.retire_listener();
+        self.retire_datagram(c);
         if c.stop_requested || self.guard.was_superseded(&self.holder) { return false; }
         if c.finished {
             // The TLS refusal and child exit can arrive in either order.
@@ -1196,6 +1217,7 @@ impl Shared {
     }
 
     fn stop(self: &Arc<Self>, c: &mut Core, keep_session: bool, notify: bool) {
+        self.retire_datagram(c);
         if notify {
             c.pending_stop_notices += 1;
         }
@@ -1279,8 +1301,10 @@ impl Shared {
         let table = crate::split_proxy::Table::parse(c.config.direct_domains.as_deref().unwrap_or_default());
         let Some(forwarder) = c.forwarder.as_ref() else { self.stop_proxy(c); return; };
         let gate = self.egress.lock().expect("egress").as_ref().map(|ctl| ctl.relay_gate());
+        let path = c.physical_gateway.as_deref().filter(|_| c.proxy_routes_ready && !c.recovery_suspended())
+            .map(|gateway| (c.config.physical_if.as_str(), gateway));
         let redirected = crate::split_proxy::redirect::sync_with_egress(
-            &mut c.proxy, table, forwarder, &self.proxy_routes, Some(&self.guard), c.config.no_routes, gate, false);
+            &mut c.proxy, table, forwarder, &self.proxy_routes, Some(&self.guard), c.config.no_routes, gate, false, path);
         if !redirected {
             c.last_error = Some(PROXY_START_ERROR.into());
             self.report(c, PROXY_START_ERROR);
@@ -1497,6 +1521,7 @@ impl Shared {
             let error="直连网段尚未同步完成；基础断线保护保持，可重试恢复网络";
             c.network_routes_error=Some(error.into());self.report(c,error);
         } else {c.network_routes_error=None;}
+        c.proxy_routes_ready = c.hook_fired && !c.tunnel_retrying && !c.pf_needs_load && c.network_routes_error.is_none();
         // The Mac's LAN may have changed which proxy networks are routed.
         if c.proxy.is_some() { self.sync_proxy(c); }
     }
@@ -1717,6 +1742,23 @@ impl Shared {
         Some("/usr/bin/env".into())
     }
 
+    fn prepare_datagram(&self, c: &mut Core) {
+        let Some(flow) = &c.datagram else { return; };
+        if c.datagram_started || !c.config.drop_protection || c.hook_fired || c.stop_requested || c.recovery_suspended()
+            || !c.child_alive() || c.cstp_dns.listener() != Some(flow.listener)
+            || c.config.relay.as_ref().and_then(|r| r.gateway_ip.parse().ok()) != Some(*flow.peer.ip())
+            || c.direct_certificate_error.is_some() || c.gate_lost || c.finished { return; }
+        c.datagram_started = self.guard.allow_login_flow(&self.holder, flow);
+    }
+
+    fn retire_datagram(&self, c: &mut Core) {
+        if let Some(flow) = c.datagram.take() {
+            if std::mem::take(&mut c.datagram_started) {
+                self.guard.expire_login_flow(&self.holder, &flow);
+            }
+        }
+    }
+
     fn require_login_hold(&self, c: &mut Core) -> bool {
         let Some(port) = c.config.login_port.filter(|_| c.config.drop_protection) else { return true; };
         let inputs = Inputs::login(&c.config.physical_if, c.config.login_gateways.clone(), port, false);
@@ -1769,6 +1811,8 @@ impl Shared {
         // No generation may inherit output suppression for a previous child.
         c.resume_after_exit = false;
         c.attempts += 1;
+        self.retire_datagram(c);
+        c.proxy_routes_ready = false;
         c.hook_fired = false;
         c.tunnel_retrying = false;
         c.saw_login_failed = false;
@@ -1996,7 +2040,8 @@ impl Shared {
             self.handle_hook(c, payload);
             return;
         }
-        let negotiated = stdout && c.forwarder.is_some() && c.cstp_dns.observe(line);
+        let negotiated = stdout && c.cstp_dns.observe(line);
+        if negotiated { self.prepare_datagram(c); }
         if negotiated && !c.hook_fired && !c.stop_requested && !c.recovery_suspended()
             && matches!(c.driver.state, SessionStatus::Authenticating | SessionStatus::AwaitingApproval) {
             self.report(c, TUNNEL_NEGOTIATED);
@@ -2115,12 +2160,15 @@ impl Shared {
                 }
                 network_guard::log(&format!("connect hook: preparation_ms={} guard_and_split_ms={}",
                     guard_start.duration_since(hook_start).as_millis(), guard_start.elapsed().as_millis()));
+                self.retire_datagram(c);
                 self.report(c, c.pf_error.as_deref().unwrap_or("tunnel up"));
                 self.route_networks_direct(c);
             }
             "attempt-reconnect" => {
                 // openconnect is retrying inside the same process (§28.1).
+                c.proxy_routes_ready = false;
                 c.tunnel_retrying = true;
+                if c.proxy.is_some() { self.sync_proxy(c); }
                 c.cstp_dns = Default::default();
                 c.tunnel_if = None;
                 self.require_login_hold(c);
@@ -2154,6 +2202,7 @@ impl Shared {
                 if c.tunnel_if.is_some() && !(c.config.drop_protection && c.pf_needs_load) {
                     c.direct_certificate_error = None;
                 }
+                self.route_networks_direct(c);
                 self.report(c, "tunnel up");
             }
             _ => {}
@@ -2204,6 +2253,7 @@ impl Shared {
     // MARK: Child exit
 
     fn child_exited(self: &Arc<Self>, c: &mut Core) {
+        self.retire_datagram(c);
         // This intent belongs to the exiting child, even when another offline
         // episode currently prevents its requested restart.
         if !c.stop_requested && c.hook_fired && c.config.drop_protection && c.config.login_port.is_some() {
@@ -2473,7 +2523,11 @@ impl Shared {
         }
         let Some((gateway, interface)) = (self.hooks.physical_network)(&c.config.physical_if) else {
             if c.physical_gateway.is_some() || c.tunnel_if.is_some() || !c.local_dns.is_empty() {
+                c.proxy_routes_ready = false;
                 c.physical_gateway = None;
+                if let Some(proxy) = &c.proxy {
+                    crate::split_proxy::hysteria::shared().physical_network_lost(&proxy.routing);
+                }
                 c.tunnel_if = None;
                 c.local_dns.clear();
                 self.update_forwarder(c);
@@ -2491,7 +2545,10 @@ impl Shared {
         if self.reconfirm_tunnel(c) { self.report(c, "网络已恢复，继续使用当前 VPN"); }
         if c.pf_needs_load {self.apply_base_pf(c);}
         if c.split_needs_sync {self.sync_split_routes(c);}
-        if c.network_routes_error.is_some() || c.routes_need_repoint {self.route_networks_direct(c);}
+        if c.network_routes_error.is_some() || c.routes_need_repoint ||
+            (!c.proxy_routes_ready && c.hook_fired && !c.tunnel_retrying && !c.pf_needs_load && !c.recovery_suspended()) {
+            self.route_networks_direct(c);
+        }
         if c.forwarder.is_some() || c.config.relay.is_some() {
             let dns = (self.hooks.local_dns)(&interface);
             if dns != c.local_dns {
@@ -2507,6 +2564,8 @@ impl Shared {
 
     /// The physical network changed under a live session (§28.1).
     fn follow_network(&self, c: &mut Core, gateway: &str, interface: &str, move_gateway_route: bool) {
+        c.cstp_dns.retire_listener();
+        self.retire_datagram(c);
         c.reset_direct_retries();
         network_guard::log(&format!("network changed: now via {interface}"));
         c.physical_gateway = Some(gateway.to_string());
@@ -2516,7 +2575,9 @@ impl Shared {
         }
         // The session's direct routes (the split's addresses and the
         // direct networks, §40.1) go via the new router.
+        c.proxy_routes_ready = false;
         c.routes_need_repoint = true;
+        if let Some(proxy) = &c.proxy { crate::split_proxy::hysteria::shared().physical_network_lost(&proxy.routing); }
         c.tunnel_if = None;
         if c.forwarder.is_some() || c.config.relay.is_some() {
             c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(interface) };
@@ -3169,6 +3230,84 @@ mod tests {
         assert!(rows[0]["detail"].as_str().unwrap().contains("已变化"));
         engine.stop(false, false); assert!(!dns_event(&engine, 0, "old.example", true));
         drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn authenticated_datagram_matches_both_the_live_relay_and_the_cli_before_pf_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ac-datagram-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pfctl = dir.join("pfctl");
+        std::fs::write(&pfctl, "#!/bin/sh\ncat >/dev/null\necho 'Token : 123' >&2\n").unwrap();
+        std::fs::set_permissions(&pfctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Arc::new(Guard::new(network_guard::Settings { support_dir: dir.clone(),
+            boot: Some("test".into()), grace: Duration::from_secs(120), pfctl: Some(pfctl.to_string_lossy().into()) }));
+        guard.owner_attached();
+        let peer = "198.51.100.7";
+        let config = Config { no_routes: true, test_active: true, drop_protection: true,
+            login_port: Some(443), login_gateways: vec![peer.into()], physical_if: "en99".into(),
+            relay: Some(RelayConfig { gateway_ip: peer.into(), arguments: vec![] }), ..Config::default() };
+        let engine = Engine::new(config, Hooks { state: Box::new(|_,_| {}), terminal: Box::new(|_| {}),
+            network_available: Box::new(|| true), physical_network: Box::new(|_| None),
+            local_dns: Box::new(|_| vec![]), system_roots: Box::new(|| None), stopped: Box::new(|| {}) }, guard.clone());
+        let base = Inputs { physical_if: "en99".into(), gateway_ips: vec![peer.into()], login_port: Some(443),
+            ..Inputs::default() };
+        guard.install_login(&engine.holder(), &base).unwrap();
+        let flow = crate::relay::DatagramFlow { interface: "en99".into(), listener: 50001,
+            source: "192.0.2.11:50002".parse().unwrap(), peer: "198.51.100.7:443".parse().unwrap() };
+        let rules = || network_guard::text(false, &guard.held().unwrap().1).unwrap();
+        let original = rules();
+        let mut sleeper = crate::child_io::spawn(Command::new("/bin/sleep").arg("5")).unwrap();
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.child = Some(Child { pid: sleeper.id() as i32, generation: c.generation, alive: Arc::new(AtomicBool::new(true)) });
+            c.datagram = Some(flow.clone());
+            for line in ["> CONNECT /CSCOSSLC/tunnel HTTP/1.1", "Got CONNECT response: HTTP/1.1 200 OK",
+                         "X-DTLS-Port: 50001"] {
+                engine.shared.handle_line(&mut c, line, true);
+                engine.shared.prepare_datagram(&mut c);
+                assert_eq!(rules(), original);
+            }
+            c.datagram.as_mut().unwrap().listener = 50003;
+            engine.shared.handle_line(&mut c, "CSTP connected. DPD 30, Keepalive 20", true);
+            assert_eq!(rules(), original);
+            for field in ["interface", "peer", "port", "source"] {
+                let mut wrong = flow.clone();
+                match field {
+                    "interface" => wrong.interface = "en98".into(),
+                    "peer" => wrong.peer.set_ip("198.51.100.8".parse().unwrap()),
+                    "port" => wrong.peer.set_port(444),
+                    _ => wrong.source.set_port(53),
+                }
+                c.datagram = Some(wrong);
+                engine.shared.prepare_datagram(&mut c);
+                assert_eq!(rules(), original);
+            }
+            c.datagram = Some(flow.clone());
+            engine.shared.prepare_datagram(&mut c);
+            let extra = "pass out quick on en99 inet proto udp from 192.0.2.11 port 50002 to 198.51.100.7 port 443 no state\n";
+            assert!(rules().contains(extra));
+            assert_eq!(rules().replace(extra, ""), original);
+            let wire = serde_json::to_vec(&guard.held().unwrap().1).unwrap();
+            assert!(serde_json::from_slice::<Inputs>(&wire).unwrap().negotiated_flow.is_none());
+
+            let mut previous = flow.clone();
+            previous.listener = 50003;
+            assert!(guard.expire_login_flow(&engine.holder(), &previous));
+            assert!(rules().contains(extra));
+            assert!(guard.expire_login_flow(&engine.holder(), &flow));
+            assert_eq!(rules(), original);
+            engine.shared.prepare_datagram(&mut c);
+            assert_eq!(rules(), original, "expired proof cannot rearm the rule");
+            engine.shared.retire_datagram(&mut c);
+            assert_eq!(rules(), original);
+            c.child.take();
+        }
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        guard.release(Some(&engine.holder()), network_guard::reason::USER);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

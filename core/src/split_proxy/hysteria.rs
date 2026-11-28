@@ -1269,7 +1269,6 @@ struct LiveProcess {
     generation: u64,
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
-    last_reason: Arc<Mutex<Option<String>>>,
     ready: Arc<AtomicBool>,
 }
 
@@ -1289,9 +1288,7 @@ fn resolve_host_ipv4(host: &str, resolver: Option<&HostResolver>) -> Option<Ipv4
         return Some(ip);
     }
     if let Some(res) = resolver {
-        if let Some(ip) = res(host).into_iter().find(|ip| !super::is_fake(*ip)) {
-            return Some(ip);
-        }
+        return res(host).into_iter().find(|ip| !super::is_fake(*ip));
     }
     (host, 443)
         .to_socket_addrs()
@@ -1317,6 +1314,11 @@ struct ManagerInner {
     live: HashMap<usize, LiveProcess>,
     backoff_steps: HashMap<usize, usize>,
     handover_token: u64,
+    // Reserved before DNS/spawn and through backoff. A replaced worker cannot
+    // publish readiness or wake up and take ownership of the replacement.
+    attempts: HashMap<usize, u64>,
+    last_path: Option<(String, String)>,
+    path_ready: bool,
 }
 
 static MANAGER: OnceLock<HysteriaManager> = OnceLock::new();
@@ -1340,6 +1342,32 @@ impl HysteriaManager {
         routing: Arc<Routing>,
         resolver: Option<HostResolver>,
     ) {
+        self.sync_on_path(specs, routing, resolver, Some(("", "")));
+    }
+
+    pub fn sync_on_path(
+        &self, specs: BTreeMap<usize, HysteriaSpec>, routing: Arc<Routing>,
+        resolver: Option<HostResolver>, path: Option<(&str, &str)>,
+    ) {
+        // Ordinary SOCKS5/HTTP needs only the resolver for editor probes.
+        // Keep the process supervisor and its code off this common path.
+        if specs.is_empty() {
+            let mut st = self.inner.lock().unwrap();
+            if st.specs.is_empty() {
+                st.handover_token = st.handover_token.wrapping_add(1);
+                st.routing = None;
+                st.resolver = resolver;
+                return;
+            }
+        }
+        self.reconcile(specs, routing, resolver, path);
+    }
+
+    #[inline(never)]
+    fn reconcile(
+        &self, specs: BTreeMap<usize, HysteriaSpec>, routing: Arc<Routing>,
+        resolver: Option<HostResolver>, path: Option<(&str, &str)>,
+    ) {
         let mut to_stop = Vec::new();
         let mut to_start = Vec::new();
         let mut recheck = Vec::new();
@@ -1348,35 +1376,39 @@ impl HysteriaManager {
             st.handover_token = st.handover_token.wrapping_add(1);
             st.routing = Some(routing.clone());
             st.resolver = resolver.clone();
-            st.specs = specs.clone();
+            let changed = path.is_some_and(|(interface, gateway)| st.last_path.as_ref()
+                .is_some_and(|(old_if, old_gw)| old_if != interface || old_gw != gateway));
+            st.path_ready = path.is_some();
+            if let Some((interface, gateway)) = path.filter(|_| !specs.is_empty()) {
+                if changed || st.last_path.is_none() {
+                    st.last_path = Some((interface.to_owned(), gateway.to_owned()));
+                }
+            }
 
-            let existing: Vec<usize> = st.live.keys().copied().collect();
-            for idx in existing {
-                let keep = specs.get(&idx).is_some_and(|want| st.live[&idx].spec == *want);
-                if !keep {
-                    if let Some(proc) = st.live.remove(&idx) {
-                        to_stop.push(proc);
-                    }
+            let reserved: Vec<_> = st.attempts.keys().copied().collect();
+            for idx in reserved {
+                let ready = st.live.get(&idx).is_some_and(|p| p.ready.load(Ordering::Acquire));
+                if changed || specs.get(&idx) != st.specs.get(&idx) || (path.is_none() && !ready) {
+                    st.attempts.remove(&idx);
                     st.backoff_steps.remove(&idx);
-                } else {
-                    let proc = &st.live[&idx];
+                    if let Some(proc) = st.live.remove(&idx) { to_stop.push(proc); }
+                }
+            }
+            st.specs = specs.clone();
+            for (idx, spec) in specs {
+                if path.is_none() {
+                    routing.set_managed_unavailable(idx, "正在等本地网络就绪".into());
+                } else if let Some(proc) = st.live.get(&idx) {
                     if proc.spec.host.parse::<Ipv4Addr>().is_err() {
                         recheck.push((idx, proc.spec.clone(), proc.resolved_ip, proc.generation));
                     }
                     if proc.ready.load(Ordering::Acquire) {
-                        routing.set_managed_ready(idx, proc.local_server.clone(), proc.resolved_ip, proc.spec.ports.clone());
-                    } else if let Some(reason) = proc.last_reason.lock().unwrap().clone() {
-                        routing.set_managed_unavailable(idx, reason);
-                    } else {
-                        routing.set_managed_unavailable(idx, "正在连接 Hysteria2 代理".into());
+                        routing.set_managed_ready(idx, proc.local_server.clone(), proc.resolved_ip, spec.ports);
                     }
-                }
-            }
-
-            for (idx, spec) in specs {
-                if !st.live.contains_key(&idx) {
+                } else if !st.attempts.contains_key(&idx) {
                     routing.set_managed_unavailable(idx, "正在连接 Hysteria2 代理".into());
                     let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                    st.attempts.insert(idx, gen);
                     to_start.push((idx, spec, gen));
                 }
             }
@@ -1386,7 +1418,7 @@ impl HysteriaManager {
             proc.terminate();
         }
         for (idx, spec, gen) in to_start {
-            self.launch_slot(idx, spec, gen, routing.clone(), resolver.clone());
+            self.launch_slot(idx, spec, gen, resolver.clone());
         }
         if !recheck.is_empty() {
             let inner = self.inner.clone();
@@ -1409,23 +1441,44 @@ impl HysteriaManager {
             if ip == old_ip {
                 continue;
             }
-            let (stale, routing, resolver) = {
+            let (stale, resolver, next_gen) = {
                 let mut st = inner.lock().unwrap();
                 if st.specs.get(&idx) != Some(&spec) || !st.live.get(&idx).is_some_and(|p| p.generation == gen) {
                     continue;
                 }
                 let Some(routing) = st.routing.clone() else { continue };
                 st.backoff_steps.remove(&idx);
-                (st.live.remove(&idx), routing, st.resolver.clone())
+                if !st.path_ready { continue; }
+                let next = shared().next_gen.fetch_add(1, Ordering::Relaxed);
+                st.attempts.insert(idx, next);
+                routing.set_managed_unavailable(idx, "正在连接 Hysteria2 代理".into());
+                (st.live.remove(&idx), st.resolver.clone(), next)
             };
             network_guard::log(&format!("hysteria2[{idx}]: server address changed, restarting the client"));
             if let Some(stale) = stale {
                 stale.terminate();
             }
-            routing.set_managed_unavailable(idx, "正在连接 Hysteria2 代理".into());
-            let gen = shared().next_gen.fetch_add(1, Ordering::Relaxed);
-            shared().launch_slot(idx, spec, gen, routing, resolver);
+            shared().launch_slot(idx, spec, next_gen, resolver);
         }
+    }
+
+    /// A confirmed loss of the physical network retires even a ready UDP
+    /// socket. The returning Wi-Fi may have the same router and interface.
+    pub fn physical_network_lost(&self, routing: &Arc<Routing>) {
+        routing.reset_health();
+        let stopped: Vec<_> = {
+            let mut st = self.inner.lock().unwrap();
+            if !st.routing.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, routing)) { return; }
+            st.path_ready = false;
+            st.last_path = None;
+            st.attempts.clear();
+            st.backoff_steps.clear();
+            for index in st.specs.keys() {
+                routing.set_managed_unavailable(*index, "正在等本地网络就绪".into());
+            }
+            st.live.drain().map(|(_, process)| process).collect()
+        };
+        for process in stopped { process.terminate(); }
     }
 
     /// Keeps running clients alive for `HANDOVER_GRACE` while ownership switches
@@ -1453,6 +1506,9 @@ impl HysteriaManager {
                     st.routing = None;
                     st.resolver = None;
                     st.specs.clear();
+                    st.attempts.clear();
+                    st.last_path = None;
+                    st.path_ready = false;
                     st.backoff_steps.clear();
                     st.live.drain().map(|(_, p)| p).collect()
                 };
@@ -1471,6 +1527,9 @@ impl HysteriaManager {
             st.routing = None;
             st.resolver = None;
             st.specs.clear();
+            st.attempts.clear();
+            st.last_path = None;
+            st.path_ready = false;
             st.backoff_steps.clear();
             st.live.drain().map(|(_, p)| p).collect()
         };
@@ -1488,6 +1547,7 @@ impl HysteriaManager {
     /// local SOCKS5 server so health checks can reuse it with zero extra processes.
     pub fn running_socks_for(&self, spec: &HysteriaSpec) -> Option<Server> {
         let st = self.inner.lock().unwrap();
+        if !st.path_ready { return None; }
         st.live.values().find_map(|p| {
             (p.spec == *spec && p.ready.load(Ordering::Acquire)).then(|| p.local_server.clone())
         })
@@ -1498,7 +1558,6 @@ impl HysteriaManager {
         idx: usize,
         spec: HysteriaSpec,
         gen: u64,
-        routing: Arc<Routing>,
         resolver: Option<HostResolver>,
     ) {
         let inner = self.inner.clone();
@@ -1506,18 +1565,23 @@ impl HysteriaManager {
             .name(format!("ac-hy2-{idx}"))
             .spawn(move || {
                 let inner_retry = inner.clone();
-                let routing_retry = routing.clone();
                 let spec_retry = spec.clone();
                 let fail_and_retry = move |reason: String| {
-                    routing_retry.set_managed_unavailable(idx, reason.clone());
-                    routing_retry.record(idx, Some(&reason));
                     let delay = {
                         let mut st = inner_retry.lock().unwrap();
-                        if st.specs.get(&idx) != Some(&spec_retry) {
+                        if st.attempts.get(&idx) != Some(&gen) {
                             return;
+                        }
+                        if let Some(r) = &st.routing {
+                            r.set_managed_unavailable(idx, reason.clone());
+                            r.record(idx, Some(&reason));
                         }
                         if st.live.get(&idx).is_some_and(|p| p.generation == gen) {
                             st.live.remove(&idx);
+                        }
+                        if !st.path_ready {
+                            st.attempts.remove(&idx);
+                            return;
                         }
                         let step = st.backoff_steps.entry(idx).or_insert(0);
                         let secs = BACKOFF_SECS[(*step).min(BACKOFF_SECS.len() - 1)];
@@ -1527,15 +1591,12 @@ impl HysteriaManager {
                     std::thread::sleep(delay);
                     let next = {
                         let st = inner_retry.lock().unwrap();
-                        if st.specs.get(&idx) != Some(&spec_retry) || st.live.contains_key(&idx) {
+                        if st.attempts.get(&idx) != Some(&gen) || !st.path_ready {
                             return;
                         }
-                        (st.routing.clone(), st.resolver.clone())
+                        st.resolver.clone()
                     };
-                    if let Some(r) = next.0 {
-                        let new_gen = shared().next_gen.fetch_add(1, Ordering::Relaxed);
-                        shared().launch_slot(idx, spec_retry, new_gen, r, next.1);
-                    }
+                    shared().launch_slot(idx, spec_retry, gen, next);
                 };
 
                 let bin = match resolve_verified_binary() {
@@ -1593,7 +1654,7 @@ impl HysteriaManager {
                     // Gone from the wanted list, or another launch for this
                     // slot (a retry racing a sync) got there first: one
                     // client per slot, never an orphan.
-                    if st.specs.get(&idx) != Some(&spec) || st.live.contains_key(&idx) {
+                    if st.attempts.get(&idx) != Some(&gen) || st.live.contains_key(&idx) {
                         drop(st);
                         if let Some(mut c) = child_slot.lock().unwrap().take() {
                             terminate_child(&mut c);
@@ -1609,7 +1670,6 @@ impl HysteriaManager {
                             generation: gen,
                             stop: stop.clone(),
                             child: child_slot.clone(),
-                            last_reason: last_reason.clone(),
                             ready: ready.clone(),
                         },
                     );
@@ -1636,22 +1696,25 @@ impl HysteriaManager {
                         match parse_log_line(&line) {
                             LogEvent::Ready => {
                                 cfg_dir.remove_file_only();
+                                let mut st = inner.lock().unwrap();
+                                if st.attempts.get(&idx) != Some(&gen) { break; }
                                 ready.store(true, Ordering::Release);
-                                {
-                                    let mut st = inner.lock().unwrap();
-                                    st.backoff_steps.insert(idx, 0);
+                                st.backoff_steps.insert(idx, 0);
+                                if let Some(r) = st.routing.as_ref().filter(|_| st.path_ready) {
+                                    r.set_managed_ready(idx, local_server.clone(), resolved_ip, spec.ports.clone());
                                 }
-                                let active_routing = inner.lock().unwrap().routing.clone().unwrap_or_else(|| routing.clone());
-                                active_routing.set_managed_ready(idx, local_server.clone(), resolved_ip, spec.ports.clone());
-                                active_routing.record(idx, None);
                             }
                             LogEvent::Failure(reason) => {
+                                let st = inner.lock().unwrap();
+                                if st.attempts.get(&idx) != Some(&gen) { break; }
                                 *last_reason.lock().unwrap() = Some(reason.to_string());
-                                let active_routing = inner.lock().unwrap().routing.clone().unwrap_or_else(|| routing.clone());
-                                if !ready.load(Ordering::Acquire) {
-                                    active_routing.set_managed_unavailable(idx, reason.to_string());
+                                if let Some(r) = &st.routing {
+                                    if !ready.load(Ordering::Acquire) {
+                                        r.set_managed_unavailable(idx, reason.to_string());
+                                    }
+                                    r.record(idx, Some(reason));
                                 }
-                                active_routing.record(idx, Some(reason));
+                                drop(st);
                                 let clean = redact_log_line(&line, &secret_refs);
                                 network_guard::log(&format!("hysteria2[{idx}]: {reason} ({clean})"));
                             }
@@ -1661,8 +1724,11 @@ impl HysteriaManager {
                 }
 
                 // Reap child
-                if let Some(mut c) = child_slot.lock().unwrap().take() {
-                    let _ = c.wait();
+                // A superseded reader can leave before EOF. Its owner terminates
+                // and reaps the child; do not race it to a blocking wait.
+                if !stop.load(Ordering::Acquire) && inner.lock().unwrap().attempts.get(&idx) == Some(&gen) {
+                    let child = child_slot.lock().unwrap().take();
+                    if let Some(mut child) = child { let _ = child.wait(); }
                 }
                 drop(cfg_dir);
 
@@ -1682,6 +1748,30 @@ impl HysteriaManager {
 
 // MARK: - On-demand probe (pre-save check & Settings check)
 
+/// A saved check follows its exact configured slot, even while a settings
+/// update is still in flight. It never starts a temporary test client.
+pub fn probe_saved(key: &str, site: Option<&str>) -> Probe {
+    let waiting = |text: &str| Probe { level: Level::Pending, text: text.into(), millis: 0 };
+    let Some(key) = super::parse_health_key(key) else { return waiting("正在等代理配置生效"); };
+    let server = {
+        let st = shared().inner.lock().unwrap();
+        let Some(routing) = &st.routing else { return waiting("正在等代理配置生效"); };
+        let table = routing.table();
+        let index = table.health_keys.iter().find_map(|(n, k)| (*k == key).then_some(*n));
+        let Some(index) = index else { return waiting("正在等代理配置生效"); };
+        if !st.path_ready { return waiting("正在等本地网络就绪"); }
+        if st.specs.get(&index).is_none() || st.specs.get(&index) != table.hysteria.get(&index) {
+            return waiting("正在等代理配置生效");
+        }
+        routing.resolve_server(index)
+    };
+    match server {
+        Ok(server) => probe_socks(&server, site),
+        Err(reason) if reason == "正在连接 Hysteria2 代理" => waiting(&reason),
+        Err(text) => Probe { level: Level::Fail, text, millis: 0 },
+    }
+}
+
 /// Probes a candidate Hysteria2 proxy: reuses an already-running managed client
 /// if identical, otherwise starts a temporary unprivileged client, waits for
 /// handshake/SOCKS5 readiness, and (when `site` is given) asks it to open `site:443`.
@@ -1697,7 +1787,6 @@ pub fn probe_hysteria(
         millis: started.elapsed().as_millis() as u64,
     };
 
-    // Fast path: identical proxy is already running in the manager.
     if let Some(existing) = shared().running_socks_for(spec) {
         return probe_socks(&existing, site);
     }

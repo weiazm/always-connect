@@ -69,6 +69,7 @@ final class CertificateRelay {
 
     /// Called on the relay queue after several connections in a row
     /// found the gateway address silent (§30.6), with that address.
+    var onDatagramFlow: ((String) -> Void)?
     var onGatewayUnreachable: ((String) -> Void)?
     var onGatewayTrustChanged: ((Bool) -> Void)?
     private var gatewayTrusted: Bool?
@@ -392,6 +393,7 @@ final class CertificateRelay {
         let pair = Pair(incoming: incoming, outgoing: outgoing, queue: queue, number: pairCount,
                         gatewayIp: ip)
         let key = ObjectIdentifier(pair)
+        pair.onDatagramFlow = onDatagramFlow
         pair.onClose = { [weak self] outcome in
             guard let self else { return }
             self.pairs.removeValue(forKey: key)
@@ -508,6 +510,7 @@ private final class Pair {
     let number: Int
     let gatewayIp: String
     enum Outcome { case carried, gatewaySilent, other }
+    var onDatagramFlow: ((String) -> Void)?
     var onClose: ((Outcome) -> Void)?
     /// The plaintext side — request and answer headers, CSTP packets,
     /// the login trace, the DTLS channel — is Rust (core/src/relay.rs,
@@ -628,6 +631,11 @@ private final class Pair {
                     self.close("framing \(self.side(fromClient)) -> \(self.side(!fromClient)): \(why)")
                     return
                 }
+                if !fromClient, let notify = self.onDatagramFlow, let raw = ac_relay_datagram_flow(self.stream) {
+                    self.onDatagramFlow = nil
+                    notify(String(cString: raw))
+                    ac_string_free(raw)
+                }
                 chunks.reserveCapacity(Int(count))
                 for index in 0..<Int(count) {
                     var bytes: UnsafePointer<UInt8>?
@@ -698,6 +706,7 @@ func ac_relay_stream_feed(_ s: OpaquePointer, _ fromClient: Bool, _ data: Unsafe
 @_silgen_name("ac_relay_stream_chunk")
 func ac_relay_stream_chunk(_ s: OpaquePointer, _ fromClient: Bool, _ index: Int,
                            _ data: UnsafeMutablePointer<UnsafePointer<UInt8>?>) -> Int
+@_silgen_name("ac_relay_datagram_flow") private func ac_relay_datagram_flow(_ s: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_relay_stream_close")
 func ac_relay_stream_close(_ s: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_relay_stream_free")

@@ -20,3 +20,6 @@ swiftc -target "$(uname -m)-apple-macos13.0" -parse-as-library -module-name Conn
     -o "$WORK/ConnectionsUITest" > "$WORK/swift.log" 2>&1 || { cat "$WORK/swift.log"; exit 1; }
 ALWAYSCONNECT_GEODATA="$ROOT/core/scripts/fixtures/geodata" ALWAYSCONNECT_GEO_DIR="$WORK/geo" \
     "$WORK/ConnectionsUITest" --settings
+
+codesign --force --sign - --identifier com.example.proxy-health-test "$WORK/ConnectionsUITest"
+AC_PROXY_HEALTH_MARKER="$WORK/health-result" "$WORK/ConnectionsUITest"

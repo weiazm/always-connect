@@ -70,6 +70,9 @@ pub struct Inputs {
     pub login_port: Option<u16>,
     #[serde(rename = "loginUDP", default)]
     pub login_udp: bool,
+    /// Valid only for a live socket. Crash recovery starts with the ordinary login policy.
+    #[serde(skip)]
+    pub negotiated_flow: Option<crate::relay::DatagramFlow>,
     #[serde(default)]
     pub login_generation: u64,
 }
@@ -132,7 +135,7 @@ pub fn is_ip(s: &str) -> bool {
 /// The anchor text for a set (core/src/pf.rs), or None when refused.
 pub fn text(connected: bool, i: &Inputs) -> Option<String> {
     if let Some(port) = i.login_port.filter(|_| !connected && i.tunnel_if.is_empty()) {
-        return pf::login_rules(&i.physical_if, &i.gateway_ips, port, i.login_udp, &i.allow_networks);
+        return pf::login_rules_with_datagram(&i.physical_if, &i.gateway_ips, port, i.login_udp, &i.allow_networks, i.negotiated_flow.as_ref());
     }
     // As the comma-separated C call did: entries trimmed, empty ones dropped.
     let clean = |v: &Vec<String>| -> Vec<String> {
@@ -458,6 +461,44 @@ impl Guard {
         Ok(())
     }
 
+    /// Only amend the narrow login policy of this exact engine. Returning to
+    /// TCP-only must never overwrite a newer normal tunnel or another owner.
+    pub(crate) fn allow_login_flow(self: &Arc<Self>, holder: &str, flow: &crate::relay::DatagramFlow) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(record) = state.record.as_ref() else { return false; };
+        if !state.owner_present || record.holder != holder || Self::is_stale(&state, holder) || record.connected ||
+            !record.inputs.tunnel_if.is_empty() || record.inputs.login_port.is_none() || record.inputs.login_udp {
+            return false;
+        }
+        if record.inputs.negotiated_flow.as_ref() == Some(flow) { return true; }
+        let mut next = record.inputs.clone();
+        next.negotiated_flow = Some(flow.clone());
+        if text(false, &next).is_none() { return false; }
+        // Arm the expiry before loading the rule. It also works while the
+        // engine queue is busy. A failed withdrawal is retried while the
+        // exact socket and owner still hold the login policy.
+        let guard = Arc::downgrade(self);
+        let expiry_holder = holder.to_owned();
+        let flow = flow.clone();
+        if std::thread::Builder::new().name("ac-dtls-bootstrap".into()).stack_size(64 * 1024).spawn(move || {
+            std::thread::sleep(Duration::from_secs(15));
+            while let Some(guard) = guard.upgrade() {
+                if guard.expire_login_flow(&expiry_holder, &flow) { break; }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }).is_err() { return false; }
+        self.apply_locked(&mut state, holder, false, &next).is_none()
+    }
+
+    pub(crate) fn expire_login_flow(self: &Arc<Self>, holder: &str, flow: &crate::relay::DatagramFlow) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let Some(record) = s.record.as_ref() else { return true; };
+        if record.holder != holder || record.inputs.negotiated_flow.as_ref() != Some(flow) { return true; }
+        let mut inputs = record.inputs.clone();
+        inputs.negotiated_flow = None;
+        self.apply_locked(&mut s, holder, false, &inputs).is_none()
+    }
+
     pub fn verify_login(&self, holder: &str) -> Result<(), String> {
         let state = self.state.lock().unwrap();
         self.verify_login_locked(&state, holder, Instant::now() + Duration::from_secs(2))
@@ -719,6 +760,11 @@ impl Guard {
     /// yet — with no App it gets the grace period too.
     pub fn owner_lost(self: &Arc<Self>, session_active: bool) {
         let mut s = self.state.lock().unwrap();
+        if let Some(record) = s.record.as_ref().filter(|r| r.inputs.negotiated_flow.is_some()).cloned() {
+            let mut inputs = record.inputs;
+            inputs.negotiated_flow = None;
+            self.apply_locked(&mut s, &record.holder, false, &inputs);
+        }
         s.owner_present = false;
         if s.record.is_some() || session_active {
             self.start_grace(&mut s);
