@@ -253,7 +253,8 @@ struct ProxyEditor: View {
         self.previewSavesFirst = previewSavesFirst
         self.previewProtectedSites = previewProtectedSites
         original = route
-        let link = isNew ? "" : ProxyLink.display(route)
+        // A proxy imported without a link (§七十五) has no address yet.
+        let link = isNew || route.host.isEmpty ? "" : ProxyLink.display(route)
         let rules = route.sites.joined(separator: "\n")
         _link = State(initialValue: link)
         _name = State(initialValue: isNew ? "" : route.name)

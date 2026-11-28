@@ -24,3 +24,5 @@ regex-lite = "0.1"
 # The network gate's record (guard.json), compatible with the Swift-written one.
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }  # exact floats: approvals name records by time (DESIGN §66.32)
+# The shared-settings file (DESIGN §七十五): read only; the App writes the text itself.
+toml = { version = "1.1", default-features = false, features = ["std", "serde", "parse"] }

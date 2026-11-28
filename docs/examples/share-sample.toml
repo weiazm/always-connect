@@ -1,0 +1,70 @@
+# AlwaysConnect 分享配置。导入：设置 → 通用 → 导入…（先列出会加什么，确认后才写入）。
+# 代理链接里的 {host}、{password} 这类是分享者没导出的部分，导入时粘贴你自己的完整链接即可。
+# 导入只加不删；没填链接的代理先停用，出口保护先暂停。
+# （本文件为示例，内容全部虚构。）
+
+[file]
+kind = "alwaysconnect-share"
+format = 1
+app_version = "0.6.0"
+exported = "2026-11-28"
+contains_secrets = false
+
+# 通用开关：导入时默认保持你本机的值，打开才改
+[general]
+drop_protection = true
+auto_lan = true
+auto_connect_on_launch = true
+approval_card = true
+site_lists_auto_update = true
+
+# Cisco 服务器：cisco_entry 是 Cisco Secure Client 里的条目名，本机找不到时用 address
+[cisco]
+group = "Staff"
+selected = "VPN-A"
+
+[[cisco.server]]
+name = "VPN-A"
+cisco_entry = "VPN-A"
+address = "vpn-a.example.com"
+
+[[cisco.server]]
+name = "VPN-B"
+address = "vpn-b.example.com"
+
+# 分流直连（按网站分流时）：rules 命中的网站不走 Cisco；exceptions 是例外，命中的照常走 Cisco。
+# 三类名单的规则写法都和 App 里的规则框相同。
+[split.direct]
+rules = [
+  "example.com",
+  "full:docs.example.org",
+  "keyword:examplecdn",
+  "geosite:example-list",
+  "203.0.113.0/24",
+]
+exceptions = ["full:login.example.com"]
+
+[[split.direct.group]]
+name = "示例分组"
+rules = ["a.example.net", "b.example.net"]
+
+# 分流代理：按先后顺序匹配；exceptions 命中的跳过这个代理，继续往后匹配
+[[proxy]]
+name = "示例 SOCKS5"
+link = "socks5://{username}:{password}@{host}:1080"
+rules = ["geosite:example-media", "full:api.example.net"]
+exceptions = []
+
+[[proxy]]
+name = "示例 Hysteria2"
+link = "hysteria2://{password}@{host}:443,20000-30000/?sni={sni}&obfs=salamander&obfs-password={obfs_password}&upmbps=50&downmbps=200&hop=30"
+rules = ["geosite:example-tools", "198.51.100.0/24"]
+exceptions = ["full:static.example.org"]
+
+# 出口保护：rules 里的网站只允许从 countries 出去；exceptions 命中的不受这条保护
+[[egress.rule]]
+name = "示例：只从美国出口"
+rules = ["shop.example.com", "geosite:example-shop"]
+exceptions = ["full:cdn.shop.example.com"]
+countries = ["US"]
+when_unverified = "when_wrong"   # allow 放行 / when_wrong 有异常就拦 / block 一律拦

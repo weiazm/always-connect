@@ -60,6 +60,7 @@ struct ProxyRoute: Codable, Equatable, Identifiable {
         return host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
     }
     var rowSubtitle: String {
+        if host.isEmpty { return "\(kind.label) · 还没填链接（导入的代理）" }
         if kind == .hysteria2 { return "Hysteria2 · \(host):\(effectivePorts)" }
         return ProxyLink.display(self).replacingOccurrences(of: "://", with: " · ")
     }

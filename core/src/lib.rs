@@ -8,6 +8,7 @@ pub mod backoff;
 pub(crate) mod child_io;
 pub mod cisco;
 pub mod cisco_import;
+pub mod config_share;
 pub mod connections;
 pub mod diagnostics;
 pub mod direct_routes;

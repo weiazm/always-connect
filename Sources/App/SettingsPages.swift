@@ -204,6 +204,8 @@ struct GeneralPage: View {
                 Footnote("需在「系统设置 → 隐私与安全性 → 辅助功能」里允许 AlwaysConnect；只接受带 ⌘/⌥/⌃ 的组合。")
             }
 
+            ShareSection()
+
             AboutSection()
         }
         .formStyle(.grouped)
