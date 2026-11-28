@@ -1,5 +1,5 @@
 # AlwaysConnect 分享配置。导入：设置 → 通用 → 导入配置…（会先预览，确认后才写入）。
-# 写成 { fill = "…" } 的是分享者没导出的信息，导入时填你自己的。
+# 代理链接里的 {host}、{password} 这类是分享者没导出的部分，导入时填你自己的。
 # 导入的代理和出口保护默认先停用。（本文件为设计示例，内容全部虚构。）
 
 [file]
@@ -50,29 +50,12 @@ rules = ["a.example.net", "b.example.net"]
 # 分流代理：按先后顺序匹配，先命中的生效
 [[proxy]]
 name = "示例 SOCKS5"
-type = "socks5"
-host = { fill = "host" }
-port = 1080
-username = { fill = "username", optional = true }
-password = { fill = "secret", optional = true }
-enabled = true
+link = "socks5://{username}:{password}@{host}:1080"
 rules = ["geosite:example-media", "full:api.example.net"]
-exceptions = []
 
 [[proxy]]
 name = "示例 Hysteria2"
-type = "hysteria2"
-host = { fill = "host" }
-ports = "443,20000-30000"
-auth = { fill = "secret" }
-sni = { fill = "sni", optional = true, hint = "服务器是 IP 时，sni 和 pin_sha256 至少填一项" }
-pin_sha256 = { fill = "pin_sha256", optional = true }
-obfs = "salamander"
-obfs_password = { fill = "secret" }
-up_mbps = 50
-down_mbps = 200
-hop_seconds = 30
-enabled = false
+link = "hysteria2://{password}@{host}:443,20000-30000/?sni={sni}&obfs=salamander&obfs-password={obfs_password}&upmbps=50&downmbps=200&hop=30"
 rules = ["geosite:example-tools", "198.51.100.0/24"]
 exceptions = ["full:static.example.org"]
 
